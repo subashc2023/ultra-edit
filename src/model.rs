@@ -201,6 +201,90 @@ pub struct Receipt {
     pub undo: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "encoding", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ByteContent {
+    Utf8 { text: String },
+    Binary { bytes: Vec<u8> },
+}
+
+impl ByteContent {
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Utf8 { text } => text.as_bytes(),
+            Self::Binary { bytes } => bytes,
+        }
+    }
+}
+
+impl From<Vec<u8>> for ByteContent {
+    fn from(bytes: Vec<u8>) -> Self {
+        match String::from_utf8(bytes) {
+            Ok(text) => Self::Utf8 { text },
+            Err(error) => Self::Binary {
+                bytes: error.into_bytes(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ObservedState {
+    File {
+        digest: String,
+        content: ByteContent,
+    },
+    Missing,
+    Unavailable {
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetObservation {
+    pub path: String,
+    pub state: ObservedState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Inspection {
+    pub id: String,
+    pub plan: PreparedPlan,
+    pub journal: ByteContent,
+    pub journal_digest: String,
+    pub receipt: Option<Receipt>,
+    pub receipt_error: Option<Diagnostic>,
+    pub files: Vec<TargetObservation>,
+    pub reconciliation: Option<Reconciliation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationDecision {
+    AcceptCurrent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconciliationRequest {
+    pub inspection: String,
+    pub decision: ReconciliationDecision,
+    pub note: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Reconciliation {
+    pub plan_id: String,
+    pub plan_digest: String,
+    pub journal_digest: String,
+    pub request: ReconciliationRequest,
+}
+
 #[derive(Debug)]
 pub struct Error {
     pub code: String,

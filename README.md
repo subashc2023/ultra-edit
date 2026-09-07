@@ -53,6 +53,8 @@ ultra-edit --root WORKSPACE edit < request.json
 ultra-edit --root WORKSPACE commit PLAN
 ultra-edit --root WORKSPACE repair < corrections.json
 ultra-edit --root WORKSPACE receipt REQUEST_ID
+ultra-edit --root WORKSPACE inspect PLAN
+ultra-edit --root WORKSPACE reconcile < resolution.json
 ultra-edit --root WORKSPACE get REFERENCE
 ultra-edit --root WORKSPACE diff PLAN
 ultra-edit --root WORKSPACE undo PLAN NEW_REQUEST_ID
@@ -188,7 +190,10 @@ References are random and workspace-local; missing references fail explicitly.
 `undo PLAN NEW_REQUEST_ID` restores the original bytes of confirmed committed
 files only if they still equal the recorded candidate. It is another journaled,
 idempotent batch. Newer work causes rejection. Partial receipts can undo their
-confirmed files; an uncertain receipt must be reconciled first.
+confirmed files. An uncertain plan remains unavailable for automatic undo;
+reconcile to permit fresh edits, then restore any desired original bytes through
+a new, explicit edit. Reconciliation does not establish which uncertain writes
+happened.
 
 ## Persistence and evidence
 
@@ -208,24 +213,81 @@ candidate and is evidence of actual output only for confirmed committed files.
 
 A missing durable outcome after a write intent is `outcome_unknown`, even when
 current bytes happen to match the candidate. Repeating that plan returns its
-recorded/recovered outcome without writing. Any uncertain journal blocks new
-mutations throughout the workspace. `JOURNAL_UNCERTAIN` errors carry the request
+recorded/recovered outcome without writing. Any unresolved uncertain journal
+blocks new mutations throughout the workspace. `JOURNAL_UNCERTAIN` errors carry the request
 and plan references with explicit `outcome_unknown`; retrieve their evidence.
-An operator reconciliation API is still pending, so retain the state and inspect
-it before further work through this adapter.
+The operator workflow below records a resolution while retaining that uncertainty.
 
 Compact reports default to 60 lines and 6,000 Unicode characters, including long
 single lines. CLI diagnostics show at most six shortened entries. `get` retrieves
-full plans/drafts/snapshots; `receipt` retrieves every file outcome. `diff` returns
-a complete before/after diff, including deletions and missing-final-newline markers.
+full plans/drafts/snapshots/inspections; `receipt` retrieves every file outcome.
+`diff` returns a complete before/after diff, including deletions and missing-final-newline markers.
 The initial full diff uses one full-file replacement hunk, so unchanged lines also
 appear on both sides. Its quoted paths are for inspection; patch import is not
 implemented. Explicit evidence commands are not subject to compact-report limits.
 
-Exit codes are `0` for successful reads/previews/commits, `2` for rejected requests
-or command/output errors, and `3` for commits that are not fully confirmed.
+Exit codes are `0` for successful reads/previews/commits/reconciliations, `2` for
+rejected requests or command/output errors, and `3` for commits that are not fully confirmed.
 Inspect JSON `commit` and `error.code`, not the exit code alone. If output is lost,
 retrieve the receipt by request ID before attempting another mutation.
+
+## Crash reconciliation
+
+`inspect PLAN` captures an immutable `i...` inspection. It includes the complete
+plan (original text and intended output), exact journal bytes and digest, the
+historical receipt or its diagnostic, and current state for every target. UTF-8
+evidence uses `{"encoding":"utf8","text":"..."}`; non-UTF-8 evidence uses
+`{"encoding":"binary","bytes":[255,0]}`. Missing targets are recorded explicitly.
+`get INSPECTION` retrieves the saved evidence after a restart. Inspection writes
+only workspace state, never target files.
+
+After reviewing the evidence, submit an explicit operator decision:
+
+```json
+{
+  "inspection": "i_REPLACE_WITH_RETURNED_ID",
+  "decision": "accept_current",
+  "note": "Reviewed the journal and all current files; accept this state and prepare fresh edits."
+}
+```
+
+```powershell
+Get-Content -Raw resolution.json | ultra-edit --root WORKSPACE reconcile
+```
+
+`accept_current` acknowledges the inspected file states as the starting point for
+further work. It makes **no claim about historical execution** and performs no
+target writes. An operator note containing 1–1,000 Unicode characters and some
+non-whitespace text is required. No automatic acceptance or replay occurs.
+
+The engine holds the workspace coordinator lock, rechecks exact journal bytes
+and every observed target state, and publishes one immutable resolution for that
+plan using the checksummed, synced object store. Changed evidence produces
+`STALE_INSPECTION`; inspect again before deciding. Torn or corrupt regular journals
+can be acknowledged when their immutable plan remains available. The original
+journal and receipt remain unchanged: an unknown outcome stays unknown, and a
+corrupt historical receipt continues to return its error.
+
+Once every uncertain plan has a valid resolution, new mutations are allowed and
+still pass their usual base checks. Other unresolved journals keep the workspace
+blocked. Repeating the exact reconciliation request returns the original record,
+including after later edits or a process restart. A different request for an
+already resolved plan returns `RECONCILIATION_CONFLICT`. `inspect PLAN` also shows
+the recorded resolution, including its original request, when one exists.
+
+Current files may be binary or safely absent, but redirected paths, directories,
+unreadable files, or excessive data produce `unavailable` observations and prevent
+acceptance. Each file and journal is limited to 16 MiB; current file bytes total at
+most 64 MiB per inspection. Missing paths are checked through their nearest
+existing ancestor to prevent accepting a redirected location. Inspection does not
+make binary or missing files editable through the existing-file UTF-8 adapter.
+
+Keep the plan, inspection, resolution, and original journal intact. Changed or
+missing journal evidence after reconciliation blocks further mutation and cannot
+reactivate the original plan. Missing or corrupt immutable state requires
+restoring that evidence; reconciliation does not repair the state store. The
+coordinator protects cooperating processes only, and observations do not exclude
+arbitrary external writers. Conditional base checks still apply to every later edit.
 
 ## Initial limits
 
@@ -265,16 +327,19 @@ order independence, stale previews, repaired conflicts, durable retry identity,
 conditional undo, path aliases, report limits, and injected persistence/journal
 failures. Focused read/search tests cover disclosed references, Unicode and
 line-ending boundaries, overlapping matches, and resource limits. CLI tests
-launch separate processes to exercise persistent state.
+launch separate processes to exercise persistent state. Reconciliation tests
+cover interrupted and corrupt journals, changed observations, binary/missing
+targets, retained historical outcomes, concurrent decisions, and restart recovery.
 
 `compiler.rs` is pure planning; `reading.rs` constructs focused source views;
-`storage.rs` owns persistence and recovery; `workspace.rs` owns the
+`storage.rs` owns persistence and recovery; `storage/reconciliation.rs` captures
+evidence and records operator resolutions; `workspace.rs` owns the
 reference/request protocol; `report.rs` formats evidence;
 `main.rs` is the thin CLI. Use `Workspace` for coordinated host integration;
 low-level `Storage` calls require the caller to hold its coordinator lock.
 
 Next milestones from the design are distinct file creation/deletion/rename
-operations, an explicit reconciliation workflow, recovery candidates,
+operations, recovery candidates,
 host/MCP/editor adapters, and platform metadata support. Contextual patches,
 regex, semantic refactors, rebasing, and model-driven
 benchmarks follow evidence from those integrations.

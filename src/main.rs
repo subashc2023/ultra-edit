@@ -19,11 +19,13 @@ Usage: ultra-edit [--root WORKSPACE] COMMAND [ARGS]
   repair                     Read {reference,request_id,changes} from stdin
   commit PLAN                Commit the recorded candidate, conditional on its base
   receipt REQUEST_ID         Retrieve the full recorded persistence outcome
-  get REFERENCE              Retrieve a full snapshot, plan, or failed draft
+  inspect PLAN               Capture journal and original/intended/current file evidence
+  reconcile                  Read {inspection,decision,note} from stdin; accept current state
+  get REFERENCE              Retrieve a full snapshot, plan, draft, or inspection
   diff PLAN                  Retrieve the full before/after diff (JSON string)
   undo PLAN NEW_REQUEST_ID    Conditionally restore confirmed committed files
 
-Output is JSON. Exit codes: 0 successful read/preview/commit, 2 rejected/error,
+Output is JSON. Exit codes: 0 successful read/preview/commit/reconciliation, 2 rejected/error,
 3 commit not fully confirmed. References and receipts live in WORKSPACE/.ultra-edit.
 See README.md for request schemas, preservation policy, and initial limitations.
 ";
@@ -85,10 +87,10 @@ fn run() -> Result<Option<(Value, u8)>, Error> {
         .into_string()
         .map_err(|_| usage("Command must be Unicode"))?;
     let expected = match command.as_str() {
-        "read" | "commit" | "receipt" | "get" | "diff" => 1,
+        "read" | "commit" | "receipt" | "inspect" | "get" | "diff" => 1,
         "undo" | "search" => 2,
         "read-range" => 3,
-        "prepare" | "edit" | "repair" => 0,
+        "prepare" | "edit" | "repair" | "reconcile" => 0,
         _ => return Err(usage("Unknown command; run --help")),
     };
     if args.len() != expected {
@@ -125,6 +127,8 @@ fn run() -> Result<Option<(Value, u8)>, Error> {
         }
         "commit" => completed(workspace.commit(argument(0)?)?),
         "receipt" => (serde_json::to_value(workspace.receipt(argument(0)?)?)?, 0),
+        "inspect" => (serde_json::to_value(workspace.inspect(argument(0)?)?)?, 0),
+        "reconcile" => (serde_json::to_value(workspace.reconcile(input()?)?)?, 0),
         "get" => (serde_json::to_value(workspace.evidence(argument(0)?)?)?, 0),
         "diff" => (json!({ "diff": workspace.diff(argument(0)?)? }), 0),
         "undo" => edited(workspace.undo(argument(0)?, argument(1)?)?),

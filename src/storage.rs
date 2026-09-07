@@ -12,6 +12,8 @@ use crate::model::{
     CommitStatus, Error, FileOutcome, FileStatus, PreparedFile, PreparedPlan, Receipt, digest,
 };
 
+mod reconciliation;
+
 pub struct Storage {
     root: PathBuf,
     state: PathBuf,
@@ -153,6 +155,7 @@ impl Storage {
 
     /// The caller must hold the coordinator lock throughout receipt lookup and commit.
     pub fn receipt(&self, plan: &PreparedPlan) -> Result<Option<Receipt>, Error> {
+        self.reconciliation(plan)?;
         let path = self.journal_path(&plan.id)?;
         if !regular_or_missing(&path)? {
             return Ok(None);
@@ -341,6 +344,7 @@ impl Storage {
     }
 
     fn assert_no_unknown(&self) -> Result<(), Error> {
+        let reconciled = self.checked_reconciliations()?;
         for entry in fs::read_dir(self.directory("journals")?)? {
             let path = entry?.path();
             if path
@@ -348,6 +352,13 @@ impl Storage {
                 .is_some_and(|extension| extension == "jsonl")
             {
                 regular_or_missing(&path)?;
+                if path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|id| reconciled.contains(id))
+                {
+                    continue;
+                }
                 let journal = read_journal(&path)?;
                 if journal.pending
                     || journal

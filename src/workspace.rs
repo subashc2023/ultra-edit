@@ -54,6 +54,7 @@ pub enum Evidence {
     Snapshot(Snapshot),
     Plan(PreparedPlan),
     Draft(Draft),
+    Inspection(Box<Inspection>),
 }
 
 impl Workspace {
@@ -140,6 +141,16 @@ impl Workspace {
         self.commit_plan(&plan)
     }
 
+    pub fn inspect(&self, reference: &str) -> Result<Inspection, Error> {
+        let _lock = self.storage.lock()?;
+        self.storage.inspect(&self.plan(reference)?)
+    }
+
+    pub fn reconcile(&self, request: ReconciliationRequest) -> Result<Reconciliation, Error> {
+        let _lock = self.storage.lock()?;
+        self.storage.reconcile(request)
+    }
+
     /// Corrections replace changes in their original positions and retain the original snapshots.
     pub fn repair(
         &self,
@@ -167,7 +178,7 @@ impl Workspace {
                 plan.request
             }
             Evidence::Draft(draft) => draft.request,
-            Evidence::Snapshot(_) => {
+            Evidence::Snapshot(_) | Evidence::Inspection(_) => {
                 return Err(Error::new(
                     "INVALID_REFERENCE",
                     "Repair requires a draft or plan",
@@ -241,9 +252,9 @@ impl Workspace {
         match self.evidence_unlocked(&binding.reference)? {
             Evidence::Plan(plan) => self.recorded_receipt(&plan),
             Evidence::Draft(_) => Ok(None),
-            Evidence::Snapshot(_) => Err(Error::new(
+            Evidence::Snapshot(_) | Evidence::Inspection(_) => Err(Error::new(
                 "CORRUPT_STATE",
-                "Request binding points to a snapshot",
+                "Request binding does not point to a plan or draft",
             )),
         }
     }
@@ -265,7 +276,7 @@ impl Workspace {
         if receipt.commit == CommitStatus::OutcomeUnknown {
             return Err(Error::new(
                 "OUTCOME_UNKNOWN",
-                "Reconcile the uncertain commit before undo or further mutation",
+                "Historical outcome is uncertain; reconcile to permit fresh edits, then restore through a new explicit request",
             ));
         }
         let mut files = Vec::new();
@@ -470,9 +481,13 @@ impl Workspace {
                 .map(Evidence::Snapshot),
             Some(b'p') => self.storage.get("plans", reference).map(Evidence::Plan),
             Some(b'd') => self.storage.get("drafts", reference).map(Evidence::Draft),
+            Some(b'i') => self
+                .storage
+                .get("inspections", reference)
+                .map(|inspection| Evidence::Inspection(Box::new(inspection))),
             _ => Err(Error::new(
                 "INVALID_REFERENCE",
-                "Expected a snapshot, plan, or draft reference",
+                "Expected a snapshot, plan, draft, or inspection reference",
             )),
         }
     }
@@ -504,7 +519,7 @@ impl Workspace {
                 diagnostics: draft.diagnostics,
                 receipt: None,
             }),
-            Evidence::Snapshot(_) => Err(Error::new(
+            Evidence::Snapshot(_) | Evidence::Inspection(_) => Err(Error::new(
                 "INVALID_REFERENCE",
                 "Expected a plan or draft reference",
             )),
