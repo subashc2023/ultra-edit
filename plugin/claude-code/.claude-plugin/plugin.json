@@ -1,0 +1,9 @@
+{
+  "name": "ultra-edit",
+  "version": "0.1.0",
+  "description": "Edit existing UTF-8 files through immutable snapshots, checked batches, and durable receipts.",
+  "author": {
+    "name": "Subash Chandra",
+    "url": "https://github.com/subashc2023"
+  }
+}

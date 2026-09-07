@@ -1,4 +1,5 @@
 pub mod compiler;
+pub mod mcp;
 pub mod model;
 mod reading;
 pub mod report;

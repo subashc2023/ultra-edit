@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp",
+            "args": ["--claude-context", "SessionStart"],
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp",
+            "args": ["--claude-context", "SubagentStart"],
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,8 +1,11 @@
 # ULTRA Edit
 
-A Rust library and JSON CLI for editing immutable UTF-8 snapshots. This is
-an early implementation of [the design](docs/ULTRA-EDIT.md), with a filesystem host
-for existing files. It is not the complete first release described in that plan.
+A Rust engine, JSON CLI, and local MCP server for editing existing UTF-8 files.
+The [Claude Code plugin](plugin/claude-code/.claude-plugin/plugin.json) packages
+the MCP connection, automatically loaded editing instructions, and a thin skill
+with focused usage references. The current product is an edit tool for Claude
+Code; [the original design](docs/ULTRA-EDIT.md)
+records a broader historical plan, not the current delivery scope.
 
 The compiler resolves every change against the original snapshot, rejects the
 whole batch on planning errors, and constructs a candidate from original byte
@@ -38,11 +41,105 @@ The JSON CLI and plain report functions remain free of ANSI sequences. Hosts can
 opt into `report::terminal` for human output; report budgets count printable text
 before styling.
 
+## Claude Code
+
+Build the plugin's private executables from this source directory:
+
+```text
+cargo build --locked --release
+```
+
+Create `plugin/claude-code/runtime` and copy both `ultra-edit` and `ultra-edit-mcp`
+from `target/release` into it, using the `.exe` filenames on Windows. These
+executables stay inside the plugin; no global command or `PATH` change is needed.
+A prepared archive for the user's OS and architecture would include them and
+require no Rust installation. Public release archives are not available yet.
+
+For persistent use, copy the **entire prepared** `plugin/claude-code` directory to
+`~/.claude/skills/ultra-edit` (`%USERPROFILE%\.claude\skills\ultra-edit` on Windows).
+If `CLAUDE_CONFIG_DIR` is set, use its `skills/ultra-edit` directory instead.
+Retain `.claude-plugin`, `.mcp.json`, `runtime`, `hooks`, `skills`, and the other
+bundled files.
+The [host setup guide](plugin/claude-code/skills/edit/references/claude-code.md#connect-locally)
+has copy commands for Windows and macOS/Linux.
+
+Then launch normally from **the workspace you want to edit**:
+
+```text
+claude
+```
+
+Claude Code discovers this as `ultra-edit@skills-dir` on startup, across projects.
+The bundled personal installation was tested with Claude Code 2.1.263, with no
+Ultra Edit executable on `PATH`. No marketplace is required; see the official
+[skills-directory plugin documentation](https://code.claude.com/docs/en/plugins-reference#skills-directory-plugins).
+
+For a session-only test without copying the plugin:
+
+```text
+claude --plugin-dir /absolute/path/to/ultra-edit/plugin/claude-code
+```
+
+Quote a plugin path containing spaces. The plugin starts its own
+`${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp` with separate arguments
+`["--root", "${CLAUDE_PROJECT_DIR}"]`. Claude Code substitutes the plugin and
+project roots; the native Windows launcher resolves the `.exe` filename. Hook
+commands use the same plugin-local executable and separate argument arrays,
+without a shell. The root is fixed for that server; it is not a model tool
+argument. See the official
+[Claude Code MCP documentation](https://code.claude.com/docs/en/mcp).
+
+Use `/mcp` to check the server connection, then make an ordinary edit request.
+The plugin automatically tells Claude to **ALWAYS use direct Ultra Edit MCP
+calls for coordinated edits to two or more existing UTF-8 files**, and never
+write file contents through Bash heredocs or inline editing scripts. Native
+Write remains appropriate for new files or isolated full rewrites; native Edit
+or Ultra Edit can handle isolated targeted edits. Required tools being unavailable
+or denied is a blocker to report, not a reason to change editing routes.
+
+The [canonical instructions](plugin/claude-code/instructions.md) load through
+`SessionStart` hooks on startup, resume, clear, compaction, and fork, plus
+`SubagentStart` for delegated work. No slash command is required;
+`/ultra-edit:edit` loads optional workflow detail. This supplies prompt context,
+not forced tool enforcement. The shell rule addresses a user-reported Bash
+backslash-loss observation from 2026-09-05; this project has not established that
+behavior for every Claude host.
+
+Inspect the hook's exact context without starting a server or opening a workspace:
+
+```text
+/absolute/plugin/directory/runtime/ultra-edit-mcp --claude-context SessionStart
+```
+
+On Windows, use the installed `runtime/ultra-edit-mcp.exe` path with PowerShell's
+`&` operator; the [host setup guide](plugin/claude-code/skills/edit/references/claude-code.md#automatic-routing-context)
+has an example. The executable embeds these instructions at build time. Copied
+plugins require manual updates: rebuild, stage the matching executables, update
+the complete plugin copy, then start a new Claude session. `--plugin-dir` loads
+the prepared plugin only for that session.
+
+The normal flow is a focused `ultra_edit_snapshot`, a batch `ultra_edit`, and
+outcome inspection; `ultra_edit_status` retrieves receipts and explicit evidence.
+Native Read/Grep can guide exploration, but the edit's base must come from an
+Ultra Edit snapshot. Preview/commit, repair, and conditional undo are separate
+tools. Crash reconciliation remains an explicit operator CLI workflow.
+
+The plugin supplies context hooks without permission grants and does not
+inherit native Edit's per-path permission policy. Keep `.ultra-edit` local and
+outside version control because it stores complete source history. See the
+[complete workflow and routing index](plugin/claude-code/skills/edit/SKILL.md),
+[Claude Code setup](plugin/claude-code/skills/edit/references/claude-code.md), and
+[MCP adapter contract](docs/mcp-adapter.md).
+
 ## CLI
 
 The workspace defaults to the current directory. Use the **same canonical root**
 for every cooperating process. References, original bytes, candidates, requests,
 and journals are persisted under that workspace's `.ultra-edit` directory.
+The bare `ultra-edit` commands in this README assume a separately available CLI.
+With the self-contained plugin, replace that name with the full installed
+`runtime/ultra-edit` path (`runtime/ultra-edit.exe` on Windows, invoked with `&`
+in PowerShell). The plugin does not add it to `PATH`.
 
 ```text
 ultra-edit --root WORKSPACE read PATH
@@ -330,19 +427,40 @@ line-ending boundaries, overlapping matches, and resource limits. CLI tests
 launch separate processes to exercise persistent state. Reconciliation tests
 cover interrupted and corrupt journals, changed observations, binary/missing
 targets, retained historical outcomes, concurrent decisions, and restart recovery.
+MCP process tests cover tool discovery, focused batch edits, stale bases, malformed
+arguments and frames, buffered messages, root confinement, restart retries,
+cancellation, and uncertain receipts.
 
 `compiler.rs` is pure planning; `reading.rs` constructs focused source views;
 `storage.rs` owns persistence and recovery; `storage/reconciliation.rs` captures
 evidence and records operator resolutions; `workspace.rs` owns the
 reference/request protocol; `report.rs` formats evidence;
-`main.rs` is the thin CLI. Use `Workspace` for coordinated host integration;
-low-level `Storage` calls require the caller to hold its coordinator lock.
+`main.rs` is the thin CLI. `mcp.rs` declares the typed MCP tools and compact
+results; `bin/ultra-edit-mcp.rs` runs the fixed-root stdio server. Use `Workspace`
+for coordinated host integration; low-level `Storage` calls require the caller
+to hold its coordinator lock.
 
-Next milestones from the design are distinct file creation/deletion/rename
-operations, recovery candidates,
-host/MCP/editor adapters, and platform metadata support. Contextual patches,
-regex, semantic refactors, rebasing, and model-driven
-benchmarks follow evidence from those integrations.
+Claude Code 2.1.263 passed an automatic-routing smoke test on 2026-09-07: the
+`SessionStart` hook loaded the policy, and an ordinary request produced snapshots
+and one two-file MCP edit without invoking the skill. Native Read, Edit, Write,
+and Bash remained available. Exact output checks passed for literal backslashes,
+regex and escape text, Windows paths, BOM, CRLF/LF, trailing spaces, and a missing
+final newline. The earlier skill-driven smoke also verified receipt retrieval.
+A separate persistent-install smoke confirmed discovery without `--plugin-dir`
+and exact final bytes. Claude guessed span IDs incorrectly on its first batch,
+then undid it and submitted a corrected batch; the exactly-one-edit assertion
+failed. This demonstrates persistent routing and recovery, not reliable
+first-attempt target selection. See the [validation details](docs/mcp-adapter.md#validation).
+The next milestone is a broader evaluation of Claude Code edit tasks: correct
+bytes, appropriate tool selection, stale-base handling, and recovery after lost
+output. Use those results to improve the MCP contract and focused instructions
+before adding more editing modes. Platform metadata support remains a separate
+limitation to address when ordinary source-file replacement is insufficient.
+
+File creation, deletion, rename, general editor adapters, contextual patches,
+regex, semantic refactors, and rebasing are outside the current edit-only scope.
+The broader historical design is retained for reference; those features are not
+the next delivery milestones.
 
 Search pagination, workspace-wide search, and arbitrary byte-range reads are
 deferred until host integration calls for them; current search is bounded to the

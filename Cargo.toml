@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.89"
 description = "Snapshot-based, verifiable batch file editing"
 publish = false
+default-run = "ultra-edit"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -13,6 +14,11 @@ sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 same-file = "1"
+rmcp = { version = "=3.2.0", default-features = false, features = ["server", "macros", "transport-io"] }
+schemars = "1"
+tokio = { version = "1", features = ["rt", "io-std"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = { version = "0.3", default-features = false, features = ["std"] }
 
 [lints.rust]
 unsafe_code = "forbid"
