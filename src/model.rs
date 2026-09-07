@@ -110,6 +110,104 @@ pub struct PreparedPlan {
     pub files: Vec<PreparedFile>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Draft {
+    pub id: String,
+    pub request: EditRequest,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Preparation {
+    pub reference: String,
+    pub ready: bool,
+    pub diagnostics: Vec<Diagnostic>,
+    pub report: String,
+    pub receipt: Option<Receipt>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommitStatus {
+    Committed,
+    NotCommitted,
+    Partial,
+    OutcomeUnknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileStatus {
+    Committed,
+    NotCommitted,
+    OutcomeUnknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileOutcome {
+    pub path: String,
+    pub before: String,
+    pub after_digest: String,
+    pub status: FileStatus,
+    pub changes_applied: usize,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Receipt {
+    pub request_id: String,
+    pub plan_id: String,
+    pub commit: CommitStatus,
+    pub files: Vec<FileOutcome>,
+    pub validation: String,
+    pub undo: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct Error {
+    pub code: String,
+    pub message: String,
+    pub request_id: Option<String>,
+    pub plan_id: Option<String>,
+    pub commit: Option<CommitStatus>,
+}
+
+impl Error {
+    pub fn new(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            request_id: None,
+            plan_id: None,
+            commit: None,
+        }
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<std::io::Error> for Error {
+    fn from(error: std::io::Error) -> Self {
+        Self::new("IO_ERROR", error.to_string())
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(error: serde_json::Error) -> Self {
+        Self::new("INVALID_JSON", error.to_string())
+    }
+}
+
 pub fn new_id(prefix: &str) -> String {
     format!("{prefix}{}", uuid::Uuid::new_v4().simple())
 }
