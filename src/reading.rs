@@ -1,11 +1,43 @@
-use crate::compiler::{line_ranges, occurrences};
+use crate::compiler::{line_ranges, occurrences_page, snapshot};
 use crate::model::{Error, RangeRead, SearchMatch, SearchResult, Snapshot, Span, digest, new_id};
 
 const MAX_RANGE_LINES: usize = 200;
 const MAX_RANGE_CHARS: usize = 6_000;
+const MAX_FULL_BYTES: usize = 24_000;
+const MAX_FULL_LINES: usize = 400;
 const MAX_QUERY_CHARS: usize = 1_000;
 const MAX_MATCHES: usize = 20;
 const CONTEXT_CHARS: usize = 80;
+
+pub(crate) fn read_full(
+    path: String,
+    text: String,
+    expected_bytes: Option<usize>,
+) -> Result<Snapshot, Error> {
+    if let Some(expected_bytes) = expected_bytes {
+        if text.len() != expected_bytes {
+            return Err(Error::new(
+                "READ_SIZE_CHANGED",
+                format!(
+                    "Expected {expected_bytes} source bytes, found {}; read a range or search before confirming the new byte count",
+                    text.len()
+                ),
+            ));
+        }
+    } else if text.len() > MAX_FULL_BYTES
+        || line_ranges(&text).take(MAX_FULL_LINES + 1).count() > MAX_FULL_LINES
+    {
+        return Err(Error::new(
+            "READ_TOO_LARGE",
+            format!(
+                "Full reads support at most {MAX_FULL_BYTES} source bytes and {MAX_FULL_LINES} lines by default; this file has {} bytes. Read a line range or search for an exact span, or deliberately request the complete response with expected_bytes={}",
+                text.len(),
+                text.len()
+            ),
+        ));
+    }
+    Ok(snapshot(path, text))
+}
 
 pub(crate) fn read_range(
     path: String,
@@ -19,17 +51,12 @@ pub(crate) fn read_range(
             "Line numbers must be positive and the first must not exceed the last",
         ));
     }
-    if last - first >= MAX_RANGE_LINES {
-        return Err(Error::new(
-            "READ_TOO_LARGE",
-            "A focused read supports at most 200 lines; choose a smaller range",
-        ));
-    }
+    let too_many_lines = last - first >= MAX_RANGE_LINES;
     let mut total_lines = 0;
     let mut spans = Vec::new();
     for (index, range) in line_ranges(&text).enumerate() {
         total_lines = index + 1;
-        if (first..=last).contains(&total_lines) {
+        if !too_many_lines && (first..=last).contains(&total_lines) {
             spans.push(Span {
                 id: format!("r{total_lines}"),
                 start: range.start,
@@ -42,6 +69,12 @@ pub(crate) fn read_range(
         return Err(Error::new(
             "INVALID_LINE_RANGE",
             format!("File has {total_lines} line(s); requested through line {last}"),
+        ));
+    }
+    if too_many_lines {
+        return Err(Error::new(
+            "READ_TOO_LARGE",
+            "A focused read supports at most 200 lines; choose a smaller range",
         ));
     }
     let start = spans[0].start;
@@ -84,6 +117,7 @@ pub(crate) fn search(
     path: String,
     text: String,
     query: &str,
+    offset: usize,
 ) -> Result<(Snapshot, SearchResult), Error> {
     if query.is_empty() || query.chars().take(MAX_QUERY_CHARS + 1).count() > MAX_QUERY_CHARS {
         return Err(Error::new(
@@ -91,7 +125,15 @@ pub(crate) fn search(
             "Literal search requires 1..1000 Unicode characters",
         ));
     }
-    let (total_matches, positions) = occurrences(&text, query, MAX_MATCHES);
+    let (total_matches, positions) = occurrences_page(&text, query, offset, MAX_MATCHES);
+    if offset > total_matches {
+        return Err(Error::new(
+            "INVALID_SEARCH_OFFSET",
+            format!(
+                "Search found {total_matches} match(es); offset {offset} exceeds the match count. Start at offset 0 or use next_offset from a previous page"
+            ),
+        ));
+    }
     let mut line = 1;
     let mut cursor = 0;
     let matches: Vec<_> = positions
@@ -118,7 +160,7 @@ pub(crate) fn search(
                 .collect();
             SearchMatch {
                 span: Span {
-                    id: format!("m{}", index + 1),
+                    id: format!("m{}", offset + index + 1),
                     start,
                     end,
                     line,
@@ -142,6 +184,8 @@ pub(crate) fn search(
         path: snapshot.path.clone(),
         digest: snapshot.digest.clone(),
         query: query.into(),
+        offset,
+        next_offset: (offset + matches.len() < total_matches).then_some(offset + matches.len()),
         total_matches,
         omitted_matches: total_matches - matches.len(),
         matches,

@@ -96,7 +96,8 @@ The plugin automatically supplies its routing instructions; `/ultra-edit:edit`
 is optional workflow detail. Use the actual MCP tool names Claude Code exposes;
 plugin tools may be namespaced.
 The core names are `ultra_edit_snapshot`, `ultra_edit`, and `ultra_edit_status`.
-Preview/commit, repair, and undo have separate tools. See the official
+Preview/commit, repair, preflight retry, undo, diff, inspection, and explicit
+reconciliation have separate tools. See the official
 [local plugin testing instructions](https://code.claude.com/docs/en/plugins#test-your-plugins-locally).
 
 Copied plugins do not update automatically. Update the installed plugin copy
@@ -113,6 +114,9 @@ writing file contents through Bash heredocs, generated-content redirection,
 inline editing scripts, and shell-piped edit JSON. Native Write serves new files
 or isolated full rewrites; native Edit or Ultra Edit serves isolated targeted
 edits. Missing or denied required tools are a blocker to report.
+Explicit user instructions and host permissions take precedence over plugin
+guidance. Report contradictory workflow instructions; generic sed/heredoc advice
+does not by itself cancel the user's explicit choice of Ultra Edit.
 
 The shell rule responds to a user's report on 2026-09-05 that Bash tool payloads
 lost backslashes upstream of shell parsing, even with quoted heredocs. This is
@@ -180,6 +184,8 @@ a host denial. See Claude Code's
 | A reference is missing | Verify that this session uses the same canonical root as the session that created it; references are not global. |
 | File lies outside the root | Start a separately configured session at the intended workspace; do not accept a root from model tool arguments. |
 | Host permission denied | Respect the denial and report the blocked action; snapshot freshness is not authorization. |
+| Malformed JSON message | The server answers `-32700` and continues; fix JSON escaping. Oversized or invalid-UTF-8 frames are fatal and exit nonzero; reconnect and inspect any in-flight receipt. |
+| Conflicting shell-editing instructions | Follow explicit user instructions and host permissions, report the conflict, and avoid silently replacing the requested Ultra Edit route. |
 
 The hooks and skill provide guidance, not a guarantee that Claude chooses the
 required tool. The server's tool descriptions and schemas also state the critical

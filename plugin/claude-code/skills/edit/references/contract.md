@@ -12,11 +12,16 @@ response discloses only a range or search matches. Any change anywhere in a
 file makes its base stale. A new snapshot is minted on every read/search; combine
 changes to one file under one base. Recreating the same canonical path with
 identical bytes is accepted; redirecting it to another target is rejected.
+Search continuation can reuse a prior snapshot's immutable source while minting
+a new snapshot with only the next page's disclosed spans.
 
 Every change is resolved against its original base. Planning errors reject the
 entire batch. Undeclared bytes remain identical. Replacement strings are literal
 UTF-8, with no regex expansion, Unicode normalization, newline conversion, shell,
 formatter, or model execution. Preserve `\r\n` explicitly when inserting CRLF.
+Candidate outputs containing NUL or both CRLF and bare LF receive nonblocking
+`NUL_BYTE` or `MIXED_LINE_ENDINGS` warnings. This includes existing conditions
+retained in the candidate; warnings do not change bytes or reject the request.
 
 ## Request identity
 
@@ -64,8 +69,9 @@ confirmation of a write. An unknown request ID is an explicit error.
 `changes_applied` counts confirmed
 change IDs; replace-all occurrences remain regions of one change.
 `after_digest` identifies the intended output and proves actual output only for
-a confirmed committed file. `validation: "not_requested"` means no external
-validation ran.
+a confirmed committed file. MCP receipt responses omit the engine's
+unconfigurable validation field. Run project validation separately; confirmed
+persistence does not mean external checks passed.
 
 Ordinary mutation responses use compact reports. For complete source, diagnostics,
 or a prepared candidate, explicitly call `ultra_edit_status` with
@@ -85,14 +91,21 @@ rolled back; retrieve its receipt or retry the identical operation under its ID.
 - At most 1,000 changes, 10,000 resolved replacement spans, and 16 MiB of inserted
   bytes per plan. A replace-all inserts its text once per resolved occurrence.
 - Each incoming MCP JSON-RPC line is limited to 16 MiB, including JSON escaping
-  and protocol fields. Exceeding this limit closes the connection; inspect the
+  and protocol fields. Malformed JSON receives `-32700` and an invalid request
+  envelope receives `-32600`; subsequent messages still run. Exceeding the frame
+  limit or invalid UTF-8 framing closes the connection with nonzero exit; inspect the
   original request's receipt before retrying after any lost response.
 - Ordinary reports default to 60 lines and 6,000 Unicode characters. Full
   evidence is an explicit opt-in and may be much larger.
+- Full snapshots default to 24,000 source bytes and 400 lines; an exact
+  `expected_bytes` deliberately permits a larger response. Search exposes at
+  most 20 matches per page; `next_offset` continues within a supplied snapshot.
 - The workspace lock coordinates cooperating clients using the same root.
   It cannot exclude arbitrary external writers. Conditional replacement is not
   filesystem compare-and-swap, and multiple files are not an atomic transaction.
-- `.ultra-edit` retains source history with no garbage collection. Keep it local
-  and outside version control. The engine targets ordinary source files;
+- `.ultra-edit` retains source history. CLI `prune-snapshots OLDER_THAN_SECONDS`
+  previews eligible old standalone snapshots; `--apply` explicitly removes them.
+  Retained plans, drafts, inspections, requests, and journals remain. Keep state
+  local and outside version control. The engine targets ordinary source files;
   replacement does not preserve ownership, ACLs, extended attributes, timestamps,
   or hardlink relationships. Power-loss durability is not promised.

@@ -194,7 +194,8 @@ The normal flow is a focused `ultra_edit_snapshot`, a batch `ultra_edit`, and
 outcome inspection; `ultra_edit_status` retrieves receipts and explicit evidence.
 Native Read/Grep can guide exploration, but the edit's base must come from an
 Ultra Edit snapshot. Preview/commit, repair, and conditional undo are separate
-tools. Crash reconciliation remains an explicit operator CLI workflow.
+tools. Diff review, crash inspection, and explicit operator reconciliation are
+also available through MCP.
 
 The plugin supplies context hooks without permission grants and does not
 inherit native Edit's per-path permission policy. Keep `.ultra-edit` local and
@@ -214,12 +215,13 @@ With the self-contained plugin, replace that name with the full installed
 in PowerShell). The plugin does not add it to `PATH`.
 
 ```text
-ultra-edit --root WORKSPACE read PATH
+ultra-edit --root WORKSPACE read PATH [EXPECTED_BYTES]
 ultra-edit --root WORKSPACE read-range PATH FIRST LAST
-ultra-edit --root WORKSPACE search PATH QUERY
+ultra-edit --root WORKSPACE search PATH QUERY [OFFSET [SNAPSHOT]]
 ultra-edit --root WORKSPACE prepare < request.json
 ultra-edit --root WORKSPACE edit < request.json
 ultra-edit --root WORKSPACE commit PLAN
+ultra-edit --root WORKSPACE retry PLAN NEW_REQUEST_ID
 ultra-edit --root WORKSPACE repair < corrections.json
 ultra-edit --root WORKSPACE receipt REQUEST_ID
 ultra-edit --root WORKSPACE inspect PLAN
@@ -227,6 +229,7 @@ ultra-edit --root WORKSPACE reconcile < resolution.json
 ultra-edit --root WORKSPACE get REFERENCE
 ultra-edit --root WORKSPACE diff PLAN
 ultra-edit --root WORKSPACE undo PLAN NEW_REQUEST_ID
+ultra-edit --root WORKSPACE prune-snapshots OLDER_THAN_SECONDS [--apply]
 ```
 
 The redirection examples use a POSIX shell. In PowerShell, pipe JSON through
@@ -234,12 +237,21 @@ The redirection examples use a POSIX shell. In PowerShell, pipe JSON through
 The executable produced by `cargo build` is `target/debug/ultra-edit.exe` on
 Windows and `target/debug/ultra-edit` on Unix.
 
-`read` returns the complete, unnormalized text, a snapshot ID, a SHA-256 digest,
+`read` returns the complete, unnormalized text, a `snapshot` ID, a SHA-256 digest,
 and snapshot-local span references. `r0` covers the whole file, including any
 UTF-8 BOM. `r1`, `r2`, etc. cover individual line bodies, excluding the BOM and
 CRLF/LF terminators. A trailing newline does not create another line reference.
 An empty file has an empty `r1`, which permits insertion. Span offsets are UTF-8
 byte offsets; the compiler validates their boundaries.
+
+Full reads default to at most 24,000 source UTF-8 bytes and 400 lines. Larger
+files return `READ_TOO_LARGE` before generating line references or serializing a
+snapshot. Use a range or search, or deliberately pass the exact current source
+byte count as `EXPECTED_BYTES` (MCP `selection.expected_bytes`) to permit a larger
+response. A changed byte count returns `READ_SIZE_CHANGED`; the 16 MiB source
+ceiling still applies. This override can produce a large response, including all
+line references. Full, range, and search responses all use `snapshot`; stored
+snapshot evidence and the Rust `Snapshot` type retain their internal `id` field.
 
 To read a small region, use `read-range src/retry.rs 12 18`. Line numbers are
 one-based and inclusive. It returns `snapshot`, `path`, `digest`, file totals,
@@ -253,16 +265,26 @@ reject oversized selections instead of issuing references to clipped text. For
 a very long line, search for its exact target or use the complete `read` command.
 
 `search src/retry.rs RETRIES` performs case-sensitive literal search in one file.
-The response contains `snapshot`, `path`, `digest`, the exact `query`,
-`total_matches`, `omitted_matches`, and up to 20 `matches` in byte order. Each
+The response contains `snapshot`, `path`, `digest`, the exact `query`, `offset`,
+`next_offset`, `total_matches`, `omitted_matches`, and up to 20 `matches` in byte order. Each
 match has an editable `span` (`m1`, `m2`, etc.), a one-based starting line number,
 and `before`/`after` context fragments of at most 80 Unicode characters, stopping
 at CR or LF. The exact target text of every match is `query`; fragments are only
 context and have no span references. Overlapping matches are counted (`aa` has
 two starting positions in `aaa`). Queries may contain literal newlines and
 Unicode, and must contain 1–1,000 Unicode characters. No matches is a successful
-search with an empty match list. When matches are omitted, use a more specific
-query, a focused line read, or full `get` evidence to inspect further targets.
+search with an empty match list. Continue with the returned `next_offset` and
+`snapshot`, for example `search src/retry.rs RETRIES 20 s_RETURNED_ID`. Offsets
+count matches from zero; span IDs retain absolute ordinals (`m21`–`m40` on the
+second page). `next_offset: null` marks the end. `omitted_matches` counts all
+matches absent from this page, including earlier pages.
+
+Supplying `SNAPSHOT` searches its immutable original bytes even if current file
+contents have changed. The requested path must still resolve to that snapshot's
+file; removed or redirected targets fail explicitly. Omitting `SNAPSHOT` captures
+fresh bytes, so offsets alone do not guarantee continuity across external edits.
+Each page creates its own snapshot with only its disclosed references; edits
+still reject stale source bytes.
 
 Use either response's `snapshot` as an edit request's `base`, then target a
 returned span, or scope an exact search to `selection` or a returned line.
@@ -290,7 +312,7 @@ An edit request uses snapshot IDs returned by `read`:
       },
       {
         "id": "delay",
-        "target": { "kind": "span", "span": "r5" },
+        "target": { "kind": "span", "span": "r5", "expect": "const delayMs = 100;" },
         "text": "const delayMs = 250;"
       }
     ]
@@ -304,11 +326,21 @@ Every change ID is unique across the entire request. Available targets:
 | --- | --- |
 | `{"kind":"exact","old":"text"}` | Exactly one occurrence in the original file. |
 | `{"kind":"exact","old":"text","scope":"r5"}` | Exactly one occurrence contained in a disclosed span. |
-| `{"kind":"all","old":"text","scope":"r0","expected":3}` | Explicit scope and exact positive count. |
+| `{"kind":"all","old":"text","scope":"r0","expected":3}` | Explicit scope and exact positive count of non-overlapping, left-to-right replacements. |
 | `{"kind":"span","span":"r5"}` | Replace that span with literal `text`. |
+| `{"kind":"span","span":"r5","expect":"old line"}` | Replace only if the selected original bytes equal `expect` exactly. |
 
-Empty exact search strings are rejected. Overlapping candidate occurrences are
-counted: `aa` occurs at two starts in `aaa`. Overlapping replacements and
+`scope` is a disclosed span ID such as `r5`, `selection`, or `m2`, never literal
+source text. Obtain an arbitrary line region with a range snapshot and use its
+`selection`; inline `{first,last}` scopes are not supported. Prefer `exact` or
+add `span.expect` when a mistaken positional ID should fail instead of replacing
+the wrong text. An expectation mismatch returns `EXPECTED_TEXT_MISMATCH`.
+
+Empty exact search strings are rejected. `exact` ambiguity checks and search
+count overlapping starts: `aa` occurs at two starts in `aaa`. `all` instead counts
+and replaces non-overlapping matches from left to right: `aa` in `aaaa` requires
+`expected: 2`, and eight spaces contain four replacements of `"  "`.
+Overlapping replacements from different changes and
 coincident insertions reject the entire batch. This initial compiler also rejects
 insertions that touch either boundary of another replacement; combine them into
 one change. Adjacent nonempty replacements are allowed.
@@ -318,6 +350,10 @@ forms, trailing spaces, and supplied newlines. There is **no newline conversion*
 write `\r\n` if newly inserted text should use CRLF. All undeclared bytes remain
 identical. Invalid UTF-8 is rejected explicitly; UTF-16 and other encodings are
 not decoded. No formatter, shell command, or model runs inside the engine.
+Ready plans and receipts carry nonblocking `NUL_BYTE` and `MIXED_LINE_ENDINGS`
+warnings when candidate output contains NUL or both CRLF and bare LF. Warnings
+also report pre-existing conditions retained in the candidate; they do not alter
+bytes or reject the request. Inspect them before committing a preview.
 
 ## Preview, repair, retry, and undo
 
@@ -347,9 +383,18 @@ whole batch against its original snapshots under a new request ID:
 ```
 
 Corrections cannot add unknown IDs or change retained snapshots. A stale base
-requires a fresh read and request. The first milestone closes repair after **any
-commit attempt**, including a failed preflight. Earlier closure avoids ambiguous
-reuse; relaxing it for proven zero-write failures is a later protocol change.
+requires a fresh read and request. Repair closes after **any commit attempt**.
+For an environmental preflight failure, fix the cause and use
+`retry PLAN NEW_REQUEST_ID` (MCP `ultra_edit_retry`). New journals must provide
+durable proof that preflight completed unsuccessfully with no write intent. It clones
+the exact candidate and original bases into a new plan, then attempts that plan;
+no re-snapshot or matching is performed. The old request, journal, and failed
+receipt remain unchanged. Partial, uncertain, and interrupted failures are
+ineligible. New journals also exclude post-preflight failures. Older journals
+lack a phase marker: a completed journal with no write intent and recognized
+preflight errors is accepted, including an indistinguishable single-file stale
+recheck before writing. Absence of write intent proves no target mutation in
+that legacy case. New source bytes still fail the usual stale checks.
 
 Repeating an identical request ID returns its original preview, draft, or recorded
 receipt, including across process restarts. Different arguments under that ID
@@ -378,7 +423,9 @@ write. It stops after the first persistence failure. Receipts distinguish
 outcomes. Counts describe confirmed committed change IDs; replace-all occurrences
 are separate regions of one change. `after_digest` identifies the **intended**
 candidate and is evidence of actual output only for confirmed committed files.
-`validation: "not_requested"` means no external validation command was run.
+The CLI's `validation: "not_requested"` means no external validation command was
+run. MCP receipt responses omit this unconfigurable field. Run project checks
+separately; a confirmed write is not evidence that tests passed.
 
 A missing durable outcome after a write intent is `outcome_unknown`, even when
 current bytes happen to match the candidate. Repeating that plan returns its
@@ -390,10 +437,27 @@ The operator workflow below records a resolution while retaining that uncertaint
 Compact reports default to 60 lines and 6,000 Unicode characters, including long
 single lines. CLI diagnostics show at most six shortened entries. `get` retrieves
 full plans/drafts/snapshots/inspections; `receipt` retrieves every file outcome.
-`diff` returns a complete before/after diff, including deletions and missing-final-newline markers.
-The initial full diff uses one full-file replacement hunk, so unchanged lines also
-appear on both sides. Its quoted paths are for inspection; patch import is not
-implemented. Explicit evidence commands are not subject to compact-report limits.
+`diff` returns a unified diff with changed regions, surrounding context, deletions,
+and missing-final-newline markers. MCP `ultra_edit_diff` takes `{plan, offset?}`
+and returns at most 6,000 Unicode characters with `next_offset` for continuation;
+diff offsets count characters, whereas search offsets count matches. Its quoted
+paths are for inspection; patch import is not implemented. Explicit evidence
+commands are not subject to compact-report limits.
+
+Diff computation has bounded work: at most 200,000 changed-middle line references,
+edit distance 1,024, and 64 MiB of line-comparison bytes. If a bound is reached,
+the diff shows the complete changed middle as one coarse hunk while retaining
+common outer context. It remains complete but may include unchanged interior lines.
+
+To review reclaimable snapshot storage, run `prune-snapshots 604800` for objects
+older than seven days. The JSON result lists `eligible` snapshot IDs and their
+stored-object `bytes`, `eligible_bytes`, and retained/removed snapshot counts;
+these byte counts include serialization overhead. Add `--apply` to rescan and
+remove eligible standalone snapshots under the workspace lock. Pruned standalone
+references become unavailable. Retained plans, drafts, and inspections keep their
+required snapshots, and request, receipt, journal, and resolution history stays.
+Uncertain or invalid recovery evidence blocks pruning; it is not a shortcut for
+resolving a failed edit.
 
 Exit codes are `0` for successful reads/previews/commits/reconciliations, `2` for
 rejected requests or command/output errors, and `3` for commits that are not fully confirmed.
@@ -410,7 +474,11 @@ evidence uses `{"encoding":"utf8","text":"..."}`; non-UTF-8 evidence uses
 `get INSPECTION` retrieves the saved evidence after a restart. Inspection writes
 only workspace state, never target files.
 
-After reviewing the evidence, submit an explicit operator decision:
+MCP `ultra_edit_inspect` accepts `{plan}` and returns a compact description with
+the inspection reference. Retrieve complete inspection evidence using
+`ultra_edit_status` with `query.kind: "evidence"` and that reference. After
+reviewing the evidence, submit an explicit operator decision through
+`ultra_edit_reconcile` or the CLI:
 
 ```json
 {
@@ -475,7 +543,11 @@ arbitrary external writers. Conditional base checks still apply to every later e
   resolved spans, and 16 MiB of inserted bytes per plan. It stops discovering
   conflicts after 128 overlap diagnostics with an explicit limit diagnostic.
   Exceeding a limit rejects the batch. CLI input is limited to 16 MiB.
-- `.ultra-edit` retains complete source history and has no garbage collection yet.
+- `.ultra-edit` retains complete source history. The `prune-snapshots` command
+  previews old standalone snapshots that no retained plan,
+  draft, or inspection needs; add `--apply` to delete the listed eligible objects.
+  This is explicit maintenance, not automatic collection. Keep recovery evidence
+  and request history intact; pruning does not delete them.
   Keep it local and exclude it from version control in workspaces you edit. The
   state directory is trusted local storage, not a security boundary against a
   hostile process running as the same user. New Unix state directories/files use
@@ -534,6 +606,7 @@ regex, semantic refactors, and rebasing are outside the current edit-only scope.
 The [broader historical design](docs/ULTRA-EDIT.md) is retained for reference;
 those features are not the next delivery milestones.
 
-Search pagination, workspace-wide search, and arbitrary byte-range reads are
-deferred until host integration calls for them; current search is bounded to the
-first 20 matches in a single file.
+Workspace-wide search and arbitrary byte-range reads remain deferred until a
+concrete workflow needs them. Single-file search now pages through all matches.
+See [experiment follow-ups](docs/followups.md) for the report's resolved issues,
+current limitations, and deferred extensions.

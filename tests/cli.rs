@@ -43,7 +43,7 @@ fn read_prepare_commit_receipt_and_undo_work_in_separate_processes() {
     fs::write(root.path().join("file.txt"), "const n = 1;\r\n").unwrap();
     let (code, snapshot) = run(root.path(), &["read", "file.txt"], None);
     assert_eq!(code, 0);
-    let edit = json!({"request_id":"cli-edit","files":[{"base":snapshot["id"],"changes":[{"id":"one","target":{"kind":"span","span":"r1"},"text":"const n = 2;"}]}]});
+    let edit = json!({"request_id":"cli-edit","files":[{"base":snapshot["snapshot"],"changes":[{"id":"one","target":{"kind":"span","span":"r1"},"text":"const n = 2;"}]}]});
     let (code, preview) = run(root.path(), &["prepare"], Some(&edit));
     assert_eq!(code, 0);
     assert_eq!(
@@ -163,4 +163,56 @@ fn malformed_focused_read_arguments_are_rejected_without_mutation() {
     assert_eq!(code, 0, "{missing}");
     assert_eq!(missing["total_matches"], 0);
     assert_eq!(missing["matches"], json!([]));
+}
+
+#[test]
+fn bounded_reads_pagination_and_pruning_flags_work_across_processes() {
+    let root = TempDir::new().unwrap();
+    fs::write(root.path().join("file.txt"), "x\n".repeat(500)).unwrap();
+    let (code, rejected) = run(root.path(), &["read", "file.txt"], None);
+    assert_eq!(code, 2);
+    assert_eq!(rejected["error"]["code"], "READ_TOO_LARGE");
+    let (code, full) = run(root.path(), &["read", "file.txt", "1000"], None);
+    assert_eq!(code, 0, "{full}");
+    assert!(full["snapshot"].is_string());
+    assert!(full.get("id").is_none());
+    let (code, page) = run(
+        root.path(),
+        &[
+            "search",
+            "file.txt",
+            "x",
+            "480",
+            full["snapshot"].as_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{page}");
+    assert_eq!(page["matches"][0]["span"]["line"], 481);
+    assert!(page["next_offset"].is_null());
+    let (code, dry_run) = run(root.path(), &["prune-snapshots", "0"], None);
+    assert_eq!(code, 0, "{dry_run}");
+    assert_eq!(dry_run["dry_run"], true);
+    assert_eq!(dry_run["removed_snapshots"], 0);
+    assert_eq!(dry_run["eligible"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        run(
+            root.path(),
+            &["get", full["snapshot"].as_str().unwrap()],
+            None
+        )
+        .0,
+        0
+    );
+    assert_eq!(
+        run(root.path(), &["prune-snapshots", "0", "--force"], None).0,
+        2
+    );
+    let (code, applied) = run(root.path(), &["prune-snapshots", "0", "--apply"], None);
+    assert_eq!(code, 0, "{applied}");
+    assert_eq!(applied["removed_snapshots"], 2);
+    assert_eq!(
+        fs::read(root.path().join("file.txt")).unwrap(),
+        "x\n".repeat(500).as_bytes()
+    );
 }

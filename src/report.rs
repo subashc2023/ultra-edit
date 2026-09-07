@@ -7,15 +7,18 @@ use std::fmt::Write;
 pub fn preview(plan: &PreparedPlan, max_lines: usize, max_chars: usize) -> String {
     let mut report = BoundedReport::new(max_lines, max_chars);
     let regions: usize = plan.files.iter().map(|file| file.replacements.len()).sum();
+    let changes: usize = plan.files.iter().map(|file| file.change_ids.len()).sum();
     report.push(
         &format!(
-            "Prepared: {}, {}; plan: {}",
+            "Prepared: {}, {}, {}; plan: {}",
             count(plan.files.len(), "file"),
-            count(regions, "region"),
+            count(changes, "change ID"),
+            count(regions, "replacement region"),
             escaped(&plan.id, max_chars)
         ),
         max_chars,
     );
+    warnings(&mut report, &plan.warnings);
     let available_lines = report.remaining_lines();
     let total_lines = regions.saturating_mul(3)
         + plan
@@ -107,12 +110,13 @@ pub fn receipt(receipt: &Receipt, max_lines: usize, max_chars: usize) -> String 
         &format!(
             "{}: {}, {files}/{} files committed, {unknown} unknown; receipt: {}",
             commit_status(receipt.commit),
-            count(changes, "confirmed change"),
+            count(changes, "confirmed change ID"),
             receipt.files.len(),
             escaped(&receipt.request_id, max_chars)
         ),
         max_chars,
     );
+    warnings(&mut report, &receipt.warnings);
     let slots = (receipt.files.len().saturating_mul(2) + 3).min(report.remaining_lines());
     let width = report.detail_width(slots);
     if width < 8 {
@@ -121,7 +125,6 @@ pub fn receipt(receipt: &Receipt, max_lines: usize, max_chars: usize) -> String 
     for (label, value) in [
         ("Plan", receipt.plan_id.as_str()),
         ("Undo", receipt.undo.as_deref().unwrap_or("none")),
-        ("Validation", receipt.validation.as_str()),
     ] {
         report.push(&format!("  {label}: {}", escaped(value, width)), width);
     }
@@ -145,7 +148,10 @@ pub fn receipt(receipt: &Receipt, max_lines: usize, max_chars: usize) -> String 
             .map(|error| format!("; error: {}", escaped(error, width)))
             .unwrap_or_default();
         if !report.push(
-            &format!("  {}; changes: {changes}{error}", file_status(file.status)),
+            &format!(
+                "  {}; change IDs: {changes}{error}",
+                file_status(file.status)
+            ),
             width,
         ) {
             break;
@@ -159,6 +165,22 @@ pub fn receipt(receipt: &Receipt, max_lines: usize, max_chars: usize) -> String 
         );
     }
     report.output
+}
+
+fn warnings(report: &mut BoundedReport, warnings: &[crate::Diagnostic]) {
+    for warning in warnings.iter().take(3) {
+        report.push(
+            &format!(
+                "  Warning {}: {}",
+                escaped(&warning.code, 80),
+                escaped(&warning.message, 240)
+            ),
+            340,
+        );
+    }
+    if warnings.len() > 3 {
+        report.push("  Further warnings available in plan/receipt evidence", 80);
+    }
 }
 
 /// Add ANSI styling to a human report only when explicitly enabled by its host.
@@ -194,38 +216,224 @@ pub fn terminal(report: &str, color: bool) -> String {
     output
 }
 
-/// Produce a complete deterministic unified diff using one full-file hunk.
-/// Unchanged lines may therefore appear as deletions and additions. Source UTF-8,
-/// BOMs, and CR bytes are retained literally, including CRLF line endings. Each
-/// unterminated last line receives the standard no-final-newline marker. Paths
-/// use Rust debug quoting; this report is evidence, not a patch-input protocol.
+/// Produce a deterministic line diff with three context lines per hunk. Source
+/// UTF-8, BOMs, and CRLF bytes remain literal; unterminated lines receive the
+/// standard no-final-newline marker. Paths use Rust debug quoting.
 pub fn diff(plan: &PreparedPlan) -> String {
     let mut output = String::new();
     for file in &plan.files {
         if file.base.text == file.output {
             continue;
         }
-        let before_lines = file.base.text.split_inclusive('\n').count();
-        let after_lines = file.output.split_inclusive('\n').count();
+        let before = &file.base.text;
+        let after = &file.output;
+        let before_count = before.split_inclusive('\n').count();
+        let after_count = after.split_inclusive('\n').count();
+        let changes = line_changes(before, after, before_count, after_count);
         writeln!(output, "--- {:?}", format!("a/{}", file.base.path)).unwrap();
         writeln!(output, "+++ {:?}", format!("b/{}", file.base.path)).unwrap();
-        writeln!(
-            output,
-            "@@ -{},{} +{},{} @@",
-            usize::from(before_lines != 0),
-            before_lines,
-            usize::from(after_lines != 0),
-            after_lines
-        )
-        .unwrap();
-        diff_lines(&mut output, '-', &file.base.text);
-        diff_lines(&mut output, '+', &file.output);
+        let mut before_lines = before.split_inclusive('\n');
+        let mut after_lines = after.split_inclusive('\n');
+        let (mut before_cursor, mut after_cursor) = (0, 0);
+        let mut first = 0;
+        while first < changes.len() {
+            let mut last = first;
+            while last + 1 < changes.len()
+                && changes[last + 1].before.start <= changes[last].before.end + 6
+            {
+                last += 1;
+            }
+            let before_start = changes[first].before.start.saturating_sub(3);
+            let after_start = changes[first].after.start.saturating_sub(3);
+            let before_end = (changes[last].before.end + 3).min(before_count);
+            let after_end = (changes[last].after.end + 3).min(after_count);
+            writeln!(
+                output,
+                "@@ -{},{} +{},{} @@",
+                before_start + usize::from(before_end != before_start),
+                before_end - before_start,
+                after_start + usize::from(after_end != after_start),
+                after_end - after_start
+            )
+            .unwrap();
+            skip_lines(&mut before_lines, before_start - before_cursor);
+            skip_lines(&mut after_lines, after_start - after_cursor);
+            before_cursor = before_start;
+            after_cursor = after_start;
+            for change in &changes[first..=last] {
+                diff_lines(
+                    &mut output,
+                    ' ',
+                    before_lines
+                        .by_ref()
+                        .take(change.before.start - before_cursor),
+                );
+                skip_lines(&mut after_lines, change.after.start - after_cursor);
+                diff_lines(
+                    &mut output,
+                    '-',
+                    before_lines.by_ref().take(change.before.len()),
+                );
+                diff_lines(
+                    &mut output,
+                    '+',
+                    after_lines.by_ref().take(change.after.len()),
+                );
+                before_cursor = change.before.end;
+                after_cursor = change.after.end;
+            }
+            diff_lines(
+                &mut output,
+                ' ',
+                before_lines.by_ref().take(before_end - before_cursor),
+            );
+            skip_lines(&mut after_lines, after_end - after_cursor);
+            before_cursor = before_end;
+            after_cursor = after_end;
+            first = last + 1;
+        }
     }
     output
 }
 
-fn diff_lines(output: &mut String, prefix: char, text: &str) {
-    for line in text.split_inclusive('\n') {
+struct LineChange {
+    before: std::ops::Range<usize>,
+    after: std::ops::Range<usize>,
+}
+
+fn line_changes(
+    before: &str,
+    after: &str,
+    before_count: usize,
+    after_count: usize,
+) -> Vec<LineChange> {
+    let prefix = before
+        .split_inclusive('\n')
+        .zip(after.split_inclusive('\n'))
+        .take_while(|(left, right)| left == right)
+        .count();
+    let suffix = before
+        .split_inclusive('\n')
+        .rev()
+        .take(before_count - prefix)
+        .zip(after.split_inclusive('\n').rev().take(after_count - prefix))
+        .take_while(|(left, right)| left == right)
+        .count();
+    let before_middle = prefix..before_count - suffix;
+    let after_middle = prefix..after_count - suffix;
+    // Bound Myers to 200k line references, edit distance 1024 (~4 MiB of trace),
+    // and 64 MiB of line-comparison bytes. Beyond any ceiling, replace only the
+    // remaining middle as one coarse hunk; common prefix/suffix stay context.
+    // A linear-space differ is the upgrade if highly divergent files need finer review.
+    if !before_middle.is_empty()
+        && !after_middle.is_empty()
+        && before_middle.len() + after_middle.len() <= 200_000
+    {
+        let left: Vec<_> = before
+            .split_inclusive('\n')
+            .skip(prefix)
+            .take(before_middle.len())
+            .collect();
+        let right: Vec<_> = after
+            .split_inclusive('\n')
+            .skip(prefix)
+            .take(after_middle.len())
+            .collect();
+        if let Some(mut changes) = myers_changes(&left, &right) {
+            for change in &mut changes {
+                change.before = change.before.start + prefix..change.before.end + prefix;
+                change.after = change.after.start + prefix..change.after.end + prefix;
+            }
+            return changes;
+        }
+    }
+    vec![LineChange {
+        before: before_middle,
+        after: after_middle,
+    }]
+}
+
+fn myers_changes(before: &[&str], after: &[&str]) -> Option<Vec<LineChange>> {
+    let mut trace: Vec<Vec<usize>> = Vec::new();
+    let mut comparison_bytes = 64 * 1024 * 1024usize;
+    for depth in 0..=1024.min(before.len() + after.len()) {
+        // Entry i follows diagonal 2*i-depth; only reachable parity is stored.
+        let mut frontier = Vec::with_capacity(depth + 1);
+        for index in 0..=depth {
+            let mut x = if depth == 0 {
+                0
+            } else {
+                let previous = &trace[depth - 1];
+                if index == 0 || (index < depth && previous[index - 1] < previous[index]) {
+                    previous[index]
+                } else {
+                    previous[index - 1] + 1
+                }
+            };
+            let mut y = x + depth - 2 * index;
+            while x < before.len() && y < after.len() {
+                let cost = if before[x].len() == after[y].len() {
+                    before[x].len() + 1
+                } else {
+                    1
+                };
+                comparison_bytes = comparison_bytes.checked_sub(cost)?;
+                if before[x] != after[y] {
+                    break;
+                }
+                x += 1;
+                y += 1;
+            }
+            frontier.push(x);
+            if x >= before.len() && y >= after.len() {
+                trace.push(frontier);
+                return Some(backtrack_changes(&trace, before.len(), after.len()));
+            }
+        }
+        trace.push(frontier);
+    }
+    None
+}
+
+fn backtrack_changes(trace: &[Vec<usize>], mut x: usize, mut y: usize) -> Vec<LineChange> {
+    let mut reversed = Vec::new();
+    for depth in (1..trace.len()).rev() {
+        let index = (x + depth - y) / 2;
+        let previous = &trace[depth - 1];
+        let insert = index == 0 || (index < depth && previous[index - 1] < previous[index]);
+        let previous_index = if insert { index } else { index - 1 };
+        let before = previous[previous_index];
+        let after = before + depth - 1 - 2 * previous_index;
+        reversed.push(LineChange {
+            before: before..before + usize::from(!insert),
+            after: after..after + usize::from(insert),
+        });
+        x = before;
+        y = after;
+    }
+    let mut changes: Vec<LineChange> = Vec::new();
+    for change in reversed.into_iter().rev() {
+        if let Some(previous) = changes.last_mut()
+            && previous.before.end == change.before.start
+            && previous.after.end == change.after.start
+        {
+            previous.before.end = change.before.end;
+            previous.after.end = change.after.end;
+        } else {
+            changes.push(change);
+        }
+    }
+    changes
+}
+
+fn skip_lines<'a>(lines: &mut impl Iterator<Item = &'a str>, count: usize) {
+    if count != 0 {
+        lines.nth(count - 1);
+    }
+}
+
+fn diff_lines<'a>(output: &mut String, prefix: char, lines: impl Iterator<Item = &'a str>) {
+    for line in lines {
         output.push(prefix);
         output.push_str(line);
         if !line.ends_with('\n') {

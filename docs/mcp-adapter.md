@@ -25,8 +25,12 @@ Server mode requires a root at startup, canonicalized once and absent from tool
 input schemas. All cooperating processes must use that same canonical root. The
 server uses JSON-RPC over stdio; stdout is reserved for protocol messages. A
 snapshot operation records state under `.ultra-edit` but changes no target file.
-Input JSON-RPC lines are limited to 16 MiB. Malformed or oversized frames close
-the transport with a stderr diagnostic; connection loss does not imply rollback.
+Input JSON-RPC lines are limited to 16 MiB. Malformed JSON receives JSON-RPC
+`-32700` with `id: null`; invalid request envelopes receive `-32600`. Both leave
+the server reading subsequent messages, including messages already buffered in
+the same write. Oversized frames, invalid UTF-8 framing, and stream I/O failures
+close the transport with a stderr diagnostic and nonzero exit. Connection loss
+does not imply rollback.
 
 For persistent Claude Code use, copy all of the prepared
 [plugin/claude-code](../plugin/claude-code/.claude-plugin/plugin.json) into
@@ -72,17 +76,27 @@ The names below are server-side names; the host may add a namespace.
 
 | Tool | Arguments | Engine operation |
 | --- | --- | --- |
-| `ultra_edit_snapshot` | `{path, selection: {kind: "range", first, last}}`, `{path, selection: {kind: "search", query}}`, or `{path, selection: {kind: "full"}}` | `read_range`, `search`, or `read` |
+| `ultra_edit_snapshot` | `{path, selection: {kind: "range", first, last}}`, `{path, selection: {kind: "search", query, offset?, snapshot?}}`, or `{path, selection: {kind: "full", expected_bytes?}}` | Focused range, paged literal search, or bounded full read |
 | `ultra_edit` | `EditRequest`: `{request_id, files: [{base, changes: [{id, target, text}]}]}` | Prepare and commit through `edit` |
 | `ultra_edit_status` | `{query: {kind: "receipt", request_id, full?: boolean}}` or `{query: {kind: "evidence", reference}}` | Retrieve a compact outcome (default), full receipt (`full: true`), or explicit evidence |
 | `ultra_edit_prepare` | The same direct `EditRequest` as `ultra_edit` | Persist a preview or rejected draft |
 | `ultra_edit_commit` | `{plan}` | Commit the stored candidate |
+| `ultra_edit_retry` | `{plan, request_id}` | Retry a proven preflight failure under a new ID, retaining the exact original candidate |
 | `ultra_edit_repair` | `{reference, request_id, changes}` | Replace retained changes by ID and prepare again |
 | `ultra_edit_undo` | `{plan, request_id}` | Conditionally restore confirmed committed files |
+| `ultra_edit_diff` | `{plan, offset?}` | Read a unified diff in pages of at most 6,000 Unicode characters |
+| `ultra_edit_inspect` | `{plan}` | Persist current recovery evidence and return a compact description and inspection reference |
+| `ultra_edit_reconcile` | `{inspection, decision: "accept_current", note}` | Record an explicit reviewed operator decision; never automatically accept an uncertain outcome |
 
 Ordinary work uses snapshot → edit → outcome inspection, with status for receipt
 details or lost responses. Mutation results carry compact reports and references;
 full source, diagnostics, and candidates require explicit evidence retrieval.
+Every snapshot response uses `snapshot` for its base. Full reads default to
+24,000 source bytes and 400 lines; an exact `expected_bytes` deliberately permits
+a larger response up to the existing source-file limit. Search pages use
+zero-based match offsets and return `next_offset`; supply the returned snapshot
+to keep searching its immutable bytes. Each page discloses only its own editable
+matches. Diff offsets instead count Unicode characters in the complete diff.
 Read the [skill's complete example](../plugin/claude-code/skills/edit/SKILL.md)
 and [contract](../plugin/claude-code/skills/edit/references/contract.md) for precise
 request semantics. Inspect the returned `commit`, request ID, and plan ID rather
@@ -98,6 +112,11 @@ Evidence uses the engine's `{kind, value}` shape. Engine errors use
 `{kind: "error", error: {code, message}, request_id, plan_id, commit}`.
 Malformed tool arguments and protocol errors can use the MCP SDK's standard
 error shapes, including text-only tool errors.
+Stored snapshot evidence retains its internal `id`, rather than the snapshot
+response's `snapshot` field. MCP receipt responses omit the engine's
+unconfigurable `validation: "not_requested"`; run external project checks
+separately. Nonblocking `NUL_BYTE` and `MIXED_LINE_ENDINGS` warnings describe the
+candidate output without changing its bytes.
 
 Rejected or incompletely committed mutation calls set MCP `isError`. Successful
 status reads do not set it merely because a historical receipt describes a
@@ -107,9 +126,11 @@ original request's receipt before starting new work.
 Every tool schema has an object at its root. The `selection` and `query` fields
 contain the typed alternatives for snapshot and status requests, respectively.
 
-Crash `inspect` and `reconcile` remain explicit operator CLI operations. There
-is no file creation/deletion/rename tool, generic shell dispatcher, automatic
-reconciliation, or model-supplied workspace root.
+Recovery tools expose the same inspection and reconciliation protocol as the
+CLI. Inspect the complete evidence through status before submitting an explicit
+operator decision; an ordinary edit request does not authorize accepting an
+uncertain state. There is no file creation/deletion/rename tool, generic shell
+dispatcher, automatic reconciliation, or model-supplied workspace root.
 
 ## Instruction layout
 
@@ -129,6 +150,10 @@ are unavailable or denied, Claude is instructed to report the blocker. The
 backslash concern comes from a user's 2026-09-05 Bash observation, not a claim
 that this project reproduced it on every host. The hooks inject instructions;
 they do not intercept or block native tools.
+Explicit user instructions and host permissions take precedence over plugin
+guidance. Report conflicting workflow instructions; generic advice to use sed
+or heredocs is not a reason to silently abandon the user's explicit Ultra Edit
+route.
 
 The runtime contract is also carried in server instructions, tool descriptions,
 and schemas. The [thin skill](../plugin/claude-code/skills/edit/SKILL.md) keeps the

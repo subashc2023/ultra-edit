@@ -31,6 +31,7 @@ fn plan(before: &str, replacements: Vec<Replacement>) -> PreparedPlan {
             replacements,
             change_ids: vec!["change-example".into()],
         }],
+        warnings: Vec::new(),
     }
 }
 
@@ -62,6 +63,7 @@ fn receipt(commit: CommitStatus, files: Vec<FileOutcome>) -> Receipt {
         files,
         validation: "not_requested".into(),
         undo: Some("u-example".into()),
+        warnings: Vec::new(),
     }
 }
 
@@ -153,14 +155,15 @@ fn unknown_outcomes_are_not_counted_as_applied() {
     );
     let output = report::receipt(&receipt, 10, 1000);
     assert!(
-        output.starts_with("outcome_unknown: 2 confirmed changes, 1/3 files committed, 1 unknown"),
+        output
+            .starts_with("outcome_unknown: 2 confirmed change IDs, 1/3 files committed, 1 unknown"),
         "{output}"
     );
     assert!(
-        output.contains("outcome_unknown; changes: unknown"),
+        output.contains("outcome_unknown; change IDs: unknown"),
         "{output}"
     );
-    assert!(output.contains("not_committed; changes: 0"), "{output}");
+    assert!(output.contains("not_committed; change IDs: 0"), "{output}");
     assert!(output.contains("error: write interrupted"), "{output}");
 }
 
@@ -176,7 +179,7 @@ fn partial_receipt_retains_status_counts_and_reference_before_long_paths() {
     receipt.files[0].path = "long-path".repeat(10_000);
     let output = report::receipt(&receipt, 1, 160);
     assert!(
-        output.starts_with("partial: 3 confirmed changes, 1/2 files committed, 0 unknown"),
+        output.starts_with("partial: 3 confirmed change IDs, 1/2 files committed, 0 unknown"),
         "{output}"
     );
     assert!(output.contains("receipt: edit-example"), "{output}");
@@ -189,7 +192,7 @@ fn diff_preserves_bom_crlf_and_missing_final_newline() {
     let output = report::diff(&plan);
     assert_eq!(
         output,
-        "--- \"a/source.txt\"\n+++ \"b/source.txt\"\n@@ -1,2 +1,2 @@\n-\u{feff}old\r\n-end\n\\ No newline at end of file\n+\u{feff}new\r\n+end\n\\ No newline at end of file\n"
+        "--- \"a/source.txt\"\n+++ \"b/source.txt\"\n@@ -1,2 +1,2 @@\n-\u{feff}old\r\n+\u{feff}new\r\n end\n\\ No newline at end of file\n"
     );
     let preview = report::preview(&plan, 10, 400);
     assert!(preview.contains("- \"old\""), "{preview}");
@@ -209,6 +212,176 @@ fn full_diff_includes_complete_long_deletions_and_empty_file_ranges() {
     assert!(output.contains(&format!("-{before}\n\\ No newline at end of file\n")));
     let output = report::diff(&plan("", vec![replacement(0, 0, "new\n")]));
     assert!(output.contains("@@ -0,0 +1,1 @@\n+new\n"));
+}
+
+fn apply_diff(before: &str, diff: &str) -> String {
+    let source: Vec<_> = before.split_inclusive('\n').collect();
+    let mut lines = diff.split_inclusive('\n').peekable();
+    let mut output = String::new();
+    let (mut old_cursor, mut new_cursor) = (0, 0);
+    if diff.is_empty() {
+        return before.into();
+    }
+    assert!(lines.next().unwrap().starts_with("--- "));
+    assert!(lines.next().unwrap().starts_with("+++ "));
+    while let Some(header) = lines.next() {
+        let ranges: Vec<_> = header.split_whitespace().collect();
+        assert_eq!(ranges[0], "@@");
+        let range = |text: &str| {
+            let (start, count) = text[1..].split_once(',').unwrap();
+            let count: usize = count.parse().unwrap();
+            (
+                start.parse::<usize>().unwrap() - usize::from(count != 0),
+                count,
+            )
+        };
+        let (old_start, old_count) = range(ranges[1]);
+        let (new_start, new_count) = range(ranges[2]);
+        for line in &source[old_cursor..old_start] {
+            output.push_str(line);
+            new_cursor += 1;
+        }
+        old_cursor = old_start;
+        assert_eq!(new_cursor, new_start, "{diff}");
+        while lines.peek().is_some_and(|line| !line.starts_with("@@ ")) {
+            let line = lines.next().unwrap();
+            let mut content = &line[1..];
+            if lines.peek() == Some(&"\\ No newline at end of file\n") {
+                lines.next();
+                content = content.strip_suffix('\n').unwrap();
+            }
+            match line.as_bytes()[0] {
+                b' ' | b'-' => {
+                    assert_eq!(source[old_cursor], content, "{diff}");
+                    old_cursor += 1;
+                }
+                b'+' => {}
+                _ => panic!("Invalid diff line: {line:?}"),
+            }
+            if !line.starts_with('-') {
+                output.push_str(content);
+                new_cursor += 1;
+            }
+        }
+        assert_eq!(old_cursor, old_start + old_count, "{diff}");
+        assert_eq!(new_cursor, new_start + new_count, "{diff}");
+    }
+    for line in &source[old_cursor..] {
+        output.push_str(line);
+    }
+    output
+}
+
+#[test]
+fn diff_reconstructs_both_sides_with_minimal_edits_for_repeated_unicode_lines() {
+    let mut corpus = vec![String::new(), "\u{feff}a\r\n\0\r".into(), "\n\nlast".into()];
+    for length in 1..=4 {
+        for bits in 0..1 << length {
+            let text: String = (0..length)
+                .map(|index| {
+                    if bits & (1 << index) == 0 {
+                        "a\n"
+                    } else {
+                        "é\r\n"
+                    }
+                })
+                .collect();
+            corpus.push(text.strip_suffix('\n').unwrap().into());
+            corpus.push(text);
+        }
+    }
+    for before in &corpus {
+        for after in &corpus {
+            let diff = report::diff(&plan(before, vec![replacement(0, before.len(), after)]));
+            assert_eq!(apply_diff(before, &diff), *after, "{before:?} -> {after:?}");
+            let left: Vec<_> = before.split_inclusive('\n').collect();
+            let right: Vec<_> = after.split_inclusive('\n').collect();
+            let mut lcs = vec![vec![0; right.len() + 1]; left.len() + 1];
+            for (i, old) in left.iter().enumerate() {
+                for (j, new) in right.iter().enumerate() {
+                    lcs[i + 1][j + 1] = if old == new {
+                        lcs[i][j] + 1
+                    } else {
+                        lcs[i][j + 1].max(lcs[i + 1][j])
+                    };
+                }
+            }
+            let edits = diff
+                .split_inclusive('\n')
+                .skip(2)
+                .filter(|line| line.starts_with(['-', '+']))
+                .count();
+            assert_eq!(
+                edits,
+                left.len() + right.len() - 2 * lcs[left.len()][right.len()],
+                "{diff}"
+            );
+        }
+    }
+}
+
+#[test]
+fn diff_separates_distant_changes_with_three_lines_of_context() {
+    let before: String = (0..10_000).map(|line| format!("line {line}\n")).collect();
+    let first = before.find("line 50\n").unwrap();
+    let last = before.find("line 9950\n").unwrap();
+    let plan = plan(
+        &before,
+        vec![
+            replacement(first, first + "line 50\n".len(), "changed first\n"),
+            replacement(last, last + "line 9950\n".len(), "changed last\n"),
+        ],
+    );
+    let diff = report::diff(&plan);
+    assert_eq!(diff.matches("@@ -").count(), 2, "{diff}");
+    assert!(diff.contains("@@ -48,7 +48,7 @@\n"), "{diff}");
+    assert!(diff.contains("@@ -9948,7 +9948,7 @@\n"), "{diff}");
+    assert!(diff.lines().count() <= 20, "{diff}");
+    assert!(!diff.contains("line 5000"));
+    assert_eq!(apply_diff(&before, &diff), plan.files[0].output);
+}
+
+#[test]
+fn diff_groups_nearby_insertions_deletions_and_boundary_changes() {
+    for (before, after, hunks) in [
+        (
+            "1\n2\n3\n4\n5\n6\n7\n8\n9\n",
+            "first\n1\n2\n3\n4\n5\n6\n7\n8\n9\nlast",
+            2,
+        ),
+        ("1\n2\n3\n4\n5\n", "1\nnew\n2\n3\n5\n", 1),
+        ("1\n2\n3\n4\n", "2\n3\n", 1),
+        ("same\nlast", "same\nlast\n", 1),
+        ("", "new", 1),
+        ("old", "", 1),
+    ] {
+        let diff = report::diff(&plan(before, vec![replacement(0, before.len(), after)]));
+        assert_eq!(diff.matches("@@ -").count(), hunks, "{diff}");
+        assert_eq!(apply_diff(before, &diff), after);
+    }
+}
+
+#[test]
+fn diff_complexity_fallback_remains_complete_and_trims_common_outer_lines() {
+    let prefix = "shared prefix\n".repeat(20);
+    let suffix = "shared suffix\n".repeat(20);
+    for count in [600, 100_001] {
+        let before = format!("{prefix}{}{suffix}", "old\n".repeat(count));
+        let after = format!("{prefix}{}{suffix}", "new\n".repeat(count));
+        let diff = report::diff(&plan(&before, vec![replacement(0, before.len(), &after)]));
+        assert_eq!(diff.matches("@@ -").count(), 1);
+        assert_eq!(diff.matches(" shared prefix\n").count(), 3);
+        assert_eq!(diff.matches(" shared suffix\n").count(), 3);
+        assert_eq!(apply_diff(&before, &diff), after);
+    }
+}
+
+#[test]
+fn preview_distinguishes_change_ids_from_replacement_regions() {
+    let plan = plan("a a", vec![replacement(0, 1, "b"), replacement(2, 3, "b")]);
+    let preview = report::preview(&plan, 20, 1000);
+    assert!(preview.contains("1 change ID"), "{preview}");
+    assert!(preview.contains("2 replacement regions"), "{preview}");
 }
 
 #[test]

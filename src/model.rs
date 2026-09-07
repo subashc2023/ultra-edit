@@ -10,6 +10,28 @@ pub struct Snapshot {
     pub spans: Vec<Span>,
 }
 
+/// Public read response; stored snapshots retain `id` for journal compatibility.
+#[derive(Serialize)]
+pub struct FullRead {
+    pub snapshot: String,
+    pub path: String,
+    pub digest: String,
+    pub text: String,
+    pub spans: Vec<Span>,
+}
+
+impl From<Snapshot> for FullRead {
+    fn from(snapshot: Snapshot) -> Self {
+        Self {
+            snapshot: snapshot.id,
+            path: snapshot.path,
+            digest: snapshot.digest,
+            text: snapshot.text,
+            spans: snapshot.spans,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Span {
@@ -48,6 +70,8 @@ pub struct SearchResult {
     pub path: String,
     pub digest: String,
     pub query: String,
+    pub offset: usize,
+    pub next_offset: Option<usize>,
     pub total_matches: usize,
     pub omitted_matches: usize,
     pub matches: Vec<SearchMatch>,
@@ -79,16 +103,24 @@ pub struct Change {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Target {
     Exact {
+        /// Literal original text; exactly one occurrence is required (including overlaps).
         old: String,
+        /// A disclosed span ID, not source text; omit to search the entire stored file.
         scope: Option<String>,
     },
     All {
         old: String,
+        /// A disclosed span ID such as selection, r0, or a returned match ID; never source text.
         scope: String,
+        /// Required number of non-overlapping occurrences, counted left to right.
         expected: usize,
     },
     Span {
+        /// A span ID disclosed by this exact base snapshot; never infer it from another read.
         span: String,
+        /// Optional literal guard: selected original bytes must equal this text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect: Option<String>,
     },
 }
 
@@ -142,6 +174,8 @@ pub struct PreparedPlan {
     pub id: String,
     pub request: EditRequest,
     pub files: Vec<PreparedFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<Diagnostic>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +192,8 @@ pub struct Preparation {
     pub reference: String,
     pub ready: bool,
     pub diagnostics: Vec<Diagnostic>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<Diagnostic>,
     pub report: String,
     pub receipt: Option<Receipt>,
 }
@@ -199,6 +235,8 @@ pub struct Receipt {
     pub files: Vec<FileOutcome>,
     pub validation: String,
     pub undo: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<Diagnostic>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -262,13 +300,13 @@ pub struct Inspection {
     pub reconciliation: Option<Reconciliation>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReconciliationDecision {
     AcceptCurrent,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReconciliationRequest {
     pub inspection: String,

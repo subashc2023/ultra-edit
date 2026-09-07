@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -24,6 +24,10 @@ impl Client {
     }
 
     fn connect(mut command: Command) -> Self {
+        Self::connect_after_prefix(&mut command, false)
+    }
+
+    fn connect_after_prefix(command: &mut Command, malformed_prefix: bool) -> Self {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -49,6 +53,14 @@ impl Client {
             output,
             next_id: 0,
         };
+        if malformed_prefix {
+            let input = client.input.as_mut().unwrap();
+            input.write_all(b"{\"invalid\":\"\\ud800\"}\n").unwrap();
+            input.flush().unwrap();
+            let error = client.output.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(error["error"]["code"], -32700);
+            assert!(error["id"].is_null());
+        }
         let initialized = client.rpc(
             "initialize",
             json!({
@@ -196,6 +208,10 @@ fn startup_requires_explicit_root_and_keeps_protocol_stdout_clean() {
         "ultra_edit_commit",
         "ultra_edit_repair",
         "ultra_edit_undo",
+        "ultra_edit_retry",
+        "ultra_edit_diff",
+        "ultra_edit_inspect",
+        "ultra_edit_reconcile",
     ] {
         let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
         assert_eq!(tool["inputSchema"]["type"], "object", "{tool}");
@@ -232,10 +248,13 @@ fn buffered_custom_notifications_do_not_block_valid_requests() {
 }
 
 #[test]
-fn malformed_frames_close_without_stalling_buffered_requests() {
-    for malformed in [
-        json!({"method":"notifications/custom","params":{}}),
-        json!({"jsonrpc":"2.0","method":"notifications/custom","params":[]}),
+fn malformed_frames_return_protocol_errors_and_continue_buffered_requests() {
+    for (malformed, code, id) in [
+        (r#"{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"ultra_edit_prepare","arguments":{"text":"a\ud800b"}}}"#.to_owned(), -32700, json!(null)),
+        ("{broken".to_owned(), -32700, json!(null)),
+        ("[]".to_owned(), -32600, json!(null)),
+        (json!({"method":"notifications/custom","params":{}}).to_string(), -32600, json!(null)),
+        (json!({"jsonrpc":"2.0","id":"invalid-id","method":"notifications/custom","params":[]}).to_string(), -32600, json!("invalid-id")),
     ] {
         let root = TempDir::new().unwrap();
         let mut client = Client::start(root.path());
@@ -247,12 +266,283 @@ fn malformed_frames_close_without_stalling_buffered_requests() {
         let input = client.input.as_mut().unwrap();
         input.write_all(buffered.as_bytes()).unwrap();
         input.flush().unwrap();
+        let error = client.output.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(error["error"]["code"], code, "{error}");
+        assert_eq!(error["id"], id, "{error}");
+        let response = client.output.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(response["id"], 10000);
+        assert_eq!(response["result"], json!({}));
+        assert_eq!(client.rpc("ping", json!({}))["result"], json!({}));
+        assert!(client.rpc("tools/list", json!({}))["result"]["tools"].is_array());
+        client.close();
+    }
+}
+
+#[test]
+fn concurrent_replies_do_not_drop_or_interleave_parse_errors() {
+    let root = TempDir::new().unwrap();
+    let mut client = Client::start(root.path());
+    let mut buffered = String::new();
+    for id in 10000..10064 {
+        buffered.push_str(&json!({"jsonrpc":"2.0","id":id,"method":"ping"}).to_string());
+        buffered.push_str("\n{broken\n");
+    }
+    client
+        .input
+        .as_mut()
+        .unwrap()
+        .write_all(buffered.as_bytes())
+        .unwrap();
+    client.input.as_mut().unwrap().flush().unwrap();
+    let mut ids = std::collections::BTreeSet::new();
+    let mut errors = 0;
+    for _ in 0..128 {
+        let response = client.output.recv_timeout(Duration::from_secs(5)).unwrap();
+        if response["id"].is_null() {
+            assert_eq!(response["error"]["code"], -32700, "{response}");
+            errors += 1;
+        } else {
+            assert_eq!(response["result"], json!({}), "{response}");
+            assert!(
+                ids.insert(response["id"].as_u64().unwrap()),
+                "Duplicate response: {response}"
+            );
+        }
+    }
+    assert_eq!(errors, 64);
+    assert_eq!(ids, (10000..10064).collect());
+    client.close();
+}
+
+#[test]
+fn transport_framing_failure_exits_unsuccessfully() {
+    for payload in [vec![0xff, b'\n'], vec![b'x'; 16 * 1024 * 1024 + 1]] {
+        let root = TempDir::new().unwrap();
+        let mut client = Client::start(root.path());
+        // Oversized input may be rejected before the writer has sent its tail.
+        let _ = client.input.as_mut().unwrap().write_all(&payload);
+        let _ = client.input.as_mut().unwrap().flush();
         assert!(matches!(
             client.output.recv_timeout(Duration::from_secs(5)),
             Err(mpsc::RecvTimeoutError::Disconnected)
         ));
-        client.close();
+        drop(client.input.take());
+        assert!(!client.child.wait().unwrap().success());
     }
+}
+
+#[test]
+fn broken_stdout_exits_without_panic_while_stdin_stays_open() {
+    for malformed in [false, true] {
+        let root = TempDir::new().unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ultra-edit-mcp"))
+            .arg("--root")
+            .arg(root.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            sender.send((line, reader)).unwrap();
+        });
+        writeln!(
+            input,
+            "{}",
+            json!({
+                "jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                    "protocolVersion":"2025-11-25","capabilities":{},
+                    "clientInfo":{"name":"broken-output-test","version":"1"}
+                }
+            })
+        )
+        .unwrap();
+        input.flush().unwrap();
+        let (line, reader) = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["id"], 1);
+        // The reader is returned here, rather than left in a background thread,
+        // so dropping it really closes the server's stdout pipe.
+        drop(reader);
+        let payload = if malformed {
+            "{broken\n".into()
+        } else {
+            (2..22)
+                .map(|id| format!("{}\n", json!({"jsonrpc":"2.0","id":id,"method":"ping"})))
+                .collect::<String>()
+        };
+        let _ = input.write_all(payload.as_bytes());
+        let _ = input.flush();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("Broken stdout did not terminate the server while stdin remained open");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        drop(input);
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert_eq!(status.code(), Some(2), "{stderr}");
+        assert!(stderr.contains("MCP output error:"), "{stderr}");
+        assert!(!stderr.contains("panicked"), "{stderr}");
+    }
+}
+
+#[test]
+fn maximum_sized_protocol_line_is_accepted_before_the_next_message() {
+    let root = TempDir::new().unwrap();
+    let mut client = Client::start(root.path());
+    let ping = json!({"jsonrpc":"2.0","id":10000,"method":"ping"}).to_string();
+    let mut line = " ".repeat(16 * 1024 * 1024 - ping.len());
+    line.push_str(&ping);
+    line.push('\n');
+    let input = client.input.as_mut().unwrap();
+    input.write_all(line.as_bytes()).unwrap();
+    input.flush().unwrap();
+    let response = client.output.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(response["id"], 10000);
+    assert_eq!(response["result"], json!({}));
+    assert_eq!(client.rpc("ping", json!({}))["result"], json!({}));
+    client.close();
+}
+
+#[test]
+fn malformed_message_before_initialization_does_not_prevent_connection() {
+    let root = TempDir::new().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ultra-edit-mcp"));
+    command.arg("--root").arg(root.path());
+    let mut client = Client::connect_after_prefix(&mut command, true);
+    assert_eq!(client.rpc("ping", json!({}))["result"], json!({}));
+    client.close();
+}
+
+#[test]
+fn invalid_request_ids_are_not_silently_treated_as_notifications() {
+    let root = TempDir::new().unwrap();
+    let mut client = Client::start(root.path());
+    for id in [
+        json!(null),
+        json!(true),
+        json!(1.5),
+        json!({}),
+        json!([]),
+        json!(u64::MAX),
+    ] {
+        client.send(json!({"jsonrpc":"2.0","id":id,"method":"ping","params":{}}));
+        let error = client.output.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(error["error"]["code"], -32600, "{error}");
+        assert!(error["id"].is_null() || error["id"] == id);
+        assert_eq!(client.rpc("ping", json!({}))["result"], json!({}));
+    }
+    client.close();
+}
+
+#[test]
+fn full_read_guard_pagination_and_scope_guards_work_over_mcp() {
+    let root = TempDir::new().unwrap();
+    fs::write(root.path().join("large.txt"), "x\n".repeat(1000)).unwrap();
+    let mut client = Client::start(root.path());
+    let rejected = client.call(
+        "ultra_edit_snapshot",
+        json!({
+            "path":"large.txt","selection":{"kind":"full"}
+        }),
+        true,
+    );
+    assert_eq!(rejected["error"]["code"], "READ_TOO_LARGE");
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("2000")
+    );
+    let page = client.call(
+        "ultra_edit_snapshot",
+        json!({
+            "path":"large.txt","selection":{"kind":"search","query":"x"}
+        }),
+        false,
+    );
+    assert_eq!(page["next_offset"], 20);
+    let later = client.call("ultra_edit_snapshot", json!({
+        "path":"large.txt","selection":{"kind":"search","query":"x","offset":980,"snapshot":page["snapshot"]}
+    }), false);
+    assert_eq!(later["matches"][0]["span"]["line"], 981);
+    assert!(later["next_offset"].is_null());
+    let full = client.call(
+        "ultra_edit_snapshot",
+        json!({
+            "path":"large.txt","selection":{"kind":"full","expected_bytes":2000}
+        }),
+        false,
+    );
+    assert!(full["snapshot"].is_string());
+    assert!(full.get("id").is_none());
+    let mut guarded = edit("wrong-span", &later["snapshot"], "m981", "replacement");
+    guarded["files"][0]["changes"][0]["target"]["expect"] = json!("wrong original");
+    assert_eq!(
+        client.call("ultra_edit_prepare", guarded, true)["diagnostics"][0]["code"],
+        "EXPECTED_TEXT_MISMATCH"
+    );
+    client.close();
+}
+
+#[test]
+fn diff_and_byte_warnings_are_available_before_and_after_commit() {
+    let root = TempDir::new().unwrap();
+    let before: String = (1..=44).map(|line| format!("line {line}\r\n")).collect();
+    fs::write(root.path().join("file.txt"), &before).unwrap();
+    let mut client = Client::start(root.path());
+    let snapshot = client.full("file.txt");
+    let request = json!({"request_id":"review","files":[{"base":snapshot["snapshot"],"changes":[
+        {"id":"one","target":{"kind":"exact","old":"line 10\r\n"},"text":"changed 10\n"},
+        {"id":"two","target":{"kind":"exact","old":"line 35"},"text":"changed\u{0000}35"}
+    ]}]});
+    let prepared = client.call("ultra_edit_prepare", request.clone(), false);
+    assert_eq!(prepared["warning_count"], 2);
+    let diff = client.call(
+        "ultra_edit_diff",
+        json!({"plan":prepared["reference"]}),
+        false,
+    );
+    let text = diff["diff"].as_str().unwrap();
+    assert!(text.contains("-line 10\r\n+changed 10\n"), "{text}");
+    assert!(!text.contains("line 22"), "{text}");
+    assert!(diff["next_offset"].is_null());
+    let committed = client.call("ultra_edit", request, false);
+    assert_eq!(committed["warning_count"], 2);
+    assert_eq!(committed["warnings"], prepared["warnings"]);
+    client.close();
+    let mut client = Client::start(root.path());
+    let status = client.call(
+        "ultra_edit_status",
+        json!({"query":{"kind":"receipt","request_id":"review"}}),
+        false,
+    );
+    assert_eq!(status, committed);
+    assert_eq!(
+        fs::read_to_string(root.path().join("file.txt")).unwrap(),
+        before
+            .replace("line 10\r\n", "changed 10\n")
+            .replace("line 35", "changed\u{0}35")
+    );
+    client.close();
 }
 
 #[test]
@@ -376,7 +666,13 @@ fn focused_batch_edit_preserves_bytes_and_retries_after_restart() {
         false,
     );
     assert_eq!(receipt["receipt"]["files"].as_array().unwrap().len(), 2);
-    assert_eq!(receipt["receipt"]["validation"], "not_requested");
+    assert!(receipt["receipt"].get("validation").is_none());
+    assert!(
+        !committed["report"]
+            .as_str()
+            .unwrap()
+            .contains("Validation:")
+    );
     let evidence = client.call(
         "ultra_edit_status",
         json!({"query":{"kind":"evidence","reference":one["snapshot"]}}),
@@ -446,7 +742,7 @@ fn preview_repair_commit_and_conditional_undo_use_retained_plans() {
     fs::write(root.path().join("file.txt"), "x x\r\n").unwrap();
     let mut client = Client::start(root.path());
     let snapshot = client.full("file.txt");
-    let request = json!({"request_id":"ambiguous","files":[{"base":snapshot["id"],"changes":[{
+    let request = json!({"request_id":"ambiguous","files":[{"base":snapshot["snapshot"],"changes":[{
         "id":"change","target":{"kind":"exact","old":"x"},"text":"y"
     }]}]});
     let rejected = client.call("ultra_edit_prepare", request, true);
@@ -489,6 +785,39 @@ fn preview_repair_commit_and_conditional_undo_use_retained_plans() {
             false
         ),
         undone
+    );
+    client.close();
+}
+
+#[test]
+fn retry_preflight_failure_keeps_original_receipt_and_candidate() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("file.txt");
+    fs::write(&path, "before").unwrap();
+    let mut client = Client::start(root.path());
+    let base = client.full("file.txt");
+    let plan = client.call(
+        "ultra_edit_prepare",
+        edit("preflight", &base["snapshot"], "r0", "after"),
+        false,
+    )["reference"]
+        .clone();
+    let original_permissions = fs::metadata(&path).unwrap().permissions();
+    let mut read_only = original_permissions.clone();
+    read_only.set_readonly(true);
+    fs::set_permissions(&path, read_only).unwrap();
+    let failed = client.call("ultra_edit_commit", json!({"plan":plan}), true);
+    fs::set_permissions(&path, original_permissions).unwrap();
+    assert_eq!(failed["commit"], "not_committed");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "before");
+    let arguments = json!({"plan":plan,"request_id":"preflight-retry"});
+    let retried = client.call("ultra_edit_retry", arguments.clone(), false);
+    assert_eq!(retried["commit"], "committed");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "after");
+    assert_eq!(client.call("ultra_edit_retry", arguments, false), retried);
+    assert_eq!(
+        client.call("ultra_edit_commit", json!({"plan":plan}), true),
+        failed
     );
     client.close();
 }
@@ -545,7 +874,7 @@ fn malformed_arguments_and_outside_paths_fail_without_writes() {
     fs::write(parent.path().join("outside.txt"), "outside").unwrap();
     let mut client = Client::start(&root);
     let snapshot = client.full("file.txt");
-    let mut invalid_edit = edit("invalid", &snapshot["id"], "r0", "bad");
+    let mut invalid_edit = edit("invalid", &snapshot["snapshot"], "r0", "bad");
     invalid_edit["force"] = json!(true);
     for (name, arguments) in [
         ("ultra_edit", invalid_edit),
@@ -595,7 +924,7 @@ fn interrupted_commit_and_corrupt_journal_preserve_unknown_status_and_references
     fs::write(root.path().join("file.txt"), "x").unwrap();
     let mut client = Client::start(root.path());
     let snapshot = client.full("file.txt");
-    let request = edit("interrupted", &snapshot["id"], "r0", "xx");
+    let request = edit("interrupted", &snapshot["snapshot"], "r0", "xx");
     let preview = client.call("ultra_edit_prepare", request.clone(), false);
     let evidence = client.call(
         "ultra_edit_status",
@@ -653,6 +982,32 @@ fn interrupted_commit_and_corrupt_journal_preserve_unknown_status_and_references
         "xx"
     );
     assert_eq!(fs::read(&journal_path).unwrap(), journal);
+    let inspection = client.call("ultra_edit_inspect", json!({"plan":plan.id}), false);
+    assert_eq!(inspection["receipt_error"]["code"], "JOURNAL_CORRUPT");
+    assert_eq!(inspection["files"][0]["state"]["digest"], digest(b"xx"));
+    let evidence = client.call(
+        "ultra_edit_status",
+        json!({"query":{"kind":"evidence","reference":inspection["inspection"]}}),
+        false,
+    );
+    assert_eq!(
+        evidence["value"]["files"][0]["state"]["content"]["text"],
+        "xx"
+    );
+    let accepted = json!({"inspection":inspection["inspection"],"decision":"accept_current","note":"Fixture operator reviewed journal and current bytes"});
+    fs::write(root.path().join("file.txt"), "changed since inspection").unwrap();
+    assert_eq!(
+        client.call("ultra_edit_reconcile", accepted.clone(), true)["error"]["code"],
+        "STALE_INSPECTION"
+    );
+    fs::write(root.path().join("file.txt"), "xx").unwrap();
+    let resolved = client.call("ultra_edit_reconcile", accepted.clone(), false);
+    assert_eq!(resolved["plan_id"], plan.id);
+    assert_eq!(
+        client.call("ultra_edit_reconcile", accepted, false),
+        resolved
+    );
+    assert_eq!(fs::read(&journal_path).unwrap(), journal);
     client.close();
 }
 
@@ -662,7 +1017,7 @@ fn cancelled_call_can_be_recovered_without_reapplying_the_edit() {
     fs::write(root.path().join("file.txt"), "x").unwrap();
     let mut client = Client::start(root.path());
     let snapshot = client.full("file.txt");
-    let request = edit("cancelled", &snapshot["id"], "r0", "xx");
+    let request = edit("cancelled", &snapshot["snapshot"], "r0", "xx");
     let storage = ultra_edit::storage::Storage::open(root.path()).unwrap();
     let lock = storage.lock().unwrap();
     client.send(

@@ -1,16 +1,24 @@
 use std::env;
-use std::future::ready;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
-use futures::StreamExt;
+use futures::{
+    SinkExt,
+    future::{BoxFuture, Either, select},
+    lock::Mutex,
+};
 use rmcp::{
     RoleServer, ServiceExt,
     service::{RxJsonRpcMessage, TxJsonRpcMessage},
-    transport::{async_rw::JsonRpcMessageCodec, sink_stream::SinkStreamTransport},
+    transport::Transport,
 };
-use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
+use tokio::sync::mpsc;
+use tokio_util::{
+    codec::{FramedWrite, LinesCodec},
+    sync::CancellationToken,
+};
 use ultra_edit::{Workspace, mcp::McpServer};
 
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -86,35 +94,196 @@ fn main() -> ExitCode {
 }
 
 async fn serve(workspace: Workspace) -> Result<(), Box<dyn std::error::Error>> {
-    // Validate each bounded line strictly: the SDK codec can silently consume a
-    // malformed notification and stall later messages already in its buffer.
-    let input = FramedRead::new(
-        tokio::io::stdin(),
-        LinesCodec::new_with_max_length(MAX_MESSAGE_BYTES),
-    )
-    .scan((), |(), result| {
-        let message = result.map_err(io::Error::other).and_then(|line| {
-            serde_json::from_str::<RxJsonRpcMessage<RoleServer>>(
-                line.strip_prefix('\u{feff}').unwrap_or(&line),
-            )
-            .map_err(io::Error::other)
-        });
-        ready(match message {
-            Ok(message) => Some(message),
-            Err(error) => {
-                eprintln!("MCP input error: {error}");
-                None
-            }
-        })
-    });
-    let output = FramedWrite::new(
-        tokio::io::stdout(),
-        JsonRpcMessageCodec::<TxJsonRpcMessage<RoleServer>>::new(),
-    );
+    let failed = CancellationToken::new();
+    let transport = StdioTransport {
+        input: stdin_messages()?,
+        pending_error: None,
+        output: Arc::new(ProtocolOutput {
+            writer: Mutex::new(FramedWrite::new(tokio::io::stdout(), LinesCodec::new())),
+            failed: failed.clone(),
+        }),
+    };
     McpServer::new(workspace)
-        .serve(SinkStreamTransport::new(output, input))
+        .serve(transport)
         .await?
         .waiting()
         .await?;
+    if failed.is_cancelled() {
+        return Err(io::Error::other("MCP transport failed; see stderr").into());
+    }
     Ok(())
+}
+
+struct ProtocolOutput {
+    writer: Mutex<FramedWrite<tokio::io::Stdout, LinesCodec>>,
+    failed: CancellationToken,
+}
+
+impl ProtocolOutput {
+    async fn send(&self, message: impl serde::Serialize) -> Result<(), io::Error> {
+        // Protocol errors and SDK replies share this writer. Check failure under
+        // the lock so queued sends never reuse a broken output stream.
+        let mut writer = self.writer.lock().await;
+        if self.failed.is_cancelled() {
+            return Err(io::Error::other("MCP transport has failed"));
+        }
+        let result = match serde_json::to_string(&message) {
+            Ok(line) => writer.send(line).await.map_err(io::Error::other),
+            Err(error) => Err(io::Error::other(error)),
+        };
+        if let Err(error) = &result {
+            eprintln!("MCP output error: {error}");
+            self.failed.cancel();
+        }
+        result
+    }
+}
+
+struct StdioTransport {
+    input: mpsc::Receiver<Result<String, io::Error>>,
+    output: Arc<ProtocolOutput>,
+    pending_error: Option<BoxFuture<'static, Result<(), io::Error>>>,
+}
+
+impl Transport<RoleServer> for StdioTransport {
+    type Error = io::Error;
+
+    fn send(
+        &mut self,
+        message: TxJsonRpcMessage<RoleServer>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+        let output = Arc::clone(&self.output);
+        async move { output.send(message).await }
+    }
+
+    async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleServer>> {
+        loop {
+            // The SDK may drop a receive future while another event is ready.
+            // Retain an in-flight error response so it is neither lost nor resent.
+            if let Some(response) = &mut self.pending_error {
+                if response.await.is_err() {
+                    return None;
+                }
+                self.pending_error = None;
+            }
+            let line = match select(
+                Box::pin(self.output.failed.cancelled()),
+                Box::pin(self.input.recv()),
+            )
+            .await
+            {
+                Either::Left(_) | Either::Right((None, _)) => return None,
+                Either::Right((Some(line), _)) => line,
+            };
+            let line = match line {
+                Ok(line) => line,
+                Err(error) => {
+                    eprintln!("MCP input error: {error}");
+                    self.output.failed.cancel();
+                    return None;
+                }
+            };
+            let value = serde_json::from_str::<serde_json::Value>(
+                line.strip_prefix('\u{feff}').unwrap_or(&line),
+            );
+            let (code, message, id) = match value {
+                Err(_) => (-32700, "Parse error", serde_json::Value::Null),
+                Ok(value) => {
+                    let has_id = value.get("id").is_some();
+                    let id = value
+                        .get("id")
+                        .filter(|id| id.is_string() || id.is_i64() || id.is_u64())
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    match serde_json::from_value::<RxJsonRpcMessage<RoleServer>>(value) {
+                        // The SDK's untagged decoder can reinterpret an invalid
+                        // request ID as a custom notification. Never drop that request.
+                        Ok(rmcp::model::JsonRpcMessage::Notification(_)) if has_id => {
+                            (-32600, "Invalid Request", id)
+                        }
+                        Ok(message) => return Some(message),
+                        Err(_) => (-32600, "Invalid Request", id),
+                    }
+                }
+            };
+            let response = serde_json::json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": {"code": code, "message": message},
+            });
+            let output = Arc::clone(&self.output);
+            self.pending_error = Some(Box::pin(async move { output.send(response).await }));
+        }
+    }
+
+    async fn close(&mut self) -> Result<(), Self::Error> {
+        self.input.close();
+        Ok(())
+    }
+}
+
+fn stdin_messages() -> Result<mpsc::Receiver<Result<String, io::Error>>, io::Error> {
+    let (sender, receiver) = mpsc::channel(1);
+    // Tokio's stdin uses a blocking worker that runtime shutdown must join. A
+    // detached reader lets broken stdout terminate with stdin still open, while
+    // the runtime continues to wait for actual workspace workers to finish.
+    std::thread::Builder::new()
+        .name("ultra-edit-stdin".into())
+        .spawn(move || {
+            let stdin = io::stdin();
+            let mut input = stdin.lock();
+            loop {
+                match read_message(&mut input) {
+                    Ok(Some(line)) => {
+                        if sender.blocking_send(Ok(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        let _ = sender.blocking_send(Err(error));
+                        break;
+                    }
+                }
+            }
+        })?;
+    Ok(receiver)
+}
+
+fn read_message(input: &mut impl BufRead) -> Result<Option<String>, io::Error> {
+    let mut bytes = Vec::new();
+    loop {
+        let buffer = input.fill_buf()?;
+        if buffer.is_empty() {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        let newline = buffer.iter().position(|byte| *byte == b'\n');
+        let count = newline.unwrap_or(buffer.len());
+        if count > MAX_MESSAGE_BYTES - bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MCP line exceeds 16 MiB",
+            ));
+        }
+        let needed = bytes.len() + count;
+        if needed > bytes.capacity() {
+            let capacity = needed
+                .max(bytes.capacity().saturating_mul(2))
+                .min(MAX_MESSAGE_BYTES);
+            bytes.reserve_exact(capacity - bytes.len());
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+        input.consume(count + usize::from(newline.is_some()));
+        if newline.is_some() {
+            break;
+        }
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }

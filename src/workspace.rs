@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -7,7 +8,7 @@ use crate::compiler;
 use crate::model::*;
 use crate::reading;
 use crate::report;
-use crate::storage::Storage;
+use crate::storage::{SnapshotPruning, Storage};
 
 const REPORT_LINES: usize = 60;
 const REPORT_CHARS: usize = 6_000;
@@ -29,6 +30,10 @@ enum Input {
         changes: Vec<Change>,
     },
     Undo {
+        reference: String,
+        request_id: String,
+    },
+    Retry {
         reference: String,
         request_id: String,
     },
@@ -68,11 +73,21 @@ impl Workspace {
         self.storage.root()
     }
 
-    /// Returns complete, unnormalized UTF-8 text; every returned span has been disclosed.
+    /// Returns complete, unnormalized UTF-8 text up to 24,000 bytes and 400 lines.
+    /// Every returned span has been disclosed.
     pub fn read(&self, path: impl AsRef<Path>) -> Result<Snapshot, Error> {
+        self.read_with_expected_bytes(path, None)
+    }
+
+    /// An exact expected byte count deliberately permits a larger full response.
+    pub fn read_with_expected_bytes(
+        &self,
+        path: impl AsRef<Path>,
+        expected_bytes: Option<usize>,
+    ) -> Result<Snapshot, Error> {
         let _lock = self.storage.lock()?;
         let (path, text) = self.read_source(path.as_ref())?;
-        let snapshot = compiler::snapshot(path, text);
+        let snapshot = reading::read_full(path, text, expected_bytes)?;
         self.storage.put("snapshots", &snapshot.id, &snapshot)?;
         Ok(snapshot)
     }
@@ -95,9 +110,39 @@ impl Workspace {
     /// Counts overlapping literal matches and discloses up to 20 exact editable
     /// spans with bounded context. This reads a fresh immutable base each call.
     pub fn search(&self, path: impl AsRef<Path>, query: &str) -> Result<SearchResult, Error> {
+        self.search_page(path, query, 0, None)
+    }
+
+    /// An offset skips literal matches, including overlaps. Supply a prior snapshot
+    /// to page through its immutable source; each page issues its own references.
+    pub fn search_page(
+        &self,
+        path: impl AsRef<Path>,
+        query: &str,
+        offset: usize,
+        snapshot: Option<&str>,
+    ) -> Result<SearchResult, Error> {
         let _lock = self.storage.lock()?;
-        let (path, text) = self.read_source(path.as_ref())?;
-        let (snapshot, result) = reading::search(path, text, query)?;
+        let (path, text) = match snapshot {
+            Some(reference) => {
+                if !reference.starts_with('s') {
+                    return Err(Error::new(
+                        "INVALID_REFERENCE",
+                        "Search pagination requires a snapshot reference",
+                    ));
+                }
+                let base: Snapshot = self.storage.get("snapshots", reference)?;
+                if self.storage.resolve(path.as_ref())? != Path::new(&base.path) {
+                    return Err(Error::new(
+                        "SNAPSHOT_PATH_MISMATCH",
+                        "The search path does not identify the supplied snapshot's file",
+                    ));
+                }
+                (base.path, base.text)
+            }
+            None => self.read_source(path.as_ref())?,
+        };
+        let (snapshot, result) = reading::search(path, text, query, offset)?;
         self.storage.put("snapshots", &snapshot.id, &snapshot)?;
         Ok(result)
     }
@@ -141,6 +186,33 @@ impl Workspace {
         self.commit_plan(&plan)
     }
 
+    /// Retries a proven preflight failure as a new request, retaining the exact original candidate.
+    /// The original request, receipt, and journal remain unchanged.
+    pub fn retry(&self, reference: &str, request_id: &str) -> Result<EditResult, Error> {
+        let _lock = self.storage.lock()?;
+        let input = Input::Retry {
+            reference: reference.into(),
+            request_id: request_id.into(),
+        };
+        if let Some(reference) = self.bound(request_id, &input)? {
+            return self.finish(self.preparation(&reference)?);
+        }
+        let mut plan = self.plan(reference)?;
+        self.storage.check_retry(&plan)?;
+        plan.id = new_id("p");
+        plan.request.request_id = request_id.into();
+        self.storage.put("plans", &plan.id, &plan)?;
+        self.storage.put(
+            "requests",
+            &digest(request_id.as_bytes()),
+            &Binding {
+                input,
+                reference: plan.id.clone(),
+            },
+        )?;
+        self.finish(self.preparation(&plan.id)?)
+    }
+
     pub fn inspect(&self, reference: &str) -> Result<Inspection, Error> {
         let _lock = self.storage.lock()?;
         self.storage.inspect(&self.plan(reference)?)
@@ -149,6 +221,111 @@ impl Workspace {
     pub fn reconcile(&self, request: ReconciliationRequest) -> Result<Reconciliation, Error> {
         let _lock = self.storage.lock()?;
         self.storage.reconcile(request)
+    }
+
+    /// Prunes only old snapshots absent from every retained request and evidence object.
+    /// With `apply` false this returns candidates without removing files.
+    pub fn prune_snapshots(
+        &self,
+        older_than: Duration,
+        apply: bool,
+    ) -> Result<SnapshotPruning, Error> {
+        let _lock = self.storage.lock()?;
+        let mut retained = BTreeSet::new();
+        for id in self.storage.object_ids("requests")? {
+            let binding: Binding = self.storage.get("requests", &id)?;
+            let request_id = match &binding.input {
+                Input::Edit { request } => {
+                    retained.extend(request.files.iter().map(|file| file.base.clone()));
+                    &request.request_id
+                }
+                Input::Repair {
+                    reference,
+                    request_id,
+                    ..
+                } => {
+                    if !matches!(
+                        self.evidence_unlocked(reference)?,
+                        Evidence::Plan(_) | Evidence::Draft(_)
+                    ) {
+                        return Err(Error::new(
+                            "STORE_CORRUPT",
+                            "Repair input does not reference retained edit evidence",
+                        ));
+                    }
+                    request_id
+                }
+                Input::Undo {
+                    reference,
+                    request_id,
+                }
+                | Input::Retry {
+                    reference,
+                    request_id,
+                } => {
+                    self.plan(reference)?;
+                    request_id
+                }
+            };
+            if digest(request_id.as_bytes()) != id
+                || !matches!(
+                    self.evidence_unlocked(&binding.reference)?,
+                    Evidence::Plan(_) | Evidence::Draft(_)
+                )
+            {
+                return Err(Error::new(
+                    "STORE_CORRUPT",
+                    "Request binding does not match its filename or retained evidence",
+                ));
+            }
+        }
+        for id in self.storage.object_ids("plans")? {
+            let plan: PreparedPlan = self.storage.get("plans", &id)?;
+            if plan.id != id {
+                return Err(Error::new(
+                    "STORE_CORRUPT",
+                    "Plan does not match its filename",
+                ));
+            }
+            self.recorded_receipt(&plan)?;
+            retained.extend(plan.request.files.iter().map(|file| file.base.clone()));
+            retained.extend(plan.files.iter().map(|file| file.base.id.clone()));
+        }
+        for id in self.storage.object_ids("drafts")? {
+            let draft: Draft = self.storage.get("drafts", &id)?;
+            if draft.id != id {
+                return Err(Error::new(
+                    "STORE_CORRUPT",
+                    "Draft does not match its filename",
+                ));
+            }
+            retained.extend(draft.request.files.iter().map(|file| file.base.clone()));
+        }
+        for id in self.storage.object_ids("inspections")? {
+            let inspection: Inspection = self.storage.get("inspections", &id)?;
+            if inspection.id != id || inspection.plan != self.plan(&inspection.plan.id)? {
+                return Err(Error::new(
+                    "STORE_CORRUPT",
+                    "Inspection does not match its filename and retained plan",
+                ));
+            }
+            retained.extend(
+                inspection
+                    .plan
+                    .request
+                    .files
+                    .iter()
+                    .map(|file| file.base.clone()),
+            );
+            retained.extend(
+                inspection
+                    .plan
+                    .files
+                    .iter()
+                    .map(|file| file.base.id.clone()),
+            );
+        }
+        self.storage.prune_snapshots(&retained, older_than, apply)
     }
 
     /// Corrections replace changes in their original positions and retain the original snapshots.
@@ -292,7 +469,10 @@ impl Workspace {
                 base: snapshot.id,
                 changes: vec![Change {
                     id: format!("undo-{}", files.len() + 1),
-                    target: Target::Span { span: "r0".into() },
+                    target: Target::Span {
+                        span: "r0".into(),
+                        expect: None,
+                    },
                     text: file.base.text.clone(),
                 }],
             });
@@ -347,6 +527,7 @@ impl Workspace {
 
     fn prepare_new(&self, input: Input, request: EditRequest) -> Result<Preparation, Error> {
         validate_request_id(&request.request_id)?;
+        let undo = matches!(&input, Input::Undo { .. });
         if request.files.len() > 64 {
             return Err(Error::new(
                 "RESOURCE_LIMIT",
@@ -388,7 +569,11 @@ impl Workspace {
                 }
                 paths.push(path.clone());
                 if self.storage.read(&path)? != snapshot.text {
-                    return Err(Error::new("STALE_SNAPSHOT", "The file changed; read a fresh snapshot and submit a new request"));
+                    return Err(Error::new("STALE_SNAPSHOT", if undo {
+                        "Undo requires the recorded after-bytes, but the file differs; it may already be undone or contain newer work. Inspect the current file and original plan before choosing an explicit restoration edit"
+                    } else {
+                        "The file changed; read a fresh snapshot and submit a new request"
+                    }));
                 }
                 Ok(())
             });
@@ -504,6 +689,7 @@ impl Workspace {
                     reference: plan.id.clone(),
                     ready: true,
                     diagnostics: vec![],
+                    warnings: plan.warnings,
                     report,
                     receipt,
                 })
@@ -517,6 +703,7 @@ impl Workspace {
                     draft.id
                 ),
                 diagnostics: draft.diagnostics,
+                warnings: vec![],
                 receipt: None,
             }),
             Evidence::Snapshot(_) | Evidence::Inspection(_) => Err(Error::new(

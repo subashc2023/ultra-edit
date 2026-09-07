@@ -255,6 +255,7 @@ pub fn compile(
     if !diagnostics.is_empty() {
         return Err(diagnostics);
     }
+    let mut warnings = Vec::new();
     let files = resolved
         .into_iter()
         .map(|(base, replacements, changes)| {
@@ -266,6 +267,7 @@ pub fn compile(
                 cursor = replacement.end;
             }
             output.push_str(&base.text[cursor..]);
+            warn_output(&base.path, &output, &mut warnings);
             PreparedFile {
                 base: base.clone(),
                 output,
@@ -278,7 +280,39 @@ pub fn compile(
         id: new_id("p"),
         request: request.clone(),
         files,
+        warnings,
     })
+}
+
+fn warn_output(path: &str, output: &str, warnings: &mut Vec<Diagnostic>) {
+    if output.contains('\0') {
+        warnings.push(at(
+            Some(path),
+            None,
+            "NUL_BYTE",
+            "Candidate output contains a NUL byte; literal bytes are preserved",
+        ));
+    }
+    let mut crlf = false;
+    let mut bare_lf = false;
+    for (index, byte) in output.bytes().enumerate() {
+        if byte == b'\n' {
+            if index > 0 && output.as_bytes()[index - 1] == b'\r' {
+                crlf = true;
+            } else {
+                bare_lf = true;
+            }
+            if crlf && bare_lf {
+                warnings.push(at(
+                    Some(path),
+                    None,
+                    "MIXED_LINE_ENDINGS",
+                    "Candidate output contains both CRLF and bare LF line endings; literal bytes are preserved",
+                ));
+                break;
+            }
+        }
+    }
 }
 
 fn at(
@@ -311,7 +345,7 @@ fn validate_target(change: &Change, path: Option<&str>, diagnostics: &mut Vec<Di
             }
             (Some(old), Some(scope))
         }
-        Target::Span { span } => (None, Some(span)),
+        Target::Span { span, .. } => (None, Some(span)),
     };
     if old.is_some_and(String::is_empty) {
         diagnostics.push(at(
@@ -426,8 +460,20 @@ fn resolve_change(
             scope,
             expected,
         } => (old.as_str(), Some(scope.as_str()), *expected),
-        Target::Span { span } => {
+        Target::Span { span, expect } => {
             if let Some((start, end)) = scope_range(base, change, Some(span), diagnostics) {
+                if expect
+                    .as_ref()
+                    .is_some_and(|text| text != &base.text[start..end])
+                {
+                    diagnostics.push(at(
+                        Some(&base.path),
+                        Some(change),
+                        "EXPECTED_TEXT_MISMATCH",
+                        "Span text does not match expect; inspect the original snapshot and choose the intended span",
+                    ));
+                    return;
+                }
                 if !budget.reserve(1, &change.text) {
                     diagnostics.push(resource_limit(base, change));
                     return;
@@ -449,8 +495,18 @@ fn resolve_change(
     let Some((start, end)) = range else {
         return;
     };
-    let (actual, positions) =
-        occurrences(&base.text[start..end], old, expected.min(budget.spans_left));
+    let retained = expected.min(budget.spans_left);
+    let (actual, positions) = if matches!(change.target, Target::All { .. }) {
+        let mut matches = base.text[start..end].match_indices(old);
+        let positions: Vec<_> = matches
+            .by_ref()
+            .take(retained)
+            .map(|(index, _)| index)
+            .collect();
+        (positions.len() + matches.count(), positions)
+    } else {
+        occurrences(&base.text[start..end], old, retained)
+    };
     if actual != expected {
         let code = if actual == 0 {
             "TARGET_NOT_FOUND"
@@ -485,6 +541,15 @@ fn resolve_change(
 }
 
 pub(crate) fn occurrences(source: &str, old: &str, retained: usize) -> (usize, Vec<usize>) {
+    occurrences_page(source, old, 0, retained)
+}
+
+pub(crate) fn occurrences_page(
+    source: &str,
+    old: &str,
+    offset: usize,
+    retained: usize,
+) -> (usize, Vec<usize>) {
     if old.len() > source.len() {
         return (0, Vec::new());
     }
@@ -513,7 +578,7 @@ pub(crate) fn occurrences(source: &str, old: &str, retained: usize) -> (usize, V
         }
         if matched == needle.len() {
             count += 1;
-            if positions.len() < retained {
+            if count > offset && positions.len() < retained {
                 positions.push(index + 1 - needle.len());
             }
             matched = prefix[matched - 1];

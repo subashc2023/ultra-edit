@@ -2,6 +2,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -87,6 +88,45 @@ fn accept(inspection: &Inspection) -> ReconciliationRequest {
     }
 }
 
+#[test]
+fn pruning_blocks_unresolved_outcomes_and_retains_all_reconciled_evidence() {
+    let (root, workspace, plan, journal) = fixture();
+    let unused = workspace.read("second.txt").unwrap();
+    let unused_path = root
+        .path()
+        .join(".ultra-edit/snapshots")
+        .join(format!("{}.json", unused.id));
+    assert_eq!(
+        workspace
+            .prune_snapshots(Duration::ZERO, true)
+            .unwrap_err()
+            .code,
+        "RECONCILIATION_REQUIRED"
+    );
+    assert!(unused_path.exists());
+    let inspection = workspace.inspect(&plan.id).unwrap();
+    let reconciliation = workspace.reconcile(accept(&inspection)).unwrap();
+    let pruned = workspace.prune_snapshots(Duration::ZERO, true).unwrap();
+    assert_eq!(pruned.removed_snapshots, 1);
+    assert!(!unused_path.exists());
+    for file in &plan.files {
+        assert!(workspace.evidence(&file.base.id).is_ok());
+    }
+    let Evidence::Inspection(retained) = workspace.evidence(&inspection.id).unwrap() else {
+        panic!()
+    };
+    assert_eq!(*retained, inspection);
+    assert_eq!(
+        workspace.inspect(&plan.id).unwrap().reconciliation,
+        Some(reconciliation)
+    );
+    assert_eq!(fs::read(journal_path(root.path(), &plan)).unwrap(), journal);
+    assert_eq!(
+        workspace.receipt("interrupted").unwrap().unwrap().commit,
+        CommitStatus::OutcomeUnknown
+    );
+}
+
 fn assert_fresh_edit(workspace: &Workspace, request_id: &str) {
     let plan = prepare(workspace, &["second.txt"], request_id);
     assert_eq!(
@@ -143,6 +183,13 @@ fn inspection_and_resolution_preserve_history_and_allow_fresh_edits_after_restar
             Some(original.clone())
         );
         assert_eq!(workspace.commit(&plan.id).unwrap(), original);
+        assert_eq!(
+            workspace
+                .retry(&plan.id, "retry-reconciled")
+                .unwrap_err()
+                .code,
+            "RETRY_CLOSED"
+        );
         assert_eq!(
             workspace.prepare(plan.request.clone()).unwrap().receipt,
             Some(original.clone())

@@ -6,24 +6,26 @@ use std::process::ExitCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use ultra_edit::workspace::EditResult;
-use ultra_edit::{Change, CommitStatus, Error, Preparation, Workspace};
+use ultra_edit::{Change, CommitStatus, Error, FullRead, Preparation, Workspace};
 
 const HELP: &str = "ultra-edit 0.1.0
 Usage: ultra-edit [--root WORKSPACE] COMMAND [ARGS]
 
-  read PATH                  Persist a complete UTF-8 snapshot and return range refs
+  read PATH [EXPECTED_BYTES]  Full snapshot; exact byte count opts into a large response
   read-range PATH FIRST LAST  Read inclusive line bodies with editable range refs
-  search PATH QUERY          Find literal text and return exact editable match refs
+  search PATH QUERY [OFFSET [SNAPSHOT]]  Page through literal editable matches
   prepare                    Read an edit request from stdin; persist a preview
   edit                       Read an edit request from stdin; prepare and commit
   repair                     Read {reference,request_id,changes} from stdin
   commit PLAN                Commit the recorded candidate, conditional on its base
+  retry PLAN NEW_REQUEST_ID  Retry a proven preflight failure using its stored candidate
   receipt REQUEST_ID         Retrieve the full recorded persistence outcome
   inspect PLAN               Capture journal and original/intended/current file evidence
   reconcile                  Read {inspection,decision,note} from stdin; accept current state
   get REFERENCE              Retrieve a full snapshot, plan, draft, or inspection
   diff PLAN                  Retrieve the full before/after diff (JSON string)
   undo PLAN NEW_REQUEST_ID    Conditionally restore confirmed committed files
+  prune-snapshots OLDER_THAN_SECONDS [--apply]  Preview/remove unreferenced snapshots
 
 Output is JSON. Exit codes: 0 successful read/preview/commit/reconciliation, 2 rejected/error,
 3 commit not fully confirmed. References and receipts live in WORKSPACE/.ultra-edit.
@@ -87,13 +89,15 @@ fn run() -> Result<Option<(Value, u8)>, Error> {
         .into_string()
         .map_err(|_| usage("Command must be Unicode"))?;
     let expected = match command.as_str() {
-        "read" | "commit" | "receipt" | "inspect" | "get" | "diff" => 1,
-        "undo" | "search" => 2,
-        "read-range" => 3,
-        "prepare" | "edit" | "repair" | "reconcile" => 0,
+        "commit" | "receipt" | "inspect" | "get" | "diff" => 1..=1,
+        "read" | "prune-snapshots" => 1..=2,
+        "search" => 2..=4,
+        "undo" | "retry" => 2..=2,
+        "read-range" => 3..=3,
+        "prepare" | "edit" | "repair" | "reconcile" => 0..=0,
         _ => return Err(usage("Unknown command; run --help")),
     };
-    if args.len() != expected {
+    if !expected.contains(&args.len()) {
         return Err(usage("Unexpected or missing command arguments; run --help"));
     }
     let workspace = Workspace::open(root)?;
@@ -104,7 +108,14 @@ fn run() -> Result<Option<(Value, u8)>, Error> {
     };
     let output = match command.as_str() {
         "read" => (
-            serde_json::to_value(workspace.read(PathBuf::from(&args[0]))?)?,
+            serde_json::to_value(FullRead::from(workspace.read_with_expected_bytes(
+                PathBuf::from(&args[0]),
+                if args.len() == 2 {
+                    Some(nonnegative_integer(argument(1)?)?)
+                } else {
+                    None
+                },
+            )?))?,
             0,
         ),
         "read-range" => (
@@ -116,7 +127,20 @@ fn run() -> Result<Option<(Value, u8)>, Error> {
             0,
         ),
         "search" => (
-            serde_json::to_value(workspace.search(PathBuf::from(&args[0]), argument(1)?)?)?,
+            serde_json::to_value(workspace.search_page(
+                PathBuf::from(&args[0]),
+                argument(1)?,
+                if args.len() >= 3 {
+                    nonnegative_integer(argument(2)?)?
+                } else {
+                    0
+                },
+                if args.len() == 4 {
+                    Some(argument(3)?)
+                } else {
+                    None
+                },
+            )?)?,
             0,
         ),
         "prepare" => preparation(workspace.prepare(input()?)?),
@@ -126,6 +150,22 @@ fn run() -> Result<Option<(Value, u8)>, Error> {
             preparation(workspace.repair(&input.reference, &input.request_id, input.changes)?)
         }
         "commit" => completed(workspace.commit(argument(0)?)?),
+        "retry" => edited(workspace.retry(argument(0)?, argument(1)?)?),
+        "prune-snapshots" => {
+            let seconds = argument(0)?
+                .parse::<u64>()
+                .map_err(|_| usage("Age must be a nonnegative number of seconds"))?;
+            let apply = args.len() == 2;
+            if apply && argument(1)? != "--apply" {
+                return Err(usage("Snapshot pruning only accepts --apply after the age"));
+            }
+            (
+                serde_json::to_value(
+                    workspace.prune_snapshots(std::time::Duration::from_secs(seconds), apply)?,
+                )?,
+                0,
+            )
+        }
         "receipt" => (serde_json::to_value(workspace.receipt(argument(0)?)?)?, 0),
         "inspect" => (serde_json::to_value(workspace.inspect(argument(0)?)?)?, 0),
         "reconcile" => (serde_json::to_value(workspace.reconcile(input()?)?)?, 0),
@@ -145,6 +185,12 @@ fn line_number(value: &str) -> Result<usize, Error> {
     value
         .parse()
         .map_err(|_| usage("Line numbers must be positive integers"))
+}
+
+fn nonnegative_integer(value: &str) -> Result<usize, Error> {
+    value
+        .parse()
+        .map_err(|_| usage("Byte counts and offsets must be nonnegative integers"))
 }
 
 fn input<T: serde::de::DeserializeOwned>() -> Result<T, Error> {
@@ -178,6 +224,8 @@ fn preparation(preparation: Preparation) -> (Value, u8) {
             "ready": preparation.ready,
             "diagnostic_count": preparation.diagnostics.len(),
             "diagnostics": diagnostic_summary,
+            "warning_count": preparation.warnings.len(),
+            "warnings": warning_summary(&preparation.warnings),
             "report": preparation.report,
         }),
         code,
@@ -202,8 +250,18 @@ fn completed(receipt: ultra_edit::Receipt) -> (Value, u8) {
             "request_id": receipt.request_id,
             "plan_id": receipt.plan_id,
             "commit": receipt.commit,
+            "warning_count": receipt.warnings.len(),
+            "warnings": warning_summary(&receipt.warnings),
             "report": ultra_edit::report::receipt(&receipt, 60, 6_000),
         }),
         code,
     )
+}
+
+fn warning_summary(warnings: &[ultra_edit::Diagnostic]) -> Vec<Value> {
+    warnings.iter().take(6).map(|warning| json!({
+        "code": warning.code.chars().take(80).collect::<String>(),
+        "file": warning.file.as_ref().map(|path| path.chars().take(500).collect::<String>()),
+        "message": warning.message.chars().take(240).collect::<String>(),
+    })).collect()
 }

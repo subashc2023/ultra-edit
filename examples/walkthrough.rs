@@ -54,7 +54,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 Change {
                     id: "delay".into(),
-                    target: Target::Span { span: "r2".into() },
+                    target: Target::Span {
+                        span: "r2".into(),
+                        expect: Some("const DELAY_MS: u32 = 100;".into()),
+                    },
                     text: "const DELAY_MS: u32 = 250;".into(),
                 },
             ],

@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use same_file::Handle;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -9,7 +10,8 @@ use tempfile::NamedTempFile;
 
 use crate::compiler::MAX_TEXT_BYTES;
 use crate::model::{
-    CommitStatus, Error, FileOutcome, FileStatus, PreparedFile, PreparedPlan, Receipt, digest,
+    CommitStatus, Error, FileOutcome, FileStatus, PreparedFile, PreparedPlan, Receipt, Snapshot,
+    digest,
 };
 
 mod reconciliation;
@@ -17,6 +19,22 @@ mod reconciliation;
 pub struct Storage {
     root: PathBuf,
     state: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SnapshotPruning {
+    pub dry_run: bool,
+    pub older_than_seconds: u64,
+    pub eligible: Vec<SnapshotPruningCandidate>,
+    pub eligible_bytes: u64,
+    pub retained_snapshots: usize,
+    pub removed_snapshots: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SnapshotPruningCandidate {
+    pub snapshot: String,
+    pub bytes: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -33,6 +51,8 @@ enum JournalEvent {
         plan_id: String,
         plan_digest: String,
         file_count: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preflight_failed: Option<bool>,
     },
     Intent {
         index: usize,
@@ -50,6 +70,8 @@ struct Journal {
     plan_digest: String,
     file_count: usize,
     outcomes: Vec<(FileStatus, Option<String>)>,
+    preflight_failed: Option<bool>,
+    had_intent: bool,
     pending: bool,
     finished: bool,
 }
@@ -153,8 +175,166 @@ impl Storage {
         decode(&fs::read(path)?)
     }
 
+    pub(crate) fn object_ids(&self, kind: &str) -> Result<Vec<String>, Error> {
+        let mut ids = Vec::new();
+        for entry in fs::read_dir(self.directory(kind)?)? {
+            let path = entry?.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                regular_or_missing(&path)?;
+                let id = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .ok_or_else(|| Error::new("STORE_CORRUPT", "Invalid stored object filename"))?;
+                safe_component(id)?;
+                ids.push(id.to_owned());
+            }
+        }
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
+    pub(crate) fn prune_snapshots(
+        &self,
+        retained: &BTreeSet<String>,
+        older_than: Duration,
+        apply: bool,
+    ) -> Result<SnapshotPruning, Error> {
+        let cutoff = SystemTime::now().checked_sub(older_than).ok_or_else(|| {
+            Error::new(
+                "INVALID_RETENTION",
+                "Retention age is outside the supported time range",
+            )
+        })?;
+        self.assert_no_unknown()?;
+        for entry in fs::read_dir(self.directory("journals")?)? {
+            let path = entry?.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+            {
+                regular_or_missing(&path)?;
+                let id = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .ok_or_else(|| Error::new("STORE_CORRUPT", "Invalid journal filename"))?;
+                let plan: PreparedPlan = self.get("plans", id)?;
+                if plan.id != id || self.journal(&plan)?.is_none() {
+                    return Err(Error::new(
+                        "STORE_CORRUPT",
+                        "Journal does not match a retained plan",
+                    ));
+                }
+            }
+        }
+        let mut result = SnapshotPruning {
+            dry_run: !apply,
+            older_than_seconds: older_than.as_secs(),
+            eligible: Vec::new(),
+            eligible_bytes: 0,
+            retained_snapshots: 0,
+            removed_snapshots: 0,
+        };
+        for id in self.object_ids("snapshots")? {
+            let snapshot: Snapshot = self.get("snapshots", &id)?;
+            if snapshot.id != id || snapshot.digest != digest(snapshot.text.as_bytes()) {
+                return Err(Error::new(
+                    "STORE_CORRUPT",
+                    "Snapshot does not match its filename or content digest",
+                ));
+            }
+            let metadata = fs::metadata(self.object_path("snapshots", &id)?)?;
+            if retained.contains(&id) || metadata.modified()? > cutoff {
+                result.retained_snapshots += 1;
+            } else {
+                result.eligible_bytes = result
+                    .eligible_bytes
+                    .checked_add(metadata.len())
+                    .ok_or_else(|| {
+                        Error::new(
+                            "RESOURCE_LIMIT",
+                            "Snapshot storage size exceeds the supported range",
+                        )
+                    })?;
+                result.eligible.push(SnapshotPruningCandidate {
+                    snapshot: id,
+                    bytes: metadata.len(),
+                });
+            }
+        }
+        // Validate all retained history and candidates before unlinking any snapshot.
+        // The coordinator lock excludes cooperating readers and request publication.
+        if apply {
+            let removal = (|| {
+                for candidate in &result.eligible {
+                    let path = self.object_path("snapshots", &candidate.snapshot)?;
+                    regular_or_missing(&path)?;
+                    fs::remove_file(path)?;
+                    result.removed_snapshots += 1;
+                }
+                sync_directory(&self.directory("snapshots")?)?;
+                Ok::<_, Error>(())
+            })();
+            if let Err(error) = removal {
+                return Err(Error::new(
+                    "PRUNE_INCOMPLETE",
+                    format!(
+                        "Removed {} snapshots before pruning failed: {error}; rerun a dry run to inspect remaining candidates",
+                        result.removed_snapshots
+                    ),
+                ));
+            }
+        }
+        Ok(result)
+    }
+
     /// The caller must hold the coordinator lock throughout receipt lookup and commit.
     pub fn receipt(&self, plan: &PreparedPlan) -> Result<Option<Receipt>, Error> {
+        let Some(journal) = self.journal(plan)? else {
+            return Ok(None);
+        };
+        let mut outcomes = journal.outcomes;
+        if journal.pending {
+            outcomes.push((
+                FileStatus::OutcomeUnknown,
+                Some("INTERRUPTED: write intent exists without a durable outcome; reconciliation required".into()),
+            ));
+        }
+        while outcomes.len() < plan.files.len() {
+            outcomes.push((
+                FileStatus::NotCommitted,
+                Some("INTERRUPTED: target was not attempted".into()),
+            ));
+        }
+        Ok(Some(make_receipt(plan, outcomes)))
+    }
+
+    /// Authorizes a new immutable attempt only when durable evidence excludes any target write.
+    /// The caller holds the coordinator lock through creation of the new attempt.
+    pub fn check_retry(&self, plan: &PreparedPlan) -> Result<(), Error> {
+        validate_plan(plan)?;
+        let eligible = self.journal(plan)?.is_some_and(|journal| {
+            journal.finished
+                && !journal.had_intent
+                && journal.outcomes.iter().all(|(status, error)| {
+                    *status == FileStatus::NotCommitted
+                        && journal
+                            .preflight_failed
+                            .unwrap_or_else(|| error.as_deref().is_some_and(legacy_preflight_error))
+                })
+        });
+        if !eligible {
+            return Err(Error::new(
+                "RETRY_CLOSED",
+                "Retry requires a completed preflight failure with no write intent; inspect the receipt before creating a fresh edit",
+            ));
+        }
+        self.assert_no_unknown()
+    }
+
+    fn journal(&self, plan: &PreparedPlan) -> Result<Option<Journal>, Error> {
         self.reconciliation(plan)?;
         let path = self.journal_path(&plan.id)?;
         if !regular_or_missing(&path)? {
@@ -170,20 +350,7 @@ impl Storage {
                 "Journal does not match its immutable plan",
             ));
         }
-        let mut outcomes = journal.outcomes;
-        if journal.pending {
-            outcomes.push((
-                FileStatus::OutcomeUnknown,
-                Some("INTERRUPTED: write intent exists without a durable outcome; reconciliation required".into()),
-            ));
-        }
-        while outcomes.len() < plan.files.len() {
-            outcomes.push((
-                FileStatus::NotCommitted,
-                Some("INTERRUPTED: target was not attempted".into()),
-            ));
-        }
-        Ok(Some(make_receipt(plan, outcomes)))
+        Ok(Some(journal))
     }
 
     /// Complete preflight precedes mutation. File replacement is not a multi-file transaction,
@@ -203,6 +370,7 @@ impl Storage {
         validate_plan(plan)?;
         self.assert_no_unknown()?;
         let (targets, failures) = self.preflight(plan);
+        let preflight_failed = failures.iter().any(Option::is_some);
         let mut journal = file_options()
             .create_new(true)
             .open(self.journal_path(&plan.id)?)?;
@@ -213,11 +381,11 @@ impl Storage {
                     plan_id: plan.id.clone(),
                     plan_digest: digest(&serde_json::to_vec(plan)?),
                     file_count: plan.files.len(),
+                    preflight_failed: Some(preflight_failed),
                 },
             )
             .map_err(journal_error)?;
         sync_directory(&self.directory("journals")?).map_err(journal_error)?;
-        let preflight_failed = failures.iter().any(Option::is_some);
         let mut outcomes = Vec::new();
         let mut stopped = false;
         for (index, file) in plan.files.iter().enumerate() {
@@ -475,6 +643,7 @@ fn read_journal(path: &Path) -> Result<Journal, Error> {
                     plan_id,
                     plan_digest,
                     file_count,
+                    preflight_failed,
                 },
             ) if file_count > 0 => {
                 journal = Some(Journal {
@@ -482,12 +651,15 @@ fn read_journal(path: &Path) -> Result<Journal, Error> {
                     plan_digest,
                     file_count,
                     outcomes: Vec::new(),
+                    preflight_failed,
+                    had_intent: false,
                     pending: false,
                     finished: false,
                 });
             }
             (Some(log), JournalEvent::Intent { index })
                 if !log.finished
+                    && log.preflight_failed != Some(true)
                     && !log.pending
                     && index == log.outcomes.len()
                     && index < log.file_count
@@ -496,6 +668,7 @@ fn read_journal(path: &Path) -> Result<Journal, Error> {
                         .iter()
                         .all(|(status, _)| *status == FileStatus::Committed) =>
             {
+                log.had_intent = true;
                 log.pending = true;
             }
             (
@@ -531,6 +704,25 @@ fn read_journal(path: &Path) -> Result<Journal, Error> {
         Error::new(
             "JOURNAL_CORRUPT",
             "Journal has no complete header; reconciliation required",
+        )
+    })
+}
+
+fn legacy_preflight_error(error: &str) -> bool {
+    // Older journals cannot distinguish preflight from a pre-write recheck failure.
+    // Both may emit these errors, but a complete journal without any Intent still
+    // proves no target write, so that legacy ambiguity remains safe to retry.
+    error.split_once(": ").is_some_and(|(code, _)| {
+        matches!(
+            code,
+            "BATCH_PREFLIGHT_FAILED"
+                | "IO_ERROR"
+                | "PATH_OUTSIDE_WORKSPACE"
+                | "NOT_REGULAR_FILE"
+                | "STALE_SNAPSHOT"
+                | "READ_ONLY_TARGET"
+                | "DUPLICATE_TARGET"
+                | "FILE_TOO_LARGE"
         )
     })
 }
@@ -575,6 +767,7 @@ fn make_receipt(plan: &PreparedPlan, outcomes: Vec<(FileStatus, Option<String>)>
         commit,
         files,
         validation: "not_requested".into(),
+        warnings: plan.warnings.clone(),
         undo: (committed > 0 && commit != CommitStatus::OutcomeUnknown).then(|| plan.id.clone()),
     }
 }
@@ -875,6 +1068,13 @@ mod tests {
             "before"
         );
         assert_eq!(storage.commit(&plan).expect("repeat"), receipt);
+        assert_eq!(
+            storage
+                .check_retry(&plan)
+                .expect_err("partial retry closed")
+                .code,
+            "RETRY_CLOSED"
+        );
     }
 
     struct FailSecondReplacement(usize);
@@ -911,6 +1111,13 @@ mod tests {
             "before"
         );
         assert_eq!(storage.commit(&plan).expect("repeat"), receipt);
+        assert_eq!(
+            storage
+                .check_retry(&plan)
+                .expect_err("uncertain retry closed")
+                .code,
+            "RETRY_CLOSED"
+        );
         let mut another = plan.clone();
         another.id = "another-plan".into();
         assert_eq!(
@@ -952,6 +1159,13 @@ mod tests {
         assert_eq!(receipt.files[1].status, FileStatus::NotCommitted);
         assert_eq!(reopened.commit(&plan).expect("repeat"), receipt);
         assert_eq!(
+            reopened
+                .check_retry(&plan)
+                .expect_err("interrupted retry closed")
+                .code,
+            "RETRY_CLOSED"
+        );
+        assert_eq!(
             fs::read_to_string(&plan.files[1].base.path).expect("read"),
             "before"
         );
@@ -987,6 +1201,171 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(&plan.files[1].base.path).expect("read"),
+            "before"
+        );
+    }
+
+    #[test]
+    fn staging_failures_and_incomplete_preflight_journals_cannot_be_retried() {
+        let (_directory, storage, plan) = fixture();
+        let _lock = storage.lock().expect("lock");
+        let receipt = storage
+            .commit_with(&plan, &mut FailSecondStage(1))
+            .expect("receipt");
+        assert_eq!(receipt.commit, CommitStatus::NotCommitted);
+        assert_eq!(
+            storage.check_retry(&plan).expect_err("stage failure").code,
+            "RETRY_CLOSED"
+        );
+
+        let mut incomplete = plan.clone();
+        incomplete.id = "incomplete-preflight".into();
+        let mut journal = file_options()
+            .create_new(true)
+            .open(storage.journal_path(&incomplete.id).unwrap())
+            .unwrap();
+        append_event(
+            &mut journal,
+            &JournalEvent::Begin {
+                plan_id: incomplete.id.clone(),
+                plan_digest: digest(&serde_json::to_vec(&incomplete).unwrap()),
+                file_count: incomplete.files.len(),
+                preflight_failed: Some(true),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            storage
+                .check_retry(&incomplete)
+                .expect_err("incomplete")
+                .code,
+            "RETRY_CLOSED"
+        );
+        append_event(&mut journal, &JournalEvent::Intent { index: 0 }).unwrap();
+        assert_eq!(
+            storage
+                .check_retry(&incomplete)
+                .expect_err("invalid preflight intent")
+                .code,
+            "JOURNAL_CORRUPT"
+        );
+    }
+
+    #[test]
+    fn single_target_stale_failure_after_staging_is_not_classified_as_preflight() {
+        let (_directory, storage, mut plan) = fixture();
+        let _lock = storage.lock().expect("lock");
+        plan.files.truncate(1);
+        plan.request.files.truncate(1);
+        let receipt = storage
+            .commit_with(&plan, &mut ChangeAfterStage)
+            .expect("receipt");
+        assert_eq!(receipt.commit, CommitStatus::NotCommitted);
+        assert!(
+            receipt.files[0]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("STALE_SNAPSHOT")
+        );
+        assert_eq!(
+            storage
+                .check_retry(&plan)
+                .expect_err("post-staging failure")
+                .code,
+            "RETRY_CLOSED"
+        );
+    }
+
+    #[test]
+    fn legacy_preflight_retry_requires_complete_no_intent_evidence() {
+        for had_intent in [false, true] {
+            let (_directory, storage, plan) = fixture();
+            let _lock = storage.lock().expect("lock");
+            let mut journal = file_options()
+                .create_new(true)
+                .open(storage.journal_path(&plan.id).unwrap())
+                .unwrap();
+            append_event(
+                &mut journal,
+                &JournalEvent::Begin {
+                    plan_id: plan.id.clone(),
+                    plan_digest: digest(&serde_json::to_vec(&plan).unwrap()),
+                    file_count: plan.files.len(),
+                    preflight_failed: None,
+                },
+            )
+            .unwrap();
+            if had_intent {
+                append_event(&mut journal, &JournalEvent::Intent { index: 0 }).unwrap();
+            }
+            for index in 0..plan.files.len() {
+                append_event(&mut journal, &JournalEvent::Outcome {
+                    index,
+                    status: FileStatus::NotCommitted,
+                    error: Some(if index == 0 { "READ_ONLY_TARGET: Read-only files cannot be replaced" } else { "BATCH_PREFLIGHT_FAILED: another target failed; no target writes attempted" }.into()),
+                }).unwrap();
+            }
+            assert_eq!(
+                storage.check_retry(&plan).expect_err("unfinished").code,
+                "RETRY_CLOSED"
+            );
+            append_event(&mut journal, &JournalEvent::Finished).unwrap();
+            if had_intent {
+                assert_eq!(
+                    storage
+                        .check_retry(&plan)
+                        .expect_err("intent disqualifies retry")
+                        .code,
+                    "RETRY_CLOSED"
+                );
+            } else {
+                storage
+                    .check_retry(&plan)
+                    .expect("legacy preflight is safe to retry");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_single_target_stale_recheck_without_write_intent_remains_retryable() {
+        let (_directory, storage, mut plan) = fixture();
+        let _lock = storage.lock().expect("lock");
+        plan.files.truncate(1);
+        plan.request.files.truncate(1);
+        let mut journal = file_options()
+            .create_new(true)
+            .open(storage.journal_path(&plan.id).unwrap())
+            .unwrap();
+        append_event(
+            &mut journal,
+            &JournalEvent::Begin {
+                plan_id: plan.id.clone(),
+                plan_digest: digest(&serde_json::to_vec(&plan).unwrap()),
+                file_count: 1,
+                preflight_failed: None,
+            },
+        )
+        .unwrap();
+        append_event(
+            &mut journal,
+            &JournalEvent::Outcome {
+                index: 0,
+                status: FileStatus::NotCommitted,
+                error: Some("STALE_SNAPSHOT: Current bytes differ from the prepared base".into()),
+            },
+        )
+        .unwrap();
+        append_event(&mut journal, &JournalEvent::Finished).unwrap();
+        storage
+            .check_retry(&plan)
+            .expect("legacy evidence proves no target write");
+        assert_eq!(
+            storage.receipt(&plan).unwrap().unwrap().commit,
+            CommitStatus::NotCommitted
+        );
+        assert_eq!(
+            fs::read_to_string(&plan.files[0].base.path).unwrap(),
             "before"
         );
     }

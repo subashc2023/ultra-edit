@@ -17,7 +17,10 @@ fn exact(id: &str, old: &str, text: &str) -> Change {
 fn span_change(id: &str, span: &str, text: &str) -> Change {
     Change {
         id: id.into(),
-        target: Target::Span { span: span.into() },
+        target: Target::Span {
+            span: span.into(),
+            expect: None,
+        },
         text: text.into(),
     }
 }
@@ -108,7 +111,7 @@ fn exact_ambiguity_counts_overlapping_unicode_matches() {
 }
 
 #[test]
-fn replace_all_requires_cardinality_and_rejects_overlapping_occurrences() {
+fn replace_all_requires_non_overlapping_cardinality() {
     let base = snapshot("all.txt".into(), "aaa".into());
     let mut change = Change {
         id: "a".into(),
@@ -120,8 +123,17 @@ fn replace_all_requires_cardinality_and_rejects_overlapping_occurrences() {
         text: "x".into(),
     };
     let errors = compile(&request(&base, vec![change.clone()]), &bases(&base)).unwrap_err();
-    assert_eq!(errors[0].code, "OVERLAPPING_CHANGES");
-    assert_eq!(errors[0].conflicts, ["a"]);
+    assert_eq!(errors[0].code, "EXPECTED_COUNT_MISMATCH");
+    assert_eq!(errors[0].expected, Some(2));
+    assert_eq!(errors[0].actual, Some(1));
+    change.target = Target::All {
+        old: "aa".into(),
+        scope: "r0".into(),
+        expected: 1,
+    };
+    let plan = compile(&request(&base, vec![change.clone()]), &bases(&base)).unwrap();
+    assert_eq!(plan.files[0].output, "xa");
+    assert_eq!(plan.files[0].replacements.len(), 1);
     change.target = Target::All {
         old: "a".into(),
         scope: "r0".into(),
@@ -131,6 +143,150 @@ fn replace_all_requires_cardinality_and_rejects_overlapping_occurrences() {
     assert_eq!(errors[0].code, "EXPECTED_COUNT_MISMATCH");
     assert_eq!(errors[0].expected, Some(2));
     assert_eq!(errors[0].actual, Some(3));
+}
+
+#[test]
+fn replace_all_self_overlapping_patterns_apply_left_to_right_within_scope() {
+    for (text, old, expected, output) in [
+        ("        self.name = name", "  ", 4, "xxxxself.name = name"),
+        ("ééééé", "éé", 2, "xxé"),
+        ("abababa", "aba", 2, "xbx"),
+        ("-----", "--", 2, "xx-"),
+        ("/////", "//", 2, "xx/"),
+        ("...", "..", 1, "x."),
+    ] {
+        let base = snapshot("periodic.txt".into(), format!("{text}\n{text}"));
+        let change = Change {
+            id: "all".into(),
+            target: Target::All {
+                old: old.into(),
+                scope: "r2".into(),
+                expected,
+            },
+            text: "x".into(),
+        };
+        let plan = compile(&request(&base, vec![change]), &bases(&base)).unwrap();
+        assert_eq!(plan.files[0].output, format!("{text}\n{output}"));
+        assert_eq!(plan.files[0].replacements.len(), expected);
+    }
+    let base = snapshot("blank-lines.txt".into(), "\n\n\n\n\n".into());
+    let change = Change {
+        id: "all".into(),
+        target: Target::All {
+            old: "\n\n".into(),
+            scope: "r0".into(),
+            expected: 2,
+        },
+        text: "\n".into(),
+    };
+    let plan = compile(&request(&base, vec![change]), &bases(&base)).unwrap();
+    assert_eq!(plan.files[0].output, "\n\n\n");
+}
+
+#[test]
+fn span_expect_checks_original_selected_bytes_without_normalization() {
+    let base = snapshot("expected.txt".into(), "\u{feff}é\r\nblue\n".into());
+    for expected in ["e\u{301}", "é\r\n", "blue", ""] {
+        let change = Change {
+            id: "guarded".into(),
+            target: Target::Span {
+                span: "r1".into(),
+                expect: Some(expected.into()),
+            },
+            text: "replacement".into(),
+        };
+        let errors = compile(&request(&base, vec![change]), &bases(&base)).unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].code, "EXPECTED_TEXT_MISMATCH");
+        assert_eq!(errors[0].file.as_deref(), Some("expected.txt"));
+        assert_eq!(errors[0].change_id.as_deref(), Some("guarded"));
+    }
+    let change = Change {
+        id: "guarded".into(),
+        target: Target::Span {
+            span: "r1".into(),
+            expect: Some("é".into()),
+        },
+        text: "new".into(),
+    };
+    let plan = compile(
+        &request(&base, vec![exact("other", "blue", "é"), change]),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(plan.files[0].output, "\u{feff}new\r\né\n");
+
+    let empty = snapshot("empty.txt".into(), "".into());
+    let change = Change {
+        id: "insert".into(),
+        target: Target::Span {
+            span: "r0".into(),
+            expect: Some("".into()),
+        },
+        text: "new".into(),
+    };
+    let plan = compile(&request(&empty, vec![change]), &bases(&empty)).unwrap();
+    assert_eq!(plan.files[0].output, "new");
+}
+
+#[test]
+fn output_warnings_are_nonblocking_and_inspect_literal_resulting_bytes() {
+    for (before, old, replacement, output, codes) in [
+        ("a", "a", "b\0b", "b\0b", vec!["NUL_BYTE"]),
+        ("a\0", "a", "b", "b\0", vec!["NUL_BYTE"]),
+        ("a\0", "\0", "", "a", vec![]),
+        (
+            "a\r\nb\r\n",
+            "a",
+            "a\nextra\0",
+            "a\nextra\0\r\nb\r\n",
+            vec!["NUL_BYTE", "MIXED_LINE_ENDINGS"],
+        ),
+        ("a\nb\n", "a", "a\r", "a\r\nb\n", vec!["MIXED_LINE_ENDINGS"]),
+        ("a\r\nb\n", "a", "A", "A\r\nb\n", vec!["MIXED_LINE_ENDINGS"]),
+        ("a\r\nb\n", "\r\n", "\n", "a\nb\n", vec![]),
+        ("a\r\nb\r\n", "a", "A", "A\r\nb\r\n", vec![]),
+        ("a\nb\n", "a", "A", "A\nb\n", vec![]),
+    ] {
+        let base = snapshot("warnings.txt".into(), before.into());
+        let plan = compile(
+            &request(&base, vec![exact("change", old, replacement)]),
+            &bases(&base),
+        )
+        .unwrap();
+        assert_eq!(plan.files[0].output.as_bytes(), output.as_bytes());
+        assert_eq!(
+            plan.warnings
+                .iter()
+                .map(|warning| warning.code.as_str())
+                .collect::<Vec<_>>(),
+            codes,
+            "{before:?}, {replacement:?}"
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .all(|warning| warning.file.as_deref() == Some("warnings.txt"))
+        );
+    }
+}
+
+#[test]
+fn optional_span_expect_and_warnings_preserve_legacy_plan_serialization() {
+    let target = serde_json::json!({"kind": "span", "span": "r0"});
+    let parsed: Target = serde_json::from_value(target.clone()).unwrap();
+    assert_eq!(serde_json::to_value(parsed).unwrap(), target);
+    let base = snapshot("legacy.txt".into(), "old".into());
+    let plan = compile(
+        &request(&base, vec![span_change("change", "r0", "new")]),
+        &bases(&base),
+    )
+    .unwrap();
+    let encoded = serde_json::to_value(&plan).unwrap();
+    assert!(encoded.get("warnings").is_none());
+    let decoded: ultra_edit::PreparedPlan = serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(decoded, plan);
+    assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
 }
 
 #[test]
@@ -573,6 +729,33 @@ fn overlap_counts_remain_exact_beyond_position_retention_limit() {
     .unwrap_err();
     assert_eq!(errors[0].code, "TARGET_AMBIGUOUS");
     assert_eq!(errors[0].actual, Some(12_289));
+}
+
+#[test]
+fn replace_all_counts_beyond_the_retained_position_budget() {
+    use ultra_edit::compiler::MAX_REPLACEMENTS;
+    let base = snapshot(
+        "repetitive.txt".into(),
+        "a".repeat(MAX_REPLACEMENTS * 2 + 2),
+    );
+    for expected in [1, MAX_REPLACEMENTS, MAX_REPLACEMENTS + 1] {
+        let change = Change {
+            id: "all".into(),
+            target: Target::All {
+                old: "aa".into(),
+                scope: "r0".into(),
+                expected,
+            },
+            text: "".into(),
+        };
+        let errors = compile(&request(&base, vec![change]), &bases(&base)).unwrap_err();
+        if expected <= MAX_REPLACEMENTS {
+            assert_eq!(errors[0].code, "EXPECTED_COUNT_MISMATCH");
+            assert_eq!(errors[0].actual, Some(MAX_REPLACEMENTS + 1));
+        } else {
+            assert_eq!(errors[0].code, "RESOURCE_LIMIT");
+        }
+    }
 }
 
 #[test]

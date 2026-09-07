@@ -1,4 +1,5 @@
 use std::fs;
+use std::time::{Duration, SystemTime};
 
 use tempfile::TempDir;
 use ultra_edit::workspace::{EditResult, Evidence};
@@ -93,6 +94,141 @@ fn stale_preview_cannot_retarget_an_identical_match_elsewhere() {
         fs::read_to_string(dir.path().join("file.txt")).unwrap(),
         current
     );
+}
+
+#[test]
+fn preflight_retry_preserves_history_candidates_and_request_identity_after_restart() {
+    let (dir, workspace, snapshot) = setup("one");
+    fs::write(dir.path().join("second.txt"), "one").unwrap();
+    let second = workspace.read("second.txt").unwrap();
+    let mut original_request = request("original", &snapshot, vec![change("first", "one", "two")]);
+    original_request.files.push(FileRequest {
+        base: second.id,
+        changes: vec![change("second", "one", "two")],
+    });
+    let preview = workspace.prepare(original_request.clone()).unwrap();
+    assert_eq!(
+        workspace
+            .retry(&preview.reference, "too-early")
+            .unwrap_err()
+            .code,
+        "RETRY_CLOSED"
+    );
+    let target = dir.path().join("second.txt");
+    let original_permissions = fs::metadata(&target).unwrap().permissions();
+    let mut readonly = original_permissions.clone();
+    readonly.set_readonly(true);
+    fs::set_permissions(&target, readonly).unwrap();
+    let failed = workspace.commit(&preview.reference).unwrap();
+    fs::set_permissions(&target, original_permissions).unwrap();
+    assert_eq!(failed.commit, CommitStatus::NotCommitted);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+        "one"
+    );
+    let original_journal = fs::read(
+        dir.path()
+            .join(".ultra-edit/journals")
+            .join(format!("{}.jsonl", preview.reference)),
+    )
+    .unwrap();
+    drop(workspace);
+    let workspace = Workspace::open(dir.path()).unwrap();
+    let retried = completed(workspace.retry(&preview.reference, "retry").unwrap());
+    assert_eq!(retried.commit, CommitStatus::Committed);
+    assert_ne!(retried.plan_id, failed.plan_id);
+    let Evidence::Plan(original) = workspace.evidence(&preview.reference).unwrap() else {
+        panic!()
+    };
+    let Evidence::Plan(attempt) = workspace.evidence(&retried.plan_id).unwrap() else {
+        panic!()
+    };
+    assert_eq!(attempt.files, original.files);
+    assert_eq!(attempt.request.files, original.request.files);
+    assert_eq!(attempt.request.request_id, "retry");
+    assert_eq!(workspace.commit(&preview.reference).unwrap(), failed);
+    assert_eq!(completed(workspace.edit(original_request).unwrap()), failed);
+    assert_eq!(workspace.receipt("original").unwrap(), Some(failed));
+    assert_eq!(
+        fs::read(
+            dir.path()
+                .join(".ultra-edit/journals")
+                .join(format!("{}.jsonl", preview.reference))
+        )
+        .unwrap(),
+        original_journal
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "two");
+    fs::write(&target, "later work").unwrap();
+    drop(workspace);
+    let workspace = Workspace::open(dir.path()).unwrap();
+    assert_eq!(
+        completed(workspace.retry(&preview.reference, "retry").unwrap()),
+        retried
+    );
+    assert_eq!(workspace.receipt("retry").unwrap(), Some(retried.clone()));
+    assert_eq!(fs::read_to_string(&target).unwrap(), "later work");
+    assert_eq!(
+        workspace.retry(&retried.plan_id, "retry").unwrap_err().code,
+        "REQUEST_ID_REUSED"
+    );
+    assert_eq!(
+        workspace
+            .retry(&retried.plan_id, "retry-committed")
+            .unwrap_err()
+            .code,
+        "RETRY_CLOSED"
+    );
+    assert_eq!(
+        workspace
+            .retry(&preview.reference, "original")
+            .unwrap_err()
+            .code,
+        "REQUEST_ID_REUSED"
+    );
+}
+
+#[test]
+fn preflight_retry_rechecks_the_original_bytes_without_retargeting() {
+    let (dir, workspace, snapshot) = setup("one");
+    let preview = workspace
+        .prepare(request(
+            "original",
+            &snapshot,
+            vec![change("c", "one", "two")],
+        ))
+        .unwrap();
+    let target = dir.path().join("file.txt");
+    fs::write(&target, "one elsewhere").unwrap();
+    assert_eq!(
+        workspace.commit(&preview.reference).unwrap().commit,
+        CommitStatus::NotCommitted
+    );
+    let failed_retry = completed(workspace.retry(&preview.reference, "retry-stale").unwrap());
+    assert_eq!(failed_retry.commit, CommitStatus::NotCommitted);
+    assert!(
+        failed_retry.files[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("STALE_SNAPSHOT")
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "one elsewhere");
+    fs::write(&target, "one").unwrap();
+    assert_eq!(
+        completed(workspace.retry(&preview.reference, "retry-stale").unwrap()),
+        failed_retry
+    );
+    assert_eq!(
+        completed(
+            workspace
+                .retry(&failed_retry.plan_id, "retry-restored")
+                .unwrap()
+        )
+        .commit,
+        CommitStatus::Committed
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "two");
 }
 
 #[test]
@@ -253,10 +389,31 @@ fn undo_is_conditional_and_idempotent() {
         completed(workspace.undo(&receipt.plan_id, "backward").unwrap()),
         undone
     );
-    assert!(matches!(
-        workspace.undo(&receipt.plan_id, "other-undo").unwrap(),
-        EditResult::Rejected { .. }
-    ));
+    let EditResult::Rejected { preparation } =
+        workspace.undo(&receipt.plan_id, "other-undo").unwrap()
+    else {
+        panic!("Expected stale undo rejection")
+    };
+    let diagnostic = preparation
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "STALE_SNAPSHOT")
+        .unwrap();
+    assert!(
+        diagnostic
+            .message
+            .contains("Undo requires the recorded after-bytes")
+    );
+    assert!(
+        diagnostic
+            .message
+            .contains("already be undone or contain newer work")
+    );
+    assert!(
+        !diagnostic
+            .message
+            .contains("read a fresh snapshot and submit a new request")
+    );
     assert_eq!(
         fs::read_to_string(dir.path().join("file.txt")).unwrap(),
         "newer work"
@@ -319,4 +476,126 @@ fn encoding_errors_and_workspace_escape_are_explicit() {
     fs::write(outside.path().join("outside.txt"), "outside").unwrap();
     assert!(workspace.read(outside.path().join("outside.txt")).is_err());
     assert!(workspace.read(".ultra-edit/coordinator.lock").is_err());
+}
+
+#[test]
+fn pruning_retains_plans_drafts_and_recent_snapshots_and_defaults_to_no_deletions() {
+    let (dir, workspace, planned) = setup("one");
+    let preview = workspace
+        .prepare(request(
+            "planned",
+            &planned,
+            vec![change("c", "one", "two")],
+        ))
+        .unwrap();
+    assert!(preview.ready);
+    let drafted = workspace.read("file.txt").unwrap();
+    assert!(
+        !workspace
+            .prepare(request(
+                "drafted",
+                &drafted,
+                vec![change("c", "missing", "two")]
+            ))
+            .unwrap()
+            .ready
+    );
+    let recent = workspace.read("file.txt").unwrap();
+    let snapshot_path = |id: &str| {
+        dir.path()
+            .join(".ultra-edit/snapshots")
+            .join(format!("{id}.json"))
+    };
+    let recent_path = snapshot_path(&recent.id);
+    fs::File::options()
+        .write(true)
+        .open(&recent_path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(SystemTime::now() + Duration::from_secs(3600)))
+        .unwrap();
+    fs::write(dir.path().join("unused.txt"), "discarded source").unwrap();
+    let unused = workspace.read("unused.txt").unwrap();
+    fs::remove_file(dir.path().join("unused.txt")).unwrap();
+    let unused_path = snapshot_path(&unused.id);
+    let protected_by_age = workspace
+        .prune_snapshots(Duration::from_secs(3600), false)
+        .unwrap();
+    assert!(protected_by_age.eligible.is_empty());
+    assert_eq!(protected_by_age.retained_snapshots, 4);
+    let dry_run = workspace.prune_snapshots(Duration::ZERO, false).unwrap();
+    assert!(dry_run.dry_run);
+    assert_eq!(dry_run.eligible.len(), 1);
+    assert_eq!(dry_run.eligible[0].snapshot, unused.id);
+    assert_eq!(
+        dry_run.eligible_bytes,
+        fs::metadata(&unused_path).unwrap().len()
+    );
+    assert_eq!(dry_run.retained_snapshots, 3);
+    assert_eq!(dry_run.removed_snapshots, 0);
+    assert!(unused_path.exists());
+    let pruned = workspace.prune_snapshots(Duration::ZERO, true).unwrap();
+    assert!(!pruned.dry_run);
+    assert_eq!(pruned.removed_snapshots, 1);
+    assert!(!unused_path.exists());
+    for retained in [&planned.id, &drafted.id, &recent.id] {
+        assert!(snapshot_path(retained).exists());
+        assert!(workspace.evidence(retained).is_ok());
+    }
+    assert_eq!(
+        workspace.commit(&preview.reference).unwrap().commit,
+        CommitStatus::Committed
+    );
+    let repeated = workspace.prune_snapshots(Duration::ZERO, true).unwrap();
+    assert_eq!(repeated.removed_snapshots, 0);
+    assert_eq!(
+        workspace.receipt("planned").unwrap().unwrap().commit,
+        CommitStatus::Committed
+    );
+}
+
+#[test]
+fn pruning_validates_retained_state_and_all_candidates_before_deleting_anything() {
+    for corrupt_kind in [
+        "requests",
+        "plans",
+        "drafts",
+        "inspections",
+        "snapshots",
+        "journals",
+    ] {
+        let (dir, workspace, snapshot) = setup("one");
+        let preview = workspace
+            .prepare(request(
+                "original",
+                &snapshot,
+                vec![change("c", "one", "two")],
+            ))
+            .unwrap();
+        let unused = workspace.read("file.txt").unwrap();
+        let candidate_path = dir
+            .path()
+            .join(".ultra-edit/snapshots")
+            .join(format!("{}.json", unused.id));
+        let corrupt_directory = dir.path().join(".ultra-edit").join(corrupt_kind);
+        fs::create_dir_all(&corrupt_directory).unwrap();
+        let extension = if corrupt_kind == "journals" {
+            "jsonl"
+        } else {
+            "json"
+        };
+        fs::write(
+            corrupt_directory.join(format!("zcorrupt.{extension}")),
+            "invalid retained state\n",
+        )
+        .unwrap();
+        assert!(
+            workspace.prune_snapshots(Duration::ZERO, true).is_err(),
+            "{corrupt_kind}"
+        );
+        assert!(
+            candidate_path.exists(),
+            "must not delete before finding {corrupt_kind} corruption"
+        );
+        assert!(workspace.evidence(&preview.reference).is_ok());
+    }
 }

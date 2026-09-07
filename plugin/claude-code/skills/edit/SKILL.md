@@ -12,6 +12,8 @@ workflow detail; invoking it is not a prerequisite for an ordinary edit request.
 Never carry file contents or edit JSON through Bash heredocs, generated-content
 redirection, or inline editing scripts. Report unavailable or denied required
 tools instead of silently changing routes.
+Explicit user instructions and host permissions take precedence; report
+conflicting editing guidance rather than silently switching routes.
 
 The server-side names are below; select the corresponding namespaced tools
 exposed by this host.
@@ -20,6 +22,8 @@ exposed by this host.
   only the returned base and disclosed span IDs; never infer IDs from change
   order. Native Read/Grep output does not supply an Ultra Edit base. Every change
   resolves against the original snapshots, never another change's output.
+  All snapshot responses return `snapshot`; use exact text or optional
+  `span.expect` to guard against selecting a mistaken span.
 - The server root stays fixed after directory changes or a subagent's worktree
   change. When working elsewhere, snapshot the intended absolute path. Report
   files outside the server root; never use a relative path that would redirect
@@ -37,10 +41,15 @@ exposed by this host.
 1. Call `ultra_edit_snapshot` with `path` and a focused `selection`: an inclusive
    line `range`, or a literal `search`. Inspect the returned source and spans.
    Use `full` only when the complete file is needed. Combine each file's changes
-   under one base snapshot.
+   under one base snapshot. Full reads default to 24,000 bytes and 400 lines;
+   oversized reads require a deliberate exact `expected_bytes` override. Search
+   pages return `next_offset`; supply it and the returned `snapshot` to continue
+   the same original bytes.
 2. Call `ultra_edit` with one request containing the intended changes. Use a
    disclosed `span`, or `exact` with an explicit scope when only the inspected
    region should match. Resolve all targets against that base.
+   `scope` is a returned span ID, not source text. `all.expected` counts
+   non-overlapping, left-to-right replacements.
 3. Inspect the returned outcome. Call `ultra_edit_status` with
    `{"query":{"kind":"receipt","request_id":"..."}}` after lost output;
    add `"full":true` inside `query` for every file outcome. Run project validation
@@ -67,7 +76,7 @@ The placeholder is not a valid snapshot; do not send it literally.
     "base": "REPLACE_WITH_RETURNED_SNAPSHOT",
     "changes": [{
       "id": "retry-limit",
-      "target": { "kind": "span", "span": "m1" },
+      "target": { "kind": "span", "span": "m1", "expect": "const RETRIES: usize = 2;" },
       "text": "const RETRIES: usize = 3;"
     }]
   }]
@@ -86,7 +95,7 @@ For the recorded outcome, call `ultra_edit_status`:
 | --- | --- |
 | Request identity, byte preservation, limits, or what a receipt proves | [Contract](references/contract.md) |
 | Choose range/search/full; ambiguous matches; replace-all; span overlap | [Targets](references/targets.md) |
-| Preview then commit; correct a rejected batch; stale base; retry; partial/unknown outcome; undo | [Recovery](references/recovery.md) |
+| Preview/diff then commit; correct a batch; preflight retry; inspect/reconcile uncertainty; undo | [Recovery](references/recovery.md) |
 | Connect the plugin; missing tools; fixed workspace root; host permissions | [Claude Code](references/claude-code.md) |
 
 The plugin supplies context hooks without permission grants or tool-blocking

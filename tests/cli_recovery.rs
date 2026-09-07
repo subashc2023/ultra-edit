@@ -53,7 +53,7 @@ fn prepare(root: &Path, files: &[(&str, &str, &str)], request_id: &str) -> (Valu
             let (code, snapshot) = run(root, &["read", path], None);
             assert_eq!(code, 0, "{snapshot}");
             json!({
-                "base": snapshot["id"],
+                "base": snapshot["snapshot"],
                 "changes": [{
                     "id": format!("change-{index}"),
                     "target": {"kind": "exact", "old": before},
@@ -120,7 +120,7 @@ fn interrupted_commit_replays_unknown_without_inferring_from_current_bytes() {
             committed["report"]
                 .as_str()
                 .unwrap()
-                .contains("0 confirmed changes")
+                .contains("0 confirmed change IDs")
         );
         for command in ["prepare", "edit"] {
             let (code, replay) = run(root.path(), &[command], Some(&request));
@@ -159,7 +159,7 @@ fn interrupted_commit_replays_unknown_without_inferring_from_current_bytes() {
         assert_eq!(current["text"], expected_first);
         let fresh_request = json!({
             "request_id": "blocked-edit",
-            "files": [{"base": current["id"], "changes": [{
+            "files": [{"base": current["snapshot"], "changes": [{
                 "id": "blocked", "target": {"kind": "exact", "old": expected_first},
                 "text": "must not write",
             }]}],
