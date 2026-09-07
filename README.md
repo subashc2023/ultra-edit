@@ -1,16 +1,88 @@
 # ULTRA Edit
 
-A Rust engine, JSON CLI, and local MCP server for editing existing UTF-8 files.
-The [Claude Code plugin](plugin/claude-code/.claude-plugin/plugin.json) packages
-the MCP connection, automatically loaded editing instructions, and a thin skill
-with focused usage references. The current product is an edit tool for Claude
-Code; [the original design](docs/ULTRA-EDIT.md)
-records a broader historical plan, not the current delivery scope.
+**A Claude Code plugin that gives Claude a better tool for coordinated file
+edits, powered by Rust.**
 
-The compiler resolves every change against the original snapshot, rejects the
-whole batch on planning errors, and constructs a candidate from original byte
-slices. Commit persists that candidate after checking its original bases. It
-never reruns a matcher against changed content.
+Install it once and its editing instructions load automatically into Claude's
+working context: at session start, on resume, after compaction, and for subagents.
+They tell Claude to use Ultra Edit for changes across multiple existing UTF-8 files
+and **stop writing file contents through Bash heredocs or inline editing
+scripts**. No slash command or repeated reminder is needed.
+
+Built for models that reach for Bash to edit, Ultra Edit aims to cut the token
+waste of generated scripts, whole-file rewrites, and escape-repair attempts.
+That waste gets expensive on premium models. Claude sends focused changes
+directly to the tool; the local Rust engine does the heavy lifting: matching,
+validation, byte-preserving output, and durable writes.
+
+[Install for Claude Code](#claude-code) ·
+[Compare editing workflows](#why-use-it) ·
+[Performance](#rust-engine-and-performance)
+
+## Why use it?
+
+| Capability | Claude Code's native Edit | Ultra Edit |
+| --- | --- | --- |
+| Target a change | Send exact old and new text | Use exact text, scoped matching, or a snapshot's span ID plus replacement text |
+| Coordinate changes | File-specific replacement calls | One batch planned against the original snapshots of multiple files |
+| Replace repeated text | Explicit `replace_all` | Explicit scope and expected occurrence count |
+| File changed since reading | May proceed if the old text still matches uniquely | Reject the batch if any base is stale at preflight |
+| Recover an edit | Claude Code session checkpoints | Persistent request receipts, retry identity, and conditional undo |
+
+Native Edit is already a useful tool for isolated replacements; see its
+[documented behavior](https://code.claude.com/docs/en/tools-reference#edit-tool-behavior)
+and [checkpoint recovery](https://code.claude.com/docs/en/checkpointing).
+Ultra Edit adds coordinated planning and explicit evidence. Planning errors
+reject the whole batch, and every change targets the original source, so an
+earlier replacement cannot accidentally become a later match. File writes are
+sequential; a multi-file commit is not an atomic filesystem transaction.
+
+A span edit avoids retransmitting the old block. Focused snapshots return only
+the requested source, and direct MCP arguments avoid shell quoting and generated
+editing code. These are concrete ways to reduce payloads compared with heredoc
+rewrites; actual token and cost savings depend on the task, model, and retries.
+Snapshots and tool instructions also cost context. No model-level token-savings
+percentage or speed advantage over native Edit has been measured yet.
+
+The routing rules are always-loaded **prompt guidance while the plugin and its
+hooks are enabled**, not a Bash permission block. Hooks add context rather than
+rewriting Claude's system prompt. See the
+[canonical instructions](plugin/claude-code/instructions.md) and
+[Claude Code hook behavior](https://code.claude.com/docs/en/hooks#add-context-for-claude).
+
+## Rust engine and performance
+
+The plugin's persistent MCP server and standalone JSON CLI share the same native
+Rust engine. The server calls it directly, without launching a shell, script
+interpreter, CLI process, or another model for each edit. Literal matching,
+snapshot checks, output construction, and journaled persistence run locally.
+
+Measured on Windows 11, a Ryzen 7 7800X3D, and a local NVMe SSD, using a release
+build. These are the **ranges of median times from three runs**, each with three
+warmups and 31 measured samples:
+
+| Operation | Workload | Median time |
+| --- | --- | --- |
+| Plan a batch in memory | 64 exact changes across 8 files, 400 KB total | **4.7–5.6 ms** |
+| Snapshot and commit a batch | 8 changes across 2 files, 20 KB total | **81–128 ms** |
+| Read and persist a focused snapshot | 10 selected lines from a 5 MB, 100,000-line file | **217–245 ms** |
+
+The file operations include normal hashing, persistence, and sync calls. Timings
+exclude model latency, MCP transport, and CLI startup; the planning row also
+excludes file I/O and snapshot creation. Disk timings varied across runs, so
+these are local measurements, not a general speed guarantee.
+
+The benchmark also exposed an avoidable allocation: focused reads used to create
+line-reference strings for every line. The scanner now produces byte ranges and
+creates references only for selected lines, avoiding **99,990 unnecessary line-ID
+strings** in the 100,000-line fixture. Whole-file stale checks and persisted
+original bytes remain intact. See [methodology and before/after results](docs/performance.md).
+
+Reproduce the measurements in disposable temporary workspaces:
+
+```text
+cargo run --locked --release --example benchmark
+```
 
 ## Run
 
@@ -459,8 +531,8 @@ limitation to address when ordinary source-file replacement is insufficient.
 
 File creation, deletion, rename, general editor adapters, contextual patches,
 regex, semantic refactors, and rebasing are outside the current edit-only scope.
-The broader historical design is retained for reference; those features are not
-the next delivery milestones.
+The [broader historical design](docs/ULTRA-EDIT.md) is retained for reference;
+those features are not the next delivery milestones.
 
 Search pagination, workspace-wide search, and arbitrary byte-range reads are
 deferred until host integration calls for them; current search is bounded to the

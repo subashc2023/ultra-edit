@@ -1,4 +1,4 @@
-use crate::compiler::{line_spans, occurrences};
+use crate::compiler::{line_ranges, occurrences};
 use crate::model::{Error, RangeRead, SearchMatch, SearchResult, Snapshot, Span, digest, new_id};
 
 const MAX_RANGE_LINES: usize = 200;
@@ -27,10 +27,15 @@ pub(crate) fn read_range(
     }
     let mut total_lines = 0;
     let mut spans = Vec::new();
-    for span in line_spans(&text) {
-        total_lines = span.line;
-        if (first..=last).contains(&span.line) {
-            spans.push(span);
+    for (index, range) in line_ranges(&text).enumerate() {
+        total_lines = index + 1;
+        if (first..=last).contains(&total_lines) {
+            spans.push(Span {
+                id: format!("r{total_lines}"),
+                start: range.start,
+                end: range.end,
+                line: total_lines,
+            });
         }
     }
     if last > total_lines {

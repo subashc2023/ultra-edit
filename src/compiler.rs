@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 
 use crate::model::{
     Change, Diagnostic, EditRequest, PreparedFile, PreparedPlan, Replacement, Snapshot, Span,
@@ -41,7 +42,12 @@ pub fn snapshot(path: String, text: String) -> Snapshot {
         end: text.len(),
         line: 0,
     }];
-    spans.extend(line_spans(&text));
+    spans.extend(line_ranges(&text).enumerate().map(|(index, range)| Span {
+        id: format!("r{}", index + 1),
+        start: range.start,
+        end: range.end,
+        line: index + 1,
+    }));
     Snapshot {
         id: new_id("s"),
         path,
@@ -51,32 +57,21 @@ pub fn snapshot(path: String, text: String) -> Snapshot {
     }
 }
 
-/// Line bodies exclude the leading BOM and LF/CRLF terminators. Iterate so a
-/// focused read need not allocate a span for every undisclosed line in a file.
-pub(crate) fn line_spans(text: &str) -> impl Iterator<Item = Span> + '_ {
+/// Line bodies exclude the leading BOM and LF/CRLF terminators. Yield only
+/// offsets so focused reads allocate span IDs for disclosed lines alone.
+pub(crate) fn line_ranges(text: &str) -> impl Iterator<Item = Range<usize>> + '_ {
     let mut start = if text.starts_with('\u{feff}') { 3 } else { 0 };
     let content = &text[start..];
-    let empty = content.is_empty().then(|| Span {
-        id: "r1".into(),
-        start,
-        end: start,
-        line: 1,
-    });
+    let empty = content.is_empty().then_some(start..start);
     content
         .split_inclusive('\n')
-        .enumerate()
-        .map(move |(index, line)| {
+        .map(move |line| {
             let body = line
                 .strip_suffix('\n')
                 .map_or(line, |body| body.strip_suffix('\r').unwrap_or(body));
-            let span = Span {
-                id: format!("r{}", index + 1),
-                start,
-                end: start + body.len(),
-                line: index + 1,
-            };
+            let range = start..start + body.len();
             start += line.len();
-            span
+            range
         })
         .chain(empty)
 }
