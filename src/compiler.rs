@@ -51,7 +51,8 @@ pub fn snapshot(path: String, text: String) -> Snapshot {
     }
 }
 
-/// Line bodies exclude the leading BOM and LF/CRLF terminators.
+/// Line bodies exclude the leading BOM and LF/CRLF terminators. Iterate so a
+/// focused read need not allocate a span for every undisclosed line in a file.
 pub(crate) fn line_spans(text: &str) -> impl Iterator<Item = Span> + '_ {
     let mut start = if text.starts_with('\u{feff}') { 3 } else { 0 };
     let content = &text[start..];

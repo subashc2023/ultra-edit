@@ -12,6 +12,8 @@ const HELP: &str = "ultra-edit 0.1.0
 Usage: ultra-edit [--root WORKSPACE] COMMAND [ARGS]
 
   read PATH                  Persist a complete UTF-8 snapshot and return range refs
+  read-range PATH FIRST LAST  Read inclusive line bodies with editable range refs
+  search PATH QUERY          Find literal text and return exact editable match refs
   prepare                    Read an edit request from stdin; persist a preview
   edit                       Read an edit request from stdin; prepare and commit
   repair                     Read {reference,request_id,changes} from stdin
@@ -84,7 +86,8 @@ fn run() -> Result<Option<(Value, u8)>, Error> {
         .map_err(|_| usage("Command must be Unicode"))?;
     let expected = match command.as_str() {
         "read" | "commit" | "receipt" | "get" | "diff" => 1,
-        "undo" => 2,
+        "undo" | "search" => 2,
+        "read-range" => 3,
         "prepare" | "edit" | "repair" => 0,
         _ => return Err(usage("Unknown command; run --help")),
     };
@@ -100,6 +103,18 @@ fn run() -> Result<Option<(Value, u8)>, Error> {
     let output = match command.as_str() {
         "read" => (
             serde_json::to_value(workspace.read(PathBuf::from(&args[0]))?)?,
+            0,
+        ),
+        "read-range" => (
+            serde_json::to_value(workspace.read_range(
+                PathBuf::from(&args[0]),
+                line_number(argument(1)?)?,
+                line_number(argument(2)?)?,
+            )?)?,
+            0,
+        ),
+        "search" => (
+            serde_json::to_value(workspace.search(PathBuf::from(&args[0]), argument(1)?)?)?,
             0,
         ),
         "prepare" => preparation(workspace.prepare(input()?)?),
@@ -120,6 +135,12 @@ fn run() -> Result<Option<(Value, u8)>, Error> {
 
 fn usage(message: &str) -> Error {
     Error::new("USAGE", message)
+}
+
+fn line_number(value: &str) -> Result<usize, Error> {
+    value
+        .parse()
+        .map_err(|_| usage("Line numbers must be positive integers"))
 }
 
 fn input<T: serde::de::DeserializeOwned>() -> Result<T, Error> {

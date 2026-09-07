@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::compiler;
 use crate::model::*;
+use crate::reading;
 use crate::report;
 use crate::storage::Storage;
 
@@ -73,6 +74,31 @@ impl Workspace {
         let snapshot = compiler::snapshot(path, text);
         self.storage.put("snapshots", &snapshot.id, &snapshot)?;
         Ok(snapshot)
+    }
+
+    /// Discloses an inclusive line range and issues only its line-body and
+    /// `selection` references. All original bytes are retained for stale checks.
+    pub fn read_range(
+        &self,
+        path: impl AsRef<Path>,
+        first: usize,
+        last: usize,
+    ) -> Result<RangeRead, Error> {
+        let _lock = self.storage.lock()?;
+        let (path, text) = self.read_source(path.as_ref())?;
+        let (snapshot, view) = reading::read_range(path, text, first, last)?;
+        self.storage.put("snapshots", &snapshot.id, &snapshot)?;
+        Ok(view)
+    }
+
+    /// Counts overlapping literal matches and discloses up to 20 exact editable
+    /// spans with bounded context. This reads a fresh immutable base each call.
+    pub fn search(&self, path: impl AsRef<Path>, query: &str) -> Result<SearchResult, Error> {
+        let _lock = self.storage.lock()?;
+        let (path, text) = self.read_source(path.as_ref())?;
+        let (snapshot, result) = reading::search(path, text, query)?;
+        self.storage.put("snapshots", &snapshot.id, &snapshot)?;
+        Ok(result)
     }
 
     fn read_source(&self, path: &Path) -> Result<(String, String), Error> {

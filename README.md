@@ -46,6 +46,8 @@ and journals are persisted under that workspace's `.ultra-edit` directory.
 
 ```text
 ultra-edit --root WORKSPACE read PATH
+ultra-edit --root WORKSPACE read-range PATH FIRST LAST
+ultra-edit --root WORKSPACE search PATH QUERY
 ultra-edit --root WORKSPACE prepare < request.json
 ultra-edit --root WORKSPACE edit < request.json
 ultra-edit --root WORKSPACE commit PLAN
@@ -67,6 +69,40 @@ UTF-8 BOM. `r1`, `r2`, etc. cover individual line bodies, excluding the BOM and
 CRLF/LF terminators. A trailing newline does not create another line reference.
 An empty file has an empty `r1`, which permits insertion. Span offsets are UTF-8
 byte offsets; the compiler validates their boundaries.
+
+To read a small region, use `read-range src/retry.rs 12 18`. Line numbers are
+one-based and inclusive. It returns `snapshot`, `path`, `digest`, file totals,
+the exact selected `text`, absolute byte `start`/`end`, and editable `spans`:
+`r12` through `r18` for individual line bodies, plus `selection` for the entire
+selected range. The text excludes the leading BOM and the last selected line's
+terminator; original newlines **inside** the range are included unchanged.
+Empty and BOM-only files have an empty line 1. Invalid ranges fail explicitly.
+Focused reads allow at most 200 lines and 6,000 source Unicode characters. They
+reject oversized selections instead of issuing references to clipped text. For
+a very long line, search for its exact target or use the complete `read` command.
+
+`search src/retry.rs RETRIES` performs case-sensitive literal search in one file.
+The response contains `snapshot`, `path`, `digest`, the exact `query`,
+`total_matches`, `omitted_matches`, and up to 20 `matches` in byte order. Each
+match has an editable `span` (`m1`, `m2`, etc.), a one-based starting line number,
+and `before`/`after` context fragments of at most 80 Unicode characters, stopping
+at CR or LF. The exact target text of every match is `query`; fragments are only
+context and have no span references. Overlapping matches are counted (`aa` has
+two starting positions in `aaa`). Queries may contain literal newlines and
+Unicode, and must contain 1–1,000 Unicode characters. No matches is a successful
+search with an empty match list. When matches are omitted, use a more specific
+query, a focused line read, or full `get` evidence to inspect further targets.
+
+Use either response's `snapshot` as an edit request's `base`, then target a
+returned span, or scope an exact search to `selection` or a returned line.
+Focused snapshots retain the whole original file internally for byte
+preservation and stale detection, but persist **only the disclosed references**:
+there is no hidden `r0`, unshown line reference, or omitted match reference.
+Unscoped exact replacements still search the complete original file; use an
+explicit scope to restrict matching. `get SNAPSHOT` explicitly retrieves the full
+stored source as evidence. Each read/search captures a new snapshot; references
+remain valid across process restarts, and a change anywhere in the file makes
+their original base stale. Combine changes to one file using one base snapshot.
 
 An edit request uses snapshot IDs returned by `read`:
 
@@ -227,9 +263,11 @@ cargo test --locked --doc
 Tests cover byte preservation, original-snapshot matching, overlapping ambiguity,
 order independence, stale previews, repaired conflicts, durable retry identity,
 conditional undo, path aliases, report limits, and injected persistence/journal
-failures. CLI tests launch separate processes to exercise persistent state.
+failures. Focused read/search tests cover disclosed references, Unicode and
+line-ending boundaries, overlapping matches, and resource limits. CLI tests
+launch separate processes to exercise persistent state.
 
-`compiler.rs` is pure planning;
+`compiler.rs` is pure planning; `reading.rs` constructs focused source views;
 `storage.rs` owns persistence and recovery; `workspace.rs` owns the
 reference/request protocol; `report.rs` formats evidence;
 `main.rs` is the thin CLI. Use `Workspace` for coordinated host integration;
@@ -241,5 +279,6 @@ host/MCP/editor adapters, and platform metadata support. Contextual patches,
 regex, semantic refactors, rebasing, and model-driven
 benchmarks follow evidence from those integrations.
 
-Focused line reads and literal search with editable references follow in the next
-milestone; this version returns complete snapshots through `read`.
+Search pagination, workspace-wide search, and arbitrary byte-range reads are
+deferred until host integration calls for them; current search is bounded to the
+first 20 matches in a single file.

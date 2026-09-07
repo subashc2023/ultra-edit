@@ -84,3 +84,83 @@ fn rejects_unknown_fields_instead_of_silently_ignoring_options() {
     assert_eq!(code, 2);
     assert_eq!(result["error"]["code"], "INVALID_JSON");
 }
+
+#[test]
+fn focused_read_and_search_issue_editable_references_across_processes() {
+    let root = TempDir::new().unwrap();
+    let original = "\u{feff}private header\r\nlet value = 1;\nprivate footer";
+    fs::write(root.path().join("source.txt"), original).unwrap();
+    let (code, selected) = run(root.path(), &["read-range", "source.txt", "2", "2"], None);
+    assert_eq!(code, 0, "{selected}");
+    assert_eq!(selected["text"], "let value = 1;");
+    assert_eq!(selected["total_lines"], 3);
+    assert!(!selected.to_string().contains("private"));
+    let request = json!({"request_id":"range-edit","files":[{
+        "base":selected["snapshot"],
+        "changes":[{"id":"value","target":{"kind":"span","span":"selection"},"text":"let value = 2;"}]
+    }]});
+    let (code, committed) = run(root.path(), &["edit"], Some(&request));
+    assert_eq!(code, 0, "{committed}");
+    assert_eq!(committed["commit"], "committed");
+    assert_eq!(
+        fs::read_to_string(root.path().join("source.txt")).unwrap(),
+        "\u{feff}private header\r\nlet value = 2;\nprivate footer"
+    );
+    let (code, found) = run(root.path(), &["search", "source.txt", "value = 2"], None);
+    assert_eq!(code, 0, "{found}");
+    assert_eq!(found["total_matches"], 1);
+    assert_eq!(found["matches"][0]["span"]["line"], 2);
+    assert_eq!(found["matches"][0]["before"], "let ");
+    assert_eq!(found["matches"][0]["after"], ";");
+    assert!(!found.to_string().contains("private"));
+    let request = json!({"request_id":"search-edit","files":[{
+        "base":found["snapshot"],
+        "changes":[{"id":"value","target":{"kind":"span","span":found["matches"][0]["span"]["id"]},"text":"value = 3"}]
+    }]});
+    let (code, committed) = run(root.path(), &["edit"], Some(&request));
+    assert_eq!(code, 0, "{committed}");
+    assert_eq!(
+        fs::read_to_string(root.path().join("source.txt")).unwrap(),
+        "\u{feff}private header\r\nlet value = 3;\nprivate footer"
+    );
+    let (code, evidence) = run(
+        root.path(),
+        &["get", selected["snapshot"].as_str().unwrap()],
+        None,
+    );
+    assert_eq!(code, 0, "{evidence}");
+    assert_eq!(evidence["value"]["text"], original);
+}
+
+#[test]
+fn malformed_focused_read_arguments_are_rejected_without_mutation() {
+    let root = TempDir::new().unwrap();
+    fs::write(root.path().join("source.txt"), "x\n").unwrap();
+    for args in [
+        vec!["read-range", "source.txt", "1"],
+        vec!["read-range", "source.txt", "one", "1"],
+        vec!["read-range", "source.txt", "-1", "1"],
+        vec!["read-range", "source.txt", "0", "1"],
+        vec!["read-range", "source.txt", "1", "2"],
+        vec![
+            "read-range",
+            "source.txt",
+            "1",
+            "999999999999999999999999999999",
+        ],
+        vec!["search", "source.txt"],
+        vec!["search", "source.txt", ""],
+    ] {
+        let (code, rejected) = run(root.path(), &args, None);
+        assert_eq!(code, 2, "{args:?}: {rejected}");
+        assert!(rejected["error"]["code"].is_string());
+        assert_eq!(
+            fs::read_to_string(root.path().join("source.txt")).unwrap(),
+            "x\n"
+        );
+    }
+    let (code, missing) = run(root.path(), &["search", "source.txt", "absent"], None);
+    assert_eq!(code, 0, "{missing}");
+    assert_eq!(missing["total_matches"], 0);
+    assert_eq!(missing["matches"], json!([]));
+}

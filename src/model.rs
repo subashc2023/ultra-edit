@@ -21,6 +21,40 @@ pub struct Span {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RangeRead {
+    pub snapshot: String,
+    pub path: String,
+    pub digest: String,
+    pub total_lines: usize,
+    pub total_bytes: usize,
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+    pub spans: Vec<Span>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchMatch {
+    pub span: Span,
+    pub before: String,
+    pub after: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchResult {
+    pub snapshot: String,
+    pub path: String,
+    pub digest: String,
+    pub query: String,
+    pub total_matches: usize,
+    pub omitted_matches: usize,
+    pub matches: Vec<SearchMatch>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EditRequest {
     pub request_id: String,
     pub files: Vec<FileRequest>,
