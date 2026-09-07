@@ -418,8 +418,35 @@ fn human_paths_are_readable_without_changing_evidence() {
         }
         assert_eq!(plan.files[0].base.path, path);
         assert_eq!(receipt.files[0].path, path);
+        let path = report::path_for_display(path);
         assert!(report::diff(&plan).starts_with(&format!("--- {:?}\n", format!("a/{path}"))));
     }
+}
+
+#[test]
+fn structured_path_projection_changes_only_filesystem_path_fields() {
+    let mut value = serde_json::json!({
+        "path": r"\\?\C:\Users\meeet\source.rs",
+        "nested": {
+            "file": r"\\?\UNC\server\share\source.rs",
+            "message": r"keep \\?\C:\Users\meeet\source.rs",
+            "base": r"\\?\C:\Users\meeet\source.rs",
+        },
+        "items": [
+            {"path": r"\\?\Volume{example}\source.rs"},
+            {"file": null},
+        ],
+    });
+    report::display_paths(&mut value);
+    assert_eq!(value["path"], r"C:\Users\meeet\source.rs");
+    assert_eq!(value["nested"]["file"], r"\\server\share\source.rs");
+    assert_eq!(
+        value["nested"]["message"],
+        r"keep \\?\C:\Users\meeet\source.rs"
+    );
+    assert_eq!(value["nested"]["base"], r"\\?\C:\Users\meeet\source.rs");
+    assert_eq!(value["items"][0]["path"], r"\\?\Volume{example}\source.rs");
+    assert!(value["items"][1]["file"].is_null());
 }
 
 #[test]

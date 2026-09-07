@@ -73,6 +73,66 @@ fn read_prepare_commit_receipt_and_undo_work_in_separate_processes() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn canonical_windows_paths_are_display_only_across_cli_responses() {
+    let root = TempDir::new().unwrap();
+    let target = root.path().join("file.txt");
+    fs::write(&target, "old\r\nkeep\r\n").unwrap();
+    let canonical = fs::canonicalize(&target)
+        .unwrap()
+        .into_os_string()
+        .into_string()
+        .unwrap();
+    let displayed = ultra_edit::report::path_for_display(&canonical).into_owned();
+
+    let (code, snapshot) = run(root.path(), &["read", "file.txt"], None);
+    assert_eq!(code, 0, "{snapshot}");
+    assert_eq!(snapshot["path"], displayed);
+    let request = json!({
+        "request_id": "windows-display",
+        "files": [{
+            "base": snapshot["snapshot"],
+            "changes": [{
+                "id": "mixed-endings",
+                "target": {"kind": "exact", "old": "old"},
+                "text": "new\nextra",
+            }],
+        }],
+    });
+    let (code, prepared) = run(root.path(), &["prepare"], Some(&request));
+    assert_eq!(code, 0, "{prepared}");
+    assert_eq!(prepared["warnings"][0]["file"], displayed);
+    let plan_id = prepared["reference"].as_str().unwrap();
+
+    let (code, diff) = run(root.path(), &["diff", plan_id], None);
+    assert_eq!(code, 0, "{diff}");
+    assert!(
+        diff["diff"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("--- {:?}\n", format!("a/{displayed}"))),
+        "{diff}"
+    );
+    let (code, evidence) = run(root.path(), &["get", plan_id], None);
+    assert_eq!(code, 0, "{evidence}");
+    assert_eq!(evidence["value"]["files"][0]["base"]["path"], displayed);
+    assert_eq!(evidence["value"]["warnings"][0]["file"], displayed);
+
+    let (code, committed) = run(root.path(), &["commit", plan_id], None);
+    assert_eq!(code, 0, "{committed}");
+    assert_eq!(committed["warnings"][0]["file"], displayed);
+    let (code, receipt) = run(root.path(), &["receipt", "windows-display"], None);
+    assert_eq!(code, 0, "{receipt}");
+    assert_eq!(receipt["files"][0]["path"], displayed);
+    assert_eq!(receipt["warnings"][0]["file"], displayed);
+
+    let storage = ultra_edit::storage::Storage::open(root.path()).unwrap();
+    let stored: ultra_edit::PreparedPlan = storage.get("plans", plan_id).unwrap();
+    assert_eq!(stored.files[0].base.path, canonical);
+    assert_eq!(stored.warnings[0].file.as_deref(), Some(canonical.as_str()));
+}
+
 #[test]
 fn rejects_unknown_fields_instead_of_silently_ignoring_options() {
     let root = TempDir::new().unwrap();

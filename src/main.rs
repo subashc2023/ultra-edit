@@ -42,7 +42,7 @@ struct RepairRequest {
 
 fn main() -> ExitCode {
     let result = run();
-    let (value, status) = match result {
+    let (mut value, status) = match result {
         Ok(None) => return ExitCode::SUCCESS,
         Ok(Some(output)) => output,
         Err(error) => {
@@ -53,6 +53,7 @@ fn main() -> ExitCode {
             )
         }
     };
+    ultra_edit::report::display_paths(&mut value);
     let stdout = io::stdout();
     let mut writer = stdout.lock();
     if serde_json::to_writer_pretty(&mut writer, &value).is_err() || writeln!(writer).is_err() {

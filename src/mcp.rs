@@ -10,7 +10,7 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::workspace::EditResult;
 use crate::{
@@ -459,7 +459,7 @@ fn bounded_identity(value: &str, max_bytes: usize) -> Option<String> {
 }
 
 fn structured(value: impl Serialize) -> Result<CallToolResult, Error> {
-    Ok(CallToolResult::structured(serde_json::to_value(value)?))
+    Ok(tool_result(serde_json::to_value(value)?, false))
 }
 
 fn edited(result: EditResult, request_id: &str) -> Result<CallToolResult, Error> {
@@ -498,11 +498,7 @@ fn prepared(preparation: Preparation, request_id: &str) -> Result<CallToolResult
         "warnings": warning_summary(&preparation.warnings),
         "report": preparation.report,
     });
-    Ok(if preparation.ready {
-        CallToolResult::structured(value)
-    } else {
-        CallToolResult::structured_error(value)
-    })
+    Ok(tool_result(value, !preparation.ready))
 }
 
 fn completed(receipt: Receipt, mutation: bool) -> CallToolResult {
@@ -515,11 +511,7 @@ fn completed(receipt: Receipt, mutation: bool) -> CallToolResult {
         "warnings": warning_summary(&receipt.warnings),
         "report": report::receipt(&receipt, 60, 6_000),
     });
-    if mutation && receipt.commit != CommitStatus::Committed {
-        CallToolResult::structured_error(value)
-    } else {
-        CallToolResult::structured(value)
-    }
+    tool_result(value, mutation && receipt.commit != CommitStatus::Committed)
 }
 
 fn warning_summary(warnings: &[crate::Diagnostic]) -> Vec<serde_json::Value> {
@@ -537,13 +529,25 @@ fn warning_summary(warnings: &[crate::Diagnostic]) -> Vec<serde_json::Value> {
 }
 
 fn failed(error: Error) -> CallToolResult {
-    CallToolResult::structured_error(json!({
-        "kind": "error",
-        "error": { "code": clipped(&error.code, 80), "message": clipped(&error.message, 1000) },
-        "request_id": error.request_id,
-        "plan_id": error.plan_id,
-        "commit": error.commit,
-    }))
+    tool_result(
+        json!({
+            "kind": "error",
+            "error": { "code": clipped(&error.code, 80), "message": clipped(&error.message, 1000) },
+            "request_id": error.request_id,
+            "plan_id": error.plan_id,
+            "commit": error.commit,
+        }),
+        true,
+    )
+}
+
+fn tool_result(mut value: Value, error: bool) -> CallToolResult {
+    report::display_paths(&mut value);
+    if error {
+        CallToolResult::structured_error(value)
+    } else {
+        CallToolResult::structured(value)
+    }
 }
 
 fn clipped(value: &str, max_chars: usize) -> String {

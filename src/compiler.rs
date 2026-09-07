@@ -352,7 +352,7 @@ fn validate_target(change: &Change, path: Option<&str>, diagnostics: &mut Vec<Di
             path,
             Some(change),
             "EMPTY_TARGET",
-            "Exact search text must not be empty; use an empty span for insertion",
+            "Exact search text must not be empty; for insertion, replace adjacent text with itself plus the insertion, or use a returned zero-width span",
         ));
     }
     if scope.is_some_and(|id| id.trim().is_empty()) {
@@ -496,33 +496,42 @@ fn resolve_change(
         return;
     };
     let retained = expected.min(budget.spans_left);
-    let (actual, positions) = if matches!(change.target, Target::All { .. }) {
+    let exact = matches!(change.target, Target::Exact { .. });
+    let (actual, non_overlapping, positions) = if matches!(change.target, Target::All { .. }) {
         let mut matches = base.text[start..end].match_indices(old);
         let positions: Vec<_> = matches
             .by_ref()
             .take(retained)
             .map(|(index, _)| index)
             .collect();
-        (positions.len() + matches.count(), positions)
+        let actual = positions.len() + matches.count();
+        (actual, actual, positions)
     } else {
-        occurrences(&base.text[start..end], old, retained)
+        let matches = scan_occurrences(&base.text[start..end], old, 0, retained);
+        (
+            matches.overlapping,
+            matches.non_overlapping,
+            matches.positions,
+        )
     };
     if actual != expected {
         let code = if actual == 0 {
             "TARGET_NOT_FOUND"
-        } else if matches!(change.target, Target::Exact { .. }) {
+        } else if exact {
             "TARGET_AMBIGUOUS"
         } else {
             "EXPECTED_COUNT_MISMATCH"
         };
-        let mut diagnostic = at(
-            Some(&base.path),
-            Some(change),
-            code,
+        let message = if exact && actual != 0 {
+            format!(
+                "Expected {expected} occurrence(s), found {actual} overlapping starts ({non_overlapping} non-overlapping); inspect the snapshot and choose an explicit span or narrower scope"
+            )
+        } else {
             format!(
                 "Expected {expected} occurrence(s), found {actual}; inspect the snapshot and choose an explicit span or narrower scope"
-            ),
-        );
+            )
+        };
+        let mut diagnostic = at(Some(&base.path), Some(change), code, message);
         diagnostic.expected = Some(expected);
         diagnostic.actual = Some(actual);
         diagnostics.push(diagnostic);
@@ -540,8 +549,10 @@ fn resolve_change(
     }));
 }
 
-pub(crate) fn occurrences(source: &str, old: &str, retained: usize) -> (usize, Vec<usize>) {
-    occurrences_page(source, old, 0, retained)
+struct OccurrenceScan {
+    overlapping: usize,
+    non_overlapping: usize,
+    positions: Vec<usize>,
 }
 
 pub(crate) fn occurrences_page(
@@ -550,8 +561,17 @@ pub(crate) fn occurrences_page(
     offset: usize,
     retained: usize,
 ) -> (usize, Vec<usize>) {
+    let matches = scan_occurrences(source, old, offset, retained);
+    (matches.overlapping, matches.positions)
+}
+
+fn scan_occurrences(source: &str, old: &str, offset: usize, retained: usize) -> OccurrenceScan {
     if old.len() > source.len() {
-        return (0, Vec::new());
+        return OccurrenceScan {
+            overlapping: 0,
+            non_overlapping: 0,
+            positions: Vec::new(),
+        };
     }
     let needle = old.as_bytes();
     // KMP keeps overlapping counts linear even for a long, highly repetitive needle.
@@ -566,7 +586,9 @@ pub(crate) fn occurrences_page(
         }
         prefix[index] = matched;
     }
-    let mut count = 0;
+    let mut overlapping = 0;
+    let mut non_overlapping = 0;
+    let mut next_non_overlapping_start = 0;
     let mut positions = Vec::new();
     let mut matched = 0;
     for (index, byte) in source.bytes().enumerate() {
@@ -577,14 +599,23 @@ pub(crate) fn occurrences_page(
             matched += 1;
         }
         if matched == needle.len() {
-            count += 1;
-            if count > offset && positions.len() < retained {
-                positions.push(index + 1 - needle.len());
+            let start = index + 1 - needle.len();
+            overlapping += 1;
+            if start >= next_non_overlapping_start {
+                non_overlapping += 1;
+                next_non_overlapping_start = index + 1;
+            }
+            if overlapping > offset && positions.len() < retained {
+                positions.push(start);
             }
             matched = prefix[matched - 1];
         }
     }
-    (count, positions)
+    OccurrenceScan {
+        overlapping,
+        non_overlapping,
+        positions,
+    }
 }
 
 fn resource_limit(base: &Snapshot, change: &Change) -> Diagnostic {

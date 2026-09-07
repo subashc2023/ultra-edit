@@ -6,7 +6,7 @@ use std::process::{Child, Command, Stdio};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use ultra_edit::storage::Storage;
-use ultra_edit::{CommitStatus, FileStatus, PreparedPlan, Receipt, digest};
+use ultra_edit::{CommitStatus, FileStatus, PreparedPlan, Receipt, digest, report};
 
 fn start(root: &Path, args: &[&str], input: Option<&Value>) -> Child {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ultra-edit"))
@@ -69,7 +69,13 @@ fn prepare(root: &Path, files: &[(&str, &str, &str)], request_id: &str) -> (Valu
     let (code, evidence) = run(root, &["get", preview["reference"].as_str().unwrap()], None);
     assert_eq!(code, 0, "{evidence}");
     assert_eq!(evidence["kind"], "plan");
-    let plan = serde_json::from_value(evidence["value"].clone()).unwrap();
+    let storage = Storage::open(root).unwrap();
+    let plan: PreparedPlan = storage
+        .get("plans", preview["reference"].as_str().unwrap())
+        .unwrap();
+    let mut displayed = serde_json::to_value(&plan).unwrap();
+    report::display_paths(&mut displayed);
+    assert_eq!(evidence["value"], displayed);
     (request, plan)
 }
 
@@ -136,7 +142,7 @@ fn interrupted_commit_replays_unknown_without_inferring_from_current_bytes() {
         assert_eq!(receipt.files[0].status, FileStatus::OutcomeUnknown);
         assert_eq!(receipt.files[1].status, FileStatus::NotCommitted);
         for (outcome, prepared) in receipt.files.iter().zip(&plan.files) {
-            assert_eq!(outcome.path, prepared.base.path);
+            assert_eq!(outcome.path, report::path_for_display(&prepared.base.path));
             assert_eq!(outcome.before, prepared.base.id);
             assert_eq!(outcome.after_digest, digest(prepared.output.as_bytes()));
             assert_eq!(outcome.changes_applied, 0);
@@ -153,7 +159,9 @@ fn interrupted_commit_replays_unknown_without_inferring_from_current_bytes() {
 
         let (code, evidence) = run(root.path(), &["get", &plan.id], None);
         assert_eq!(code, 0, "{evidence}");
-        assert_eq!(evidence["value"], serde_json::to_value(&plan).unwrap());
+        let mut displayed = serde_json::to_value(&plan).unwrap();
+        report::display_paths(&mut displayed);
+        assert_eq!(evidence["value"], displayed);
         let (code, current) = run(root.path(), &["read", "first.txt"], None);
         assert_eq!(code, 0, "{current}");
         assert_eq!(current["text"], expected_first);

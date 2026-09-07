@@ -35,8 +35,16 @@ and recompiles the entire request under a new ID:
 }
 ```
 
-Use inspected original text for corrections. Unknown change IDs cannot be added,
-and a repair cannot replace the base snapshots. A successful repair is a preview;
+Use inspected original text for corrections. For `TARGET_AMBIGUOUS`, `actual` is
+the overlapping-start count; the message's parenthesized non-overlapping count is
+the `expected` value only when changing the same `old` and disclosed scope to
+`{"kind":"all"}`. If the original `exact` was unscoped and its focused snapshot
+has no covering span, take a suitable snapshot and start a new request. For
+`EMPTY_TARGET`, use a returned zero-width span if available. Otherwise, to insert
+a line, replace the preceding line body with original + line ending + insertion,
+or the following body with insertion + line ending + original.
+Unknown change IDs cannot be added, and a repair cannot replace the base snapshots.
+A successful repair is a preview;
 commit its returned plan separately. Any commit attempt closes repair, including
 a failed preflight. For changed source (`STALE_SNAPSHOT`), inspect the recorded
 outcome and take fresh snapshots for a new request. A proven environmental

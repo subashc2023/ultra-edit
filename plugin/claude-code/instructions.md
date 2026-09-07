@@ -44,6 +44,12 @@ Prefer range/search snapshots. All snapshot responses return `snapshot`; full
 reads default to 24,000 bytes and 400 lines. Use `next_offset` and the returned
 snapshot for stable search pagination. `scope` means a disclosed span ID, never
 literal text. Replace-all counts non-overlapping matches from left to right.
+For `TARGET_AMBIGUOUS`, `actual` counts overlapping starts; the message's
+parenthesized count is `expected` only for the same `old` and disclosed scope in
+a `{"kind":"all"}` target. Exact search text cannot be empty. For insertion,
+use a returned zero-width span where available. Between nonblank lines, replace
+the preceding body with original + line ending + insertion, or the following
+body with insertion + line ending + original.
 Review candidate warnings and `ultra_edit_diff` when needed. A proven preflight
 failure can use `ultra_edit_retry` with a new request ID after fixing its cause;
 partial or uncertain outcomes cannot. `ultra_edit_inspect` captures recovery

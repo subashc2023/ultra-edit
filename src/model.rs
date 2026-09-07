@@ -127,6 +127,7 @@ pub enum Target {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Diagnostic {
+    /// Canonical filesystem path when the diagnostic identifies a file.
     pub file: Option<String>,
     pub change_id: Option<String>,
     pub code: String,

@@ -77,7 +77,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         WARMUPS,
         SAMPLES
     );
-    println!("Temporary parent: {}", fs::canonicalize(parent)?.display());
+    let parent = fs::canonicalize(parent)?;
+    println!(
+        "Temporary parent: {}",
+        ultra_edit::report::path_for_display(&parent.to_string_lossy())
+    );
     println!(
         "Setup, output verification, and cleanup are outside timers; source reads are warm-cache."
     );

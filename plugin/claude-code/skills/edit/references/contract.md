@@ -15,6 +15,12 @@ identical bytes is accepted; redirecting it to another target is rejected.
 Search continuation can reuse a prior snapshot's immutable source while minting
 a new snapshot with only the next page's disclosed spans.
 
+On Windows, response filesystem `path` fields, diagnostic and warning `file`
+fields, and diff headers use conventional drive or UNC display spelling. Normal
+extended-length prefixes remain in stored objects and internal identity checks;
+other verbatim namespaces remain unchanged. JSON still escapes backslashes
+normally.
+
 Every change is resolved against its original base. Planning errors reject the
 entire batch. Undeclared bytes remain identical. Replacement strings are literal
 UTF-8, with no regex expansion, Unicode normalization, newline conversion, shell,

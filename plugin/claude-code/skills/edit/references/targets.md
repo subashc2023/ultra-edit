@@ -26,7 +26,9 @@ when the complete larger response is needed. The count must match exactly or
 Ranges use one-based inclusive lines. Individual line spans exclude the leading
 UTF-8 BOM and CRLF/LF terminators. `selection` includes internal original newlines
 but excludes the last selected line's terminator. A trailing newline adds no
-extra line reference; empty and BOM-only files have an empty `r1` for insertion.
+extra line reference. A blank line has a zero-width line span; an empty file has
+zero-width `r0` and `r1`, and a BOM-only file has a zero-width `r1` after its BOM.
+Any returned zero-width span permits insertion at that position.
 Ranges allow at most 200 lines and 6,000 source Unicode characters. Oversized
 selections fail rather than silently clipping editable text.
 
@@ -70,16 +72,29 @@ separate literal `text` field.
 
 Unscoped `exact` searches the complete original file even after a focused read.
 Use a scope when the intended edit is limited to the inspected region. Empty
-`old` is rejected. Never derive an edit from a clipped context fragment.
+`old` is rejected with `EMPTY_TARGET`. To insert, target a returned zero-width
+span with `expect: ""` where one exists. No zero-width target is synthesized
+between adjacent nonblank lines. Line spans exclude their terminators, so to add
+an `inserted` line between `first\r\nsecond`, replace `first` with
+`first\r\ninserted` or replace `second` with `inserted\r\nsecond`. Use
+`expect` to guard the restated original bytes. Never derive an edit from a
+clipped context fragment.
 `scope` is a span ID, never literal text. To select a multi-line region, first
 read its range and use `selection`; inline `{first,last}` scopes are unsupported.
 
 Search and `exact` ambiguity counts include overlapping starts: `aa` occurs twice in `aaa`.
-Ambiguous exact matches are errors; select a disclosed match or narrow the scope
-after inspecting evidence. Replace-all instead counts non-overlapping matches
-from left to right: `aa` in `aaaa` requires `expected: 2`, and eight spaces
-contain four replacements of `"  "`. Its expected count equals the number of
-replacement regions. Separate changes can still conflict with these regions.
+Ambiguous exact matches are errors. In `TARGET_AMBIGUOUS`, `actual` remains the
+overlapping-start count; the message adds, in parentheses, the non-overlapping
+count for a corresponding same-scope `{"kind":"all"}` target:
+`found 6 overlapping starts
+(4 non-overlapping)`. Select a disclosed match, narrow the scope, or deliberately
+switch to `all` using that parenthesized value as `expected`, with the same `old`
+and disclosed scope. An unscoped `exact` from a focused snapshot has no equivalent
+`all` repair unless that snapshot discloses a span covering the intended region;
+otherwise take a suitable snapshot and start a new request. Replace-all proceeds
+left to right: `aa` in `aaaa` requires `expected: 2`, and eight spaces contain
+four replacements of `"  "`. Separate changes can still conflict with these
+regions.
 
 Overlapping replacements and coincident insertions reject the complete batch.
 An insertion touching either boundary of another replacement also conflicts in

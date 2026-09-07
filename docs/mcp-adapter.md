@@ -118,6 +118,13 @@ unconfigurable `validation: "not_requested"`; run external project checks
 separately. Nonblocking `NUL_BYTE` and `MIXED_LINE_ENDINGS` warnings describe the
 candidate output without changing its bytes.
 
+On Windows, response filesystem `path` fields, diagnostic and warning `file`
+fields, and diff headers use conventional drive or UNC display spelling instead
+of normal extended-length prefixes. Stored snapshots, plans, receipts, and
+identity checks retain canonical paths. Other verbatim namespaces remain
+unchanged. This projection changes presentation only; JSON still escapes
+backslashes according to JSON syntax.
+
 Rejected or incompletely committed mutation calls set MCP `isError`. Successful
 status reads do not set it merely because a historical receipt describes a
 failure. Cancellation or disconnection cannot establish rollback; inspect the

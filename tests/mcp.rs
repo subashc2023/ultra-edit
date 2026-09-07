@@ -7,7 +7,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use ultra_edit::storage::Storage;
 use ultra_edit::{PreparedPlan, digest};
+
+#[cfg(windows)]
+use ultra_edit::{Draft, Inspection, Snapshot};
 
 struct Client {
     child: Child,
@@ -545,6 +549,142 @@ fn diff_and_byte_warnings_are_available_before_and_after_commit() {
     client.close();
 }
 
+#[cfg(windows)]
+#[test]
+fn canonical_windows_paths_are_display_only_across_mcp_responses() {
+    let root = TempDir::new().unwrap();
+    let target = root.path().join("file.txt");
+    fs::write(&target, "old\r\nkeep\r\n").unwrap();
+    let canonical = fs::canonicalize(&target)
+        .unwrap()
+        .into_os_string()
+        .into_string()
+        .unwrap();
+    let displayed = ultra_edit::report::path_for_display(&canonical).into_owned();
+
+    let mut client = Client::start(root.path());
+    let full = client.full("file.txt");
+    assert_eq!(full["path"], displayed);
+    let range = client.range("file.txt", 1, 1);
+    assert_eq!(range["path"], displayed);
+    let search = client.call(
+        "ultra_edit_snapshot",
+        json!({"path":"file.txt","selection":{"kind":"search","query":"old"}}),
+        false,
+    );
+    assert_eq!(search["path"], displayed);
+
+    let request = json!({
+        "request_id": "windows-display",
+        "files": [{
+            "base": full["snapshot"],
+            "changes": [{
+                "id": "mixed-endings",
+                "target": {"kind": "exact", "old": "old"},
+                "text": "new\nextra",
+            }],
+        }],
+    });
+    let prepared = client.call("ultra_edit_prepare", request.clone(), false);
+    assert_eq!(prepared["warnings"][0]["file"], displayed);
+    let plan_id = prepared["reference"].as_str().unwrap();
+    let diff = client.call("ultra_edit_diff", json!({"plan": plan_id}), false);
+    assert!(
+        diff["diff"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("--- {:?}\n", format!("a/{displayed}"))),
+        "{diff}"
+    );
+
+    let snapshot_evidence = client.call(
+        "ultra_edit_status",
+        json!({"query":{"kind":"evidence","reference":full["snapshot"]}}),
+        false,
+    );
+    assert_eq!(snapshot_evidence["value"]["path"], displayed);
+    let plan_evidence = client.call(
+        "ultra_edit_status",
+        json!({"query":{"kind":"evidence","reference":plan_id}}),
+        false,
+    );
+    assert_eq!(
+        plan_evidence["value"]["files"][0]["base"]["path"],
+        displayed
+    );
+    assert_eq!(plan_evidence["value"]["warnings"][0]["file"], displayed);
+
+    let rejected = client.call(
+        "ultra_edit_prepare",
+        json!({
+            "request_id": "windows-display-draft",
+            "files": [{
+                "base": full["snapshot"],
+                "changes": [{
+                    "id": "missing",
+                    "target": {"kind": "exact", "old": "absent"},
+                    "text": "unused",
+                }],
+            }],
+        }),
+        true,
+    );
+    let draft_evidence = client.call(
+        "ultra_edit_status",
+        json!({"query":{"kind":"evidence","reference":rejected["reference"]}}),
+        false,
+    );
+    assert_eq!(draft_evidence["value"]["diagnostics"][0]["file"], displayed);
+
+    let committed = client.call("ultra_edit", request, false);
+    assert_eq!(committed["warnings"][0]["file"], displayed);
+    let receipt = client.call(
+        "ultra_edit_status",
+        json!({"query":{"kind":"receipt","request_id":"windows-display","full":true}}),
+        false,
+    );
+    assert_eq!(receipt["receipt"]["files"][0]["path"], displayed);
+    assert_eq!(receipt["receipt"]["warnings"][0]["file"], displayed);
+
+    let inspection = client.call("ultra_edit_inspect", json!({"plan":plan_id}), false);
+    assert_eq!(inspection["files"][0]["path"], displayed);
+    let inspection_evidence = client.call(
+        "ultra_edit_status",
+        json!({"query":{"kind":"evidence","reference":inspection["inspection"]}}),
+        false,
+    );
+    let evidence = &inspection_evidence["value"];
+    assert_eq!(evidence["plan"]["files"][0]["base"]["path"], displayed);
+    assert_eq!(evidence["receipt"]["files"][0]["path"], displayed);
+    assert_eq!(evidence["files"][0]["path"], displayed);
+    client.close();
+
+    let storage = Storage::open(root.path()).unwrap();
+    let stored_snapshot: Snapshot = storage
+        .get("snapshots", full["snapshot"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(stored_snapshot.path, canonical);
+    let stored_plan: PreparedPlan = storage.get("plans", plan_id).unwrap();
+    assert_eq!(stored_plan.files[0].base.path, canonical);
+    assert_eq!(
+        stored_plan.warnings[0].file.as_deref(),
+        Some(canonical.as_str())
+    );
+    let stored_draft: Draft = storage
+        .get("drafts", rejected["reference"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(
+        stored_draft.diagnostics[0].file.as_deref(),
+        Some(canonical.as_str())
+    );
+    let stored_receipt = storage.receipt(&stored_plan).unwrap().unwrap();
+    assert_eq!(stored_receipt.files[0].path, canonical);
+    let stored_inspection: Inspection = storage
+        .get("inspections", inspection["inspection"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(stored_inspection.files[0].path, canonical);
+}
+
 #[test]
 fn bundled_plugin_launches_hooks_and_mcp_without_path_lookup() {
     let root = TempDir::new().unwrap();
@@ -919,6 +1059,58 @@ fn malformed_arguments_and_outside_paths_fail_without_writes() {
 }
 
 #[test]
+fn path_shaped_snapshot_references_remain_non_path_data_over_mcp() {
+    let root = TempDir::new().unwrap();
+    let reference = r"\\?\C:\looks-like-a-path";
+    let mut client = Client::start(root.path());
+    let rejected = client.call(
+        "ultra_edit_prepare",
+        json!({
+            "request_id": "invalid-reference",
+            "files": [{
+                "base": reference,
+                "changes": [{
+                    "id": "unused",
+                    "target": {"kind": "exact", "old": "unused"},
+                    "text": "unused",
+                }],
+            }],
+        }),
+        true,
+    );
+    let mentions = |diagnostics: &Value| {
+        diagnostics
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|diagnostic| {
+                diagnostic["message"]
+                    .as_str()
+                    .unwrap()
+                    .matches(reference)
+                    .count()
+            })
+            .sum::<usize>()
+    };
+    assert_eq!(mentions(&rejected["diagnostics"]), 1);
+    let evidence = client.call(
+        "ultra_edit_status",
+        json!({"query":{"kind":"evidence","reference":rejected["reference"]}}),
+        false,
+    );
+    assert_eq!(evidence["value"]["request"]["files"][0]["base"], reference);
+    assert!(
+        evidence["value"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|diagnostic| diagnostic["file"].is_null())
+    );
+    assert_eq!(mentions(&evidence["value"]["diagnostics"]), 1);
+    client.close();
+}
+
+#[test]
 fn interrupted_commit_and_corrupt_journal_preserve_unknown_status_and_references() {
     let root = TempDir::new().unwrap();
     fs::write(root.path().join("file.txt"), "x").unwrap();
@@ -931,7 +1123,13 @@ fn interrupted_commit_and_corrupt_journal_preserve_unknown_status_and_references
         json!({"query":{"kind":"evidence","reference":preview["reference"]}}),
         false,
     );
-    let plan: PreparedPlan = serde_json::from_value(evidence["value"].clone()).unwrap();
+    let storage = Storage::open(root.path()).unwrap();
+    let plan: PreparedPlan = storage
+        .get("plans", evidence["value"]["id"].as_str().unwrap())
+        .unwrap();
+    let mut displayed = serde_json::to_value(&plan).unwrap();
+    ultra_edit::report::display_paths(&mut displayed);
+    assert_eq!(evidence["value"], displayed);
     client.close();
     // Same durable crash fixture as CLI recovery: intent persisted, outcome absent.
     let mut journal = Vec::new();

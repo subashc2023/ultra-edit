@@ -107,7 +107,48 @@ fn exact_ambiguity_counts_overlapping_unicode_matches() {
         assert_eq!(errors[0].code, "TARGET_AMBIGUOUS");
         assert_eq!(errors[0].expected, Some(1));
         assert_eq!(errors[0].actual, Some(2));
+        assert!(
+            errors[0]
+                .message
+                .contains("found 2 overlapping starts (1 non-overlapping)")
+        );
     }
+}
+
+#[test]
+fn exact_ambiguity_reports_replace_all_cardinality() {
+    let base = snapshot(
+        "overlap.txt".into(),
+        "one\ntwo\nthree\naaa aaa aa aa".into(),
+    );
+    let exact = Change {
+        id: "exact".into(),
+        target: Target::Exact {
+            old: "aa".into(),
+            scope: Some("r4".into()),
+        },
+        text: "x".into(),
+    };
+    let errors = compile(&request(&base, vec![exact]), &bases(&base)).unwrap_err();
+    assert_eq!(errors[0].code, "TARGET_AMBIGUOUS");
+    assert_eq!(errors[0].expected, Some(1));
+    assert_eq!(errors[0].actual, Some(6));
+    assert_eq!(
+        errors[0].message,
+        "Expected 1 occurrence(s), found 6 overlapping starts (4 non-overlapping); inspect the snapshot and choose an explicit span or narrower scope"
+    );
+
+    let all = Change {
+        id: "all".into(),
+        target: Target::All {
+            old: "aa".into(),
+            scope: "r4".into(),
+            expected: 4,
+        },
+        text: "x".into(),
+    };
+    let plan = compile(&request(&base, vec![all]), &bases(&base)).unwrap();
+    assert_eq!(plan.files[0].output, "one\ntwo\nthree\nxa xa x x");
 }
 
 #[test]
@@ -403,6 +444,30 @@ fn insertions_are_explicit_and_boundary_conflicts_are_rejected() {
             .output,
         "text"
     );
+}
+
+#[test]
+fn empty_exact_target_gives_reachable_insertion_advice() {
+    let base = snapshot("insertion.txt".into(), "first\r\nsecond".into());
+    let rejected = request(&base, vec![exact("insert", "", "inserted")]);
+    let errors = compile(&rejected, &bases(&base)).unwrap_err();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].code, "EMPTY_TARGET");
+    assert_eq!(
+        errors[0].message,
+        "Exact search text must not be empty; for insertion, replace adjacent text with itself plus the insertion, or use a returned zero-width span"
+    );
+
+    let repaired = Change {
+        id: "insert".into(),
+        target: Target::Exact {
+            old: "first".into(),
+            scope: Some("r1".into()),
+        },
+        text: "first\r\ninserted".into(),
+    };
+    let plan = compile(&request(&base, vec![repaired]), &bases(&base)).unwrap();
+    assert_eq!(plan.files[0].output, "first\r\ninserted\r\nsecond");
 }
 
 #[test]

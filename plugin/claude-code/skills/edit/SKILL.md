@@ -49,7 +49,12 @@ exposed by this host.
    disclosed `span`, or `exact` with an explicit scope when only the inspected
    region should match. Resolve all targets against that base.
    `scope` is a returned span ID, not source text. `all.expected` counts
-   non-overlapping, left-to-right replacements.
+   non-overlapping, left-to-right replacements. For `TARGET_AMBIGUOUS`, `actual`
+   counts overlapping starts; use the message's parenthesized count only with the
+   same `old` and disclosed scope in a `{"kind":"all"}` target. Empty exact text
+   is invalid; insert through a returned zero-width span where available. To add
+   a line between nonblank lines, replace the preceding body with original + line
+   ending + insertion, or the following body with insertion + line ending + original.
 3. Inspect the returned outcome. Call `ultra_edit_status` with
    `{"query":{"kind":"receipt","request_id":"..."}}` after lost output;
    add `"full":true` inside `query` for every file outcome. Run project validation

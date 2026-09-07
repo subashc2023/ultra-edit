@@ -98,8 +98,8 @@ cargo run --locked -- --help
 The walkthrough edits disposable files in its own temporary directory and shows
 preview, commit, retry, and undo. It checks the file bytes at each stage and does
 not edit this project. Headings, grouped file changes, and red/green edits make
-the terminal output easier to scan. Windows paths appear without doubled
-separators or the extended path prefix; stored identities remain canonical.
+the terminal output easier to scan. The walkthrough uses conventional Windows
+display paths; the CLI and MCP response contract is described below.
 
 Color is automatic on a terminal and disabled for redirected output or a nonempty
 `NO_COLOR` environment variable. To override automatic detection:
@@ -241,8 +241,10 @@ Windows and `target/debug/ultra-edit` on Unix.
 and snapshot-local span references. `r0` covers the whole file, including any
 UTF-8 BOM. `r1`, `r2`, etc. cover individual line bodies, excluding the BOM and
 CRLF/LF terminators. A trailing newline does not create another line reference.
-An empty file has an empty `r1`, which permits insertion. Span offsets are UTF-8
-byte offsets; the compiler validates their boundaries.
+A blank line body exposes a zero-width line span. An empty file has zero-width
+`r0` and `r1`; a BOM-only file has a zero-width `r1` after the BOM. Any returned
+zero-width span permits insertion at its position. Span offsets are UTF-8 byte
+offsets; the compiler validates their boundaries.
 
 Full reads default to at most 24,000 source UTF-8 bytes and 400 lines. Larger
 files return `READ_TOO_LARGE` before generating line references or serializing a
@@ -252,6 +254,11 @@ response. A changed byte count returns `READ_SIZE_CHANGED`; the 16 MiB source
 ceiling still applies. This override can produce a large response, including all
 line references. Full, range, and search responses all use `snapshot`; stored
 snapshot evidence and the Rust `Snapshot` type retain their internal `id` field.
+On Windows, emitted filesystem `path` fields, diagnostic and warning `file`
+fields, and diff headers use conventional drive or UNC display spelling. Normal
+extended-length prefixes remain only in stored objects and internal path identity
+checks. Other verbatim namespaces remain unchanged, and JSON still escapes
+backslashes according to JSON syntax.
 
 To read a small region, use `read-range src/retry.rs 12 18`. Line numbers are
 one-based and inclusive. It returns `snapshot`, `path`, `digest`, file totals,
@@ -336,11 +343,25 @@ source text. Obtain an arbitrary line region with a range snapshot and use its
 add `span.expect` when a mistaken positional ID should fail instead of replacing
 the wrong text. An expectation mismatch returns `EXPECTED_TEXT_MISMATCH`.
 
-Empty exact search strings are rejected. `exact` ambiguity checks and search
-count overlapping starts: `aa` occurs at two starts in `aaa`. `all` instead counts
-and replaces non-overlapping matches from left to right: `aa` in `aaaa` requires
-`expected: 2`, and eight spaces contain four replacements of `"  "`.
-Overlapping replacements from different changes and
+Empty exact search strings are rejected. Use a returned zero-width span with
+`expect: ""` for insertion where one exists. Line snapshots do not synthesize a
+zero-width target at every boundary. Because line spans exclude terminators, to
+insert a new `inserted` line between `first\r\nsecond`, either replace `first`
+with `first\r\ninserted` or replace `second` with `inserted\r\nsecond`,
+preferably guarded by `span.expect`. The untouched line ending supplies the other
+separator.
+
+`exact` ambiguity checks and search count overlapping starts: `aa` occurs at two
+starts in `aaa`. For `TARGET_AMBIGUOUS`, `actual` remains that overlapping-start
+count; the message also gives the non-overlapping count required by a corresponding
+same-scope `{"kind":"all"}` target, for example
+`found 6 overlapping starts (4 non-overlapping)`. `all` counts and replaces those
+non-overlapping matches from left to right: `aa` in `aaaa` requires `expected: 2`,
+and eight spaces contain four replacements of `"  "`.
+Use the parenthesized value only with the same `old` and disclosed scope. Because
+`all` requires a scope, an unscoped `exact` from a focused snapshot may require a
+new snapshot and request that disclose the intended region. Overlapping
+replacements from different changes and
 coincident insertions reject the entire batch. This initial compiler also rejects
 insertions that touch either boundary of another replacement; combine them into
 one change. Adjacent nonempty replacements are allowed.

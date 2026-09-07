@@ -545,9 +545,7 @@ impl Workspace {
             let snapshot: Snapshot = match self.storage.get("snapshots", &file.base) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
-                    let mut diagnostic = Diagnostic::new("INVALID_SNAPSHOT", error.to_string());
-                    diagnostic.file = Some(file.base.clone());
-                    diagnostics.push(diagnostic);
+                    diagnostics.push(Diagnostic::new("INVALID_SNAPSHOT", error.to_string()));
                     continue;
                 }
             };

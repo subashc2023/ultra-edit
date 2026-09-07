@@ -468,6 +468,48 @@ fn references_are_workspace_local_and_missing_references_never_rebind() {
 }
 
 #[test]
+fn invalid_snapshot_references_are_not_misreported_as_file_paths() {
+    let (_dir, workspace, _) = setup("one");
+    let reference = r"\\?\C:\looks-like-a-path";
+    let rejected = workspace
+        .prepare(EditRequest {
+            request_id: "invalid-reference".into(),
+            files: vec![FileRequest {
+                base: reference.into(),
+                changes: vec![change("unused", "one", "two")],
+            }],
+        })
+        .unwrap();
+    assert!(!rejected.ready);
+    assert!(
+        rejected
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "INVALID_SNAPSHOT")
+    );
+    assert!(
+        rejected
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.file.is_none())
+    );
+    assert_eq!(
+        rejected
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.matches(reference).count())
+            .sum::<usize>(),
+        1
+    );
+
+    let Evidence::Draft(draft) = workspace.evidence(&rejected.reference).unwrap() else {
+        panic!("Expected rejected draft evidence")
+    };
+    assert_eq!(draft.request.files[0].base, reference);
+    assert_eq!(draft.diagnostics, rejected.diagnostics);
+}
+
+#[test]
 fn encoding_errors_and_workspace_escape_are_explicit() {
     let (dir, workspace, _) = setup("valid");
     fs::write(dir.path().join("invalid.txt"), [0xff, 0xfe, 0x61, 0x00]).unwrap();

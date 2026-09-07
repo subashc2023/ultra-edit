@@ -1,5 +1,6 @@
 use crate::model::{CommitStatus, FileStatus, PreparedPlan, Receipt};
-use std::fmt::Write;
+use serde_json::Value;
+use std::{borrow::Cow, fmt::Write};
 
 /// Show literal replacement spans, with control characters and BOMs escaped.
 /// Excerpts are bounded independently so a long line cannot consume later regions.
@@ -230,8 +231,9 @@ pub fn diff(plan: &PreparedPlan) -> String {
         let before_count = before.split_inclusive('\n').count();
         let after_count = after.split_inclusive('\n').count();
         let changes = line_changes(before, after, before_count, after_count);
-        writeln!(output, "--- {:?}", format!("a/{}", file.base.path)).unwrap();
-        writeln!(output, "+++ {:?}", format!("b/{}", file.base.path)).unwrap();
+        let path = path_for_display(&file.base.path);
+        writeln!(output, "--- {:?}", format!("a/{path}")).unwrap();
+        writeln!(output, "+++ {:?}", format!("b/{path}")).unwrap();
         let mut before_lines = before.split_inclusive('\n');
         let mut after_lines = after.split_inclusive('\n');
         let (mut before_cursor, mut after_cursor) = (0, 0);
@@ -472,29 +474,59 @@ fn count(value: usize, noun: &str) -> String {
     format!("{value} {noun}{}", if value == 1 { "" } else { "s" })
 }
 
-fn display_path(path: &str, limit: usize) -> String {
-    let (prefix, path) = match path.strip_prefix(r"\\?\") {
+/// Strip Windows extended-length syntax when an equivalent display path exists.
+///
+/// Other verbatim namespaces and malformed UNC paths retain their exact spelling.
+pub fn path_for_display(path: &str) -> Cow<'_, str> {
+    match path.strip_prefix(r"\\?\") {
         Some(path)
             if path
                 .as_bytes()
                 .get(0..3)
                 .is_some_and(|drive| drive[0].is_ascii_alphabetic() && drive[1..] == *b":\\") =>
         {
-            ("", path)
+            Cow::Borrowed(path)
         }
         Some(stripped) if stripped.starts_with("UNC\\") => {
             let unc = &stripped[4..];
             if unc.split_once('\\').is_some_and(|(server, rest)| {
                 !server.is_empty() && !rest.split('\\').next().unwrap_or_default().is_empty()
             }) {
-                (r"\\", unc)
+                Cow::Owned(format!(r"\\{unc}"))
             } else {
-                ("", path)
+                Cow::Borrowed(path)
             }
         }
-        _ => ("", path),
-    };
-    let characters = prefix.chars().chain(path.chars());
+        _ => Cow::Borrowed(path),
+    }
+}
+
+/// Project serialized `path` and diagnostic `file` fields to their display spelling.
+/// Callers use a response copy, leaving stored models, identity checks, and hashes on
+/// the canonical path.
+pub fn display_paths(value: &mut Value) {
+    match value {
+        Value::Array(values) => values.iter_mut().for_each(display_paths),
+        Value::Object(fields) => {
+            for (name, value) in fields {
+                if matches!(name.as_str(), "path" | "file")
+                    && let Value::String(path) = value
+                {
+                    let displayed = path_for_display(path);
+                    if displayed.as_ref() != path {
+                        *path = displayed.into_owned();
+                    }
+                }
+                display_paths(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn display_path(path: &str, limit: usize) -> String {
+    let path = path_for_display(path);
+    let characters = path.chars();
     let quoted = characters
         .clone()
         .any(|character| character != '\\' && character.escape_debug().count() != 1);
