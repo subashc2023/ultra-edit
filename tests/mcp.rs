@@ -769,7 +769,8 @@ fn focused_batch_edit_preserves_bytes_and_retries_after_restart() {
     let one = client.range("one.txt", 2, 2);
     let two = client.range("two.txt", 1, 1);
     assert_eq!(one["text"], "let value = 1;");
-    assert!(!one.to_string().contains("private"));
+    assert!(!one.to_string().contains("private header"));
+    assert!(!one.to_string().contains("private footer"));
     let literal = "let value = '$1\\path\t😀';  ";
     let mut request = edit("batch", &one["snapshot"], "selection", literal);
     request["files"]
@@ -965,7 +966,11 @@ fn retry_preflight_failure_keeps_original_receipt_and_candidate() {
 #[test]
 fn search_discloses_only_editable_matches_and_empty_files_allow_insertion() {
     let root = TempDir::new().unwrap();
-    fs::write(root.path().join("file.txt"), "header\nα α\nfooter").unwrap();
+    fs::write(
+        root.path().join("file.txt"),
+        "header\nα α\nULTRA_EDIT_UNDISCLOSED_FOOTER",
+    )
+    .unwrap();
     fs::write(root.path().join("empty.txt"), "").unwrap();
     let mut client = Client::start(root.path());
     let found = client.call(
@@ -974,7 +979,7 @@ fn search_discloses_only_editable_matches_and_empty_files_allow_insertion() {
         false,
     );
     assert_eq!(found["total_matches"], 2);
-    assert!(!found.to_string().contains("footer"));
+    assert!(!found.to_string().contains("ULTRA_EDIT_UNDISCLOSED_FOOTER"));
     let bad = client.call(
         "ultra_edit",
         edit("undisclosed", &found["snapshot"], "r0", "bad"),
@@ -993,7 +998,7 @@ fn search_discloses_only_editable_matches_and_empty_files_allow_insertion() {
     );
     assert_eq!(
         fs::read_to_string(root.path().join("file.txt")).unwrap(),
-        "header\nα β\nfooter"
+        "header\nα β\nULTRA_EDIT_UNDISCLOSED_FOOTER"
     );
     let empty = client.range("empty.txt", 1, 1);
     client.call(

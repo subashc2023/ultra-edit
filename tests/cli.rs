@@ -180,7 +180,8 @@ fn focused_read_and_search_issue_editable_references_across_processes() {
     assert_eq!(code, 0, "{selected}");
     assert_eq!(selected["text"], "let value = 1;");
     assert_eq!(selected["total_lines"], 3);
-    assert!(!selected.to_string().contains("private"));
+    assert!(!selected.to_string().contains("private header"));
+    assert!(!selected.to_string().contains("private footer"));
     let request = json!({"request_id":"range-edit","files":[{
         "base":selected["snapshot"],
         "changes":[{"id":"value","target":{"kind":"span","span":"selection"},"text":"let value = 2;"}]
@@ -198,7 +199,8 @@ fn focused_read_and_search_issue_editable_references_across_processes() {
     assert_eq!(found["matches"][0]["span"]["line"], 2);
     assert_eq!(found["matches"][0]["before"], "let ");
     assert_eq!(found["matches"][0]["after"], ";");
-    assert!(!found.to_string().contains("private"));
+    assert!(!found.to_string().contains("private header"));
+    assert!(!found.to_string().contains("private footer"));
     let request = json!({"request_id":"search-edit","files":[{
         "base":found["snapshot"],
         "changes":[{"id":"value","target":{"kind":"span","span":found["matches"][0]["span"]["id"]},"text":"value = 3"}]
