@@ -1,3 +1,5 @@
 /target/
 /.ultra-edit/
 /plugin/claude-code/runtime/
+__pycache__/
+*.py[cod]

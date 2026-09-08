@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Snapshot-based, verifiable batch file editing"
+homepage = "https://github.com/subashc2023/ultra-edit"
+repository = "https://github.com/subashc2023/ultra-edit"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["file-editing", "batch-editing", "mcp", "claude-code"]
+categories = ["command-line-utilities", "development-tools"]
 publish = false
 default-run = "ultra-edit"
 

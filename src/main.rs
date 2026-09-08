@@ -8,7 +8,10 @@ use serde_json::{Value, json};
 use ultra_edit::workspace::EditResult;
 use ultra_edit::{Change, CommitStatus, Error, FullRead, Preparation, Workspace};
 
-const HELP: &str = "ultra-edit 0.1.0
+const HELP: &str = concat!(
+    "ultra-edit ",
+    env!("CARGO_PKG_VERSION"),
+    "
 Usage: ultra-edit [--root WORKSPACE] COMMAND [ARGS]
 
   read PATH [EXPECTED_BYTES]  Full snapshot; exact byte count opts into a large response
@@ -30,7 +33,8 @@ Usage: ultra-edit [--root WORKSPACE] COMMAND [ARGS]
 Output is JSON. Exit codes: 0 successful read/preview/commit/reconciliation, 2 rejected/error,
 3 commit not fully confirmed. References and receipts live in WORKSPACE/.ultra-edit.
 See README.md for request schemas, preservation policy, and initial limitations.
-";
+"
+);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

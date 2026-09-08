@@ -5,6 +5,32 @@ use std::process::{Command, Stdio};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+#[test]
+fn help_and_version_report_the_package_version() {
+    let expected = format!("ultra-edit {}", env!("CARGO_PKG_VERSION"));
+
+    for arguments in [vec![], vec!["--help"], vec!["-h"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_ultra-edit"))
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().lines().next(),
+            Some(expected.as_str())
+        );
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ultra-edit"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
+}
+
 fn run(root: &std::path::Path, args: &[&str], input: Option<&Value>) -> (i32, Value) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ultra-edit"))
         .arg("--root")

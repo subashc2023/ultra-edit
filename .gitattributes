@@ -1,0 +1,21 @@
+# Preserve exact notice bytes, including upstream whitespace.
+THIRD_PARTY_LICENSES.txt -text whitespace=-trailing-space
+
+# Preserve the byte-for-byte notice copied from the pinned Rust toolchain.
+RUST_STANDARD_LIBRARY_LICENSES.html -text whitespace=-trailing-space
+
+# Preserve the byte-for-byte notice copied from upstream musl.
+MUSL_COPYRIGHT -text whitespace=-trailing-space
+
+# Preserve the byte-for-byte notice copied from Rust's pinned LLVM revision.
+LLVM_LIBUNWIND_LICENSE.txt -text whitespace=-trailing-space
+
+# Preserve the byte-for-byte notices copied from Rust's pinned source revision.
+RUST_COMPILER_BUILTINS_LICENSE.txt -text whitespace=-trailing-space
+RUST_LIBM_LICENSE.txt -text whitespace=-trailing-space
+
+# Preserve the compiler-rt notice copied from Rust's pinned LLVM revision.
+LLVM_COMPILER_RT_LICENSE.txt -text whitespace=-trailing-space
+
+# Keep the POSIX launcher in LF format on fresh Windows checkouts.
+packaging/launcher.sh text eol=lf

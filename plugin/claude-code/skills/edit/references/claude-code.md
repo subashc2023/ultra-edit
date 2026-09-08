@@ -1,8 +1,41 @@
 # Claude Code host
 
-## Connect locally
+## Install from a release
 
-Build the two private executables from the Ultra Edit Rust repository:
+Claude Code 2.1.224 or newer can install the complete, SHA-256-pinned release
+archive without Git, Rust, or a source checkout:
+
+```text
+claude plugin marketplace add https://github.com/subashc2023/ultra-edit/releases/latest/download/marketplace.json
+claude plugin install ultra-edit@ultra-edit
+```
+
+The default scope is the current user, so the plugin is available across
+projects. Start a new Claude Code session from the workspace to edit, run `/mcp`,
+and confirm that the `ultra-edit` server is connected. Claude Code identifies
+this installation as `ultra-edit@ultra-edit`.
+
+The release archive keeps the manifest, MCP configuration, hooks, instructions,
+skill, licenses, and all supported native executables together. Windows resolves
+the adjacent x64 `.exe`; the Unix launchers select Linux x64 or ARM64 and macOS
+Intel or Apple Silicon. The plugin adds no global command and needs no `PATH`
+change.
+
+Refresh the catalog and plugin when a new release is available:
+
+```text
+claude plugin marketplace update ultra-edit
+claude plugin update ultra-edit@ultra-edit
+```
+
+Restart Claude Code or run `/reload-plugins` after updating. The catalog's stable
+URL selects the latest non-prerelease GitHub release, while each catalog entry
+names a versioned archive and pins its exact SHA-256 digest.
+
+## Connect a source build
+
+For development or an unreleased commit, build the two private executables with
+Rust 1.89 or newer from the Ultra Edit repository:
 
 ```text
 cargo build --locked --release
@@ -23,10 +56,9 @@ cp ./target/release/ultra-edit ./target/release/ultra-edit-mcp ./plugin/claude-c
 ```
 
 The plugin launches these files directly. No global executable installation or
-`PATH` change is required. A prepared archive for the user's OS and architecture
-would already include them and skip the Rust build/staging steps; no public
-release archive is available yet. Generated `runtime/` files are not committed
-to source control.
+`PATH` change is required. Release archives already contain the executables and
+skip these source-build steps. Generated `runtime/` files are not committed to
+source control.
 
 For persistent use across projects, copy the entire prepared
 `plugin/claude-code` directory to `~/.claude/skills/ultra-edit`. On Windows the
@@ -62,9 +94,10 @@ Then launch normally **from the workspace to edit**:
 claude
 ```
 
-Claude Code discovers it as `ultra-edit@skills-dir` across projects, without a
-marketplace or slash command. The bundled personal installation was tested with
-Claude Code 2.1.263, with no global Ultra Edit executable. See the official
+Claude Code discovers a copied source build as `ultra-edit@skills-dir` across
+projects, without a marketplace or slash command. The bundled personal
+installation was tested with Claude Code 2.1.263, with no global Ultra Edit
+executable. See the official
 [skills-directory plugin documentation](https://code.claude.com/docs/en/plugins-reference#skills-directory-plugins).
 
 To test only one session without copying the prepared plugin, pass its absolute
@@ -100,11 +133,12 @@ Preview/commit, repair, preflight retry, undo, diff, inspection, and explicit
 reconciliation have separate tools. See the official
 [local plugin testing instructions](https://code.claude.com/docs/en/plugins#test-your-plugins-locally).
 
-Copied plugins do not update automatically. Update the installed plugin copy
-manually when updating the source, after rebuilding and staging matching native
-executables in `runtime/`.
+Copied source plugins do not update automatically. Update the installed plugin
+copy manually when updating the source, after rebuilding and staging matching
+native executables in `runtime/`. Marketplace installations instead use the two
+update commands under [Install from a release](#install-from-a-release).
 Do not nest a second `claude-code` directory inside the existing plugin. This
-repository does not yet package public release downloads.
+source-copy procedure is separate from the versioned marketplace cache.
 
 ## Automatic routing context
 
@@ -177,7 +211,10 @@ a host denial. See Claude Code's
 
 | Symptom | Action |
 | --- | --- |
+| Marketplace rejects the archive source | Run `claude --version` and update Claude Code to 2.1.224 or newer before adding the release catalog again. |
+| Archive integrity check fails | Refresh the `ultra-edit` marketplace and retry. Do not bypass the SHA-256 check; report the release version and digest if it still fails. |
 | Server executable missing or cannot launch | Confirm the installed plugin contains the matching OS/architecture executable under `runtime/`, run that full path with `--help`, and rebuild/stage or replace the incomplete package. Unix executables must retain executable permission. No `PATH` change is needed. |
+| Operating system blocks a downloaded executable | Current release binaries are unsigned. Use a reviewed source build on that machine; signing and macOS notarization are required before broader distribution. |
 | Plugin or skill absent | Confirm the absolute plugin directory contains `.claude-plugin/plugin.json`, `.mcp.json`, `runtime/`, `hooks/hooks.json`, and `skills/edit/SKILL.md`; run `claude plugin validate PATH`. |
 | Tools not connected | Inspect `/mcp`; after changing the plugin, use `/reload-plugins` or restart the session. |
 | Routing instructions absent or stale | Run the installed runtime executable with `--claude-context SessionStart` as above; rebuild and stage matching binaries if the option is missing or the text is stale, confirm the plugin's hooks are enabled, and start a new session. |

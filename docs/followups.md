@@ -4,8 +4,8 @@ The reported failures and navigation gaps are addressed in the current source.
 The changes preserve original-snapshot resolution, literal bytes, immutable
 receipts, and explicit recovery decisions. This page records the outcome for
 each item in the approximately 25-experiment report; it does not claim that an
-older copied plugin installation has been updated. Rebuild and stage matching
-executables before updating an installation.
+older installation has been updated. Marketplace users must refresh the catalog
+and plugin; copied source builds must rebuild and stage matching executables.
 
 ## Reported issues
 

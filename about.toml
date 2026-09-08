@@ -1,0 +1,16 @@
+# Regenerate with cargo-about 0.9.2:
+# cargo about generate --locked --fail third-party-licenses.hbs -o THIRD_PARTY_LICENSES.txt
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+]
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+ignore-dev-dependencies = true
+private = { ignore = true }

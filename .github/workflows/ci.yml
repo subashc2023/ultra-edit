@@ -1,0 +1,151 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: 1.89.0
+  RUST_SOURCE_COMMIT: 29483883eed69d5fb4db01964cdf2af4d86e9cb2
+  RUST_LLVM_COMMIT: 9b1bf4cf041c1c1fe62cf03891ac90431615e780
+
+jobs:
+  quality:
+    name: Format, lint, and package checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_VERSION" \
+            --profile minimal \
+            --component rustfmt \
+            --component clippy
+
+      - name: Check formatting
+        run: cargo +${{ env.RUST_VERSION }} fmt --all -- --check
+
+      - name: Lint
+        run: cargo +${{ env.RUST_VERSION }} clippy --locked --all-targets -- -D warnings
+
+      - name: Check
+        run: cargo +${{ env.RUST_VERSION }} check --locked --all-targets
+
+      - name: Check Rust standard library licenses
+        shell: bash
+        run: |
+          set -euo pipefail
+          rust_sysroot="$(rustc +"$RUST_VERSION" --print sysroot)"
+          cmp \
+            RUST_STANDARD_LIBRARY_LICENSES.html \
+            "$rust_sysroot/share/doc/rust/COPYRIGHT-library.html"
+
+      - name: Check musl license notice
+        shell: bash
+        run: |
+          printf '%s  %s\n' \
+            'f9bc4423732350eb0b3f7ed7e91d530298476f8fec0c6c427a1c04ade22655af' \
+            MUSL_COPYRIGHT \
+            | sha256sum --check --strict
+
+      - name: Check LLVM libunwind license notice
+        shell: bash
+        run: |
+          printf '%s  %s\n' \
+            'b5efebcaca80879234098e52d1725e6d9eb8fb96a19fce625d39184b705f7b6d' \
+            LLVM_LIBUNWIND_LICENSE.txt \
+            | sha256sum --check --strict
+
+      - name: Check Rust compiler runtime license notices
+        shell: bash
+        run: |
+          set -euo pipefail
+          check_notice() {
+            local file="$1"
+            local expected_sha256="$2"
+            local source_url="$3"
+            local upstream="$RUNNER_TEMP/$file.upstream"
+            printf '%s  %s\n' "$expected_sha256" "$file" \
+              | sha256sum --check --strict
+            curl --fail --silent --show-error --location \
+              "$source_url" --output "$upstream"
+            cmp "$file" "$upstream"
+          }
+          check_notice \
+            RUST_COMPILER_BUILTINS_LICENSE.txt \
+            ab6eec6caf0fa5775e411c7a8bc6a45c4ef2956b0980b157ab74fc5cd62a928b \
+            "https://raw.githubusercontent.com/rust-lang/rust/$RUST_SOURCE_COMMIT/library/compiler-builtins/LICENSE.txt"
+          check_notice \
+            RUST_LIBM_LICENSE.txt \
+            3823dda7cf046602f4b4e77ec8e227863dc4736037cc85bb33d9f19febe16bb7 \
+            "https://raw.githubusercontent.com/rust-lang/rust/$RUST_SOURCE_COMMIT/library/compiler-builtins/libm/LICENSE.txt"
+          check_notice \
+            LLVM_COMPILER_RT_LICENSE.txt \
+            1a8f1058753f1ba890de984e48f0242a3a5c29a6a8f2ed9fd813f36985387e8d \
+            "https://raw.githubusercontent.com/rust-lang/llvm-project/$RUST_LLVM_COMMIT/compiler-rt/LICENSE.TXT"
+
+      - name: Test release packaging
+        run: python -m unittest discover -s scripts/tests -v
+
+      - name: Check Cargo dependency licenses
+        shell: bash
+        run: |
+          set -euo pipefail
+          about_root="$RUNNER_TEMP/cargo-about"
+          about="$about_root/bin/cargo-about"
+          cargo +${{ env.RUST_VERSION }} install cargo-about \
+            --version '=0.9.2' \
+            --locked \
+            --features cli \
+            --root "$about_root"
+          [[ "$("$about" --version)" == "cargo-about 0.9.2" ]]
+          generated="$(mktemp)"
+          "$about" generate \
+            --locked \
+            --fail \
+            third-party-licenses.hbs \
+            --output-file "$generated"
+          cmp THIRD_PARTY_LICENSES.txt "$generated"
+
+  test:
+    name: Test on ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-24.04
+          - windows-2025
+          - macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal
+
+      - name: Test all targets
+        run: cargo +${{ env.RUST_VERSION }} test --locked --all-targets
+
+      - name: Test documentation
+        run: cargo +${{ env.RUST_VERSION }} test --locked --doc

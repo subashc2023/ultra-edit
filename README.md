@@ -1,23 +1,59 @@
 # ULTRA Edit
 
-**A Claude Code plugin that gives Claude a better tool for coordinated file
-edits, powered by Rust.**
+**A Rust-powered Claude Code plugin for coordinated, verifiable edits across
+multiple existing UTF-8 files.**
 
-Install it once and its editing instructions load automatically into Claude's
-working context: at session start, on resume, after compaction, and for subagents.
-They tell Claude to use Ultra Edit for changes across multiple existing UTF-8 files
-and **stop writing file contents through Bash heredocs or inline editing
-scripts**. No slash command or repeated reminder is needed.
+Install it once and its guidance loads automatically for sessions, resumes,
+compaction, and subagents. Claude sends focused changes directly to the local
+engine for matching, byte preservation, validation, and durable receipts.
 
-Built for models that reach for Bash to edit, Ultra Edit aims to cut the token
-waste of generated scripts, whole-file rewrites, and escape-repair attempts.
-That waste gets expensive on premium models. Claude sends focused changes
-directly to the tool; the local Rust engine does the heavy lifting: matching,
-validation, byte-preserving output, and durable writes.
+## Quickstart
 
-[Install for Claude Code](#claude-code) ·
-[Compare editing workflows](#why-use-it) ·
-[Performance](#rust-engine-and-performance)
+**Requires:** [Claude Code](https://code.claude.com/docs/en/terminal-guide)
+2.1.224 or newer, installed and signed in. The release package includes the
+native executables; Git, Rust, a source checkout, and a `PATH` change are not
+needed.
+
+### 1. Add the marketplace
+
+```text
+claude plugin marketplace add https://github.com/subashc2023/ultra-edit/releases/latest/download/marketplace.json
+```
+
+### 2. Install Ultra Edit
+
+```text
+claude plugin install ultra-edit@ultra-edit
+```
+
+The release catalog pins the exact multi-platform plugin archive by SHA-256.
+Claude Code installs it in its versioned plugin cache with the MCP server,
+automatic context hooks, skill, licenses, and native executables together.
+
+### 3. Start Claude Code
+
+Change to the separate project you want Claude to edit and start a **new**
+session:
+
+```text
+claude
+```
+
+Claude discovers the plugin as `ultra-edit@ultra-edit`. Inside Claude Code,
+run `/mcp` and confirm that the `ultra-edit` server is connected. Then make an
+ordinary request that changes two existing UTF-8 files—for example, update a
+setting in a source file and its README documentation.
+
+To update later:
+
+```text
+claude plugin marketplace update ultra-edit
+claude plugin update ultra-edit@ultra-edit
+```
+
+Restart Claude Code or run `/reload-plugins` after an update. See the
+[detailed Claude Code setup](plugin/claude-code/skills/edit/references/claude-code.md#install-from-a-release)
+for source builds, session-only loading, and troubleshooting.
 
 ## Why use it?
 
@@ -115,38 +151,14 @@ before styling.
 
 ## Claude Code
 
-Build the plugin's private executables from this source directory:
+The [Quickstart](#quickstart) installs a user-scoped plugin for all projects.
+Each release keeps `.claude-plugin`, `.mcp.json`, `runtime`, `hooks`, `skills`,
+licenses, and both executables in one versioned archive. The release workflow
+validates the packaged plugin with Claude Code 2.1.263 before publishing it.
 
-```text
-cargo build --locked --release
-```
-
-Create `plugin/claude-code/runtime` and copy both `ultra-edit` and `ultra-edit-mcp`
-from `target/release` into it, using the `.exe` filenames on Windows. These
-executables stay inside the plugin; no global command or `PATH` change is needed.
-A prepared archive for the user's OS and architecture would include them and
-require no Rust installation. Public release archives are not available yet.
-
-For persistent use, copy the **entire prepared** `plugin/claude-code` directory to
-`~/.claude/skills/ultra-edit` (`%USERPROFILE%\.claude\skills\ultra-edit` on Windows).
-If `CLAUDE_CONFIG_DIR` is set, use its `skills/ultra-edit` directory instead.
-Retain `.claude-plugin`, `.mcp.json`, `runtime`, `hooks`, `skills`, and the other
-bundled files.
-The [host setup guide](plugin/claude-code/skills/edit/references/claude-code.md#connect-locally)
-has copy commands for Windows and macOS/Linux.
-
-Then launch normally from **the workspace you want to edit**:
-
-```text
-claude
-```
-
-Claude Code discovers this as `ultra-edit@skills-dir` on startup, across projects.
-The bundled personal installation was tested with Claude Code 2.1.263, with no
-Ultra Edit executable on `PATH`. No marketplace is required; see the official
-[skills-directory plugin documentation](https://code.claude.com/docs/en/plugins-reference#skills-directory-plugins).
-
-For a session-only test without copying the plugin:
+For a session-only source test, first follow the
+[source-build staging instructions](plugin/claude-code/skills/edit/references/claude-code.md#connect-a-source-build).
+Then, from the project Claude should edit, load that prepared directory:
 
 ```text
 claude --plugin-dir /absolute/path/to/ultra-edit/plugin/claude-code
@@ -186,9 +198,10 @@ Inspect the hook's exact context without starting a server or opening a workspac
 On Windows, use the installed `runtime/ultra-edit-mcp.exe` path with PowerShell's
 `&` operator; the [host setup guide](plugin/claude-code/skills/edit/references/claude-code.md#automatic-routing-context)
 has an example. The executable embeds these instructions at build time. Copied
-plugins require manual updates: rebuild, stage the matching executables, update
-the complete plugin copy, then start a new Claude session. `--plugin-dir` loads
-the prepared plugin only for that session.
+source plugins require manual updates: rebuild, stage the matching executables,
+update the complete plugin copy, then start a new Claude session. Marketplace
+installs use the update commands in [Quickstart](#quickstart). `--plugin-dir`
+loads the prepared plugin only for that session.
 
 The normal flow is a focused `ultra_edit_snapshot`, a batch `ultra_edit`, and
 outcome inspection; `ultra_edit_status` retrieves receipts and explicit evidence.
@@ -576,12 +589,27 @@ arbitrary external writers. Conditional base checks still apply to every later e
 
 ## Development
 
+Source work requires [Git](https://git-scm.com/downloads) and
+[Rust/Cargo 1.89 or newer](https://rust-lang.org/tools/install/). Keep the
+checkout separate from the project Claude will edit:
+
+```text
+git clone https://github.com/subashc2023/ultra-edit.git ~/src/ultra-edit
+cd ~/src/ultra-edit
+```
+
+To contribute through a fork, use `gh repo fork subashc2023/ultra-edit --clone`
+instead; GitHub CLI configures your fork as `origin` and this repository as
+`upstream`. The [source-build guide](plugin/claude-code/skills/edit/references/claude-code.md#connect-a-source-build)
+has complete Windows and Unix staging, persistent-copy, and session-only commands.
+
 ```text
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo check --locked --all-targets
 cargo test --locked --all-targets
 cargo test --locked --doc
+python -m unittest discover -s scripts/tests -v
 ```
 
 Tests cover byte preservation, original-snapshot matching, overlapping ambiguity,
@@ -631,3 +659,17 @@ Workspace-wide search and arbitrary byte-range reads remain deferred until a
 concrete workflow needs them. Single-file search now pages through all matches.
 See [experiment follow-ups](docs/followups.md) for the report's resolved issues,
 current limitations, and deferred extensions.
+
+The tag-driven release process and its local gates are documented in
+[Releasing](docs/releasing.md).
+
+## License
+
+Ultra Edit is available under the [MIT License](LICENSE-MIT) or the
+[Apache License 2.0](LICENSE-APACHE), at your option. Distributed binaries also
+include notices for [Cargo dependencies](THIRD_PARTY_LICENSES.txt) and the
+[Rust standard library](RUST_STANDARD_LIBRARY_LICENSES.html),
+[Rust compiler-builtins](RUST_COMPILER_BUILTINS_LICENSE.txt), and its bundled
+[libm code](RUST_LIBM_LICENSE.txt), plus the [musl C library](MUSL_COPYRIGHT),
+[LLVM libunwind](LLVM_LIBUNWIND_LICENSE.txt), and
+[LLVM compiler-rt](LLVM_COMPILER_RT_LICENSE.txt) licenses.

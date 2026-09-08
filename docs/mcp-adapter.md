@@ -12,14 +12,25 @@ conditional commit, retry identity, receipts, and recovery.
 ```
 
 The plugin owns its executables under `runtime/`; it requires no global CLI
-installation or `PATH` change. On Windows use `runtime/ultra-edit-mcp.exe` and
-PowerShell's `&` operator. To prepare the plugin from source, run
-`cargo build --locked --release`, then copy both native executables from
-`target/release` into `plugin/claude-code/runtime`. The
-[host setup guide](../plugin/claude-code/skills/edit/references/claude-code.md#connect-locally)
-has complete platform-specific commands. A prepared OS/architecture-specific
-archive would contain the binaries and need no Rust; public archives are not
-available yet.
+installation or `PATH` change. Claude Code 2.1.224 or newer can install the
+complete multi-platform release through its native marketplace flow:
+
+```text
+claude plugin marketplace add https://github.com/subashc2023/ultra-edit/releases/latest/download/marketplace.json
+claude plugin install ultra-edit@ultra-edit
+```
+
+The catalog pins a versioned archive by SHA-256. Windows x64 executables live at
+the runtime root; POSIX launchers choose Linux x64/ARM64 or macOS Intel/Apple
+Silicon binaries below `runtime/targets`. Thin target-specific release archives
+keep their native pair directly under `runtime/`.
+
+On Windows use `runtime/ultra-edit-mcp.exe` and PowerShell's `&` operator. To
+prepare an unreleased plugin from source, run `cargo build --locked --release`,
+then copy both native executables from `target/release` into
+`plugin/claude-code/runtime`. The
+[host setup guide](../plugin/claude-code/skills/edit/references/claude-code.md#connect-a-source-build)
+has complete platform-specific commands.
 
 Server mode requires a root at startup, canonicalized once and absent from tool
 input schemas. All cooperating processes must use that same canonical root. The
@@ -32,14 +43,16 @@ the same write. Oversized frames, invalid UTF-8 framing, and stream I/O failures
 close the transport with a stderr diagnostic and nonzero exit. Connection loss
 does not imply rollback.
 
-For persistent Claude Code use, copy all of the prepared
+Marketplace installation copies the archive into Claude Code's versioned plugin
+cache and identifies it as `ultra-edit@ultra-edit`. Launch `claude` normally from
+the target workspace. For a persistent source build, copy all of the prepared
 [plugin/claude-code](../plugin/claude-code/.claude-plugin/plugin.json) into
 `~/.claude/skills/ultra-edit`, or `CLAUDE_CONFIG_DIR/skills/ultra-edit` when using
-a custom configuration directory. Launch `claude` normally from the target
-workspace. Claude Code discovers this as `ultra-edit@skills-dir`; it requires no
-marketplace. See the official
+a custom configuration directory; Claude Code identifies that copy as
+`ultra-edit@skills-dir`. See the official
 [skills-directory plugin documentation](https://code.claude.com/docs/en/plugins-reference#skills-directory-plugins).
-For a session-only test, use `claude --plugin-dir ABSOLUTE_PLUGIN_DIRECTORY`.
+For a session-only source test, use
+`claude --plugin-dir ABSOLUTE_PLUGIN_DIRECTORY`.
 The packaged `.mcp.json` runs `${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp` with
 the argument array `["--root", "${CLAUDE_PROJECT_DIR}"]`. The native launcher
 resolves `.exe` on Windows. Hook entries point to the same executable with an
@@ -48,8 +61,10 @@ keeps the binaries private; a plugin `bin/` directory would be added to Claude's
 Bash session `PATH`. Plugin-root and project-root substitution are supported by
 [Claude Code's MCP documentation](https://code.claude.com/docs/en/mcp).
 See [host setup and permissions](../plugin/claude-code/skills/edit/references/claude-code.md).
-The copied personal plugin applies across projects; `--plugin-dir` applies only
-to its session. This repository does not yet include public release downloads.
+Marketplace and copied personal plugins apply across projects; `--plugin-dir`
+applies only to its session. Refresh marketplace installations with
+`claude plugin marketplace update ultra-edit` followed by
+`claude plugin update ultra-edit@ultra-edit`.
 
 The server root stays fixed after shell directory changes and when a subagent
 enters a separate worktree. From another working directory, pass the intended
@@ -184,10 +199,15 @@ files. See the official
 Validate packaging without installing the plugin:
 
 ```text
-claude plugin validate plugin/claude-code
+claude plugin validate plugin/claude-code --strict --json
+python -m unittest discover -s scripts/tests -v
 ```
 
-Run the repository's configured Rust gates from [the README](../README.md#development).
+The Python suite verifies deterministic target and multi-platform archives,
+launcher dispatch, required contents and permissions, version agreement,
+path safety, marketplace pinning, and checksums. Run the repository's configured
+Rust gates from [the README](../README.md#development). The complete tag and
+release procedure is in [Releasing](releasing.md).
 The adapter's process tests cover initialization and tool discovery,
 focused snapshot → edit → receipt, literal bytes, stale bases, retry after
 restart, buffered messages, malformed frames and tool arguments, and
