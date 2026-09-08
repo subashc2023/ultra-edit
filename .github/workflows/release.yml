@@ -196,6 +196,11 @@ jobs:
         shell: bash
         run: rustup toolchain install "$RUST_VERSION" --profile minimal --target "$TARGET"
 
+      - name: Install LLVM tools for Windows binary inspection
+        if: runner.os == 'Windows'
+        shell: bash
+        run: rustup component add llvm-tools-preview --toolchain "$RUST_VERSION"
+
       - name: Test
         shell: bash
         run: |
@@ -240,22 +245,13 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
-            throw "vswhere is required to locate dumpbin: $vswhere"
+          $hostLibDir = rustc "+$env:RUST_VERSION" --print target-libdir
+          if ($LASTEXITCODE -ne 0 -or -not $hostLibDir) {
+            throw "rustc could not locate the Rust $env:RUST_VERSION target library directory."
           }
-          $vswhereArguments = @(
-            '-latest'
-            '-products'
-            '*'
-            '-requires'
-            'Microsoft.VisualStudio.Component.VC.Tools.x86.x64'
-            '-find'
-            'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe'
-          )
-          $dumpbin = & $vswhere @vswhereArguments | Select-Object -First 1
-          if ($LASTEXITCODE -ne 0 -or -not $dumpbin -or -not (Test-Path -LiteralPath $dumpbin)) {
-            throw 'dumpbin is required to verify the Windows release binaries.'
+          $llvmReadobj = Join-Path (Split-Path -Parent $hostLibDir) 'bin\llvm-readobj.exe'
+          if (-not (Test-Path -LiteralPath $llvmReadobj -PathType Leaf)) {
+            throw "llvm-readobj is required to verify the Windows release binaries: $llvmReadobj"
           }
 
           foreach ($name in 'ultra-edit.exe', 'ultra-edit-mcp.exe') {
@@ -263,14 +259,28 @@ jobs:
             if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
               throw "Release binary is missing: $binary"
             }
-            $dependencies = & $dumpbin /dependents $binary 2>&1
+            $inspection = & $llvmReadobj --coff-imports $binary 2>&1
             if ($LASTEXITCODE -ne 0) {
-              throw "dumpbin could not inspect $binary"
+              throw "llvm-readobj could not inspect $binary"
             }
-            $dependencyText = $dependencies -join "`n"
-            Write-Host $dependencyText
-            if ($dependencyText -match '(?im)^\s*(?:vcruntime\S*|msvcp\S*|msvcr\S*|ucrtbase\S*|api-ms-win-crt-\S*)\.dll\s*$') {
-              throw "$binary imports a dynamically linked Microsoft C runtime."
+            $inspectionText = $inspection -join "`n"
+            Write-Host $inspectionText
+            if ($inspectionText -notmatch '(?m)^Format:\s+COFF-' -or
+                $inspectionText -notmatch '(?m)^(?:Import|DelayImport) \{$') {
+              throw "llvm-readobj returned unrecognized import output for $binary"
+            }
+            $imports = @(
+              [regex]::Matches($inspectionText, '(?im)^\s*Name:\s*(?<name>\S+\.dll)\s*$') |
+                ForEach-Object { $_.Groups['name'].Value }
+            )
+            if ($imports.Count -eq 0) {
+              throw "llvm-readobj found no imports for $binary"
+            }
+            $dynamicCrt = @($imports | Where-Object {
+              $_ -match '^(?i:vcruntime\S*|msvcp\S*|msvcr\S*|ucrtbase\S*|api-ms-win-crt-\S*)\.dll$'
+            })
+            if ($dynamicCrt.Count -ne 0) {
+              throw "$binary imports a dynamically linked Microsoft C runtime: $($dynamicCrt -join ', ')"
             }
           }
 
