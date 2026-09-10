@@ -54,6 +54,7 @@ jobs:
           fi
 
           python scripts/release.py verify-version --tag "$GITHUB_REF_NAME"
+          python scripts/release.py verify-catalog
 
       - name: Test release packaging
         run: python -m unittest discover -s scripts/tests -v
@@ -629,3 +630,62 @@ jobs:
                .name == $name and
                (.body | startswith($marker + "\n"))' \
               >/dev/null
+
+  catalog:
+    name: Point the committed catalog at the release
+    needs:
+      - aggregate
+      - publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Download the published assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.aggregate.outputs.release_artifact_id }}
+          path: ${{ runner.temp }}/dist
+
+      - name: Verify the published assets
+        shell: bash
+        run: (cd "$RUNNER_TEMP/dist" && sha256sum --check SHA256SUMS)
+
+      - name: Commit the catalog for this release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" HEAD; then
+            echo "The released commit is not contained in main." >&2
+            exit 1
+          fi
+
+          python scripts/release.py update-catalog \
+            --marketplace "$RUNNER_TEMP/dist/marketplace.json" \
+            --tag "$GITHUB_REF_NAME" \
+            --repository "$GITHUB_REPOSITORY"
+
+          changed="$(git diff --name-only)"
+          if [[ -z "$changed" ]]; then
+            echo "The catalog already installs $GITHUB_REF_NAME."
+            exit 0
+          fi
+          if [[ "$changed" != ".claude-plugin/marketplace.json" ]]; then
+            echo "Refusing to commit unrelated changes: $changed" >&2
+            exit 1
+          fi
+
+          git -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit --only .claude-plugin/marketplace.json \
+            --message "chore: point the plugin catalog at $GITHUB_REF_NAME"
+          git fetch --no-tags origin main
+          git rebase origin/main
+          git push origin HEAD:main

@@ -3,6 +3,16 @@
 All notable changes to Ultra Edit are documented here. Releases follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Install the marketplace from the repository with
+  `claude plugin marketplace add subashc2023/ultra-edit`. Claude Code clones any
+  `github.com` source it is given, so the previously documented release-asset URL
+  could not be added. Releases now commit the same SHA-256-pinned catalog to
+  `.claude-plugin/marketplace.json` on `main`.
+
 ## [0.1.0] - 2026-09-08
 
 ### Added

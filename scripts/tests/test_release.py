@@ -445,6 +445,118 @@ class ReleasePackagingTests(unittest.TestCase):
             digest, name = line.split("  ", 1)
             self.assertEqual(digest, hashlib.sha256((assets / name).read_bytes()).hexdigest())
 
+    def _catalog(self, version: str, repository: str = "owner/repository") -> Path:
+        assets, archive_path = self._all_archives()
+        marketplace_path = assets / "marketplace.json"
+        release.write_metadata(
+            archive_path,
+            f"v{version}",
+            repository,
+            marketplace_path,
+            assets / "SHA256SUMS",
+            assets,
+            repo_root=self.root,
+        )
+        catalog, _ = release.update_catalog(
+            marketplace_path, f"v{version}", repository, repo_root=self.root
+        )
+        return catalog
+
+    def test_update_catalog_mirrors_the_generated_release_metadata(self) -> None:
+        assets, archive_path = self._all_archives()
+        marketplace_path = assets / "marketplace.json"
+        release.write_metadata(
+            archive_path,
+            "v1.2.3",
+            "owner/repository",
+            marketplace_path,
+            assets / "SHA256SUMS",
+            assets,
+            repo_root=self.root,
+        )
+
+        catalog, changed = release.update_catalog(
+            marketplace_path, "v1.2.3", "owner/repository", repo_root=self.root
+        )
+        self.assertTrue(changed)
+        self.assertEqual(catalog, self.root / release.CATALOG_PATH)
+        self.assertEqual(catalog.read_bytes(), marketplace_path.read_bytes())
+        self.assertEqual(release.verify_catalog("owner/repository", self.root), "1.2.3")
+
+        _, changed_again = release.update_catalog(
+            marketplace_path, "v1.2.3", "owner/repository", repo_root=self.root
+        )
+        self.assertFalse(changed_again)
+
+    def test_update_catalog_refuses_a_tag_that_the_metadata_does_not_install(self) -> None:
+        catalog = self._catalog("1.2.3")
+        before = catalog.read_bytes()
+        marketplace_path = self.root / "assets/marketplace.json"
+
+        with self.assertRaisesRegex(release.ReleaseError, "does not match tag"):
+            release.update_catalog(
+                marketplace_path, "v1.2.4", "owner/repository", repo_root=self.root
+            )
+        self.assertEqual(catalog.read_bytes(), before)
+
+    def test_update_catalog_refuses_to_move_the_catalog_backwards(self) -> None:
+        catalog = self._catalog("1.2.3")
+        published = json.loads(catalog.read_text(encoding="utf-8"))
+        older = json.loads(json.dumps(published))
+        older["plugins"][0]["source"]["url"] = (
+            "https://github.com/owner/repository/releases/download/"
+            "v1.2.2/ultra-edit-plugin-v1.2.2-all.zip"
+        )
+        older_path = self.root / "assets/older-marketplace.json"
+        older_path.write_text(json.dumps(older, indent=2) + "\n", encoding="utf-8")
+        before = catalog.read_bytes()
+
+        with self.assertRaisesRegex(release.ReleaseError, "refusing to move it back"):
+            release.update_catalog(
+                older_path, "v1.2.2", "owner/repository", repo_root=self.root
+            )
+        self.assertEqual(catalog.read_bytes(), before)
+
+    def test_verify_catalog_rejects_unpinned_unreleased_and_reformatted_catalogs(self) -> None:
+        catalog = self._catalog("1.2.3")
+        published = json.loads(catalog.read_text(encoding="utf-8"))
+
+        unpinned = json.loads(json.dumps(published))
+        unpinned["plugins"][0]["source"]["sha256"] = "not-a-digest"
+        ahead = json.loads(json.dumps(published))
+        ahead["plugins"][0]["source"]["url"] = (
+            "https://github.com/owner/repository/releases/download/"
+            "v9.9.9/ultra-edit-plugin-v9.9.9-all.zip"
+        )
+        foreign = json.loads(json.dumps(published))
+        foreign["plugins"][0]["source"]["url"] = (
+            "https://github.com/attacker/repository/releases/download/"
+            "v1.2.3/ultra-edit-plugin-v1.2.3-all.zip"
+        )
+        extra = json.loads(json.dumps(published))
+        extra["plugins"].append(published["plugins"][0])
+
+        cases = (
+            (unpinned, "SHA-256 digest"),
+            (ahead, "unreleased"),
+            (foreign, "released all-target archive"),
+            (extra, "exactly one plugin"),
+        )
+        for document, message in cases:
+            with self.subTest(message=message):
+                catalog.write_text(
+                    json.dumps(document, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+                )
+                with self.assertRaisesRegex(release.ReleaseError, message):
+                    release.verify_catalog("owner/repository", self.root)
+
+        catalog.write_text(json.dumps(published), encoding="utf-8")
+        with self.assertRaisesRegex(release.ReleaseError, "generated catalog formatting"):
+            release.verify_catalog("owner/repository", self.root)
+
+    def test_repository_catalog_matches_the_committed_project(self) -> None:
+        self.assertRegex(release.verify_catalog(), rf"^{release.SEMVER_PATTERN}$")
+
     def test_metadata_rejects_every_output_path_collision_before_writing(self) -> None:
         collisions = ("archive-marketplace", "archive-checksums", "marketplace-checksums")
         for collision in collisions:

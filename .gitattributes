@@ -19,3 +19,6 @@ LLVM_COMPILER_RT_LICENSE.txt -text whitespace=-trailing-space
 
 # Keep the POSIX launcher in LF format on fresh Windows checkouts.
 packaging/launcher.sh text eol=lf
+
+# Keep the catalog byte-identical to the generated release asset it mirrors.
+.claude-plugin/marketplace.json text eol=lf

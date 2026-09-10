@@ -16,7 +16,7 @@ installation or `PATH` change. Claude Code 2.1.224 or newer can install the
 complete multi-platform release through its native marketplace flow:
 
 ```text
-claude plugin marketplace add https://github.com/subashc2023/ultra-edit/releases/latest/download/marketplace.json
+claude plugin marketplace add subashc2023/ultra-edit
 claude plugin install ultra-edit@ultra-edit
 ```
 

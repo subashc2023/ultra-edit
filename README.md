@@ -17,7 +17,7 @@ needed.
 ### 1. Add the marketplace
 
 ```text
-claude plugin marketplace add https://github.com/subashc2023/ultra-edit/releases/latest/download/marketplace.json
+claude plugin marketplace add subashc2023/ultra-edit
 ```
 
 ### 2. Install Ultra Edit
@@ -26,9 +26,10 @@ claude plugin marketplace add https://github.com/subashc2023/ultra-edit/releases
 claude plugin install ultra-edit@ultra-edit
 ```
 
-The release catalog pins the exact multi-platform plugin archive by SHA-256.
-Claude Code installs it in its versioned plugin cache with the MCP server,
-automatic context hooks, skill, licenses, and native executables together.
+The repository's catalog pins the latest release's multi-platform plugin archive
+by SHA-256. Claude Code downloads that archive and installs it in its versioned
+plugin cache with the MCP server, automatic context hooks, skill, licenses, and
+native executables together.
 
 ### 3. Start Claude Code
 

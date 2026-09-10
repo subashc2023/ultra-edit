@@ -1,11 +1,12 @@
 # Releasing Ultra Edit
 
 GitHub Actions builds and publishes releases from exact `vMAJOR.MINOR.PATCH`
-tags whose commits are reachable from `main`. The final job creates a draft bound
-to the exact tag and commit, uploads and verifies the complete asset set, and
-publishes it only after every gate passes. A rerun can resume that matching draft
-or verify the exact published release; it refuses to use any other existing
-release.
+tags whose commits are reachable from `main`. The publish job creates a draft
+bound to the exact tag and commit, uploads and verifies the complete asset set,
+and publishes it only after every gate passes. A rerun can resume that matching
+draft or verify the exact published release; it refuses to use any other existing
+release. A final `catalog` job then commits the published catalog to `main`, so
+`claude plugin marketplace add subashc2023/ultra-edit` installs the new version.
 
 ## Release contents
 
@@ -17,6 +18,14 @@ Each release contains:
 - `marketplace.json`, whose archive source uses the versioned all-target ZIP and
   its exact SHA-256 digest; and
 - `SHA256SUMS`, covering the catalog and every ZIP.
+
+`.claude-plugin/marketplace.json` on `main` is a byte-identical copy of the
+published `marketplace.json`, committed by the `catalog` job after the release
+goes out. Claude Code reads that committed file, not the release asset: it clones
+any `github.com` source it is given, so a release-asset URL cannot be added as a
+marketplace. Between a version bump and the release that follows it, the
+committed catalog still installs the previous version; `verify-catalog` allows
+that but rejects a catalog naming a version the project has not reached.
 
 Every plugin ZIP includes Ultra Edit's MIT and Apache-2.0 licenses, notices for
 Cargo dependencies in `THIRD_PARTY_LICENSES.txt`, and the Rust standard library
@@ -54,7 +63,10 @@ binaries. The downstream Linux jobs assemble the all-target archive, exercise
 its launchers, validate the plugin and generated marketplace with Claude Code,
 check every SHA-256 entry, and create GitHub build-provenance attestations. The
 downloaded Claude Code package runs in a separate read-only job; the attestation
-job consumes the immutable artifact in a fresh runner.
+job consumes the immutable artifact in a fresh runner. Only two jobs hold write
+permissions: `publish` creates the release, and `catalog` pushes a single-file
+catalog commit to `main` after verifying the downloaded assets and refusing any
+other tracked change.
 
 ## Prepare a release
 
@@ -83,6 +95,7 @@ job consumes the immutable artifact in a fresh runner.
 
    ```text
    python scripts/release.py verify-version --tag vX.Y.Z
+   python scripts/release.py verify-catalog
    python -m unittest discover -s scripts/tests -v
    cargo fmt --all -- --check
    cargo clippy --locked --all-targets -- -D warnings
@@ -127,12 +140,13 @@ sha256sum --check SHA256SUMS
 gh attestation verify ultra-edit-plugin-vX.Y.Z-all.zip --repo subashc2023/ultra-edit
 ```
 
-Confirm that the release is neither a draft nor a prerelease and that the stable
-catalog URL returns its `marketplace.json`. Test a clean user-scoped install and
-both executable versions:
+Confirm that the release is neither a draft nor a prerelease, and that the
+`catalog` job committed `.claude-plugin/marketplace.json` on `main` with the new
+version and digest. Pull that commit locally before further work. Test a clean
+user-scoped install and both executable versions:
 
 ```text
-claude plugin marketplace add https://github.com/subashc2023/ultra-edit/releases/latest/download/marketplace.json
+claude plugin marketplace add subashc2023/ultra-edit
 claude plugin install ultra-edit@ultra-edit
 ```
 

@@ -21,6 +21,8 @@ from urllib.parse import quote
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_PATH = Path("plugin/claude-code")
+CATALOG_PATH = Path(".claude-plugin/marketplace.json")
+CATALOG_REPOSITORY = "subashc2023/ultra-edit"
 LAUNCHER_PATH = Path("packaging/launcher.sh")
 FIXED_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 MAX_ARCHIVE_SIZE = 256 * 1024 * 1024
@@ -46,6 +48,10 @@ REQUIRED_REPO_DOCUMENTS = (
 SEMVER_PATTERN = r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
 TAG_RE = re.compile(rf"^v(?P<version>{SEMVER_PATTERN})$")
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+CATALOG_KEYS = frozenset({"name", "description", "owner", "plugins"})
+CATALOG_PLUGIN_KEYS = frozenset({"name", "source", "description", "author"})
+CATALOG_SOURCE_KEYS = frozenset({"source", "url", "sha256"})
 TEXT_SUFFIXES = frozenset({".json", ".md", ".txt", ".toml", ".yaml", ".yml", ".sh"})
 
 
@@ -124,6 +130,15 @@ def version_from_tag(tag: str) -> str:
     if match is None:
         raise ReleaseError(f"tag {tag!r} must have the form vMAJOR.MINOR.PATCH")
     return match.group("version")
+
+
+def _version_key(version: str) -> tuple[int, int, int]:
+    major, minor, patch = version.split(".")
+    return (int(major), int(minor), int(patch))
+
+
+def _all_archive_name(version: str) -> str:
+    return f"ultra-edit-plugin-v{version}-all.zip"
 
 
 def project_version(repo_root: Path | None = None) -> str:
@@ -685,6 +700,123 @@ def _marketplace_document(
     }
 
 
+def _canonical_catalog_bytes(document: Mapping[str, object]) -> bytes:
+    return (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def _catalog_url_pattern(repository: str) -> re.Pattern[str]:
+    prefix = re.escape(f"https://github.com/{repository}/releases/download/")
+    return re.compile(
+        rf"{prefix}v(?P<version>{SEMVER_PATTERN})/ultra-edit-plugin-v(?P=version)-all\.zip"
+    )
+
+
+def _validate_catalog(document: Mapping[str, object], repository: str, source: str) -> str:
+    """Validate a marketplace catalog and return the release version it installs."""
+    if REPOSITORY_RE.fullmatch(repository) is None:
+        raise ReleaseError("repository must have the form OWNER/REPO")
+
+    unknown = sorted(set(document) - CATALOG_KEYS)
+    if unknown:
+        raise ReleaseError(f"{source} has unsupported keys: {', '.join(unknown)}")
+    if document.get("name") != "ultra-edit":
+        raise ReleaseError(f"{source} must set name to 'ultra-edit'")
+    description = document.get("description")
+    if not isinstance(description, str) or not description.strip():
+        raise ReleaseError(f"{source} must contain a non-empty description")
+    owner = document.get("owner")
+    if not isinstance(owner, dict):
+        raise ReleaseError(f"{source} owner must be an object")
+    if not isinstance(owner.get("name"), str) or not owner["name"].strip():
+        raise ReleaseError(f"{source} owner.name must be a non-empty string")
+
+    plugins = document.get("plugins")
+    if not isinstance(plugins, list) or len(plugins) != 1:
+        raise ReleaseError(f"{source} must list exactly one plugin")
+    plugin = plugins[0]
+    if not isinstance(plugin, dict):
+        raise ReleaseError(f"{source} plugin entry must be an object")
+    unknown = sorted(set(plugin) - CATALOG_PLUGIN_KEYS)
+    if unknown:
+        raise ReleaseError(f"{source} plugin entry has unsupported keys: {', '.join(unknown)}")
+    if plugin.get("name") != "ultra-edit":
+        raise ReleaseError(f"{source} plugin entry must be named 'ultra-edit'")
+
+    archive_source = plugin.get("source")
+    if not isinstance(archive_source, dict):
+        raise ReleaseError(f"{source} plugin source must be an object")
+    unknown = sorted(set(archive_source) - CATALOG_SOURCE_KEYS)
+    if unknown:
+        raise ReleaseError(f"{source} plugin source has unsupported keys: {', '.join(unknown)}")
+    if archive_source.get("source") != "archive":
+        raise ReleaseError(f"{source} plugin source must be an archive source")
+    digest = archive_source.get("sha256")
+    if not isinstance(digest, str) or SHA256_RE.fullmatch(digest) is None:
+        raise ReleaseError(f"{source} plugin source must pin a lowercase SHA-256 digest")
+    url = archive_source.get("url")
+    if not isinstance(url, str):
+        raise ReleaseError(f"{source} plugin source must name an archive URL")
+    match = _catalog_url_pattern(repository).fullmatch(url)
+    if match is None:
+        raise ReleaseError(
+            f"{source} plugin source must install a released all-target archive from {repository}"
+        )
+    return match.group("version")
+
+
+def verify_catalog(repository: str = CATALOG_REPOSITORY, repo_root: Path | None = None) -> str:
+    """Verify the committed catalog that `claude plugin marketplace add OWNER/REPO` reads."""
+    root = _root(repo_root)
+    catalog = root / CATALOG_PATH
+    if not catalog.is_file():
+        raise ReleaseError(f"marketplace catalog does not exist: {catalog}")
+    data = _source_file_bytes(catalog)
+    document = _read_json_bytes(data, str(catalog))
+    if data != _canonical_catalog_bytes(document):
+        raise ReleaseError(f"{catalog} must match the generated catalog formatting exactly")
+    released = _validate_catalog(document, repository, str(catalog))
+    version = project_version(root)
+    if _version_key(released) > _version_key(version):
+        raise ReleaseError(
+            f"marketplace catalog installs unreleased v{released}; project version is {version}"
+        )
+    return released
+
+
+def update_catalog(
+    marketplace: Path,
+    tag: str,
+    repository: str,
+    repo_root: Path | None = None,
+) -> tuple[Path, bool]:
+    """Point the committed catalog at the release the generated marketplace file describes."""
+    root = _root(repo_root)
+    version = version_from_tag(tag)
+    marketplace = Path(marketplace)
+    document = _read_json_file(marketplace)
+    published = _validate_catalog(document, repository, str(marketplace))
+    if published != version:
+        raise ReleaseError(f"{marketplace} installs v{published}, which does not match tag {tag}")
+
+    catalog = root / CATALOG_PATH
+    data = _canonical_catalog_bytes(document)
+    changed = True
+    if catalog.is_file():
+        current_bytes = _source_file_bytes(catalog)
+        current = _validate_catalog(
+            _read_json_bytes(current_bytes, str(catalog)), repository, str(catalog)
+        )
+        if _version_key(current) > _version_key(version):
+            raise ReleaseError(
+                f"marketplace catalog installs v{current}; refusing to move it back to {tag}"
+            )
+        changed = current_bytes != data
+    if changed:
+        _atomic_write(catalog, data)
+    verify_catalog(repository, root)
+    return catalog, changed
+
+
 def write_metadata(
     archive: Path,
     tag: str,
@@ -712,7 +844,7 @@ def write_metadata(
     if len(metadata_paths) != 3:
         raise ReleaseError("archive, marketplace output, and checksums output must be distinct")
 
-    expected_name = f"ultra-edit-plugin-v{version}-all.zip"
+    expected_name = _all_archive_name(version)
     if archive.name != expected_name:
         raise ReleaseError(f"all-target archive must be named {expected_name}")
     archive_version = verify_archive(archive, all_targets=True, repo_root=root)
@@ -731,8 +863,8 @@ def write_metadata(
 
     digest = _sha256(archive)
     marketplace = _marketplace_document(archive, tag, repository, digest, root)
-    marketplace_bytes = (json.dumps(marketplace, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
-    _atomic_write(marketplace_output, marketplace_bytes)
+    _validate_catalog(marketplace, repository, str(marketplace_output))
+    _atomic_write(marketplace_output, _canonical_catalog_bytes(marketplace))
 
     assets = []
     for path in asset_dir.iterdir():
@@ -780,6 +912,18 @@ def _parser() -> argparse.ArgumentParser:
     metadata_parser.add_argument("--checksums-output", required=True, type=Path)
     metadata_parser.add_argument("--asset-dir", required=True, type=Path)
 
+    verify_catalog_parser = commands.add_parser(
+        "verify-catalog", help="verify the committed marketplace catalog"
+    )
+    verify_catalog_parser.add_argument("--repository", default=CATALOG_REPOSITORY)
+
+    update_catalog_parser = commands.add_parser(
+        "update-catalog", help="point the committed marketplace catalog at a published release"
+    )
+    update_catalog_parser.add_argument("--marketplace", required=True, type=Path)
+    update_catalog_parser.add_argument("--tag", required=True)
+    update_catalog_parser.add_argument("--repository", required=True)
+
     archive_parser = commands.add_parser("verify-archive", help="validate a packaged plugin ZIP")
     archive_parser.add_argument("--archive", required=True, type=Path)
     kind = archive_parser.add_mutually_exclusive_group()
@@ -809,6 +953,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(marketplace)
             print(checksums)
+        elif args.command == "verify-catalog":
+            print(verify_catalog(args.repository))
+        elif args.command == "update-catalog":
+            catalog, changed = update_catalog(args.marketplace, args.tag, args.repository)
+            print(catalog)
+            print("changed" if changed else "unchanged")
         elif args.command == "verify-archive":
             verify_archive(
                 args.archive,

@@ -6,7 +6,7 @@ Claude Code 2.1.224 or newer can install the complete, SHA-256-pinned release
 archive without Git, Rust, or a source checkout:
 
 ```text
-claude plugin marketplace add https://github.com/subashc2023/ultra-edit/releases/latest/download/marketplace.json
+claude plugin marketplace add subashc2023/ultra-edit
 claude plugin install ultra-edit@ultra-edit
 ```
 
@@ -28,9 +28,9 @@ claude plugin marketplace update ultra-edit
 claude plugin update ultra-edit@ultra-edit
 ```
 
-Restart Claude Code or run `/reload-plugins` after updating. The catalog's stable
-URL selects the latest non-prerelease GitHub release, while each catalog entry
-names a versioned archive and pins its exact SHA-256 digest.
+Restart Claude Code or run `/reload-plugins` after updating. `marketplace update`
+pulls the repository's `.claude-plugin/marketplace.json`, which each release
+rewrites to name the new versioned archive and pin its exact SHA-256 digest.
 
 ## Connect a source build
 
