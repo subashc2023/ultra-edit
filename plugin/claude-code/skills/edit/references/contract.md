@@ -100,9 +100,14 @@ rolled back; retrieve its receipt or retry the identical operation under its ID.
   bytes per plan. A replace-all inserts its text once per resolved occurrence.
 - Each incoming MCP JSON-RPC line is limited to 16 MiB, including JSON escaping
   and protocol fields. Malformed JSON receives `-32700` and an invalid request
-  envelope receives `-32600`; subsequent messages still run. Exceeding the frame
-  limit or invalid UTF-8 framing closes the connection with nonzero exit; inspect the
-  original request's receipt before retrying after any lost response.
+  envelope receives `-32600`; subsequent messages still run. Before a successful
+  `initialize`, only `ping` is answered, any other request receives `-32002`, and
+  notifications are ignored. A `tools/call` that does not pass `{name,
+  arguments?}` with object arguments receives `-32602`, and a request reusing the
+  ID of one still awaiting a reply receives `-32600`. Exceeding the frame limit or
+  invalid UTF-8 framing closes the connection with nonzero exit, and end of input
+  closes it successfully; either way requests already accepted are answered first.
+  Inspect the original request's receipt before retrying after any lost response.
 - Ordinary reports default to 60 lines and 6,000 Unicode characters. Full
   evidence is an explicit opt-in and may be much larger.
 - Full snapshots default to 24,000 source bytes and 400 lines; an exact

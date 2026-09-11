@@ -1253,3 +1253,228 @@ fn cancelled_call_can_be_recovered_without_reapplying_the_edit() {
     );
     client.close();
 }
+
+impl Client {
+    /// Starts a server without handshaking so a test can drive raw protocol
+    /// traffic first.
+    fn raw(root: &Path) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ultra-edit-mcp"))
+            .arg("--root")
+            .arg(root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let input = child.stdin.take();
+        let stdout = child.stdout.take().unwrap();
+        let (sender, output) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let line = line.unwrap();
+                let value = serde_json::from_str(&line)
+                    .unwrap_or_else(|error| panic!("Non-protocol stdout: {error}: {line}"));
+                if sender.send(value).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            child,
+            input,
+            output,
+            next_id: 0,
+        }
+    }
+
+    fn write_raw(&mut self, bytes: &[u8]) {
+        let input = self.input.as_mut().unwrap();
+        input.write_all(bytes).unwrap();
+        input.flush().unwrap();
+    }
+
+    fn next_response(&mut self) -> Value {
+        self.output.recv_timeout(Duration::from_secs(15)).unwrap()
+    }
+
+    fn handshake(&mut self) {
+        let initialized = self.rpc(
+            "initialize",
+            json!({
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "ultra-edit-test", "version": "1"},
+            }),
+        );
+        assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+        self.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    }
+
+    fn tool_call(id: u64, name: &str, arguments: Value) -> Value {
+        json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
+            "name":name,"arguments":arguments
+        }})
+    }
+
+    fn snapshot_call(id: u64) -> Value {
+        Self::tool_call(
+            id,
+            "ultra_edit_snapshot",
+            json!({"path":"file.txt","selection":{"kind":"full"}}),
+        )
+    }
+}
+
+#[test]
+fn requests_before_initialization_are_refused_without_ending_the_session() {
+    let root = TempDir::new().unwrap();
+    let mut client = Client::raw(root.path());
+    client.send(json!({"jsonrpc":"2.0","id":10000,"method":"tools/list","params":{}}));
+    let refused = client.next_response();
+    assert_eq!(refused["id"], 10000, "{refused}");
+    assert_eq!(refused["error"]["code"], -32002, "{refused}");
+    assert_eq!(
+        refused["error"]["message"],
+        "Server not initialized; send initialize first"
+    );
+    client.handshake();
+    assert!(client.rpc("tools/list", json!({}))["result"]["tools"].is_array());
+    client.close();
+}
+
+#[test]
+fn notifications_before_initialization_are_ignored_and_ping_still_answers() {
+    let root = TempDir::new().unwrap();
+    let mut client = Client::raw(root.path());
+    client.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    client.send(
+        json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{
+            "requestId":10000,"reason":"Never sent"
+        }}),
+    );
+    client.send(json!({"jsonrpc":"2.0","id":10001,"method":"ping"}));
+    // The first response proves the notifications drew neither a reply nor an exit.
+    let pong = client.next_response();
+    assert_eq!(pong["id"], 10001, "{pong}");
+    assert_eq!(pong["result"], json!({}), "{pong}");
+    client.handshake();
+    assert_eq!(client.rpc("ping", json!({}))["result"], json!({}));
+    client.close();
+}
+
+#[test]
+fn duplicate_in_flight_request_ids_are_refused_until_their_reply_is_written() {
+    let root = TempDir::new().unwrap();
+    fs::write(root.path().join("file.txt"), "x").unwrap();
+    let mut client = Client::start(root.path());
+    let storage = Storage::open(root.path()).unwrap();
+    let lock = storage.lock().unwrap();
+    let buffered = format!(
+        "{}\n{}\n",
+        Client::snapshot_call(500),
+        json!({"jsonrpc":"2.0","id":500,"method":"ping"})
+    );
+    client.write_raw(buffered.as_bytes());
+    // The snapshot holds ID 500 while it waits for the workspace lock, so the
+    // duplicate is refused instead of consuming the snapshot's reply.
+    let refused = client.next_response();
+    assert_eq!(refused["id"], 500, "{refused}");
+    assert_eq!(refused["error"]["code"], -32600, "{refused}");
+    assert_eq!(
+        refused["error"]["message"],
+        "Duplicate in-flight request id"
+    );
+    drop(lock);
+    let snapshot = client.next_response();
+    assert_eq!(snapshot["id"], 500, "{snapshot}");
+    assert!(
+        snapshot["result"]["structuredContent"]["snapshot"].is_string(),
+        "{snapshot}"
+    );
+    client.send(json!({"jsonrpc":"2.0","id":500,"method":"ping"}));
+    let reused = client.next_response();
+    assert_eq!(reused["id"], 500, "{reused}");
+    assert_eq!(reused["result"], json!({}), "{reused}");
+    client.close();
+}
+
+#[test]
+fn malformed_tool_call_envelopes_are_refused_as_invalid_params() {
+    let root = TempDir::new().unwrap();
+    let mut client = Client::start(root.path());
+    for (id, params) in [
+        (10000, Some(json!([]))),
+        (10001, Some(json!({"name": 5}))),
+        (10002, Some(json!({"name": "ultra_edit", "arguments": "x"}))),
+        (10003, None),
+    ] {
+        let mut request = json!({"jsonrpc":"2.0","id":id,"method":"tools/call"});
+        if let Some(params) = params {
+            request["params"] = params;
+        }
+        client.send(request);
+        let refused = client.next_response();
+        assert_eq!(refused["id"], id, "{refused}");
+        assert_eq!(refused["error"]["code"], -32602, "{refused}");
+        assert_eq!(
+            refused["error"]["message"],
+            "Invalid params: tools/call requires {name, arguments?} with object arguments"
+        );
+        assert_eq!(client.rpc("ping", json!({}))["result"], json!({}));
+    }
+    client.close();
+}
+
+#[test]
+fn a_fatal_frame_answers_an_accepted_request_before_exiting() {
+    let root = TempDir::new().unwrap();
+    fs::write(root.path().join("file.txt"), "x").unwrap();
+    let mut client = Client::start(root.path());
+    let storage = Storage::open(root.path()).unwrap();
+    let lock = storage.lock().unwrap();
+    let mut payload = Client::snapshot_call(10000).to_string().into_bytes();
+    payload.extend_from_slice(b"\n\xff\n");
+    client.write_raw(&payload);
+    // The fatal frame is read while the snapshot still waits for the workspace
+    // lock, so the exit has to wait for the reply rather than drop it.
+    assert!(matches!(
+        client.output.recv_timeout(Duration::from_millis(200)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    drop(lock);
+    let snapshot = client.next_response();
+    assert_eq!(snapshot["id"], 10000, "{snapshot}");
+    assert!(
+        snapshot["result"]["structuredContent"]["snapshot"].is_string(),
+        "{snapshot}"
+    );
+    assert!(matches!(
+        client.output.recv_timeout(Duration::from_secs(10)),
+        Err(mpsc::RecvTimeoutError::Disconnected)
+    ));
+    drop(client.input.take());
+    assert!(!client.child.wait().unwrap().success());
+}
+
+#[test]
+fn end_of_input_answers_an_accepted_request_before_exiting() {
+    let root = TempDir::new().unwrap();
+    fs::write(root.path().join("file.txt"), "x").unwrap();
+    let mut client = Client::start(root.path());
+    let storage = Storage::open(root.path()).unwrap();
+    let lock = storage.lock().unwrap();
+    client.send(Client::snapshot_call(10000));
+    drop(client.input.take());
+    assert!(matches!(
+        client.output.recv_timeout(Duration::from_millis(200)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    drop(lock);
+    let snapshot = client.next_response();
+    assert_eq!(snapshot["id"], 10000, "{snapshot}");
+    assert!(
+        snapshot["result"]["structuredContent"]["snapshot"].is_string(),
+        "{snapshot}"
+    );
+    client.close();
+}

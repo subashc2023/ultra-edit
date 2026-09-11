@@ -1,8 +1,9 @@
+use std::collections::HashSet;
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use futures::{
     SinkExt,
@@ -14,7 +15,7 @@ use rmcp::{
     service::{RxJsonRpcMessage, TxJsonRpcMessage},
     transport::Transport,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio_util::{
     codec::{FramedWrite, LinesCodec},
     sync::CancellationToken,
@@ -22,6 +23,8 @@ use tokio_util::{
 use ultra_edit::{Workspace, mcp::McpServer};
 
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+const INVALID_TOOL_CALL: &str =
+    "Invalid params: tools/call requires {name, arguments?} with object arguments";
 const CLAUDE_CONTEXT: &str = include_str!("../../plugin/claude-code/instructions.md");
 
 fn main() -> ExitCode {
@@ -98,9 +101,13 @@ async fn serve(workspace: Workspace) -> Result<(), Box<dyn std::error::Error>> {
     let transport = StdioTransport {
         input: stdin_messages()?,
         pending_error: None,
+        ended: None,
+        initialized: false,
         output: Arc::new(ProtocolOutput {
             writer: Mutex::new(FramedWrite::new(tokio::io::stdout(), LinesCodec::new())),
             failed: failed.clone(),
+            in_flight: std::sync::Mutex::new(HashSet::new()),
+            answered: Notify::new(),
         }),
     };
     McpServer::new(workspace)
@@ -117,6 +124,11 @@ async fn serve(workspace: Workspace) -> Result<(), Box<dyn std::error::Error>> {
 struct ProtocolOutput {
     writer: Mutex<FramedWrite<tokio::io::Stdout, LinesCodec>>,
     failed: CancellationToken,
+    // Request IDs the SDK still owes a reply for: a second request reusing one
+    // is refused instead of losing a reply, and input that ends while one is
+    // outstanding is answered instead of dropped.
+    in_flight: std::sync::Mutex<HashSet<serde_json::Value>>,
+    answered: Notify,
 }
 
 impl ProtocolOutput {
@@ -137,12 +149,175 @@ impl ProtocolOutput {
         }
         result
     }
+
+    /// Sends an SDK reply and frees the request ID it answers. Freeing it in the
+    /// same step as the write keeps the ID reusable as soon as a client can see
+    /// the reply, and holds a drain open until those bytes are out.
+    async fn reply(&self, message: TxJsonRpcMessage<RoleServer>) -> Result<(), io::Error> {
+        let answered = answered_id(&message);
+        let result = self.send(message).await;
+        if let Some(id) = answered {
+            self.release(&id);
+        }
+        result
+    }
+
+    /// Records a request ID as awaiting a reply; false means it already is.
+    fn accept(&self, id: &serde_json::Value) -> bool {
+        self.pending().insert(id.clone())
+    }
+
+    fn release(&self, id: &serde_json::Value) {
+        self.pending().remove(id);
+        self.answered.notify_one();
+    }
+
+    fn awaits_reply(&self) -> bool {
+        !self.pending().is_empty()
+    }
+
+    fn pending(&self) -> std::sync::MutexGuard<'_, HashSet<serde_json::Value>> {
+        // These IDs are bookkeeping: a poisoned set must not stop the transport
+        // from answering the requests it still holds.
+        self.in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The request ID a reply releases, if it carries one.
+fn answered_id(message: &TxJsonRpcMessage<RoleServer>) -> Option<serde_json::Value> {
+    match message {
+        rmcp::model::JsonRpcMessage::Response(response) => {
+            Some(response.id.clone().into_json_value())
+        }
+        rmcp::model::JsonRpcMessage::Error(error) => {
+            error.id.clone().map(|id| id.into_json_value())
+        }
+        _ => None,
+    }
+}
+
+/// Whether a `tools/call` request names a tool and, if it passes arguments at
+/// all, passes them as an object.
+fn tool_call_envelope_is_valid(value: &serde_json::Value) -> bool {
+    let Some(params) = value.get("params").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    params.get("name").is_some_and(serde_json::Value::is_string)
+        && params
+            .get("arguments")
+            .is_none_or(serde_json::Value::is_object)
+}
+
+/// Why stdin stopped producing messages. The SDK may drop a `receive` future
+/// mid-drain, and a closed channel cannot report its reason twice.
+enum InputEnd {
+    Closed,
+    Failed(io::Error),
+}
+
+/// The JSON-RPC error a rejected line is answered with.
+struct Rejection {
+    code: i32,
+    message: &'static str,
+    id: serde_json::Value,
 }
 
 struct StdioTransport {
     input: mpsc::Receiver<Result<String, io::Error>>,
     output: Arc<ProtocolOutput>,
     pending_error: Option<BoxFuture<'static, Result<(), io::Error>>>,
+    ended: Option<InputEnd>,
+    initialized: bool,
+}
+
+impl StdioTransport {
+    /// Decodes one line for the SDK. `Ok(None)` means the line has no reply to
+    /// send and is dropped; `Err` carries the error to answer it with.
+    fn accept(&mut self, line: &str) -> Result<Option<RxJsonRpcMessage<RoleServer>>, Rejection> {
+        let rejected = |code, message, id| Err(Rejection { code, message, id });
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(
+            line.strip_prefix('\u{feff}').unwrap_or(line),
+        ) else {
+            return rejected(-32700, "Parse error", serde_json::Value::Null);
+        };
+        let has_id = value.get("id").is_some();
+        let id = value
+            .get("id")
+            .filter(|id| id.is_string() || id.is_i64() || id.is_u64())
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        // Decoding consumes the value, so keep what the checks below need.
+        let method = value
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let envelope_is_valid = method != "tools/call" || tool_call_envelope_is_valid(&value);
+        let cancelled = (method == "notifications/cancelled")
+            .then(|| value.pointer("/params/requestId").cloned())
+            .flatten();
+        let message = match serde_json::from_value::<RxJsonRpcMessage<RoleServer>>(value) {
+            // The SDK's untagged decoder can reinterpret an invalid request ID
+            // as a custom notification. Never drop that request.
+            Ok(rmcp::model::JsonRpcMessage::Notification(_)) if has_id => {
+                return rejected(-32600, "Invalid Request", id);
+            }
+            Ok(message) => message,
+            // A malformed tools/call envelope may not decode at all. Report the
+            // envelope instead of a bare decode failure.
+            Err(_) if !envelope_is_valid && !id.is_null() => {
+                return rejected(-32602, INVALID_TOOL_CALL, id);
+            }
+            Err(_) => return rejected(-32600, "Invalid Request", id),
+        };
+        let is_request = matches!(message, rmcp::model::JsonRpcMessage::Request(_));
+        if !self.initialized {
+            // The SDK answers a pre-initialize ping, but treats every other
+            // pre-initialize message as a fatal handshake fault and exits.
+            match method.as_str() {
+                _ if !is_request => return Ok(None),
+                "initialize" => self.initialized = true,
+                "ping" => (),
+                _ => {
+                    return rejected(-32002, "Server not initialized; send initialize first", id);
+                }
+            }
+        }
+        if is_request && !envelope_is_valid {
+            // The SDK decodes a malformed tools/call as a custom request and
+            // answers it as an unknown method, which hides the real fault.
+            return rejected(-32602, INVALID_TOOL_CALL, id);
+        }
+        if let Some(id) = cancelled {
+            // The SDK drops a cancelled request's response, so stop waiting for
+            // a reply that will never be written.
+            self.output.release(&id);
+        }
+        if is_request && !self.output.accept(&id) {
+            return rejected(-32600, "Duplicate in-flight request id", id);
+        }
+        Ok(Some(message))
+    }
+
+    /// Waits for the replies the SDK still owes, then reports a fatal input
+    /// error. The SDK may drop this future at any await, so each wake rechecks.
+    async fn drain(&mut self) {
+        while !self.output.failed.is_cancelled() {
+            let answered = self.output.answered.notified();
+            if !self.output.awaits_reply() {
+                break;
+            }
+            answered.await;
+        }
+        // Cancelling `failed` is what makes the run exit unsuccessfully, but it
+        // also stops `send`, so it has to wait for the drain.
+        if let Some(InputEnd::Failed(error)) = self.ended.take() {
+            eprintln!("MCP input error: {error}");
+            self.output.failed.cancel();
+        }
+    }
 }
 
 impl Transport<RoleServer> for StdioTransport {
@@ -153,7 +328,7 @@ impl Transport<RoleServer> for StdioTransport {
         message: TxJsonRpcMessage<RoleServer>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
         let output = Arc::clone(&self.output);
-        async move { output.send(message).await }
+        async move { output.reply(message).await }
     }
 
     async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleServer>> {
@@ -166,52 +341,43 @@ impl Transport<RoleServer> for StdioTransport {
                 }
                 self.pending_error = None;
             }
+            if self.ended.is_some() {
+                self.drain().await;
+                return None;
+            }
             let line = match select(
                 Box::pin(self.output.failed.cancelled()),
                 Box::pin(self.input.recv()),
             )
             .await
             {
-                Either::Left(_) | Either::Right((None, _)) => return None,
+                // Broken output can no longer answer anything still pending.
+                Either::Left(_) => return None,
+                Either::Right((None, _)) => {
+                    self.ended = Some(InputEnd::Closed);
+                    continue;
+                }
                 Either::Right((Some(line), _)) => line,
             };
             let line = match line {
                 Ok(line) => line,
                 Err(error) => {
-                    eprintln!("MCP input error: {error}");
-                    self.output.failed.cancel();
-                    return None;
+                    self.ended = Some(InputEnd::Failed(error));
+                    continue;
                 }
             };
-            let value = serde_json::from_str::<serde_json::Value>(
-                line.strip_prefix('\u{feff}').unwrap_or(&line),
-            );
-            let (code, message, id) = match value {
-                Err(_) => (-32700, "Parse error", serde_json::Value::Null),
-                Ok(value) => {
-                    let has_id = value.get("id").is_some();
-                    let id = value
-                        .get("id")
-                        .filter(|id| id.is_string() || id.is_i64() || id.is_u64())
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null);
-                    match serde_json::from_value::<RxJsonRpcMessage<RoleServer>>(value) {
-                        // The SDK's untagged decoder can reinterpret an invalid
-                        // request ID as a custom notification. Never drop that request.
-                        Ok(rmcp::model::JsonRpcMessage::Notification(_)) if has_id => {
-                            (-32600, "Invalid Request", id)
-                        }
-                        Ok(message) => return Some(message),
-                        Err(_) => (-32600, "Invalid Request", id),
-                    }
+            match self.accept(&line) {
+                Ok(Some(message)) => return Some(message),
+                Ok(None) => (),
+                Err(Rejection { code, message, id }) => {
+                    let response = serde_json::json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "error": {"code": code, "message": message},
+                    });
+                    let output = Arc::clone(&self.output);
+                    self.pending_error = Some(Box::pin(async move { output.send(response).await }));
                 }
-            };
-            let response = serde_json::json!({
-                "jsonrpc": "2.0", "id": id,
-                "error": {"code": code, "message": message},
-            });
-            let output = Arc::clone(&self.output);
-            self.pending_error = Some(Box::pin(async move { output.send(response).await }));
+            }
         }
     }
 
