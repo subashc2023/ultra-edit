@@ -37,11 +37,18 @@ input schemas. All cooperating processes must use that same canonical root. The
 server uses JSON-RPC over stdio; stdout is reserved for protocol messages. A
 snapshot operation records state under `.ultra-edit` but changes no target file.
 Input JSON-RPC lines are limited to 16 MiB. Malformed JSON receives JSON-RPC
-`-32700` with `id: null`; invalid request envelopes receive `-32600`. Both leave
-the server reading subsequent messages, including messages already buffered in
-the same write. Oversized frames, invalid UTF-8 framing, and stream I/O failures
-close the transport with a stderr diagnostic and nonzero exit. Connection loss
-does not imply rollback.
+`-32700` with `id: null`; invalid request envelopes receive `-32600`. Before a
+successful `initialize`, `ping` is answered and every other request receives
+`-32002`, while notifications, including `notifications/initialized` and
+`notifications/cancelled`, are ignored because JSON-RPC has no reply for them. A
+`tools/call` whose `params` is not an object, whose `params.name` is not a
+string, or whose `arguments` are present and not an object, receives `-32602`; a
+request reusing the ID of one still awaiting a reply receives `-32600`. All of
+these leave the server reading subsequent messages, including messages already
+buffered in the same write. Oversized frames, invalid UTF-8 framing, and stream
+I/O failures close the transport with a stderr diagnostic and nonzero exit, and
+end of input closes it successfully; either way the server first answers the
+requests it had already accepted. Connection loss does not imply rollback.
 
 Marketplace installation copies the archive into Claude Code's versioned plugin
 cache and identifies it as `ultra-edit@ultra-edit`. Launch `claude` normally from
