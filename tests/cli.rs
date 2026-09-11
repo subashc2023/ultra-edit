@@ -254,6 +254,42 @@ fn malformed_focused_read_arguments_are_rejected_without_mutation() {
 }
 
 #[test]
+fn a_rejected_batch_identifies_the_file_that_failed() {
+    let root = TempDir::new().unwrap();
+    fs::write(root.path().join("one.txt"), "one\n").unwrap();
+    fs::write(root.path().join("two.txt"), "two\n").unwrap();
+    let (code, one) = run(root.path(), &["read-range", "one.txt", "1", "1"], None);
+    assert_eq!(code, 0, "{one}");
+    let (code, two) = run(root.path(), &["read-range", "two.txt", "1", "1"], None);
+    assert_eq!(code, 0, "{two}");
+    fs::write(root.path().join("two.txt"), "external change\n").unwrap();
+    let request = json!({"request_id":"stale-batch","files":[
+        {"base":one["snapshot"],"changes":[
+            {"id":"first","target":{"kind":"span","span":"selection"},"text":"ONE"}
+        ]},
+        {"base":two["snapshot"],"changes":[
+            {"id":"second","target":{"kind":"span","span":"selection"},"text":"TWO"}
+        ]}
+    ]});
+    let (code, rejected) = run(root.path(), &["edit"], Some(&request));
+    assert_eq!(code, 2, "{rejected}");
+    let stale = rejected["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "STALE_SNAPSHOT")
+        .unwrap_or_else(|| panic!("{rejected}"));
+    assert!(
+        stale["file"].as_str().unwrap().ends_with("two.txt"),
+        "{stale}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("one.txt")).unwrap(),
+        "one\n"
+    );
+}
+
+#[test]
 fn bounded_reads_pagination_and_pruning_flags_work_across_processes() {
     let root = TempDir::new().unwrap();
     fs::write(root.path().join("file.txt"), "x\n".repeat(500)).unwrap();

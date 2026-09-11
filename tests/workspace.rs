@@ -507,6 +507,51 @@ fn invalid_snapshot_references_are_not_misreported_as_file_paths() {
     };
     assert_eq!(draft.request.files[0].base, reference);
     assert_eq!(draft.diagnostics, rejected.diagnostics);
+
+    let two_unknown = workspace
+        .prepare(EditRequest {
+            request_id: "two-invalid-references".into(),
+            files: vec![
+                FileRequest {
+                    base: "sdoesnotexist000".into(),
+                    changes: vec![change("first", "one", "two")],
+                },
+                FileRequest {
+                    base: reference.into(),
+                    changes: vec![change("second", "one", "two")],
+                },
+            ],
+        })
+        .unwrap();
+    assert!(!two_unknown.ready);
+    assert_eq!(
+        two_unknown
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect::<Vec<_>>(),
+        ["INVALID_SNAPSHOT", "INVALID_SNAPSHOT"]
+    );
+}
+
+#[test]
+fn a_blank_request_id_is_rejected_before_anything_is_persisted() {
+    let (dir, workspace, snapshot) = setup("one");
+    let error = workspace
+        .prepare(request("   ", &snapshot, vec![change("c", "one", "two")]))
+        .unwrap_err();
+    assert_eq!(error.code, "INVALID_REQUEST_ID");
+    for kind in ["drafts", "requests"] {
+        let directory = dir.path().join(".ultra-edit").join(kind);
+        assert!(
+            !directory.exists() || fs::read_dir(&directory).unwrap().next().is_none(),
+            "{kind} retained state for a blank request ID"
+        );
+    }
+    assert_eq!(
+        workspace.receipt("   ").unwrap_err().code,
+        "INVALID_REQUEST_ID"
+    );
 }
 
 #[test]

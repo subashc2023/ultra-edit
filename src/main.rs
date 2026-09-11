@@ -217,6 +217,7 @@ fn preparation(preparation: Preparation) -> (Value, u8) {
         // Full strings/counts remain in the draft; inline diagnostics cannot grow with source size.
         json!({
             "code": diagnostic.code.chars().take(80).collect::<String>(),
+            "file": diagnostic.file.as_ref().map(|path| path.chars().take(500).collect::<String>()),
             "change_id": diagnostic.change_id.as_ref().map(|id| id.chars().take(80).collect::<String>()),
             "message": diagnostic.message.chars().take(240).collect::<String>(),
             "expected": diagnostic.expected,

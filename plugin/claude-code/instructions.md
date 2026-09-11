@@ -41,9 +41,13 @@ ID before another mutation. Require `commit: "committed"` to report completion;
 stop and inspect partial or unknown outcomes. Run project validation separately.
 
 Prefer range/search snapshots. All snapshot responses return `snapshot`; full
-reads default to 24,000 bytes and 400 lines. Use `next_offset` and the returned
-snapshot for stable search pagination. `scope` means a disclosed span ID, never
-literal text. Replace-all counts non-overlapping matches from left to right.
+reads default to 24,000 bytes and 400 lines. Range and full reads summarize
+disclosed IDs in `spans` and list each line in `lines` as `"r12 | body"`; choose
+`r{n}` there instead of counting newlines. Use `next_offset` and the returned
+snapshot for stable search pagination; a continued page keeps the references
+already disclosed, so the last page's snapshot can edit every match paged through
+it, and `stale: true` means that source must be read again instead of edited.
+`scope` means a disclosed span ID, never literal text. Replace-all counts non-overlapping matches from left to right.
 For `TARGET_AMBIGUOUS`, `actual` counts overlapping starts; the message's
 parenthesized count is `expected` only for the same `old` and disclosed scope in
 a `{"kind":"all"}` target. Exact search text cannot be empty. For insertion,

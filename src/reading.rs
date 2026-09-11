@@ -27,11 +27,13 @@ pub(crate) fn read_full(
     } else if text.len() > MAX_FULL_BYTES
         || line_ranges(&text).take(MAX_FULL_LINES + 1).count() > MAX_FULL_LINES
     {
+        // Both measurements are reported so the rejected limit is never guessed.
         return Err(Error::new(
             "READ_TOO_LARGE",
             format!(
-                "Full reads support at most {MAX_FULL_BYTES} source bytes and {MAX_FULL_LINES} lines by default; this file has {} bytes. Read a line range or search for an exact span, or deliberately request the complete response with expected_bytes={}",
+                "Full reads support at most {MAX_FULL_BYTES} source bytes and {MAX_FULL_LINES} lines by default; this file has {} bytes and {} lines. Read a line range or search for an exact span, or deliberately request the complete response with expected_bytes={}",
                 text.len(),
+                line_ranges(&text).count(),
                 text.len()
             ),
         ));
@@ -81,9 +83,13 @@ pub(crate) fn read_range(
     let end = spans[spans.len() - 1].end;
     let selected = &text[start..end];
     if selected.chars().take(MAX_RANGE_CHARS + 1).count() > MAX_RANGE_CHARS {
+        // A plain full read may be over its own limits; the exact byte count is not.
         return Err(Error::new(
             "READ_TOO_LARGE",
-            "A focused read supports at most 6000 source characters; choose a smaller range, search for an exact span, or use a full read",
+            format!(
+                "A focused read supports at most {MAX_RANGE_CHARS} source characters; choose a smaller range, search for an exact span, or request the complete file with expected_bytes={}",
+                text.len()
+            ),
         ));
     }
     spans.push(Span {
@@ -108,16 +114,71 @@ pub(crate) fn read_range(
         start,
         end,
         text: snapshot.text[start..end].into(),
-        spans: snapshot.spans.clone(),
+        spans: span_summary(&snapshot.spans),
+        lines: line_listing(&snapshot.spans, &snapshot.text),
     };
     Ok((snapshot, view))
 }
 
+/// Summarizes disclosed span IDs, collapsing consecutive line IDs into
+/// `r12..r18`. Byte offsets stay server-side; full evidence still carries them.
+pub(crate) fn span_summary(spans: &[Span]) -> Vec<String> {
+    let mut summary = Vec::new();
+    let mut run: Option<(usize, usize)> = None;
+    for span in spans {
+        match (line_id(&span.id), run) {
+            (Some(line), Some((first, last))) if line == last + 1 => run = Some((first, line)),
+            (Some(line), _) => {
+                push_run(run, &mut summary);
+                run = Some((line, line));
+            }
+            (None, _) => {
+                push_run(run, &mut summary);
+                run = None;
+                summary.push(span.id.clone());
+            }
+        }
+    }
+    push_run(run, &mut summary);
+    summary
+}
+
+/// Lists every disclosed line body as `"{id} | {body}"` so a line can be chosen
+/// without counting newlines in the selected text. Whole-file `r0` is not a line.
+pub(crate) fn line_listing(spans: &[Span], text: &str) -> Vec<String> {
+    spans
+        .iter()
+        .filter(|span| line_id(&span.id).is_some())
+        .map(|span| format!("{} | {}", span.id, &text[span.start..span.end]))
+        .collect()
+}
+
+/// Line-body IDs are `r` and a one-based line number. `r0` covers the whole
+/// file, so it never joins a line range or the listing.
+fn line_id(id: &str) -> Option<usize> {
+    id.strip_prefix('r')
+        .and_then(|line| line.parse().ok())
+        .filter(|line| *line > 0)
+}
+
+fn push_run(run: Option<(usize, usize)>, summary: &mut Vec<String>) {
+    if let Some((first, last)) = run {
+        summary.push(if first == last {
+            format!("r{first}")
+        } else {
+            format!("r{first}..r{last}")
+        });
+    }
+}
+
+/// `retained` carries the references a continued snapshot already disclosed, so
+/// one request can address every match paged through the same immutable source.
 pub(crate) fn search(
     path: String,
     text: String,
     query: &str,
     offset: usize,
+    retained: Vec<Span>,
 ) -> Result<(Snapshot, SearchResult), Error> {
     if query.is_empty() || query.chars().take(MAX_QUERY_CHARS + 1).count() > MAX_QUERY_CHARS {
         return Err(Error::new(
@@ -171,13 +232,22 @@ pub(crate) fn search(
         })
         .collect();
     // Only complete disclosed targets receive references. Context fragments and
-    // omitted matches do not grant a whole-file or line reference.
+    // omitted matches do not grant a whole-file or line reference. Re-requesting
+    // a page must not duplicate a reference the retained snapshot already has.
+    let mut spans = retained;
+    for hit in &matches {
+        if !spans.iter().any(|span| {
+            (&span.id, span.start, span.end) == (&hit.span.id, hit.span.start, hit.span.end)
+        }) {
+            spans.push(hit.span.clone());
+        }
+    }
     let snapshot = Snapshot {
         id: new_id("s"),
         path,
         digest: digest(text.as_bytes()),
         text,
-        spans: matches.iter().map(|hit| hit.span.clone()).collect(),
+        spans,
     };
     let result = SearchResult {
         snapshot: snapshot.id.clone(),
@@ -185,6 +255,7 @@ pub(crate) fn search(
         digest: snapshot.digest.clone(),
         query: query.into(),
         offset,
+        stale: false,
         next_offset: (offset + matches.len() < total_matches).then_some(offset + matches.len()),
         total_matches,
         omitted_matches: total_matches - matches.len(),

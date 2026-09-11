@@ -260,16 +260,22 @@ The executable produced by `cargo build` is `target/debug/ultra-edit.exe` on
 Windows and `target/debug/ultra-edit` on Unix.
 
 `read` returns the complete, unnormalized text, a `snapshot` ID, a SHA-256 digest,
-and snapshot-local span references. `r0` covers the whole file, including any
+and snapshot-local span references. `spans` summarizes the disclosed reference
+IDs, collapsing consecutive line IDs: `["r0", "r1..r400"]`, or `["r0", "r1"]` for
+an empty file. `lines` lists each disclosed line body as `"r12 | const retries = 2;"`,
+so a line can be chosen without counting newlines; whole-file `r0` has no listing
+entry and a blank line reads `"r14 | "`. `r0` covers the whole file, including any
 UTF-8 BOM. `r1`, `r2`, etc. cover individual line bodies, excluding the BOM and
 CRLF/LF terminators. A trailing newline does not create another line reference.
 A blank line body exposes a zero-width line span. An empty file has zero-width
 `r0` and `r1`; a BOM-only file has a zero-width `r1` after the BOM. Any returned
-zero-width span permits insertion at its position. Span offsets are UTF-8 byte
-offsets; the compiler validates their boundaries.
+zero-width span permits insertion at its position. Byte offsets stay server-side:
+`get SNAPSHOT` evidence retains each span's UTF-8 byte `start`/`end`, and the
+compiler validates their boundaries.
 
 Full reads default to at most 24,000 source UTF-8 bytes and 400 lines. Larger
-files return `READ_TOO_LARGE` before generating line references or serializing a
+files return `READ_TOO_LARGE`, reporting both the byte count and the line count so
+the exceeded limit is visible, before generating line references or serializing a
 snapshot. Use a range or search, or deliberately pass the exact current source
 byte count as `EXPECTED_BYTES` (MCP `selection.expected_bytes`) to permit a larger
 response. A changed byte count returns `READ_SIZE_CHANGED`; the 16 MiB source
@@ -284,18 +290,25 @@ backslashes according to JSON syntax.
 
 To read a small region, use `read-range src/retry.rs 12 18`. Line numbers are
 one-based and inclusive. It returns `snapshot`, `path`, `digest`, file totals,
-the exact selected `text`, absolute byte `start`/`end`, and editable `spans`:
-`r12` through `r18` for individual line bodies, plus `selection` for the entire
-selected range. The text excludes the leading BOM and the last selected line's
-terminator; original newlines **inside** the range are included unchanged.
+the exact selected `text`, absolute byte `start`/`end` of the selection, the
+summarized editable `spans` — `["r12..r18", "selection"]`, where `r12`…`r18` are
+individual line bodies and `selection` is the entire selected range — and a
+`lines` listing such as `"r12 | const retries = 2;"`. Copy replacement bodies
+from that listing or from `text`; `text` remains the exact selected bytes for
+`expect` guards and multi-line `exact` targets. The text excludes the leading BOM
+and the last selected line's terminator; original newlines **inside** the range
+are included unchanged.
 Empty and BOM-only files have an empty line 1. Invalid ranges fail explicitly.
 Focused reads allow at most 200 lines and 6,000 source Unicode characters. They
-reject oversized selections instead of issuing references to clipped text. For
-a very long line, search for its exact target or use the complete `read` command.
+reject oversized selections instead of issuing references to clipped text,
+directing an oversized selection to a smaller range, a search, or an explicit
+`EXPECTED_BYTES` full read rather than a plain full read that may also be over
+its limits. For a very long line, search for its exact target.
 
 `search src/retry.rs RETRIES` performs case-sensitive literal search in one file.
 The response contains `snapshot`, `path`, `digest`, the exact `query`, `offset`,
-`next_offset`, `total_matches`, `omitted_matches`, and up to 20 `matches` in byte order. Each
+`stale`, `next_offset`, `total_matches`, `omitted_matches`, and up to 20 `matches`
+in byte order. Each
 match has an editable `span` (`m1`, `m2`, etc.), a one-based starting line number,
 and `before`/`after` context fragments of at most 80 Unicode characters, stopping
 at CR or LF. The exact target text of every match is `query`; fragments are only
@@ -312,8 +325,15 @@ Supplying `SNAPSHOT` searches its immutable original bytes even if current file
 contents have changed. The requested path must still resolve to that snapshot's
 file; removed or redirected targets fail explicitly. Omitting `SNAPSHOT` captures
 fresh bytes, so offsets alone do not guarantee continuity across external edits.
-Each page creates its own snapshot with only its disclosed references; edits
-still reject stale source bytes.
+A fresh search reports `stale: false`; a continued page reports `stale: true` once
+the file no longer matches the retained source, meaning an edit against that
+snapshot is rejected with `STALE_SNAPSHOT`, so read the file again instead.
+Each page creates its own snapshot, which retains the references of the snapshot
+it continued as well as its own page's matches. One edit request using the last
+page's snapshot can therefore target every match disclosed while paging, within
+the one-entry-per-file rule. Continuing with a different `query` drops the
+previous query's match references, whose absolute ordinals no longer apply, and
+keeps line references. Edits still reject stale source bytes.
 
 Use either response's `snapshot` as an edit request's `base`, then target a
 returned span, or scope an exact search to `selection` or a returned line.
@@ -372,6 +392,15 @@ insert a new `inserted` line between `first\r\nsecond`, either replace `first`
 with `first\r\ninserted` or replace `second` with `inserted\r\nsecond`,
 preferably guarded by `span.expect`. The untouched line ending supplies the other
 separator.
+
+For the same reason, replacing a line span with `""` only blanks that line; its
+terminator remains. To **delete** a line, read a range that also covers the
+following line, then either match the line and its actual line ending as exact
+text inside `selection` — `{"kind":"exact","old":"gamma\n","scope":"selection"}`,
+using `"gamma\r\n"` in CRLF source — or replace the `selection` of that line and
+its neighbour with the surviving neighbour's body alone. `selection` excludes only
+the **last** selected line's terminator, so the deleted line must not be the last
+line of the selection.
 
 `exact` ambiguity checks and search count overlapping starts: `aa` occurs at two
 starts in `aaa`. For `TARGET_AMBIGUOUS`, `actual` remains that overlapping-start

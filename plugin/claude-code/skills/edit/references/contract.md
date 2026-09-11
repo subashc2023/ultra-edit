@@ -13,7 +13,13 @@ file makes its base stale. A new snapshot is minted on every read/search; combin
 changes to one file under one base. Recreating the same canonical path with
 identical bytes is accepted; redirecting it to another target is rejected.
 Search continuation can reuse a prior snapshot's immutable source while minting
-a new snapshot with only the next page's disclosed spans.
+a new snapshot that carries the next page's spans plus the references the
+continued snapshot already disclosed, so the last page's snapshot addresses every
+match paged through it. A different `query` drops the previous query's match
+references. The server root is canonical, so a workspace launched with a
+drive-letter root rejects `\\localhost\C$\…` spellings of the same file, and a
+UNC-rooted workspace rejects the drive-letter spelling; mapped drives and
+subagent worktrees must use the launch spelling.
 
 On Windows, response filesystem `path` fields, diagnostic and warning `file`
 fields, and diff headers use conventional drive or UNC display spelling. Normal
@@ -105,7 +111,9 @@ rolled back; retrieve its receipt or retry the identical operation under its ID.
   evidence is an explicit opt-in and may be much larger.
 - Full snapshots default to 24,000 source bytes and 400 lines; an exact
   `expected_bytes` deliberately permits a larger response. Search exposes at
-  most 20 matches per page; `next_offset` continues within a supplied snapshot.
+  most 20 matches per page; `next_offset` continues within a supplied snapshot,
+  and each continued page retains the references disclosed before it, so paging
+  to the last page makes all of them editable under one base.
 - The workspace lock coordinates cooperating clients using the same root.
   It cannot exclude arbitrary external writers. Conditional replacement is not
   filesystem compare-and-swap, and multiple files are not an atomic transaction.

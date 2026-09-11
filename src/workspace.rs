@@ -114,7 +114,8 @@ impl Workspace {
     }
 
     /// An offset skips literal matches, including overlaps. Supply a prior snapshot
-    /// to page through its immutable source; each page issues its own references.
+    /// to page through its immutable source; its page keeps the references that
+    /// snapshot disclosed, so one request can address every match paged so far.
     pub fn search_page(
         &self,
         path: impl AsRef<Path>,
@@ -123,7 +124,7 @@ impl Workspace {
         snapshot: Option<&str>,
     ) -> Result<SearchResult, Error> {
         let _lock = self.storage.lock()?;
-        let (path, text) = match snapshot {
+        let (path, text, retained, stale) = match snapshot {
             Some(reference) => {
                 if !reference.starts_with('s') {
                     return Err(Error::new(
@@ -132,19 +133,39 @@ impl Workspace {
                     ));
                 }
                 let base: Snapshot = self.storage.get("snapshots", reference)?;
-                if self.storage.resolve(path.as_ref())? != Path::new(&base.path) {
+                let resolved = self.storage.resolve(path.as_ref())?;
+                if resolved != Path::new(&base.path) {
                     return Err(Error::new(
                         "SNAPSHOT_PATH_MISMATCH",
                         "The search path does not identify the supplied snapshot's file",
                     ));
                 }
-                (base.path, base.text)
+                // A match reference keeps its absolute ordinal only while the query
+                // that numbered it is unchanged; a line reference is query-independent.
+                let retained = base
+                    .spans
+                    .iter()
+                    .filter(|span| {
+                        !span.id.starts_with('m')
+                            || base.text.get(span.start..span.end) == Some(query)
+                    })
+                    .cloned()
+                    .collect();
+                // An unreadable file can no longer match the retained source bytes.
+                let stale = !self
+                    .storage
+                    .read(&resolved)
+                    .is_ok_and(|current| current == base.text);
+                (base.path, base.text, retained, stale)
             }
-            None => self.read_source(path.as_ref())?,
+            None => {
+                let (path, text) = self.read_source(path.as_ref())?;
+                (path, text, Vec::new(), false)
+            }
         };
-        let (snapshot, result) = reading::search(path, text, query, offset)?;
+        let (snapshot, result) = reading::search(path, text, query, offset, retained)?;
         self.storage.put("snapshots", &snapshot.id, &snapshot)?;
-        Ok(result)
+        Ok(SearchResult { stale, ..result })
     }
 
     fn read_source(&self, path: &Path) -> Result<(String, String), Error> {
@@ -537,15 +558,29 @@ impl Workspace {
         let mut snapshots = BTreeMap::new();
         let mut diagnostics = Vec::new();
         let mut paths: Vec<PathBuf> = Vec::new();
+        let mut examined = BTreeSet::new();
         let mut total_bytes = 0usize;
         for file in &request.files {
-            if snapshots.contains_key(&file.base) {
+            // An empty base is reported once by the compiler as EMPTY_SNAPSHOT_ID.
+            if !examined.insert(&file.base) || file.base.trim().is_empty() {
                 continue;
             }
             let snapshot: Snapshot = match self.storage.get("snapshots", &file.base) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
-                    diagnostics.push(Diagnostic::new("INVALID_SNAPSHOT", error.to_string()));
+                    diagnostics.push(Diagnostic::new(
+                        "INVALID_SNAPSHOT",
+                        match error.code.as_str() {
+                            "REFERENCE_NOT_FOUND" | "INVALID_REFERENCE" => format!(
+                                "Snapshot {} is unavailable; read the file again",
+                                file.base
+                            ),
+                            _ => format!(
+                                "Snapshot {} is unavailable ({error}); read the file again",
+                                file.base
+                            ),
+                        },
+                    ));
                     continue;
                 }
             };
@@ -586,7 +621,12 @@ impl Workspace {
         let plan = match compiled {
             Ok(plan) => Some(plan),
             Err(errors) => {
-                diagnostics.extend(errors);
+                // The workspace already reported every base absent from the map.
+                diagnostics.extend(
+                    errors
+                        .into_iter()
+                        .filter(|error| error.code != "UNKNOWN_SNAPSHOT"),
+                );
                 None
             }
         };
@@ -713,10 +753,13 @@ impl Workspace {
 }
 
 fn validate_request_id(request_id: &str) -> Result<(), Error> {
-    if request_id.is_empty() || request_id.len() > 256 || request_id.chars().any(char::is_control) {
+    if request_id.trim().is_empty()
+        || request_id.len() > 256
+        || request_id.chars().any(char::is_control)
+    {
         return Err(Error::new(
             "INVALID_REQUEST_ID",
-            "Request ID must be 1..256 UTF-8 bytes without control characters",
+            "Request ID must be 1..256 UTF-8 bytes without control characters and must contain a non-whitespace character",
         ));
     }
     Ok(())

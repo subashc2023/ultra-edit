@@ -110,7 +110,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(view.text, selected);
         assert_eq!(view.total_bytes, large.len());
         assert_eq!(view.total_lines, 100_000);
-        assert_eq!(view.spans.len(), 11);
+        assert_eq!(view.spans, ["r50000..r50009", "selection"]);
+        assert_eq!(view.lines.len(), 10);
         assert_eq!(fs::read(&path)?, large.as_bytes());
         Ok(elapsed)
     })?;

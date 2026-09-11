@@ -47,8 +47,15 @@ pub struct SnapshotRequest {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Selection {
     /// Inclusive 1-based line bodies, at most 200 lines and 6000 source characters.
-    Range { first: usize, last: usize },
+    Range {
+        #[schemars(range(min = 1))]
+        first: usize,
+        #[schemars(range(min = 1))]
+        last: usize,
+    },
     /// Literal search, 1..1000 characters; at most 20 editable match spans per page.
+    /// A continued page also retains the references its prior snapshot disclosed,
+    /// so the last page's snapshot can address every match paged through it.
     Search {
         query: String,
         /// Zero-based match ordinal; use the previous page's next_offset.
@@ -480,6 +487,7 @@ fn prepared(preparation: Preparation, request_id: &str) -> Result<CallToolResult
         .map(|diagnostic| {
             json!({
                 "code": clipped(&diagnostic.code, 80),
+                "file": diagnostic.file.as_deref().map(|path| clipped(path, 500)),
                 "change_id": diagnostic.change_id.as_deref().map(|id| clipped(id, 80)),
                 "message": clipped(&diagnostic.message, 240),
                 "expected": diagnostic.expected,
