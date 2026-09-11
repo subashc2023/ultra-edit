@@ -34,7 +34,7 @@ fn full_reads_require_an_exact_byte_count_to_disclose_large_files() {
     let (dir, workspace) = setup(&source);
     let error = workspace.read("file.txt").unwrap_err();
     assert_eq!(error.code, "READ_TOO_LARGE");
-    assert!(error.message.contains("24002 bytes"));
+    assert!(error.message.contains("24002 bytes and 1 lines"), "{error}");
     assert!(error.message.contains("line range or search"));
     assert!(error.message.contains("expected_bytes=24002"));
     assert!(!dir.path().join(".ultra-edit/snapshots").exists());
@@ -67,10 +67,10 @@ fn full_reads_require_an_exact_byte_count_to_disclose_large_files() {
 fn full_reads_bound_line_spans_before_persisting_a_snapshot() {
     let source = "x\n".repeat(401);
     let (dir, workspace) = setup(&source);
-    assert_eq!(
-        workspace.read("file.txt").unwrap_err().code,
-        "READ_TOO_LARGE"
-    );
+    let error = workspace.read("file.txt").unwrap_err();
+    assert_eq!(error.code, "READ_TOO_LARGE");
+    // The rejected limit is the line count, not the byte count.
+    assert!(error.message.contains("802 bytes and 401 lines"), "{error}");
     assert!(!dir.path().join(".ultra-edit/snapshots").exists());
     let base = workspace
         .read_with_expected_bytes("file.txt", Some(source.len()))
@@ -92,13 +92,8 @@ fn range_references_and_original_bytes_survive_reopening_and_commit() {
     assert_eq!(view.digest, digest(original.as_bytes()));
     assert_eq!(&original[view.start..view.end], view.text);
     assert_eq!(view.start, 3);
-    assert_eq!(
-        view.spans
-            .iter()
-            .map(|span| span.id.as_str())
-            .collect::<Vec<_>>(),
-        ["r1", "r2", "r3", "selection"]
-    );
+    assert_eq!(view.spans, ["r1..r3", "selection"]);
+    assert_eq!(view.lines, ["r1 | alpha", "r2 | é", "r3 | third"]);
     drop(workspace);
 
     let reopened = Workspace::open(dir.path()).unwrap();
@@ -106,7 +101,19 @@ fn range_references_and_original_bytes_survive_reopening_and_commit() {
         panic!("Expected the retained snapshot")
     };
     assert_eq!(base.text, original);
-    assert_eq!(base.spans, view.spans);
+    // Stored evidence keeps the byte offsets the response summarizes away.
+    assert_eq!(
+        base.spans
+            .iter()
+            .map(|span| (span.id.as_str(), span.start, span.end))
+            .collect::<Vec<_>>(),
+        [
+            ("r1", 3, 8),
+            ("r2", 10, 12),
+            ("r3", 13, 18),
+            ("selection", 3, 18)
+        ]
+    );
     assert_ne!(
         reopened.read_range("file.txt", 1, 3).unwrap().snapshot,
         view.snapshot
@@ -142,8 +149,8 @@ fn focused_reads_do_not_issue_references_for_undisclosed_source() {
     let (_dir, workspace) = setup("hidden\nshown\nhidden again\n");
     let view = workspace.read_range("file.txt", 2, 2).unwrap();
     assert_eq!(view.text, "shown");
-    assert_eq!(view.spans.len(), 2);
-    assert_eq!(view.spans[0].id, "r2");
+    assert_eq!(view.spans, ["r2", "selection"]);
+    assert_eq!(view.lines, ["r2 | shown"]);
     for span in ["r0", "r1", "r3"] {
         let rejected = workspace
             .prepare(request(span, &view.snapshot, span, "replacement"))
@@ -220,6 +227,8 @@ fn empty_and_terminated_files_have_no_phantom_line_and_allow_empty_insertion() {
         assert_eq!(view.text, "");
         assert_eq!(view.total_lines, 1);
         assert_eq!(view.start, view.end);
+        assert_eq!(view.spans, ["r1", "selection"]);
+        assert_eq!(view.lines, ["r1 | "]);
         assert_eq!(
             workspace.read_range("file.txt", 2, 2).unwrap_err().code,
             "INVALID_LINE_RANGE"
@@ -252,14 +261,9 @@ fn empty_and_terminated_files_have_no_phantom_line_and_allow_empty_insertion() {
 #[test]
 fn focused_range_limits_count_unicode_characters_and_interior_line_endings() {
     let (dir, workspace) = setup(&"x\n".repeat(201));
-    assert_eq!(
-        workspace
-            .read_range("file.txt", 1, 200)
-            .unwrap()
-            .spans
-            .len(),
-        201
-    );
+    let view = workspace.read_range("file.txt", 1, 200).unwrap();
+    assert_eq!(view.spans, ["r1..r200", "selection"]);
+    assert_eq!(view.lines.len(), 200);
     assert_eq!(
         workspace.read_range("file.txt", 1, 201).unwrap_err().code,
         "READ_TOO_LARGE"
@@ -276,10 +280,43 @@ fn focused_range_limits_count_unicode_characters_and_interior_line_endings() {
         if accepted {
             assert_eq!(result.unwrap().text, source);
         } else {
-            assert_eq!(result.unwrap_err().code, "READ_TOO_LARGE");
+            let error = result.unwrap_err();
+            assert_eq!(error.code, "READ_TOO_LARGE");
+            // A plain full read is not offered: it can exceed its own limits.
+            assert!(!error.message.contains("use a full read"), "{error}");
+            assert!(
+                error
+                    .message
+                    .contains(&format!("expected_bytes={}", source.len())),
+                "{error}"
+            );
             assert_eq!(workspace.read("file.txt").unwrap().text, source);
         }
     }
+}
+
+#[test]
+fn reads_summarize_references_and_list_lines_without_byte_offsets() {
+    let (_dir, workspace) = setup("alpha\n\nbravo\ncharlie\n");
+    let view = workspace.read_range("file.txt", 1, 3).unwrap();
+    assert_eq!(view.spans, ["r1..r3", "selection"]);
+    assert_eq!(view.lines, ["r1 | alpha", "r2 | ", "r3 | bravo"]);
+    let single = workspace.read_range("file.txt", 4, 4).unwrap();
+    assert_eq!(single.spans, ["r4", "selection"]);
+    assert_eq!(single.lines, ["r4 | charlie"]);
+    let full = FullRead::from(workspace.read("file.txt").unwrap());
+    assert_eq!(full.spans, ["r0", "r1..r4"]);
+    assert_eq!(
+        full.lines,
+        ["r1 | alpha", "r2 | ", "r3 | bravo", "r4 | charlie"]
+    );
+    let serialized = serde_json::to_string(&full).unwrap();
+    assert!(!serialized.contains("\"start\""), "{serialized}");
+
+    let (_dir, workspace) = setup("");
+    let empty = FullRead::from(workspace.read("file.txt").unwrap());
+    assert_eq!(empty.spans, ["r0", "r1"]);
+    assert_eq!(empty.lines, ["r1 | "]);
 }
 
 #[test]
@@ -306,7 +343,7 @@ fn invalid_and_extreme_line_ranges_are_rejected() {
 }
 
 #[test]
-fn search_pages_disclose_later_overlaps_without_granting_previous_spans() {
+fn search_pages_accumulate_every_disclosed_match_into_the_latest_snapshot() {
     let original = "a".repeat(25);
     let (dir, workspace) = setup(&original);
     let first = workspace.search("file.txt", "aa").unwrap();
@@ -322,26 +359,86 @@ fn search_pages_disclose_later_overlaps_without_granting_previous_spans() {
     assert_eq!((second.total_matches, second.omitted_matches), (24, 20));
     assert_eq!(second.matches.len(), 4);
     assert_eq!(second.digest, first.digest);
+    assert!(!second.stale);
     assert_ne!(second.snapshot, first.snapshot);
     for (index, hit) in second.matches.iter().enumerate() {
         assert_eq!(hit.span.id, format!("m{}", index + 21));
         assert_eq!((hit.span.start, hit.span.end), (index + 20, index + 22));
     }
-    let rejected = workspace
-        .prepare(request("hidden-earlier", &second.snapshot, "m1", "X"))
-        .unwrap();
-    assert_eq!(rejected.diagnostics[0].code, "UNKNOWN_SPAN");
-    let preview = workspace
-        .prepare(request("later-hit", &second.snapshot, "m24", "X"))
-        .unwrap();
-    assert!(preview.ready);
+    // The page lists only its own matches; its snapshot retains all 24.
+    let Evidence::Snapshot(base) = workspace.evidence(&second.snapshot).unwrap() else {
+        panic!("Expected the continued snapshot")
+    };
+    assert_eq!(
+        base.spans
+            .iter()
+            .map(|span| span.id.clone())
+            .collect::<Vec<_>>(),
+        (1..=24)
+            .map(|ordinal| format!("m{ordinal}"))
+            .collect::<Vec<_>>()
+    );
+    let mut edit = request("both-pages", &second.snapshot, "m1", "X");
+    edit.files[0].changes.push(Change {
+        id: "last".into(),
+        target: Target::Span {
+            span: "m24".into(),
+            expect: Some("aa".into()),
+        },
+        text: "Y".into(),
+    });
+    let preview = workspace.prepare(edit).unwrap();
+    assert!(preview.ready, "{:?}", preview.diagnostics);
     assert_eq!(
         workspace.commit(&preview.reference).unwrap().commit,
         CommitStatus::Committed
     );
     assert_eq!(
         fs::read_to_string(dir.path().join("file.txt")).unwrap(),
-        format!("{}X", "a".repeat(23))
+        format!("X{}Y", "a".repeat(21))
+    );
+}
+
+#[test]
+fn continued_pages_keep_line_references_and_drop_another_query_matches() {
+    let (_dir, workspace) = setup("alpha beta\nalpha gamma\n");
+    let view = workspace.read_range("file.txt", 1, 2).unwrap();
+    let first = workspace
+        .search_page("file.txt", "alpha", 0, Some(&view.snapshot))
+        .unwrap();
+    assert!(!first.stale);
+    let repeated = workspace
+        .search_page("file.txt", "alpha", 0, Some(&first.snapshot))
+        .unwrap();
+    let other = workspace
+        .search_page("file.txt", "beta", 0, Some(&first.snapshot))
+        .unwrap();
+    let disclosed = |reference: &str| match workspace.evidence(reference).unwrap() {
+        Evidence::Snapshot(base) => base
+            .spans
+            .iter()
+            .map(|span| span.id.clone())
+            .collect::<Vec<_>>(),
+        evidence => panic!("Expected a snapshot, got {evidence:?}"),
+    };
+    assert_eq!(
+        disclosed(&first.snapshot),
+        ["r1", "r2", "selection", "m1", "m2"]
+    );
+    // Re-requesting a page must not duplicate the references it already granted.
+    assert_eq!(disclosed(&repeated.snapshot), disclosed(&first.snapshot));
+    assert_eq!(disclosed(&other.snapshot), ["r1", "r2", "selection", "m1"]);
+    assert!(
+        workspace
+            .prepare(request("repeated-page", &repeated.snapshot, "m2", "X"))
+            .unwrap()
+            .ready
+    );
+    assert!(
+        workspace
+            .prepare(request("lines-kept", &other.snapshot, "r2", "X"))
+            .unwrap()
+            .ready
     );
 }
 
@@ -352,6 +449,7 @@ fn search_pagination_keeps_snapshot_bytes_and_lines_after_source_changes() {
         .collect::<String>();
     let (dir, workspace) = setup(&original);
     let first = workspace.search("file.txt", "é").unwrap();
+    assert!(!first.stale);
     fs::write(dir.path().join("file.txt"), "changed: é").unwrap();
     drop(workspace);
     let reopened = Workspace::open(dir.path()).unwrap();
@@ -360,6 +458,8 @@ fn search_pagination_keeps_snapshot_bytes_and_lines_after_source_changes() {
         .unwrap();
     assert_eq!((second.total_matches, second.next_offset), (45, Some(40)));
     assert_eq!(second.digest, first.digest);
+    // Continuing retained source after an external change cannot be edited.
+    assert!(second.stale);
     assert_eq!(second.matches[0].span.line, 21);
     assert_eq!(second.matches[19].span.line, 40);
     let last = reopened
@@ -378,6 +478,7 @@ fn search_pagination_keeps_snapshot_bytes_and_lines_after_source_changes() {
     );
     let fresh = reopened.search_page("file.txt", "é", 0, None).unwrap();
     assert_eq!(fresh.total_matches, 1);
+    assert!(!fresh.stale);
     assert_ne!(fresh.digest, first.digest);
 
     let end = reopened

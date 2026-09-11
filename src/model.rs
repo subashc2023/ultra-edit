@@ -11,23 +11,27 @@ pub struct Snapshot {
 }
 
 /// Public read response; stored snapshots retain `id` for journal compatibility.
+/// Disclosed references are summarized and listed by line; byte offsets remain
+/// internal and are retrieved only as full snapshot evidence.
 #[derive(Serialize)]
 pub struct FullRead {
     pub snapshot: String,
     pub path: String,
     pub digest: String,
     pub text: String,
-    pub spans: Vec<Span>,
+    pub spans: Vec<String>,
+    pub lines: Vec<String>,
 }
 
 impl From<Snapshot> for FullRead {
     fn from(snapshot: Snapshot) -> Self {
         Self {
+            spans: crate::reading::span_summary(&snapshot.spans),
+            lines: crate::reading::line_listing(&snapshot.spans, &snapshot.text),
             snapshot: snapshot.id,
             path: snapshot.path,
             digest: snapshot.digest,
             text: snapshot.text,
-            spans: snapshot.spans,
         }
     }
 }
@@ -52,7 +56,10 @@ pub struct RangeRead {
     pub start: usize,
     pub end: usize,
     pub text: String,
-    pub spans: Vec<Span>,
+    /// Disclosed reference IDs, with consecutive line IDs collapsed to ranges.
+    pub spans: Vec<String>,
+    /// Each disclosed line as `"{id} | {body}"`.
+    pub lines: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +78,9 @@ pub struct SearchResult {
     pub digest: String,
     pub query: String,
     pub offset: usize,
+    /// True when the continued snapshot no longer matches the current file, so
+    /// an edit against it is rejected with `STALE_SNAPSHOT`.
+    pub stale: bool,
     pub next_offset: Option<usize>,
     pub total_matches: usize,
     pub omitted_matches: usize,
@@ -113,6 +123,7 @@ pub enum Target {
         /// A disclosed span ID such as selection, r0, or a returned match ID; never source text.
         scope: String,
         /// Required number of non-overlapping occurrences, counted left to right.
+        #[schemars(range(min = 1))]
         expected: usize,
     },
     Span {

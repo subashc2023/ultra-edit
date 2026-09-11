@@ -40,11 +40,17 @@ exposed by this host.
 
 1. Call `ultra_edit_snapshot` with `path` and a focused `selection`: an inclusive
    line `range`, or a literal `search`. Inspect the returned source and spans.
+   Range and full reads summarize disclosed IDs in `spans` (`["r12..r18",
+   "selection"]`) and list each line in `lines` as `"r12 | const retries = 2;"`;
+   pick `r{n}` from that listing rather than counting newlines in `text`.
    Use `full` only when the complete file is needed. Combine each file's changes
    under one base snapshot. Full reads default to 24,000 bytes and 400 lines;
    oversized reads require a deliberate exact `expected_bytes` override. Search
    pages return `next_offset`; supply it and the returned `snapshot` to continue
-   the same original bytes.
+   the same original bytes. A continued page also retains the references already
+   disclosed, so one request against the last page's snapshot can edit every
+   match paged through it. `stale: true` means that source no longer matches the
+   file, so read again instead of editing.
 2. Call `ultra_edit` with one request containing the intended changes. Use a
    disclosed `span`, or `exact` with an explicit scope when only the inspected
    region should match. Resolve all targets against that base.

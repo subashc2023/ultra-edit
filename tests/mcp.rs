@@ -508,6 +508,113 @@ fn full_read_guard_pagination_and_scope_guards_work_over_mcp() {
 }
 
 #[test]
+fn every_paged_search_match_is_editable_in_one_batch_over_mcp() {
+    let root = TempDir::new().unwrap();
+    let original: String = (1..=25)
+        .map(|line| format!("retries = 2; // line {line}\n"))
+        .collect();
+    fs::write(root.path().join("file.txt"), &original).unwrap();
+    let mut client = Client::start(root.path());
+    let search = |offset: Value, snapshot: Value| {
+        json!({"path":"file.txt","selection":{
+            "kind":"search","query":"retries = 2","offset":offset,"snapshot":snapshot
+        }})
+    };
+    let first = client.call("ultra_edit_snapshot", search(json!(0), Value::Null), false);
+    assert_eq!(first["total_matches"], 25);
+    assert_eq!(first["next_offset"], 20);
+    assert_eq!(first["stale"], false);
+    let second = client.call(
+        "ultra_edit_snapshot",
+        search(first["next_offset"].clone(), first["snapshot"].clone()),
+        false,
+    );
+    assert_eq!(second["matches"].as_array().unwrap().len(), 5);
+    assert!(second["next_offset"].is_null());
+    assert_eq!(second["stale"], false);
+    let changes = (1..=25)
+        .map(|ordinal| {
+            json!({
+                "id": format!("match-{ordinal}"),
+                "target": {
+                    "kind":"span", "span": format!("m{ordinal}"), "expect":"retries = 2"
+                },
+                "text": "retries = 3",
+            })
+        })
+        .collect::<Vec<_>>();
+    let committed = client.call(
+        "ultra_edit",
+        json!({"request_id":"all-pages","files":[{
+            "base":second["snapshot"],"changes":changes
+        }]}),
+        false,
+    );
+    assert_eq!(committed["commit"], "committed");
+    assert_eq!(
+        fs::read_to_string(root.path().join("file.txt")).unwrap(),
+        original.replace("retries = 2", "retries = 3")
+    );
+    client.close();
+}
+
+#[test]
+fn declared_schema_minimums_agree_with_the_runtime_line_and_count_rules() {
+    let root = TempDir::new().unwrap();
+    fs::write(root.path().join("file.txt"), "one\n").unwrap();
+    let mut client = Client::start(root.path());
+    let tools = client.rpc("tools/list", json!({}))["result"]["tools"].clone();
+    let schema = |name: &str| {
+        tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is not exposed"))["inputSchema"]
+            .clone()
+    };
+    let variant = |schema: &Value, definition: &str, kind: &str| {
+        schema["$defs"][definition]["oneOf"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{definition} is not a variant schema: {schema}"))
+            .iter()
+            .find(|variant| variant["properties"]["kind"]["const"] == kind)
+            .unwrap_or_else(|| panic!("{definition} has no {kind} variant: {schema}"))
+            .clone()
+    };
+    let snapshot = schema("ultra_edit_snapshot");
+    assert_eq!(snapshot["type"], "object");
+    for keyword in ["oneOf", "anyOf", "allOf"] {
+        assert!(snapshot.get(keyword).is_none(), "{snapshot}");
+    }
+    assert_eq!(
+        snapshot["properties"]["selection"]["$ref"],
+        "#/$defs/Selection"
+    );
+    let range = variant(&snapshot, "Selection", "range");
+    assert_eq!(range["properties"]["first"]["minimum"], 1);
+    assert_eq!(range["properties"]["last"]["minimum"], 1);
+    let all = variant(&schema("ultra_edit"), "Target", "all");
+    assert_eq!(all["properties"]["expected"]["minimum"], 1);
+
+    let rejected = client.call(
+        "ultra_edit_snapshot",
+        json!({"path":"file.txt","selection":{"kind":"range","first":0,"last":1}}),
+        true,
+    );
+    assert_eq!(rejected["error"]["code"], "INVALID_LINE_RANGE");
+    let base = client.range("file.txt", 1, 1);
+    let mut zero = edit("zero-expected", &base["snapshot"], "selection", "two");
+    zero["files"][0]["changes"][0]["target"] =
+        json!({"kind":"all","old":"one","scope":"selection","expected":0});
+    assert_eq!(
+        client.call("ultra_edit_prepare", zero, true)["diagnostics"][0]["code"],
+        "INVALID_EXPECTED_COUNT"
+    );
+    client.close();
+}
+
+#[test]
 fn diff_and_byte_warnings_are_available_before_and_after_commit() {
     let root = TempDir::new().unwrap();
     let before: String = (1..=44).map(|line| format!("line {line}\r\n")).collect();
@@ -846,12 +953,16 @@ fn stale_file_rejects_whole_batch_and_never_refreshes_its_base() {
     fs::write(root.path().join("two.txt"), "target\nexternal change").unwrap();
     let result = client.call("ultra_edit", request, true);
     assert_eq!(result["kind"], "rejected");
+    let stale = result["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "STALE_SNAPSHOT")
+        .unwrap_or_else(|| panic!("{result}"));
+    // A multi-file batch must name the file that went stale.
     assert!(
-        result["diagnostics"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|d| d["code"] == "STALE_SNAPSHOT")
+        stale["file"].as_str().unwrap().ends_with("two.txt"),
+        "{stale}"
     );
     assert_eq!(
         fs::read_to_string(root.path().join("one.txt")).unwrap(),

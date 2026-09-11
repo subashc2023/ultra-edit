@@ -6,9 +6,17 @@ Call `ultra_edit_snapshot` with one existing `path` and one `selection`:
 
 | Selection | Shape | Returned editable references |
 | --- | --- | --- |
-| Inclusive line range | `{"kind":"range","first":12,"last":18}` | `r12` … `r18`, plus `selection` |
-| Literal search | `{"kind":"search","query":"RETRIES","offset":0}` | Returned match spans `m1`, `m2`, etc. |
-| Complete file | `{"kind":"full"}` | `r0` for all bytes, plus line-body spans `r1`, `r2`, etc., within the default full-read limits |
+| Inclusive line range | `{"kind":"range","first":12,"last":18}` | `spans: ["r12..r18", "selection"]`, plus one `lines` entry per line |
+| Literal search | `{"kind":"search","query":"RETRIES","offset":0}` | Returned match spans `m1`, `m2`, etc., each with its line number |
+| Complete file | `{"kind":"full"}` | `spans: ["r0", "r1..r400"]`, where `r0` is all bytes and `r1`… are line bodies, plus `lines`; within the default full-read limits |
+
+Range and full responses summarize their disclosed IDs in `spans`, collapsing
+consecutive line IDs into `r12..r18`, and list every disclosed line body in
+`lines` as `"r12 | const retries = 2;"`. A blank line is `"r14 | "`, and whole-file
+`r0` has no listing entry. Choose `r{n}` from that listing instead of counting
+newlines; `text` still holds the exact selected bytes, which is what `expect`
+guards and multi-line `exact` targets copy. Byte offsets stay server-side: full
+evidence retains byte offsets, retrieved with `ultra_edit_status` evidence.
 
 Every snapshot response identifies its base in `snapshot`. Stored full evidence
 retains the engine's internal `id`. Use only span IDs actually returned for that base. A focused
@@ -50,12 +58,19 @@ text is `query`. Continue with the returned `next_offset` and `snapshot`:
 ```
 
 `offset` counts matches from zero, and `next_offset: null` marks the end.
-Later pages retain absolute match IDs (`m21` etc.) and receive new snapshots
-containing only that page's references. `omitted_matches` counts all matches
-outside the current page, including preceding ones. A supplied snapshot keeps
-the original source fixed across external file edits; omitting it reads fresh
-bytes. The requested path must still resolve to the same file. Stale snapshots
-remain ineligible for edits. An empty match list is successful but grants no target.
+Later pages retain absolute match IDs (`m21` etc.) and receive new snapshots that
+also retain the earlier pages' match references and any line references of the
+snapshot they continued. One `ultra_edit` request using the LAST page's snapshot
+can therefore address every match disclosed while paging through it; a request
+still allows only one entry per file. Continuing with a different `query` drops
+the previous query's match references, whose ordinals no longer apply.
+`omitted_matches` counts all matches outside the current page, including
+preceding ones. A supplied snapshot keeps the original source fixed across
+external file edits; omitting it reads fresh bytes. The requested path must still
+resolve to the same file. `stale: true` means the file no longer matches that
+retained source, so an edit against this snapshot is rejected with
+`STALE_SNAPSHOT`: read again instead of editing. An empty match list is
+successful but grants no target.
 
 ## Choose the replacement target
 
@@ -81,6 +96,21 @@ an `inserted` line between `first\r\nsecond`, replace `first` with
 clipped context fragment.
 `scope` is a span ID, never literal text. To select a multi-line region, first
 read its range and use `selection`; inline `{first,last}` scopes are unsupported.
+
+Because line spans exclude terminators, replacing a line span with `""` only
+blanks that line; its terminator survives. To delete a line, read a range that
+also covers the following line, then either replace the line plus its actual line
+ending as exact text inside `selection` (the `selection` excludes only the LAST
+selected line's terminator, so the deleted line must not be the last selected
+line):
+
+```json
+{ "kind": "exact", "old": "gamma\n", "scope": "selection" }
+```
+
+or replace `selection` of the line and its neighbour with the surviving
+neighbour's body alone. Use the file's own line ending: write `"gamma\r\n"` in
+CRLF source.
 
 Search and `exact` ambiguity counts include overlapping starts: `aa` occurs twice in `aaa`.
 Ambiguous exact matches are errors. In `TARGET_AMBIGUOUS`, `actual` remains the

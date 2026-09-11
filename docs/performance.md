@@ -30,7 +30,7 @@ performance with a long history of retained plans and journals.
 
 | Case | Input | What the timer includes |
 | --- | --- | --- |
-| Focused read | 100,000 fixed-width ASCII/LF lines; exactly 5,000,000 bytes; lines 50,000–50,009 return 499 source bytes and 11 spans | `Workspace::read_range`: file read, whole-file hash, line scanning, selected references, and complete-byte snapshot persistence |
+| Focused read | 100,000 fixed-width ASCII/LF lines; exactly 5,000,000 bytes; lines 50,000–50,009 return 499 source bytes, 10 listed lines, and the 11 disclosed references summarized as `["r50000..r50009", "selection"]` | `Workspace::read_range`: file read, whole-file hash, line scanning, selected references, and complete-byte snapshot persistence |
 | Batch planning | 8 preloaded full snapshots, each 1,000 lines / 50,000 bytes; 8 exact changes per file | `compiler::compile`: digest/span validation, exact matching, conflict checks, output construction, and plan allocation; no snapshot creation or file I/O |
 | Snapshots + batch edit | 2 files, each 200 lines / 10,000 bytes; 4 exact changes per file | Two `Workspace::read` calls, request construction, and `Workspace::edit`, including normal validation, retained snapshots/plans, staging, journals, and sync calls |
 
