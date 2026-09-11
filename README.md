@@ -3,7 +3,15 @@
 **A Rust-powered Claude Code plugin for coordinated, verifiable edits across
 multiple existing UTF-8 files.**
 
-Install it once and its guidance loads automatically for sessions, resumes,
+Claude loves to use heredoc for file editing and multi-patching because Claude Code's
+own edit tool is not good enough to perform verifiable, deterministic multi-tool edits. 
+Claude Code's auto-permission-mode also adds an instruction to the end of the system
+prompt telling it to attempt to use python, bash, and heredoc for file editing. 
+The problem is that Claude Code's Windows Bash tool is broken, it constantly drops one
+of each //, as well as <, >, .., and more. This tool gives it a multi-edit tool that is
+as good as, if not better than Claude's native edit tool, as well as Bash/Python.
+
+Install the plugin once and its guidance loads automatically for sessions, resumes,
 compaction, and subagents. Claude sends focused changes directly to the local
 engine for matching, byte preservation, validation, and durable receipts.
 
