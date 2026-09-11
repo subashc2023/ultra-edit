@@ -1,7 +1,7 @@
 {
   "name": "ultra-edit",
   "displayName": "Ultra Edit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Edit existing UTF-8 files through immutable snapshots, checked batches, and durable receipts.",
   "homepage": "https://github.com/subashc2023/ultra-edit",
   "repository": "https://github.com/subashc2023/ultra-edit",
