@@ -11,10 +11,14 @@ use tempfile::NamedTempFile;
 use crate::compiler::MAX_TEXT_BYTES;
 use crate::model::{
     CommitStatus, Error, FileOutcome, FileStatus, PreparedFile, PreparedPlan, Receipt, Snapshot,
-    digest,
+    digest, new_id,
 };
 
 mod reconciliation;
+
+const STATE_DIRECTORY: &str = ".ultra-edit";
+
+const CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by Ultra Edit.\n# For information about cache directory tags see https://bford.info/cachedir/\n";
 
 pub struct Storage {
     root: PathBuf,
@@ -61,6 +65,8 @@ enum JournalEvent {
         index: usize,
         status: FileStatus,
         error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
     },
     Finished,
 }
@@ -69,11 +75,45 @@ struct Journal {
     plan_id: String,
     plan_digest: String,
     file_count: usize,
-    outcomes: Vec<(FileStatus, Option<String>)>,
+    outcomes: Vec<Outcome>,
     preflight_failed: Option<bool>,
     had_intent: bool,
     pending: bool,
     finished: bool,
+}
+
+/// One recorded per-file result. `after` references a snapshot of the committed bytes;
+/// files that were not committed, and journals written before it existed, have none.
+struct Outcome {
+    status: FileStatus,
+    error: Option<String>,
+    after: Option<String>,
+}
+
+impl Outcome {
+    fn committed(after: Option<String>) -> Self {
+        Self {
+            status: FileStatus::Committed,
+            error: None,
+            after,
+        }
+    }
+
+    fn failed(error: impl Into<String>) -> Self {
+        Self {
+            status: FileStatus::NotCommitted,
+            error: Some(error.into()),
+            after: None,
+        }
+    }
+
+    fn unknown(error: impl Into<String>) -> Self {
+        Self {
+            status: FileStatus::OutcomeUnknown,
+            error: Some(error.into()),
+            after: None,
+        }
+    }
 }
 
 struct TargetFile {
@@ -90,28 +130,65 @@ impl Storage {
                 "Workspace must be a directory",
             ));
         }
-        let state = root.join(".ultra-edit");
-        ensure_directory(&state)?;
-        Ok(Self { root, state })
+        // Refuse before creating anything: a root without a parent holds every file on the
+        // volume, and a state directory is this engine's own storage, not editable source.
+        if root.parent().is_none()
+            || root
+                .components()
+                .any(|component| component.as_os_str() == STATE_DIRECTORY)
+        {
+            return Err(Error::new(
+                "INVALID_WORKSPACE",
+                "Workspace must not be a drive root or an Ultra Edit state directory",
+            ));
+        }
+        let storage = Self {
+            state: root.join(STATE_DIRECTORY),
+            root,
+        };
+        storage.ensure_state()?;
+        Ok(storage)
     }
 
     pub fn root(&self) -> &Path {
         &self.root
     }
 
+    /// Creates the state directory with markers that keep it out of commits and backups.
+    /// Existing markers are never rewritten; a workspace may have adjusted them.
+    fn ensure_state(&self) -> Result<(), Error> {
+        self.in_state(|| {
+            ensure_directory(&self.state)?;
+            for (name, contents) in [(".gitignore", "*\n"), ("CACHEDIR.TAG", CACHEDIR_TAG)] {
+                match file_options().create_new(true).open(self.state.join(name)) {
+                    Ok(mut marker) => {
+                        marker.write_all(contents.as_bytes())?;
+                        marker.sync_all()?;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Ok(())
+        })
+    }
+
     pub fn lock(&self) -> Result<File, Error> {
-        ensure_directory(&self.state)?;
-        let path = self.state.join("coordinator.lock");
-        regular_or_missing(&path)?;
-        let lock = file_options().create(true).truncate(false).open(path)?;
-        // One workspace lock serializes cooperating processes. Use ordered target locks
-        // if independent-file throughput becomes a measured bottleneck.
-        lock.lock()?;
-        Ok(lock)
+        self.in_state(|| {
+            ensure_directory(&self.state)?;
+            let path = self.state.join("coordinator.lock");
+            regular_or_missing(&path)?;
+            let lock = file_options().create(true).truncate(false).open(path)?;
+            // One workspace lock serializes cooperating processes. Use ordered target locks
+            // if independent-file throughput becomes a measured bottleneck.
+            lock.lock()?;
+            Ok(lock)
+        })
     }
 
     pub fn resolve(&self, path: &Path) -> Result<PathBuf, Error> {
-        let path = fs::canonicalize(self.root.join(path))?;
+        let requested = self.root.join(path);
+        let path = fs::canonicalize(&requested).map_err(|error| target_error(&requested, error))?;
         if !path.starts_with(&self.root) || path.starts_with(&self.state) {
             return Err(Error::new(
                 "PATH_OUTSIDE_WORKSPACE",
@@ -138,62 +215,88 @@ impl Storage {
     }
 
     pub fn exists(&self, kind: &str, id: &str) -> Result<bool, Error> {
-        regular_or_missing(&self.object_path(kind, id)?)
+        self.in_state(|| regular_or_missing(&self.object_path(kind, id)?))
     }
 
     pub fn put<T: Serialize>(&self, kind: &str, id: &str, value: &T) -> Result<(), Error> {
-        let path = self.object_path(kind, id)?;
-        let bytes = encode(value)?;
-        if regular_or_missing(&path)? {
-            if fs::read(path)? == bytes {
-                return Ok(());
+        self.in_state(|| {
+            let path = self.object_path(kind, id)?;
+            let bytes = encode(value)?;
+            if regular_or_missing(&path)? {
+                if fs::read(path)? == bytes {
+                    return Ok(());
+                }
+                return Err(Error::new(
+                    "OBJECT_CONFLICT",
+                    "Immutable object already exists",
+                ));
             }
-            return Err(Error::new(
-                "OBJECT_CONFLICT",
-                "Immutable object already exists",
-            ));
-        }
-        let parent = parent(&path)?;
-        let mut staged = temporary(parent)?;
-        staged.write_all(&bytes)?;
-        staged.as_file().sync_all()?;
-        staged
-            .persist_noclobber(&path)
-            .map_err(|error| Error::from(error.error))?;
-        sync_directory(parent)?;
-        Ok(())
+            let parent = parent(&path)?;
+            let mut staged = temporary(parent)?;
+            staged.write_all(&bytes)?;
+            staged.as_file().sync_all()?;
+            staged
+                .persist_noclobber(&path)
+                .map_err(|error| Error::from(error.error))?;
+            sync_directory(parent)?;
+            Ok(())
+        })
     }
 
     pub fn get<T: DeserializeOwned>(&self, kind: &str, id: &str) -> Result<T, Error> {
-        let path = self.object_path(kind, id)?;
-        if !regular_or_missing(&path)? {
-            return Err(Error::new(
-                "REFERENCE_NOT_FOUND",
-                format!("Unknown {kind} reference: {id}"),
-            ));
-        }
-        decode(&fs::read(path)?)
+        self.in_state(|| {
+            let path = self.object_path(kind, id)?;
+            if !regular_or_missing(&path)? {
+                return Err(Error::new(
+                    "REFERENCE_NOT_FOUND",
+                    format!("Unknown {kind} reference: {id}"),
+                ));
+            }
+            decode(&fs::read(path)?)
+        })
     }
 
     pub(crate) fn object_ids(&self, kind: &str) -> Result<Vec<String>, Error> {
-        let mut ids = Vec::new();
-        for entry in fs::read_dir(self.directory(kind)?)? {
-            let path = entry?.path();
-            if path
-                .extension()
-                .is_some_and(|extension| extension == "json")
-            {
-                regular_or_missing(&path)?;
-                let id = path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .ok_or_else(|| Error::new("STORE_CORRUPT", "Invalid stored object filename"))?;
-                safe_component(id)?;
-                ids.push(id.to_owned());
+        self.in_state(|| {
+            let mut ids = Vec::new();
+            for entry in fs::read_dir(self.directory(kind)?)? {
+                let path = entry?.path();
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                {
+                    regular_or_missing(&path)?;
+                    let id = path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .ok_or_else(|| {
+                            Error::new("STORE_CORRUPT", "Invalid stored object filename")
+                        })?;
+                    safe_component(id)?;
+                    ids.push(id.to_owned());
+                }
             }
-        }
-        ids.sort_unstable();
-        Ok(ids)
+            ids.sort_unstable();
+            Ok(ids)
+        })
+    }
+
+    /// Runs a state-store operation, naming the state directory in its IO failures: the same
+    /// OS message from a target file and from `.ultra-edit` needs different operator action.
+    fn in_state<T>(&self, operation: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+        operation().map_err(|error| {
+            if error.code != "IO_ERROR" {
+                return error;
+            }
+            Error::new(
+                "STATE_DIR_UNAVAILABLE",
+                format!(
+                    "Cannot use the Ultra Edit state directory {}: {}",
+                    crate::report::path_for_display(&self.state.to_string_lossy()),
+                    error.message
+                ),
+            )
+        })
     }
 
     pub(crate) fn prune_snapshots(
@@ -209,6 +312,7 @@ impl Storage {
             )
         })?;
         self.assert_no_unknown()?;
+        let mut committed = BTreeSet::new();
         for entry in fs::read_dir(self.directory("journals")?)? {
             let path = entry?.path();
             if path
@@ -221,12 +325,20 @@ impl Storage {
                     .and_then(|stem| stem.to_str())
                     .ok_or_else(|| Error::new("STORE_CORRUPT", "Invalid journal filename"))?;
                 let plan: PreparedPlan = self.get("plans", id)?;
-                if plan.id != id || self.journal(&plan)?.is_none() {
+                let Some(journal) = self.journal(&plan)?.filter(|_| plan.id == id) else {
                     return Err(Error::new(
                         "STORE_CORRUPT",
                         "Journal does not match a retained plan",
                     ));
-                }
+                };
+                // A receipt keeps naming the committed output of every file it recorded, so
+                // those snapshots stay retained for as long as their journal does.
+                committed.extend(
+                    journal
+                        .outcomes
+                        .into_iter()
+                        .filter_map(|outcome| outcome.after),
+                );
             }
         }
         let mut result = SnapshotPruning {
@@ -246,7 +358,7 @@ impl Storage {
                 ));
             }
             let metadata = fs::metadata(self.object_path("snapshots", &id)?)?;
-            if retained.contains(&id) || metadata.modified()? > cutoff {
+            if retained.contains(&id) || committed.contains(&id) || metadata.modified()? > cutoff {
                 result.retained_snapshots += 1;
             } else {
                 result.eligible_bytes = result
@@ -297,16 +409,12 @@ impl Storage {
         };
         let mut outcomes = journal.outcomes;
         if journal.pending {
-            outcomes.push((
-                FileStatus::OutcomeUnknown,
-                Some("INTERRUPTED: write intent exists without a durable outcome; reconciliation required".into()),
+            outcomes.push(Outcome::unknown(
+                "INTERRUPTED: write intent exists without a durable outcome; reconciliation required",
             ));
         }
         while outcomes.len() < plan.files.len() {
-            outcomes.push((
-                FileStatus::NotCommitted,
-                Some("INTERRUPTED: target was not attempted".into()),
-            ));
+            outcomes.push(Outcome::failed("INTERRUPTED: target was not attempted"));
         }
         Ok(Some(make_receipt(plan, outcomes)))
     }
@@ -317,18 +425,14 @@ impl Storage {
         validate_plan(plan)?;
         let eligible = self.journal(plan)?.is_some_and(|journal| {
             journal.finished
-                && !journal.had_intent
-                && journal.outcomes.iter().all(|(status, error)| {
-                    *status == FileStatus::NotCommitted
-                        && journal
-                            .preflight_failed
-                            .unwrap_or_else(|| error.as_deref().is_some_and(legacy_preflight_error))
+                && journal.outcomes.iter().all(|outcome| {
+                    outcome.status == FileStatus::NotCommitted && proves_no_write(&journal, outcome)
                 })
         });
         if !eligible {
             return Err(Error::new(
                 "RETRY_CLOSED",
-                "Retry requires a completed preflight failure with no write intent; inspect the receipt before creating a fresh edit",
+                "Retry requires a completed failure that proves no target write; inspect the receipt before creating a fresh edit",
             ));
         }
         self.assert_no_unknown()
@@ -371,9 +475,11 @@ impl Storage {
         self.assert_no_unknown()?;
         let (targets, failures) = self.preflight(plan);
         let preflight_failed = failures.iter().any(Option::is_some);
-        let mut journal = file_options()
-            .create_new(true)
-            .open(self.journal_path(&plan.id)?)?;
+        let mut journal = self.in_state(|| {
+            Ok(file_options()
+                .create_new(true)
+                .open(self.journal_path(&plan.id)?)?)
+        })?;
         backend
             .record(
                 &mut journal,
@@ -386,65 +492,127 @@ impl Storage {
             )
             .map_err(journal_error)?;
         sync_directory(&self.directory("journals")?).map_err(journal_error)?;
+        // Indexed before any target write, so a crash mid-commit is always listed.
+        self.mark_uncertain(&plan.id)?;
         let mut outcomes = Vec::new();
         let mut stopped = false;
         for (index, file) in plan.files.iter().enumerate() {
-            let (status, error) = if preflight_failed {
-                (FileStatus::NotCommitted, Some(failures[index].clone().unwrap_or_else(|| {
-                    "BATCH_PREFLIGHT_FAILED: another target failed; no target writes attempted".into()
-                })))
+            let outcome = if preflight_failed {
+                Outcome::failed(failures[index].clone().unwrap_or_else(|| {
+                    "BATCH_PREFLIGHT_FAILED: another target failed; no target writes attempted"
+                        .into()
+                }))
             } else if stopped {
-                (
-                    FileStatus::NotCommitted,
-                    Some("NOT_ATTEMPTED: an earlier persistence operation failed".into()),
-                )
+                Outcome::failed("NOT_ATTEMPTED: an earlier persistence operation failed")
             } else if let Some(target) = &targets[index] {
-                match backend.stage(&target.path, file.output.as_bytes()) {
-                    Err(error) => (
-                        FileStatus::NotCommitted,
-                        Some(format!("STAGING_FAILED: {error}")),
-                    ),
-                    Ok(staged) => match self.recheck(target, file) {
-                        Err(error) => (FileStatus::NotCommitted, Some(error.to_string())),
-                        Ok(()) => {
-                            backend
-                                .record(&mut journal, &JournalEvent::Intent { index })
-                                .map_err(journal_error)?;
-                            match backend.replace(staged.path(), &target.path) {
-                                Ok(()) => (FileStatus::Committed, None),
-                                Err(error) => (
-                                    FileStatus::OutcomeUnknown,
-                                    Some(format!(
-                                        "REPLACEMENT_UNCERTAIN: {error}; reconciliation required"
-                                    )),
-                                ),
-                            }
-                        }
-                    },
-                }
+                self.persist(file, target, index, &mut journal, backend)?
             } else {
                 return Err(Error::new(
                     "INVALID_PLAN",
                     "Preflight did not resolve a target",
                 ));
             };
-            stopped |= status != FileStatus::Committed;
+            stopped |= outcome.status != FileStatus::Committed;
             backend
                 .record(
                     &mut journal,
                     &JournalEvent::Outcome {
                         index,
-                        status,
-                        error: error.clone(),
+                        status: outcome.status,
+                        error: outcome.error.clone(),
+                        after: outcome.after.clone(),
                     },
                 )
                 .map_err(journal_error)?;
-            outcomes.push((status, error));
+            outcomes.push(outcome);
         }
         backend
             .record(&mut journal, &JournalEvent::Finished)
             .map_err(journal_error)?;
+        if !outcomes
+            .iter()
+            .any(|outcome| outcome.status == FileStatus::OutcomeUnknown)
+        {
+            self.clear_uncertain(&plan.id);
+        }
         Ok(make_receipt(plan, outcomes))
+    }
+
+    /// Stages, rechecks, and replaces one target, recording write intent before any write.
+    fn persist(
+        &self,
+        file: &PreparedFile,
+        target: &TargetFile,
+        index: usize,
+        journal: &mut File,
+        backend: &mut impl Persistence,
+    ) -> Result<Outcome, Error> {
+        if file.output == file.base.text {
+            // Nothing to write. Replacing identical bytes would still change the file
+            // identity, modification time, and explicit non-inherited ACEs.
+            return Ok(match self.recheck(target, file) {
+                Err(error) => Outcome::failed(error.to_string()),
+                Ok(()) => Outcome::committed(self.after_snapshot(file)),
+            });
+        }
+        let staged = match backend.stage(&target.path, file.output.as_bytes()) {
+            Err(error) => return Ok(Outcome::failed(format!("STAGING_FAILED: {error}"))),
+            Ok(staged) => staged,
+        };
+        if let Err(error) = self.recheck(target, file) {
+            return Ok(Outcome::failed(error.to_string()));
+        }
+        backend
+            .record(journal, &JournalEvent::Intent { index })
+            .map_err(journal_error)?;
+        Ok(match backend.replace(staged.path(), &target.path) {
+            Ok(()) => Outcome::committed(self.after_snapshot(file)),
+            Err(error) => self.observe_failed_replacement(target, file, &error),
+        })
+    }
+
+    /// Same-volume rename is atomic on NTFS and POSIX, so an error observed while still
+    /// holding the workspace lock, with the original identity and base bytes in place,
+    /// proves nothing was written; the candidate bytes prove the rename already took effect.
+    fn observe_failed_replacement(
+        &self,
+        target: &TargetFile,
+        file: &PreparedFile,
+        error: &io::Error,
+    ) -> Outcome {
+        let observed =
+            (|| Ok::<_, Error>((Handle::from_path(&target.path)?, read_target(&target.path)?)))();
+        match observed {
+            Ok((identity, bytes))
+                if identity == target.identity && bytes == file.base.text.as_bytes() =>
+            {
+                Outcome::failed(format!(
+                    "REPLACEMENT_FAILED: {error}; the target is unchanged"
+                ))
+            }
+            Ok((_, bytes)) if bytes == file.output.as_bytes() => {
+                Outcome::committed(self.after_snapshot(file))
+            }
+            _ => Outcome::unknown(format!(
+                "REPLACEMENT_UNCERTAIN: {error}; reconciliation required"
+            )),
+        }
+    }
+
+    /// Retains the bytes just written so a follow-up edit needs no fresh read. It discloses
+    /// no spans deliberately: this output has not been shown to the model.
+    fn after_snapshot(&self, file: &PreparedFile) -> Option<String> {
+        let snapshot = Snapshot {
+            id: new_id("s"),
+            path: file.base.path.clone(),
+            digest: digest(file.output.as_bytes()),
+            text: file.output.clone(),
+            spans: Vec::new(),
+        };
+        // The target is already replaced; this evidence is best effort, never the outcome.
+        self.put("snapshots", &snapshot.id, &snapshot)
+            .ok()
+            .map(|()| snapshot.id)
     }
 
     fn preflight(&self, plan: &PreparedPlan) -> (Vec<Option<TargetFile>>, Vec<Option<String>>) {
@@ -511,48 +679,55 @@ impl Storage {
         Ok(())
     }
 
+    /// Reads only the journals the uncertain index still lists. A plan without a marker
+    /// recorded a complete certain outcome, so its journal cannot hide a target write, and
+    /// commit latency stays independent of how much history the workspace holds.
     fn assert_no_unknown(&self) -> Result<(), Error> {
         let reconciled = self.checked_reconciliations()?;
-        for entry in fs::read_dir(self.directory("journals")?)? {
-            let path = entry?.path();
-            if path
-                .extension()
-                .is_some_and(|extension| extension == "jsonl")
+        let directory = self.directory("uncertain")?;
+        for entry in self.in_state(|| Ok(fs::read_dir(&directory)?))? {
+            let path = self.in_state(|| Ok(entry?.path()))?;
+            let id = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| Error::new("STORE_CORRUPT", "Invalid uncertain marker filename"))?;
+            safe_component(id)?;
+            let journal_path = self.journal_path(id)?;
+            if reconciled.contains(id) || !regular_or_missing(&journal_path)? {
+                self.clear_uncertain(id);
+                continue;
+            }
+            let journal = read_journal(&journal_path)?;
+            if journal.pending
+                || journal
+                    .outcomes
+                    .iter()
+                    .any(|outcome| outcome.status == FileStatus::OutcomeUnknown)
             {
-                regular_or_missing(&path)?;
-                if path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .is_some_and(|id| reconciled.contains(id))
-                {
-                    continue;
-                }
-                let journal = read_journal(&path)?;
-                if journal.pending
-                    || journal
-                        .outcomes
-                        .iter()
-                        .any(|(status, _)| *status == FileStatus::OutcomeUnknown)
-                {
-                    return Err(Error::new(
-                        "RECONCILIATION_REQUIRED",
-                        format!(
-                            "Plan {} has an uncertain outcome; new mutations are blocked",
-                            journal.plan_id
-                        ),
-                    ));
-                }
+                return Err(Error::new(
+                    "RECONCILIATION_REQUIRED",
+                    format!(
+                        "Plan {} has an uncertain outcome; new mutations are blocked",
+                        journal.plan_id
+                    ),
+                ));
+            }
+            if journal.finished {
+                // A crash between the final record and marker removal leaves a stale marker.
+                self.clear_uncertain(id);
             }
         }
         Ok(())
     }
 
     fn directory(&self, kind: &str) -> Result<PathBuf, Error> {
-        safe_component(kind)?;
-        ensure_directory(&self.state)?;
-        let directory = self.state.join(kind);
-        ensure_directory(&directory)?;
-        Ok(directory)
+        self.in_state(|| {
+            safe_component(kind)?;
+            ensure_directory(&self.state)?;
+            let directory = self.state.join(kind);
+            ensure_directory(&directory)?;
+            Ok(directory)
+        })
     }
 
     fn object_path(&self, kind: &str, id: &str) -> Result<PathBuf, Error> {
@@ -563,6 +738,34 @@ impl Storage {
     fn journal_path(&self, id: &str) -> Result<PathBuf, Error> {
         safe_component(id)?;
         Ok(self.directory("journals")?.join(format!("{id}.jsonl")))
+    }
+
+    fn marker_path(&self, plan_id: &str) -> Result<PathBuf, Error> {
+        safe_component(plan_id)?;
+        Ok(self.directory("uncertain")?.join(plan_id))
+    }
+
+    /// Indexes a commit that has begun but has no complete certain outcome yet, so later
+    /// commits read only those journals instead of the workspace's whole history.
+    fn mark_uncertain(&self, plan_id: &str) -> Result<(), Error> {
+        let path = self.marker_path(plan_id)?;
+        self.in_state(|| {
+            match file_options().create_new(true).open(&path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+            sync_directory(parent(&path)?)?;
+            Ok(())
+        })
+    }
+
+    /// Drops a plan's marker. A failed removal is left to the next scan, which resolves it
+    /// from the journal: the index only narrows which journals are read, never the outcome.
+    fn clear_uncertain(&self, plan_id: &str) {
+        if let Ok(path) = self.marker_path(plan_id) {
+            drop(fs::remove_file(path));
+        }
     }
 }
 
@@ -666,7 +869,7 @@ fn read_journal(path: &Path) -> Result<Journal, Error> {
                     && log
                         .outcomes
                         .iter()
-                        .all(|(status, _)| *status == FileStatus::Committed) =>
+                        .all(|outcome| outcome.status == FileStatus::Committed) =>
             {
                 log.had_intent = true;
                 log.pending = true;
@@ -677,14 +880,20 @@ fn read_journal(path: &Path) -> Result<Journal, Error> {
                     index,
                     status,
                     error,
+                    after,
                 },
             ) if !log.finished
                 && index == log.outcomes.len()
                 && index < log.file_count
-                && (log.pending || status == FileStatus::NotCommitted)
+                // A committed no-op records no write intent; an unknown outcome always follows one.
+                && (log.pending || status != FileStatus::OutcomeUnknown)
                 && (status == FileStatus::Committed) == error.is_none() =>
             {
-                log.outcomes.push((status, error));
+                log.outcomes.push(Outcome {
+                    status,
+                    error,
+                    after,
+                });
                 log.pending = false;
             }
             (Some(log), JournalEvent::Finished)
@@ -708,6 +917,24 @@ fn read_journal(path: &Path) -> Result<Journal, Error> {
     })
 }
 
+/// Durable proof that a failed file was never written: either the whole journal shows the
+/// failure preceded any write intent, or its error is one the engine records only after
+/// confirming under the workspace lock that the target still holds its original bytes.
+fn proves_no_write(journal: &Journal, outcome: &Outcome) -> bool {
+    if !journal.had_intent
+        && journal
+            .preflight_failed
+            .unwrap_or_else(|| outcome.error.as_deref().is_some_and(legacy_preflight_error))
+    {
+        return true;
+    }
+    outcome
+        .error
+        .as_deref()
+        .and_then(|error| error.split_once(": "))
+        .is_some_and(|(code, _)| matches!(code, "REPLACEMENT_FAILED" | "NOT_ATTEMPTED"))
+}
+
 fn legacy_preflight_error(error: &str) -> bool {
     // Older journals cannot distinguish preflight from a pre-write recheck failure.
     // Both may emit these errors, but a complete journal without any Intent still
@@ -727,22 +954,23 @@ fn legacy_preflight_error(error: &str) -> bool {
     })
 }
 
-fn make_receipt(plan: &PreparedPlan, outcomes: Vec<(FileStatus, Option<String>)>) -> Receipt {
+fn make_receipt(plan: &PreparedPlan, outcomes: Vec<Outcome>) -> Receipt {
     let files: Vec<_> = plan
         .files
         .iter()
         .zip(outcomes)
-        .map(|(file, (status, error))| FileOutcome {
+        .map(|(file, outcome)| FileOutcome {
             path: file.base.path.clone(),
             before: file.base.id.clone(),
-            after_digest: digest(file.output.as_bytes()),
-            status,
-            changes_applied: if status == FileStatus::Committed {
+            intended_digest: digest(file.output.as_bytes()),
+            after: outcome.after,
+            status: outcome.status,
+            changes_applied: if outcome.status == FileStatus::Committed {
                 file.change_ids.len()
             } else {
                 0
             },
-            error,
+            error: outcome.error,
         })
         .collect();
     let committed = files
@@ -951,6 +1179,23 @@ fn parent(path: &Path) -> Result<&Path, Error> {
         .ok_or_else(|| Error::new("INVALID_PATH", "Path has no parent directory"))
 }
 
+/// Names the path the caller asked for, spelled conventionally, so a missing or
+/// unrepresentable target is not reported as a bare OS message.
+fn target_error(path: &Path, error: io::Error) -> Error {
+    let path = path.to_string_lossy();
+    let display = crate::report::path_for_display(&path);
+    match error.kind() {
+        io::ErrorKind::NotFound => {
+            Error::new("TARGET_MISSING", format!("No file exists at {display}"))
+        }
+        io::ErrorKind::InvalidInput => Error::new(
+            "INVALID_PATH",
+            "Path contains characters the platform cannot represent",
+        ),
+        _ => Error::new("IO_ERROR", format!("{display}: {error}")),
+    }
+}
+
 fn read_target(path: &Path) -> Result<Vec<u8>, Error> {
     let mut bytes = Vec::new();
     File::open(path)?
@@ -1028,6 +1273,36 @@ mod tests {
         (directory, storage, plan)
     }
 
+    fn one_file_plan(
+        storage: &Storage,
+        path: &Path,
+        request_id: &str,
+        old: &str,
+        text: &str,
+    ) -> PreparedPlan {
+        let canonical = storage.resolve(path).expect("resolve");
+        let snapshot = compiler::snapshot(
+            canonical.to_string_lossy().into_owned(),
+            fs::read_to_string(&canonical).expect("read fixture"),
+        );
+        let request = EditRequest {
+            request_id: request_id.into(),
+            files: vec![FileRequest {
+                base: snapshot.id.clone(),
+                changes: vec![Change {
+                    id: format!("{request_id}-change"),
+                    target: Target::Exact {
+                        old: old.into(),
+                        scope: None,
+                    },
+                    text: text.into(),
+                }],
+            }],
+        };
+        let snapshots = BTreeMap::from([(snapshot.id.clone(), snapshot)]);
+        compiler::compile(&request, &snapshots).expect("compile")
+    }
+
     struct FailSecondStage(usize);
     impl Persistence for FailSecondStage {
         fn stage(&mut self, target: &Path, bytes: &[u8]) -> io::Result<NamedTempFile> {
@@ -1090,26 +1365,91 @@ mod tests {
     }
 
     #[test]
-    fn replacement_error_is_unknown_even_when_new_bytes_are_visible() {
+    fn replacement_error_after_the_rename_took_effect_is_committed() {
         let (_directory, storage, plan) = fixture();
         let _lock = storage.lock().expect("lock");
         let receipt = storage
             .commit_with(&plan, &mut FailSecondReplacement(0))
             .expect("receipt");
-        assert_eq!(receipt.commit, CommitStatus::OutcomeUnknown);
-        assert_eq!(receipt.files[0].status, FileStatus::Committed);
-        assert_eq!(receipt.files[1].status, FileStatus::OutcomeUnknown);
-        assert_eq!(receipt.files[2].status, FileStatus::NotCommitted);
-        assert_eq!(receipt.files[1].changes_applied, 0);
+        assert_eq!(receipt.commit, CommitStatus::Committed);
+        assert!(
+            receipt
+                .files
+                .iter()
+                .all(|file| file.status == FileStatus::Committed && file.changes_applied == 1)
+        );
+        assert_eq!(receipt.undo, Some(plan.id.clone()));
+        for file in &plan.files {
+            assert_eq!(fs::read_to_string(&file.base.path).expect("read"), "after");
+        }
+        assert_eq!(storage.commit(&plan).expect("repeat"), receipt);
+    }
+
+    struct FailReplacementWithoutWriting;
+    impl Persistence for FailReplacementWithoutWriting {
+        fn replace(&mut self, _staged: &Path, _target: &Path) -> io::Result<()> {
+            Err(io::Error::other("injected rename failure before any write"))
+        }
+    }
+
+    #[test]
+    fn replacement_failure_that_left_the_target_unchanged_stays_retryable() {
+        let (_directory, storage, plan) = fixture();
+        let _lock = storage.lock().expect("lock");
+        let receipt = storage
+            .commit_with(&plan, &mut FailReplacementWithoutWriting)
+            .expect("receipt");
+        assert_eq!(receipt.commit, CommitStatus::NotCommitted);
+        let error = receipt.files[0].error.as_deref().expect("failure error");
+        assert!(error.starts_with("REPLACEMENT_FAILED: "), "{error}");
+        assert!(error.ends_with("; the target is unchanged"), "{error}");
+        assert!(receipt.files[1..].iter().all(|file| {
+            file.error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("NOT_ATTEMPTED: "))
+        }));
+        assert!(receipt.files.iter().all(|file| file.after.is_none()));
         assert_eq!(receipt.undo, None);
+        for file in &plan.files {
+            assert_eq!(fs::read_to_string(&file.base.path).expect("read"), "before");
+        }
+        storage
+            .check_retry(&plan)
+            .expect("a proven unchanged target is safe to retry");
+        let mut another = plan.clone();
+        another.id = "another-plan".into();
         assert_eq!(
-            fs::read_to_string(&plan.files[1].base.path).expect("read"),
-            "after"
+            storage.commit(&another).expect("fresh attempt").commit,
+            CommitStatus::Committed
         );
-        assert_eq!(
-            fs::read_to_string(&plan.files[2].base.path).expect("read"),
-            "before"
+    }
+
+    struct ReplaceWithForeignBytes;
+    impl Persistence for ReplaceWithForeignBytes {
+        fn replace(&mut self, _staged: &Path, target: &Path) -> io::Result<()> {
+            fs::write(target, "external writer")?;
+            Err(io::Error::other("injected failure after foreign bytes"))
+        }
+    }
+
+    #[test]
+    fn replacement_failure_with_unexpected_bytes_remains_uncertain() {
+        let (_directory, storage, plan) = fixture();
+        let _lock = storage.lock().expect("lock");
+        let receipt = storage
+            .commit_with(&plan, &mut ReplaceWithForeignBytes)
+            .expect("receipt");
+        assert_eq!(receipt.commit, CommitStatus::OutcomeUnknown);
+        assert_eq!(receipt.files[0].status, FileStatus::OutcomeUnknown);
+        assert!(
+            receipt.files[0]
+                .error
+                .as_deref()
+                .expect("uncertain error")
+                .starts_with("REPLACEMENT_UNCERTAIN: ")
         );
+        assert_eq!(receipt.files[1].status, FileStatus::NotCommitted);
+        assert_eq!(receipt.undo, None);
         assert_eq!(storage.commit(&plan).expect("repeat"), receipt);
         assert_eq!(
             storage
@@ -1124,6 +1464,116 @@ mod tests {
             storage.commit(&another).expect_err("block new writes").code,
             "RECONCILIATION_REQUIRED"
         );
+        assert_eq!(
+            fs::read_to_string(&plan.files[0].base.path).expect("read"),
+            "external writer"
+        );
+    }
+
+    #[test]
+    fn committed_outcomes_record_a_durable_spanless_snapshot_of_the_output() {
+        let (directory, storage, plan) = fixture();
+        let lock = storage.lock().expect("lock");
+        let receipt = storage.commit(&plan).expect("receipt");
+        assert_eq!(receipt.commit, CommitStatus::Committed);
+        let id = receipt.files[0].after.clone().expect("after snapshot");
+        let snapshot: Snapshot = storage.get("snapshots", &id).expect("stored snapshot");
+        assert_eq!(snapshot.id, id);
+        assert_eq!(snapshot.path, plan.files[0].base.path);
+        assert_eq!(snapshot.text, plan.files[0].output);
+        assert_eq!(snapshot.digest, digest(plan.files[0].output.as_bytes()));
+        assert!(snapshot.spans.is_empty());
+        assert_eq!(receipt.files[0].intended_digest, snapshot.digest);
+        drop(lock);
+        let reopened = Storage::open(directory.path()).expect("reopen");
+        let _lock = reopened.lock().expect("lock");
+        assert_eq!(reopened.receipt(&plan).expect("recover"), Some(receipt));
+        assert!(
+            !reopened
+                .marker_path(&plan.id)
+                .expect("marker path")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn an_identical_candidate_commits_without_replacing_the_file() {
+        let (directory, storage, _) = fixture();
+        let _lock = storage.lock().expect("lock");
+        let target = directory.path().join("file-0.txt");
+        let plan = one_file_plan(&storage, &target, "identical", "before", "before");
+        let canonical = Path::new(&plan.files[0].base.path);
+        let identity = Handle::from_path(canonical).expect("identity");
+        let modified = fs::metadata(canonical)
+            .expect("metadata")
+            .modified()
+            .expect("modification time");
+        let receipt = storage.commit(&plan).expect("receipt");
+        assert_eq!(receipt.commit, CommitStatus::Committed);
+        assert_eq!(receipt.files[0].changes_applied, 1);
+        assert_eq!(Handle::from_path(canonical).expect("identity"), identity);
+        assert_eq!(
+            fs::metadata(canonical)
+                .expect("metadata")
+                .modified()
+                .expect("modification time"),
+            modified
+        );
+        assert_eq!(fs::read_to_string(canonical).expect("read"), "before");
+        let after: Snapshot = storage
+            .get("snapshots", &receipt.files[0].after.clone().expect("after"))
+            .expect("stored snapshot");
+        assert_eq!(after.text, "before");
+        assert_eq!(storage.commit(&plan).expect("repeat"), receipt);
+    }
+
+    #[test]
+    fn pruning_retains_the_committed_output_its_receipts_still_reference() {
+        let (_directory, storage, plan) = fixture();
+        let _lock = storage.lock().expect("lock");
+        let receipt = storage.commit(&plan).expect("receipt");
+        storage.put("plans", &plan.id, &plan).expect("retain plan");
+        let after: Vec<_> = receipt
+            .files
+            .iter()
+            .map(|file| file.after.clone().expect("after snapshot"))
+            .collect();
+        let pruning = storage
+            .prune_snapshots(&BTreeSet::new(), Duration::ZERO, true)
+            .expect("pruning");
+        assert!(
+            pruning
+                .eligible
+                .iter()
+                .all(|candidate| !after.contains(&candidate.snapshot))
+        );
+        for id in &after {
+            assert!(storage.get::<Snapshot>("snapshots", id).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_stale_uncertain_marker_for_a_certain_journal_is_removed_without_blocking() {
+        let (directory, storage, plan) = fixture();
+        let _lock = storage.lock().expect("lock");
+        assert_eq!(
+            storage.commit(&plan).expect("receipt").commit,
+            CommitStatus::Committed
+        );
+        let marker = storage.marker_path(&plan.id).expect("marker path");
+        File::create_new(&marker).expect("stale marker");
+        let next = one_file_plan(
+            &storage,
+            &directory.path().join("file-0.txt"),
+            "after-stale-marker",
+            "after",
+            "final",
+        );
+        assert_eq!(
+            storage.commit(&next).expect("receipt").commit,
+            CommitStatus::Committed
+        );
+        assert!(!marker.exists());
     }
 
     struct FailOutcomeRecord;
@@ -1164,6 +1614,21 @@ mod tests {
                 .expect_err("interrupted retry closed")
                 .code,
             "RETRY_CLOSED"
+        );
+        assert!(
+            reopened
+                .marker_path(&plan.id)
+                .expect("marker path")
+                .exists()
+        );
+        let mut another = plan.clone();
+        another.id = "another-plan".into();
+        assert_eq!(
+            reopened
+                .commit(&another)
+                .expect_err("torn journal blocks new writes")
+                .code,
+            "RECONCILIATION_REQUIRED"
         );
         assert_eq!(
             fs::read_to_string(&plan.files[1].base.path).expect("read"),
@@ -1304,6 +1769,7 @@ mod tests {
                     index,
                     status: FileStatus::NotCommitted,
                     error: Some(if index == 0 { "READ_ONLY_TARGET: Read-only files cannot be replaced" } else { "BATCH_PREFLIGHT_FAILED: another target failed; no target writes attempted" }.into()),
+                    after: None,
                 }).unwrap();
             }
             assert_eq!(
@@ -1353,6 +1819,7 @@ mod tests {
                 index: 0,
                 status: FileStatus::NotCommitted,
                 error: Some("STALE_SNAPSHOT: Current bytes differ from the prepared base".into()),
+                after: None,
             },
         )
         .unwrap();
@@ -1376,6 +1843,8 @@ mod tests {
         let _lock = storage.lock().expect("lock");
         fs::write(storage.journal_path("corrupt").expect("path"), b"broken\n")
             .expect("corrupt journal");
+        let marker = storage.marker_path("corrupt").expect("marker path");
+        File::create_new(&marker).expect("uncertain marker");
         assert_eq!(
             storage.commit(&plan).expect_err("fail closed").code,
             "JOURNAL_CORRUPT"
@@ -1383,6 +1852,15 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&plan.files[0].base.path).expect("read"),
             "before"
+        );
+        // Pruning rescans every journal, including ones the uncertain index no longer lists.
+        fs::remove_file(&marker).expect("remove marker");
+        assert_eq!(
+            storage
+                .prune_snapshots(&BTreeSet::new(), Duration::ZERO, false)
+                .expect_err("pruning fails closed")
+                .code,
+            "REFERENCE_NOT_FOUND"
         );
     }
 }

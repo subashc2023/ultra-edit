@@ -66,8 +66,10 @@ does not replay writes.
 
 After correcting an environmental failure such as a read-only target, call
 `ultra_edit_retry` with `{"plan":"FAILED_PLAN","request_id":"NEW_RETRY_ID"}`.
-For new journals, this requires proof of completed failed preflight and no write
-intent. It copies the original candidate and bases into
+For new journals, this requires durable proof that no target was written: a completed
+failed preflight with no write intent, or every file recording `REPLACEMENT_FAILED`
+(the engine reobserved the original bytes and file identity after the failure) or
+`NOT_ATTEMPTED`. It copies the original candidate and bases into
 a new plan and attempts that plan, preserving the previous failure receipt.
 The original `commit` remains idempotent. New source bytes still fail stale
 checks. Partial, uncertain, or incomplete failures cannot use this route. New
@@ -89,6 +91,11 @@ deciding which fresh edits are needed. For `outcome_unknown`, `JOURNAL_UNCERTAIN
 or `JOURNAL_CORRUPT`, stop new mutations and retain the request and plan references.
 Matching current bytes do not resolve historical uncertainty. Do not delete
 state, replay under a fresh ID, or attempt automatic undo.
+
+The workspace lists the plans still awaiting resolution as empty marker files in
+`.ultra-edit/uncertain`; every mutation checks those journals, and a marker is removed
+only once the plan records a certain outcome or an operator resolution. Do not create
+or delete these markers by hand: removing one hides an unresolved uncertain commit.
 
 Crash inspection and reconciliation are available through MCP. Call
 `ultra_edit_inspect` with `{plan}`, then retrieve the complete saved inspection

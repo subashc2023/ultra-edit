@@ -427,13 +427,16 @@ whole batch against its original snapshots under a new request ID:
 
 Corrections cannot add unknown IDs or change retained snapshots. A stale base
 requires a fresh read and request. Repair closes after **any commit attempt**.
-For an environmental preflight failure, fix the cause and use
+For an environmental failure, fix the cause and use
 `retry PLAN NEW_REQUEST_ID` (MCP `ultra_edit_retry`). New journals must provide
-durable proof that preflight completed unsuccessfully with no write intent. It clones
+durable proof that no target was written: either preflight completed unsuccessfully
+with no write intent, or every file records a failed replacement the engine confirmed
+had left the original bytes and file identity in place (`REPLACEMENT_FAILED`) or was
+never attempted. It clones
 the exact candidate and original bases into a new plan, then attempts that plan;
 no re-snapshot or matching is performed. The old request, journal, and failed
 receipt remain unchanged. Partial, uncertain, and interrupted failures are
-ineligible. New journals also exclude post-preflight failures. Older journals
+ineligible, as are staging failures and post-staging stale bases. Older journals
 lack a phase marker: a completed journal with no write intent and recognized
 preflight errors is accepted, including an indistinguishable single-file stale
 recheck before writing. Absence of write intent proves no target mutation in
@@ -458,14 +461,22 @@ The filesystem adapter holds one workspace lock across an operation, validates
 all targets, stages each candidate beside its target, syncs it, rechecks its base,
 then uses the platform's [rename replacement](https://doc.rust-lang.org/std/fs/fn.rename.html).
 Canonical path aliases and hardlink aliases cannot produce competing candidates
-within one batch. Read-only files fail preflight.
+within one batch. Read-only files fail preflight. A candidate identical to the
+current bytes is confirmed without staging or renaming, so an effectively empty
+edit leaves file identity, timestamps, and explicit ACLs untouched.
 
 The adapter appends checksummed, synced journal records before and after each
-write. It stops after the first persistence failure. Receipts distinguish
+write. It stops after the first persistence failure. A replacement that reports an
+error is reobserved under the same lock: the original bytes and file identity mean
+`not_committed` with `REPLACEMENT_FAILED`, the candidate bytes mean `committed`, and
+anything else stays `outcome_unknown`. Receipts distinguish
 `committed`, `not_committed`, `partial`, and `outcome_unknown`, with per-file
 outcomes. Counts describe confirmed committed change IDs; replace-all occurrences
-are separate regions of one change. `after_digest` identifies the **intended**
+are separate regions of one change. `intended_digest` identifies the **intended**
 candidate and is evidence of actual output only for confirmed committed files.
+Each committed file also carries `after`: a snapshot reference holding the bytes
+that were written, with no disclosed spans, usable as the base of a follow-up
+unscoped `exact` edit or search page without reading the file again.
 The CLI's `validation: "not_requested"` means no external validation command was
 run. MCP receipt responses omit this unconfigurable field. Run project checks
 separately; a confirmed write is not evidence that tests passed.
@@ -473,7 +484,12 @@ separately; a confirmed write is not evidence that tests passed.
 A missing durable outcome after a write intent is `outcome_unknown`, even when
 current bytes happen to match the candidate. Repeating that plan returns its
 recorded/recovered outcome without writing. Any unresolved uncertain journal
-blocks new mutations throughout the workspace. `JOURNAL_UNCERTAIN` errors carry the request
+blocks new mutations throughout the workspace. Each commit indexes its plan with an
+empty marker file under `.ultra-edit/uncertain` before its first write and removes it
+once a complete certain outcome is recorded, so later mutations read only the journals
+still listed there instead of the whole history. Stale markers are resolved from their
+journals automatically; do not add or delete them by hand.
+`JOURNAL_UNCERTAIN` errors carry the request
 and plan references with explicit `outcome_unknown`; retrieve their evidence.
 The operator workflow below records a resolution while retaining that uncertainty.
 
@@ -498,7 +514,8 @@ stored-object `bytes`, `eligible_bytes`, and retained/removed snapshot counts;
 these byte counts include serialization overhead. Add `--apply` to rescan and
 remove eligible standalone snapshots under the workspace lock. Pruned standalone
 references become unavailable. Retained plans, drafts, and inspections keep their
-required snapshots, and request, receipt, journal, and resolution history stays.
+required snapshots, retained journals keep the committed-output snapshots their
+receipts name, and request, receipt, journal, and resolution history stays.
 Uncertain or invalid recovery evidence blocks pruning; it is not a shortcut for
 resolving a failed edit.
 
@@ -591,6 +608,9 @@ arbitrary external writers. Conditional base checks still apply to every later e
   draft, or inspection needs; add `--apply` to delete the listed eligible objects.
   This is explicit maintenance, not automatic collection. Keep recovery evidence
   and request history intact; pruning does not delete them.
+  Opening a workspace also writes `.ultra-edit/.gitignore`, which ignores everything
+  under it, and a `CACHEDIR.TAG` marker for backup tools. Both are created once and
+  never overwritten, so local edits to them survive.
   Keep it local and exclude it from version control in workspaces you edit. The
   state directory is trusted local storage, not a security boundary against a
   hostile process running as the same user. New Unix state directories/files use

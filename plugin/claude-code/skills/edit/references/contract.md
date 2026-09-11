@@ -74,8 +74,10 @@ outcome. Add `"full":true` inside `query` to retrieve all file outcomes.
 confirmation of a write. An unknown request ID is an explicit error.
 `changes_applied` counts confirmed
 change IDs; replace-all occurrences remain regions of one change.
-`after_digest` identifies the intended output and proves actual output only for
-a confirmed committed file. MCP receipt responses omit the engine's
+`intended_digest` identifies the intended output and proves actual output only for
+a confirmed committed file. A committed file also carries `after`, a snapshot of the
+bytes written with no disclosed spans; use it as the base of a follow-up unscoped
+`exact` edit or search page instead of reading the file again. MCP receipt responses omit the engine's
 unconfigurable validation field. Run project validation separately; confirmed
 persistence does not mean external checks passed.
 
@@ -112,6 +114,8 @@ rolled back; retrieve its receipt or retry the identical operation under its ID.
 - `.ultra-edit` retains source history. CLI `prune-snapshots OLDER_THAN_SECONDS`
   previews eligible old standalone snapshots; `--apply` explicitly removes them.
   Retained plans, drafts, inspections, requests, and journals remain. Keep state
-  local and outside version control. The engine targets ordinary source files;
+  local and outside version control; the directory ignores itself through its own
+  `.gitignore` and carries a `CACHEDIR.TAG`, both created once and never overwritten.
+  A drive root or a state directory cannot be a workspace. The engine targets ordinary source files;
   replacement does not preserve ownership, ACLs, extended attributes, timestamps,
   or hardlink relationships. Power-loss durability is not promised.

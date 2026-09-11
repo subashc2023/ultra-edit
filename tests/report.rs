@@ -48,7 +48,8 @@ fn outcome(status: FileStatus, changes_applied: usize) -> FileOutcome {
     FileOutcome {
         path: "source.txt".into(),
         before: "s-example".into(),
-        after_digest: String::new(),
+        intended_digest: String::new(),
+        after: None,
         status,
         changes_applied,
         error: (status != FileStatus::Committed).then(|| "write interrupted".into()),

@@ -151,6 +151,129 @@ fn read_rejects_unsupported_encoding_and_non_workspace_targets() {
 }
 
 #[test]
+fn missing_and_unrepresentable_targets_are_reported_with_their_path() {
+    let directory = tempfile::tempdir().expect("directory");
+    let storage = Storage::open(directory.path()).expect("storage");
+    let _lock = storage.lock().expect("lock");
+    let error = storage
+        .resolve(Path::new("missing.txt"))
+        .expect_err("missing target");
+    assert_eq!(error.code, "TARGET_MISSING");
+    assert!(error.message.contains("missing.txt"), "{}", error.message);
+    assert!(!error.message.contains(r"\\?\"), "{}", error.message);
+    assert_eq!(
+        storage
+            .resolve(Path::new("a\0.txt"))
+            .expect_err("unrepresentable path")
+            .code,
+        "INVALID_PATH"
+    );
+}
+
+#[test]
+fn state_directory_failures_are_distinguished_from_target_failures() {
+    let directory = tempfile::tempdir().expect("directory");
+    fs::write(directory.path().join(".ultra-edit"), "not a directory").expect("state file");
+    assert_eq!(
+        Storage::open(directory.path())
+            .map(drop)
+            .expect_err("state path is a file")
+            .code,
+        "UNSAFE_STATE_PATH"
+    );
+
+    let workspace = tempfile::tempdir().expect("directory");
+    let storage = Storage::open(workspace.path()).expect("storage");
+    let _lock = storage.lock().expect("lock");
+    storage.put("examples", "a1", &"value").expect("put");
+    let error = {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // An exclusive share mode denies every other open of this stored object.
+            let _exclusive = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(workspace.path().join(".ultra-edit/examples/a1.json"))
+                .expect("exclusive handle");
+            storage
+                .get::<String>("examples", "a1")
+                .expect_err("state object unavailable")
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let state = workspace.path().join(".ultra-edit");
+            let original = fs::metadata(&state).expect("metadata").permissions();
+            fs::set_permissions(&state, fs::Permissions::from_mode(0o500))
+                .expect("read-only state directory");
+            let error = storage
+                .put("others", "a1", &"value")
+                .expect_err("state directory unwritable");
+            fs::set_permissions(&state, original).expect("restore permissions");
+            error
+        }
+    };
+    assert_eq!(error.code, "STATE_DIR_UNAVAILABLE");
+    assert!(error.message.contains(".ultra-edit"), "{}", error.message);
+}
+
+#[test]
+fn a_drive_root_or_a_state_directory_cannot_be_a_workspace() {
+    let directory = tempfile::tempdir().expect("directory");
+    let state = directory.path().join(".ultra-edit");
+    fs::create_dir(&state).expect("state directory");
+    let nested = state.join("journals");
+    fs::create_dir(&nested).expect("nested state directory");
+    for root in [state.as_path(), nested.as_path()] {
+        assert_eq!(
+            Storage::open(root)
+                .map(drop)
+                .expect_err("state directory")
+                .code,
+            "INVALID_WORKSPACE"
+        );
+    }
+    let filesystem_root = directory
+        .path()
+        .ancestors()
+        .last()
+        .expect("filesystem root");
+    // The rejection must precede any state creation, whatever the root already holds.
+    let root_state = filesystem_root.join(".ultra-edit");
+    let existing_root_state = root_state.exists();
+    assert_eq!(
+        Storage::open(filesystem_root)
+            .map(drop)
+            .expect_err("filesystem root")
+            .code,
+        "INVALID_WORKSPACE"
+    );
+    assert_eq!(root_state.exists(), existing_root_state);
+}
+
+#[test]
+fn a_new_workspace_ignores_its_own_state_directory_without_overwriting_changes() {
+    let directory = tempfile::tempdir().expect("directory");
+    let state = directory.path().join(".ultra-edit");
+    Storage::open(directory.path()).expect("storage");
+    assert_eq!(
+        fs::read_to_string(state.join(".gitignore")).expect("gitignore"),
+        "*\n"
+    );
+    assert_eq!(
+        fs::read_to_string(state.join("CACHEDIR.TAG")).expect("cache tag"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by Ultra Edit.\n# For information about cache directory tags see https://bford.info/cachedir/\n"
+    );
+    fs::write(state.join(".gitignore"), "*\n!keep\n").expect("operator change");
+    Storage::open(directory.path()).expect("reopen");
+    assert_eq!(
+        fs::read_to_string(state.join(".gitignore")).expect("gitignore"),
+        "*\n!keep\n"
+    );
+}
+
+#[test]
 fn object_store_is_immutable_checksums_payloads_and_rejects_path_traversal() {
     let directory = tempfile::tempdir().expect("directory");
     let storage = Storage::open(directory.path()).expect("storage");

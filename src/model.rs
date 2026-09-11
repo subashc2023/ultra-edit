@@ -221,7 +221,11 @@ pub enum FileStatus {
 pub struct FileOutcome {
     pub path: String,
     pub before: String,
-    pub after_digest: String,
+    #[serde(alias = "after_digest")]
+    pub intended_digest: String,
+    /// Snapshot of the bytes actually written, without disclosed spans. Committed files only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
     pub status: FileStatus,
     pub changes_applied: usize,
     pub error: Option<String>,

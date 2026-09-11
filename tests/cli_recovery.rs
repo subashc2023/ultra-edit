@@ -81,7 +81,11 @@ fn prepare(root: &Path, files: &[(&str, &str, &str)], request_id: &str) -> (Valu
 
 fn record_interrupted_commit(root: &Path, plan: &PreparedPlan) -> Vec<u8> {
     // This durable wire fixture represents a process crash after recording write
-    // intent but before recording whether the target replacement completed.
+    // intent but before recording whether the target replacement completed. A real
+    // commit also indexes the plan as uncertain before its first write.
+    let uncertain = root.join(".ultra-edit/uncertain");
+    fs::create_dir_all(&uncertain).unwrap();
+    File::create_new(uncertain.join(&plan.id)).unwrap();
     let path = root
         .join(".ultra-edit/journals")
         .join(format!("{}.jsonl", plan.id));
@@ -144,7 +148,8 @@ fn interrupted_commit_replays_unknown_without_inferring_from_current_bytes() {
         for (outcome, prepared) in receipt.files.iter().zip(&plan.files) {
             assert_eq!(outcome.path, report::path_for_display(&prepared.base.path));
             assert_eq!(outcome.before, prepared.base.id);
-            assert_eq!(outcome.after_digest, digest(prepared.output.as_bytes()));
+            assert_eq!(outcome.intended_digest, digest(prepared.output.as_bytes()));
+            assert_eq!(outcome.after, None);
             assert_eq!(outcome.changes_applied, 0);
             assert!(
                 outcome

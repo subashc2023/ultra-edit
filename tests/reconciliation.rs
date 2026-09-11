@@ -51,9 +51,18 @@ fn record(payload: Value) -> Vec<u8> {
     bytes
 }
 
+fn mark_uncertain(root: &Path, plan: &PreparedPlan) {
+    // A commit indexes its plan as uncertain before its first write; the index is what
+    // later mutations scan, so a crash fixture needs its marker as well as its journal.
+    let uncertain = root.join(".ultra-edit/uncertain");
+    fs::create_dir_all(&uncertain).unwrap();
+    File::create_new(uncertain.join(&plan.id)).unwrap();
+}
+
 fn interrupted(root: &Path, plan: &PreparedPlan) -> Vec<u8> {
     // A durable intent without an outcome models either side of an interrupted
     // target replacement; the target's present bytes cannot distinguish them.
+    mark_uncertain(root, plan);
     let mut bytes = record(json!({
         "event": "begin", "plan_id": plan.id,
         "plan_digest": digest(&serde_json::to_vec(plan).unwrap()),
