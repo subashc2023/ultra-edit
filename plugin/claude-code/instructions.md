@@ -54,9 +54,10 @@ a `{"kind":"all"}` target. Exact search text cannot be empty. For insertion,
 use a returned zero-width span where available. Between nonblank lines, replace
 the preceding body with original + line ending + insertion, or the following
 body with insertion + line ending + original.
-Review candidate warnings and `ultra_edit_diff` when needed. A proven preflight
-failure can use `ultra_edit_retry` with a new request ID after fixing its cause;
-partial or uncertain outcomes cannot. `ultra_edit_inspect` captures recovery
+Review candidate warnings and `ultra_edit_diff` when needed. A failure that
+proves no target write (failed preflight, or `REPLACEMENT_FAILED` with the target
+unchanged) can use `ultra_edit_retry` with a new request ID after fixing its
+cause; partial or uncertain outcomes cannot. `ultra_edit_inspect` captures recovery
 evidence; reconcile only after reviewing it and an explicit operator decision.
 
 For detailed targets, examples, and recovery, load `/ultra-edit:edit` as needed.

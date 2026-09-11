@@ -264,7 +264,7 @@ impl McpServer {
 
     #[tool(
         name = "ultra_edit_commit",
-        description = "Advanced: commit exactly a recorded ready plan, conditional on its original snapshot bytes. No new snapshot or normalization. Repeated calls return the original receipt. Lost response/cancellation does not imply rollback: query the receipt or repeat this same plan. For a proven preflight failure use ultra_edit_retry after fixing the environment. partial/outcome_unknown require receipt review; never resubmit with a new request ID.",
+        description = "Advanced: commit exactly a recorded ready plan, conditional on its original snapshot bytes. No new snapshot or normalization. Repeated calls return the original receipt. Lost response/cancellation does not imply rollback: query the receipt or repeat this same plan. For a failure that proves no target write (preflight, or REPLACEMENT_FAILED with the target unchanged) use ultra_edit_retry after fixing the environment. partial/outcome_unknown require receipt review; never resubmit with a new request ID.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -286,7 +286,7 @@ impl McpServer {
 
     #[tool(
         name = "ultra_edit_retry",
-        description = "Retry a proven preflight-failed plan after correcting its environment, using a NEW request_id. Reuses the exact stored candidate and original bases without another snapshot or rebuild; retains the old receipt. Refuses staging/write failures, partial or unknown outcomes. Repeat identical retry arguments/ID after lost output; never choose another ID to bypass an uncertain result.",
+        description = "Retry a plan whose failure proves no target write (failed preflight, or REPLACEMENT_FAILED with the target unchanged) after correcting its environment, using a NEW request_id. Reuses the exact stored candidate and original bases without another snapshot or rebuild; retains the old receipt. Refuses staging failures, partial or unknown outcomes. Repeat identical retry arguments/ID after lost output; never choose another ID to bypass an uncertain result.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,

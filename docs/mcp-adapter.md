@@ -103,7 +103,7 @@ The names below are server-side names; the host may add a namespace.
 | `ultra_edit_status` | `{query: {kind: "receipt", request_id, full?: boolean}}` or `{query: {kind: "evidence", reference}}` | Retrieve a compact outcome (default), full receipt (`full: true`), or explicit evidence |
 | `ultra_edit_prepare` | The same direct `EditRequest` as `ultra_edit` | Persist a preview or rejected draft |
 | `ultra_edit_commit` | `{plan}` | Commit the stored candidate |
-| `ultra_edit_retry` | `{plan, request_id}` | Retry a proven preflight failure under a new ID, retaining the exact original candidate |
+| `ultra_edit_retry` | `{plan, request_id}` | Retry a failure that proves no target write (failed preflight, or `REPLACEMENT_FAILED` with the target unchanged) under a new ID, retaining the exact original candidate |
 | `ultra_edit_repair` | `{reference, request_id, changes}` | Replace retained changes by ID and prepare again |
 | `ultra_edit_undo` | `{plan, request_id}` | Conditionally restore confirmed committed files |
 | `ultra_edit_diff` | `{plan, offset?}` | Read a unified diff in pages of at most 6,000 Unicode characters |
