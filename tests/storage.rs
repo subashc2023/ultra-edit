@@ -207,6 +207,15 @@ fn state_directory_failures_are_distinguished_from_target_failures() {
             let original = fs::metadata(&state).expect("metadata").permissions();
             fs::set_permissions(&state, fs::Permissions::from_mode(0o500))
                 .expect("read-only state directory");
+            // Privileged processes, such as root in most CI containers, bypass
+            // directory permissions, so this mode cannot make the store unwritable.
+            let probe = state.join("permission-probe");
+            if fs::write(&probe, "").is_ok() {
+                fs::remove_file(&probe).expect("remove probe");
+                fs::set_permissions(&state, original).expect("restore permissions");
+                eprintln!("skipped: directory permissions do not restrict this process");
+                return;
+            }
             let error = storage
                 .put("others", "a1", &"value")
                 .expect_err("state directory unwritable");
