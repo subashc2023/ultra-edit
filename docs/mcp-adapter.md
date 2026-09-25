@@ -2,7 +2,7 @@
 
 Ultra Edit exposes the existing `Workspace` API through a local stdio MCP server.
 The Claude Code plugin distributes its server configuration, context hooks, a
-Bash guard hook, and a small usage skill. The Rust engine remains responsible
+shell guard hook, and a small usage skill. The Rust engine remains responsible
 for snapshots, planning, conditional commit, retry identity, receipts, and
 recovery.
 
@@ -90,11 +90,13 @@ The same executable also serves non-MCP hook modes:
 Each `--claude-context` mode prints hook JSON containing the requested
 `hookEventName` and the embedded editing policy as `additionalContext`, then
 exits without opening a workspace. `--claude-hook PreToolUse` reads Claude
-Code's hook JSON from stdin. For a Bash command that writes content embedded in
-the command into files, it prints a `permissionDecision: "deny"` with a reason;
-otherwise it prints nothing. Malformed input, other tools, parse failures, and
-internal errors allow the call, and `ULTRA_EDIT_SHELL_WRITES=allow` in its
-environment disables it. The
+Code's hook JSON from stdin. For a Bash or PowerShell command that writes
+content embedded in the command into project files, it prints a
+`permissionDecision: "deny"` with a reason; otherwise it prints nothing. The
+project is `CLAUDE_PROJECT_DIR` from its environment, or else the event's `cwd`,
+and targets certainly outside it are allowed. Malformed input, other tools,
+parse failures, and internal errors allow the call, and
+`ULTRA_EDIT_SHELL_WRITES=allow` in its environment disables it. The
 [host setup guide](../plugin/claude-code/skills/edit/references/claude-code.md#automatic-routing-context)
 lists what it blocks, allows, and misses. No `--root` is needed in these modes.
 The policy is compiled into the executable, so plugin instruction updates require
@@ -204,9 +206,10 @@ tools remain available for new files and isolated edits. If required MCP tools
 are unavailable or denied, Claude is instructed to report the blocker. The
 backslash concern comes from a user's 2026-09-05 Bash observation, not a claim
 that this project reproduced it on every host. The context hooks inject
-instructions. The `PreToolUse` hook, matched to `Bash`, denies commands that
-write content embedded in the command into files and leaves other tools and
-commands alone; it is a guard against common patterns, not a sandbox.
+instructions. The `PreToolUse` hook, matched to `Bash|PowerShell`, denies
+commands that write content embedded in the command into project files and
+leaves other tools and commands alone; it is a guard against common patterns,
+not a sandbox.
 Explicit user instructions and host permissions take precedence over plugin
 guidance. Report conflicting workflow instructions; generic advice to use sed
 or heredocs is not a reason to silently abandon the user's explicit Ultra Edit
@@ -248,14 +251,15 @@ initialization and tool discovery, focused snapshot → edit → receipt, contin
 ranges, derived IDs and replay, near-miss candidates, literal bytes, stale
 bases, retry after restart, buffered messages, malformed frames and tool
 arguments, hook launches, and persistence-error reporting; the shell-guard tests
-cover the Bash hook's deny, allow, and fail-open decisions. A real Claude Code
-session is a separate integration check: use a disposable workspace, verify
-`/mcp` connects, confirm hook context loaded, ask for a multi-file edit without
-invoking the skill, inspect exact resulting bytes, and test stale/retry
-behavior. Manifest validation alone does not prove that the host can locate the
+cover the hook's Bash and PowerShell deny, allow, project-scope, and fail-open
+decisions. A real Claude Code session is a separate integration check: use a
+disposable workspace, verify `/mcp` connects, confirm hook context loaded, ask
+for a multi-file edit without invoking the skill, inspect exact resulting bytes,
+and test stale/retry behavior. Manifest validation alone does not prove that the
+host can locate the
 executable or discover and invoke the tools. The
 [evaluation harness](../eval/README.md) compares native editing, native editing
-with only the Bash guard, and the full plugin on six fixture tasks.
+with only the shell guard, and the full plugin on six fixture tasks.
 
 The initial smoke test passed with Claude Code 2.1.263 on 2026-09-07: the plugin
 server connected, Claude loaded the skill, called snapshot → edit → status,

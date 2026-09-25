@@ -20,11 +20,15 @@ All notable changes to Ultra Edit are documented here. Releases follow
 - Responses mark a recorded result returned without a new attempt with
   `replayed: true`, and replayed reports start with a notice. CLI preparation
   output now includes `request_id`, so a derived ID can be used with `receipt`.
-- A `PreToolUse` hook (`ultra-edit-mcp --claude-hook PreToolUse`) denies Bash
-  commands that write file content through the shell. Set
-  `ULTRA_EDIT_SHELL_WRITES=allow` in Claude Code's environment to disable it. The
-  hook allows anything it cannot parse, and a misconfigured hook exits with a
-  non-blocking error rather than denying every command.
+- A `PreToolUse` hook (`ultra-edit-mcp --claude-hook PreToolUse`, matched to
+  `Bash|PowerShell`) denies Bash and PowerShell commands that write file content
+  into the project through the shell, including here-strings, `Set-Content`,
+  `Out-File`, `-replace` rewrites, and .NET write APIs. Writes certainly outside
+  the project (`CLAUDE_PROJECT_DIR`, else the event's `cwd`), such as
+  `$GITHUB_OUTPUT`, `/etc/hosts`, `~/.bashrc`, or temporary files, are allowed.
+  Set `ULTRA_EDIT_SHELL_WRITES=allow` in Claude Code's environment to disable
+  it. The hook allows anything it cannot parse, and a misconfigured hook exits
+  with a non-blocking error rather than denying every command.
 - An evaluation harness (`eval/`) compares native editing, native editing with
   the guard, and Ultra Edit on fixture tasks.
 - `prune-snapshots` reports and removes unreferenced blobs (`reclaimable_blobs`,
@@ -42,7 +46,8 @@ All notable changes to Ultra Edit are documented here. Releases follow
   continuation, and candidates.
 - The engine contract moved from the README to `docs/reference.md`, and the
   README lists what routing edits through MCP gives up.
-- Release packaging requires the Bash guard hook.
+- Release packaging requires the shell guard hook, matched to Bash and
+  PowerShell.
 
 ### Fixed
 

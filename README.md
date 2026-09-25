@@ -14,8 +14,8 @@ payloads before the shell parses them, so quoting does not help.
 Ultra Edit gives Claude a multi-file edit tool that never touches a shell. Changes
 travel as MCP JSON arguments to a local Rust engine, are checked against immutable
 snapshots of the original files, and land with durable receipts. A hook blocks
-file writes through Bash, and the plugin's guidance loads automatically for
-sessions, resumes, compaction, and subagents.
+project file writes through Bash and PowerShell, and the plugin's guidance loads
+automatically for sessions, resumes, compaction, and subagents.
 
 ## Quickstart
 
@@ -153,28 +153,38 @@ contract, persistence, crash reconciliation, and limits.
 
 ## Shell-write guard
 
-The plugin registers a `PreToolUse` hook for Claude Code's Bash tool. It parses
-each command and denies ones that write content embedded in the command into
-files:
+The plugin registers a `PreToolUse` hook for Claude Code's Bash and PowerShell
+tools. It parses each command and denies ones that write content embedded in
+the command into project files:
 
-- heredocs and `echo`/`printf` output redirected or `tee`d into files;
+- heredocs, here-strings, and `echo`/`printf`, `Write-Output`, or string
+  literals redirected, `tee`d, or passed to `Set-Content`, `Add-Content`,
+  `Out-File`, or `New-Item -Value`;
 - inline Python, Node, Perl, Ruby, PHP, or PowerShell code that calls file-write
-  APIs;
-- in-place editors such as `sed -i` and `perl -pi`;
+  APIs, including .NET's `[IO.File]::WriteAllText`;
+- in-place editors such as `sed -i` and `perl -pi`, and `Get-Content` text
+  rewritten with `-replace` or `.Replace()` and written back;
 - patches or edit JSON piped into `patch`, `git apply`, or `ultra-edit`.
 
-The deny reason tells Claude to use Ultra Edit, native Edit, or Write instead.
-Ordinary output redirection (`cargo test > log.txt`), `/dev/null`, and heredocs
-passed to commands that don't write them to files (`git commit -F -`, Claude
-Code's `git commit -m "$(cat <<'EOF' …)"` pattern) are allowed. The guard allows
-anything it cannot parse and is not a sandbox: it misses dynamic commands,
-redirects on grouped commands, rewrites through temporary files, scripts already
-on disk, and Claude Code's PowerShell tool.
+Only writes that may land in the project count. The project is
+`CLAUDE_PROJECT_DIR`, or the hook event's working directory. Targets certainly
+outside it are allowed: `$GITHUB_OUTPUT` and the other runner files, `/dev/null`
+and `$null`, and absolute paths elsewhere such as `/etc/hosts`, `~/.bashrc`, or
+`$TMPDIR` and `$env:TEMP` files. Paths are compared lexically, and Windows drive,
+UNC, and Git Bash `/c/…` paths ignore case. Relative paths, other variables, and
+globs count as inside.
 
-It also blocks legitimate `echo`/`printf` writes, such as appending to
-`$GITHUB_OUTPUT`. To turn the guard off, set `ULTRA_EDIT_SHELL_WRITES=allow` in
-Claude Code's environment, for example `"env": {"ULTRA_EDIT_SHELL_WRITES": "allow"}`
-in `settings.json`. Setting it inside a Bash command has no effect.
+The deny reason tells Claude to use Ultra Edit, native Edit, or Write instead.
+Ordinary output redirection (`cargo test > log.txt`, `git diff > d.patch`),
+plain copies, and heredocs passed to commands that don't write them to files
+(`git commit -F -`, Claude Code's `git commit -m "$(cat <<'EOF' …)"` pattern)
+are allowed. The guard allows anything it cannot parse and is not a sandbox: it
+misses dynamic commands, redirects on grouped commands, rewrites through
+temporary files, scripts already on disk, and symlinks into the project.
+
+To turn the guard off, set `ULTRA_EDIT_SHELL_WRITES=allow` in Claude Code's
+environment, for example `"env": {"ULTRA_EDIT_SHELL_WRITES": "allow"}` in
+`settings.json`. Setting it inside a shell command has no effect.
 
 ## Performance
 
@@ -294,7 +304,8 @@ launch separate processes to exercise persistent state.
 `reading.rs` builds focused views; `workspace.rs` owns the reference and request
 protocol; `storage.rs` owns persistence, blobs, and recovery, with
 `storage/reconciliation.rs` for operator resolutions; `report.rs` formats
-evidence; `shell_guard.rs` classifies Bash commands; `main.rs` is the CLI;
+evidence; `shell_guard.rs` classifies Bash commands, with `shell_guard/` for
+PowerShell and the project scope; `main.rs` is the CLI;
 `mcp.rs` declares the MCP tools; `bin/ultra-edit-mcp.rs` runs the stdio server and
 the hook modes. Use `Workspace` for host integration; low-level `Storage` calls
 require the caller to hold its coordinator lock.

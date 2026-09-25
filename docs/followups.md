@@ -114,7 +114,8 @@ has the complete contract.
   IDs are derived from the arguments, and repeating a recorded call returns its
   result with `replayed: true`. Retry still needs an explicit new ID. See
   [Preview, repair, retry, and undo](reference.md#preview-repair-retry-and-undo).
-- **Shell-editing conflicts:** a `PreToolUse` hook now denies Bash commands that
-  write file content through the shell, such as heredoc redirection and
-  `sed -i`, behind the prompt guidance. It fails open and is not a sandbox; see
+- **Shell-editing conflicts:** a `PreToolUse` hook now denies Bash and PowerShell
+  commands that write file content into the project through the shell, such as
+  heredoc redirection, `sed -i`, and `Set-Content`, behind the prompt guidance.
+  It fails open and is not a sandbox; see
   the [host guide](../plugin/claude-code/skills/edit/references/claude-code.md#automatic-routing-context).

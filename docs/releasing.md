@@ -151,7 +151,7 @@ claude plugin install ultra-edit@ultra-edit
 ```
 
 Start Claude Code in a disposable workspace, inspect `/mcp`, and confirm the
-`SessionStart` context, one focused snapshot-to-edit flow, and that the Bash
+`SessionStart` context, one focused snapshot-to-edit flow, and that the shell
 guard denies a heredoc written to a file (for example, ask Claude to run
 `cat > note.txt <<'EOF'` with some text). Release binaries
 are currently unsigned. Add Authenticode signing and macOS Developer ID signing
