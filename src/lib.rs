@@ -1,3 +1,4 @@
+mod candidates;
 pub mod compiler;
 pub mod mcp;
 pub mod model;

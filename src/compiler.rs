@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
+use crate::candidates;
 use crate::model::{
     Change, Diagnostic, EditRequest, PreparedFile, PreparedPlan, Replacement, Snapshot, Span,
     Target, digest, new_id,
@@ -11,10 +12,14 @@ pub const MAX_REPLACEMENTS: usize = 10_000;
 pub const MAX_OVERLAP_DIAGNOSTICS: usize = 128;
 /// Maximum bytes in each source/output file and in all inserted text across a plan.
 pub const MAX_TEXT_BYTES: usize = 16 * 1024 * 1024;
+/// Source and needle bytes that a request's failed targets may search for
+/// near-miss candidates; failures beyond it are reported without candidates.
+pub const MAX_CANDIDATE_SEARCH_BYTES: usize = 2 * MAX_TEXT_BYTES;
 
 struct Budget {
     spans_left: usize,
     bytes_left: usize,
+    search_bytes_left: usize,
 }
 
 impl Budget {
@@ -150,6 +155,7 @@ pub fn compile(
     let mut budget = Budget {
         spans_left: MAX_REPLACEMENTS,
         bytes_left: MAX_TEXT_BYTES,
+        search_bytes_left: MAX_CANDIDATE_SEARCH_BYTES,
     };
     let mut overlap_count = 0;
     let mut overlap_limit_reached = false;
@@ -462,16 +468,20 @@ fn resolve_change(
         } => (old.as_str(), Some(scope.as_str()), *expected),
         Target::Span { span, expect } => {
             if let Some((start, end)) = scope_range(base, change, Some(span), diagnostics) {
-                if expect
-                    .as_ref()
-                    .is_some_and(|text| text != &base.text[start..end])
-                {
-                    diagnostics.push(at(
+                let actual = &base.text[start..end];
+                if let Some(expect) = expect.as_ref().filter(|text| *text != actual) {
+                    // The span may be the wrong one, so search the whole snapshot.
+                    let whole = 0..base.text.len();
+                    let search = &mut budget.search_bytes_left;
+                    let found = candidates::find(search, &base.text, whole, expect, true);
+                    let mut diagnostic = at(
                         Some(&base.path),
                         Some(change),
                         "EXPECTED_TEXT_MISMATCH",
-                        "Span text does not match expect; inspect the original snapshot and choose the intended span",
-                    ));
+                        candidates::mismatch(actual, &found),
+                    );
+                    diagnostic.candidates = found;
+                    diagnostics.push(diagnostic);
                     return;
                 }
                 if !budget.reserve(1, &change.text) {
@@ -522,10 +532,19 @@ fn resolve_change(
         } else {
             "EXPECTED_COUNT_MISMATCH"
         };
+        // Counts explain a target that matched somewhere; only a miss searches.
+        let found = if actual == 0 {
+            let search = &mut budget.search_bytes_left;
+            candidates::find(search, &base.text, start..end, old, false)
+        } else {
+            Vec::new()
+        };
         let message = if exact && actual != 0 {
             format!(
                 "Expected {expected} occurrence(s), found {actual} overlapping starts ({non_overlapping} non-overlapping); inspect the snapshot and choose an explicit span or narrower scope"
             )
+        } else if !found.is_empty() {
+            candidates::not_found(expected, &found)
         } else {
             format!(
                 "Expected {expected} occurrence(s), found {actual}; inspect the snapshot and choose an explicit span or narrower scope"
@@ -534,6 +553,7 @@ fn resolve_change(
         let mut diagnostic = at(Some(&base.path), Some(change), code, message);
         diagnostic.expected = Some(expected);
         diagnostic.actual = Some(actual);
+        diagnostic.candidates = found;
         diagnostics.push(diagnostic);
         return;
     }
