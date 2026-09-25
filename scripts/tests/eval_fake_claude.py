@@ -94,8 +94,9 @@ def main():
     plan = json.loads(pathlib.Path(os.environ["FAKE_CLAUDE_PLAN"]).read_text(encoding="utf-8"))
     settings = json.loads(pathlib.Path(option(args, "--settings")).read_text(encoding="utf-8"))
     plugin_dir = option(args, "--plugin-dir")
+    # %at, not %aI: newer git prints a UTC %aI with "Z" instead of "+00:00".
     git_log = subprocess.run(
-        ["git", "log", "-1", "--format=%an|%ae|%aI|%s"], capture_output=True, text=True, check=False
+        ["git", "log", "-1", "--format=%an|%ae|%at|%s"], capture_output=True, text=True, check=False
     ).stdout.strip()
     autocrlf = subprocess.run(
         ["git", "config", "--get", "core.autocrlf"], capture_output=True, text=True, check=False

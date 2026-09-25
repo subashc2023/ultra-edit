@@ -17,6 +17,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime
 from pathlib import Path, PureWindowsPath
 from unittest import mock
 
@@ -1113,9 +1114,8 @@ class HarnessProcessTests(unittest.TestCase):
         log = json.loads(self.log_path.read_text(encoding="utf-8"))
         self.assertEqual(log["prompt"], task.prompt, "the prompt arrives on stdin unchanged")
         self.assertNotIn(task.prompt, log["argv"])
-        self.assertEqual(
-            log["git_log"], "Ultra Edit Eval|eval@ultra-edit.invalid|2026-01-01T00:00:00+00:00|Fixture"
-        )
+        pinned = int(datetime.fromisoformat(evaluation.GIT_DATE).timestamp())
+        self.assertEqual(log["git_log"], f"Ultra Edit Eval|eval@ultra-edit.invalid|{pinned}|Fixture")
         self.assertEqual(log["autocrlf"], "false")
         self.assertEqual(
             log["env"],
