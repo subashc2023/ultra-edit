@@ -5,6 +5,46 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ## [Unreleased]
 
+### Added
+
+- When an `exact` or `all` target is not found, or a span's `expect` fails,
+  diagnostics list up to three `candidates` (`exact`, `whitespace`, or `similar`)
+  with line numbers and the exact current text to copy.
+- Range reads can continue a snapshot (`read-range PATH FIRST LAST SNAPSHOT`, MCP
+  `range.snapshot`) and keep its spans, so one request can edit distant regions
+  of a file. Range responses report `stale`.
+- `request_id` and change `id` are optional; omitted IDs are derived from the
+  request (`auto-…` and `"1.2"`). Retry still requires an explicit request ID.
+- Responses mark a recorded result returned without a new attempt with
+  `replayed: true`, and replayed reports start with a notice.
+- A `PreToolUse` hook (`ultra-edit-mcp --claude-hook PreToolUse`) denies Bash
+  commands that write file content through the shell. Set
+  `ULTRA_EDIT_SHELL_WRITES=allow` in Claude Code's environment to disable it.
+- An evaluation harness (`eval/`) compares native editing, native editing with
+  the guard, and Ultra Edit on fixture tasks.
+- `prune-snapshots` reports and removes unreferenced blobs (`reclaimable_blobs`,
+  `reclaimable_blob_bytes`, `retained_blobs`, `removed_blobs`).
+
+### Changed
+
+- `.ultra-edit` stores each string of 4 KiB or more once, in `blobs/` by SHA-256.
+  Re-reading an unchanged file writes only a small snapshot. State from 0.2.0
+  loads without migration, but earlier versions cannot read state written by this
+  one and fail with `STORE_CORRUPT`; do not mix versions on one workspace.
+- `TARGET_ALIAS`, `DUPLICATE_TARGET_PATH`, and `EXPECTED_TEXT_MISMATCH` messages
+  say how to recover; `EXPECTED_TEXT_MISMATCH` shows the span's actual text.
+- The plugin instructions are shorter and cover the guard, derived IDs,
+  continuation, and candidates.
+- The engine contract moved from the README to `docs/reference.md`, and the
+  README lists what routing edits through MCP gives up.
+- Release packaging requires the Bash guard hook.
+
+### Fixed
+
+- The MCP server freed an answered request ID only after writing the reply, so a
+  client that reused the ID immediately could be refused as a duplicate.
+- The unwritable-state-directory test no longer fails when run as root.
+
 ## [0.2.0] - 2026-09-11
 
 ### Added
