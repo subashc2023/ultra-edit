@@ -422,11 +422,12 @@ fn similar_regions(text: &str, scope: &Range<usize>, needle: &str) -> Found {
     let needle_lines: Vec<Vec<u8>> = body
         .split('\n')
         .map(|line| {
-            let mut squeezed = Vec::new();
-            squeeze_into(
-                line.strip_suffix('\r').unwrap_or(line).as_bytes(),
-                &mut squeezed,
-            );
+            let line = line.strip_suffix('\r').unwrap_or(line).as_bytes();
+            let mut squeezed = Vec::with_capacity(line.len());
+            squeeze(line, |byte, _| {
+                squeezed.push(byte);
+                true
+            });
             squeezed
         })
         .collect();
@@ -559,23 +560,35 @@ fn scope_lines<'a>(text: &'a str, scope: &Range<usize>) -> impl Iterator<Item = 
         })
 }
 
-/// Appends a line without leading or trailing spaces and tabs, and with each
-/// inner run of them as one space.
-fn squeeze_into(line: &[u8], out: &mut Vec<u8>) {
-    let mut started = false;
-    let mut space = false;
-    for &byte in line {
+/// The squeezing rule: visits one line's squeezed bytes in order, each with the
+/// range of the line it stands for. A visible byte, neither space nor tab,
+/// stands for itself, and a space for a run of spaces and tabs between two
+/// visible bytes; leading and trailing runs are dropped. Both blanks are ASCII,
+/// so every range of UTF-8 text starts on a character boundary. Stops,
+/// returning `false`, as soon as `visit` does.
+///
+/// `Bigrams::compare` runs this on every scope line, so it visits single bytes
+/// and is forced inline: it then compiles to the single loop it replaced, and
+/// callers that ignore ranges pay nothing for them. Measured on the similar
+/// tier, a call cost about 6% more instructions and 10% more memory accesses,
+/// and visiting whole runs of visible bytes about 25% more instructions.
+#[inline(always)]
+fn squeeze(line: &[u8], mut visit: impl FnMut(u8, Range<usize>) -> bool) -> bool {
+    let (mut started, mut space, mut end) = (false, false, 0);
+    for (index, &byte) in line.iter().enumerate() {
         if byte == b' ' || byte == b'\t' {
             space = started;
-        } else {
-            if space {
-                out.push(b' ');
-                space = false;
-            }
-            out.push(byte);
-            started = true;
+            continue;
         }
+        if space && !visit(b' ', end..index) {
+            return false;
+        }
+        if !visit(byte, index..index + 1) {
+            return false;
+        }
+        (started, space, end) = (true, false, index + 1);
     }
+    true
 }
 
 /// Squeezed window text as characters with the source bytes each stands for; a
@@ -590,24 +603,22 @@ fn window_chars(
         if index > 0 {
             chars.push(('\n', lines[index - 1].end..line.start));
         }
-        let mut started = false;
-        let mut run = None;
-        for (offset, character) in text[line.clone()].char_indices() {
-            let at = line.start + offset;
-            if character == ' ' || character == '\t' {
-                if started && run.is_none() {
-                    run = Some(at);
-                }
-                continue;
+        let body = &text[line.clone()];
+        let complete = squeeze(body.as_bytes(), |byte, range| {
+            let at = line.start + range.start;
+            if byte == b' ' {
+                chars.push((' ', at..line.start + range.end));
+            } else if let Some(character) =
+                body.get(range.start..).and_then(|rest| rest.chars().next())
+            {
+                // The later bytes of a character start no slice, so each
+                // character is pushed once, at its first byte.
+                chars.push((character, at..at + character.len_utf8()));
             }
-            if let Some(run) = run.take() {
-                chars.push((' ', run..at));
-            }
-            chars.push((character, at..at + character.len_utf8()));
-            started = true;
-            if chars.len() > limit {
-                return None;
-            }
+            chars.len() <= limit
+        });
+        if !complete {
+            return None;
         }
     }
     (chars.len() <= limit).then_some(chars)
@@ -846,20 +857,10 @@ impl Bigrams {
             if index > 0 {
                 visit(b'\n');
             }
-            // Squeezes exactly as `squeeze_into` does.
-            let (mut started, mut space) = (false, false);
-            for &byte in &text[line.clone()] {
-                if byte == b' ' || byte == b'\t' {
-                    space = started;
-                    continue;
-                }
-                if space {
-                    visit(b' ');
-                    space = false;
-                }
+            squeeze(&text[line.clone()], |byte, _| {
                 visit(byte);
-                started = true;
-            }
+                true
+            });
         }
         visit(b'\n');
         Tally {
@@ -936,6 +937,40 @@ mod tests {
         assert_eq!(quoted("it's", 60), "\"it's\"");
         assert_eq!(quoted("abc\u{0}", 4), "\"abc\"…");
         assert_eq!(quoted("…", 1), "\"…\"");
+    }
+
+    #[test]
+    fn squeezing_maps_each_byte_to_the_source_it_stands_for() {
+        let mut visited = Vec::new();
+        assert!(squeeze(b" \ta  \tb c\t ", |byte, range| {
+            visited.push((byte, range));
+            true
+        }));
+        let expected = [
+            (b'a', 2..3),
+            (b' ', 3..6),
+            (b'b', 6..7),
+            (b' ', 7..8),
+            (b'c', 8..9),
+        ];
+        assert_eq!(visited, expected);
+        let mut calls = 0;
+        assert!(!squeeze(b"a b", |_, _| {
+            calls += 1;
+            calls < 2
+        }));
+        assert_eq!(calls, 2);
+        // Window characters keep multi-byte characters whole.
+        let text = "  é\t ü\nx";
+        let expected = [
+            ('é', 2..4),
+            (' ', 4..6),
+            ('ü', 6..8),
+            ('\n', 8..9),
+            ('x', 9..10),
+        ];
+        assert_eq!(window_chars(text, &[0..8, 9..10], 5).unwrap(), expected);
+        assert!(window_chars(text, &[0..8, 9..10], 4).is_none());
     }
 
     #[test]
