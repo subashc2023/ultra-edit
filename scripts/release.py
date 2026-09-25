@@ -53,6 +53,9 @@ CATALOG_KEYS = frozenset({"name", "description", "owner", "plugins"})
 CATALOG_PLUGIN_KEYS = frozenset({"name", "source", "description", "author"})
 CATALOG_SOURCE_KEYS = frozenset({"source", "url", "sha256"})
 TEXT_SUFFIXES = frozenset({".json", ".md", ".txt", ".toml", ".yaml", ".yml", ".sh"})
+# Claude Code tools whose commands the shell-write guard classifies.
+SHELL_TOOLS = frozenset({"Bash", "PowerShell"})
+TOOL_NAME_RE = re.compile(r"[A-Za-z0-9_]+")
 
 
 class ReleaseError(RuntimeError):
@@ -221,15 +224,38 @@ def _validate_mcp_config(config: Mapping[str, object], source: str) -> None:
             raise ReleaseError(f"{source} ultra-edit.{key} must be {value!r}")
 
 
+def _matcher_names(matcher: object) -> frozenset[str]:
+    """The tool names an exact `A|B` hook matcher lists; empty for anything else."""
+    if not isinstance(matcher, str):
+        return frozenset()
+    names = matcher.split("|")
+    if not all(TOOL_NAME_RE.fullmatch(name) for name in names):
+        return frozenset()
+    return frozenset(names)
+
+
 def _validate_hooks_config(config: Mapping[str, object], source: str) -> None:
     hooks = config.get("hooks")
     if not isinstance(hooks, dict):
         raise ReleaseError(f"{source} must contain a hooks object")
     command = "${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp"
-    for event in ("SessionStart", "SubagentStart"):
+    # Context hooks cover every source of their event; the shell-write guard
+    # applies to the Bash and PowerShell tools.
+    events = {
+        "SessionStart": (None, ["--claude-context", "SessionStart"]),
+        "SubagentStart": (None, ["--claude-context", "SubagentStart"]),
+        "PreToolUse": (SHELL_TOOLS, ["--claude-hook", "PreToolUse"]),
+    }
+    for event, (matcher, args) in events.items():
         groups = hooks.get(event)
         if not isinstance(groups, list) or len(groups) != 1 or not isinstance(groups[0], dict):
             raise ReleaseError(f"{source} must define exactly one {event} hook group")
+        if isinstance(matcher, frozenset):
+            if not _matcher_names(groups[0].get("matcher")) >= matcher:
+                names = " and ".join(repr(name) for name in sorted(matcher))
+                raise ReleaseError(f"{source} {event}.matcher must list the tool names {names}")
+        elif groups[0].get("matcher") != matcher:
+            raise ReleaseError(f"{source} {event}.matcher must be {matcher!r}")
         commands = groups[0].get("hooks")
         if not isinstance(commands, list) or len(commands) != 1 or not isinstance(commands[0], dict):
             raise ReleaseError(f"{source} must define exactly one {event} command hook")
@@ -237,7 +263,7 @@ def _validate_hooks_config(config: Mapping[str, object], source: str) -> None:
         expected = {
             "type": "command",
             "command": command,
-            "args": ["--claude-context", event],
+            "args": args,
             "timeout": 10,
         }
         for key, value in expected.items():

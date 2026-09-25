@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use same_file::Handle;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::{Map, Value};
 use tempfile::NamedTempFile;
 
 use crate::compiler::MAX_TEXT_BYTES;
@@ -20,6 +21,18 @@ const STATE_DIRECTORY: &str = ".ultra-edit";
 
 const CACHEDIR_TAG: &str = "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by Ultra Edit.\n# For information about cache directory tags see https://bford.info/cachedir/\n";
 
+/// Holds each large string once, as raw UTF-8 named by its SHA-256 digest, so snapshots,
+/// plans, and inspections of the same content share storage.
+const BLOB_DIRECTORY: &str = "blobs";
+
+/// A stored object names a blob as `{"$blob": "<digest>"}` in place of the string. The
+/// form is unambiguous because no persisted type serializes a single-key object named
+/// `$blob`; `put` refuses values that contain one.
+const BLOB_KEY: &str = "$blob";
+
+/// Strings of at least this many UTF-8 bytes are externalized; object keys never are.
+const BLOB_THRESHOLD: usize = 4096;
+
 pub struct Storage {
     root: PathBuf,
     state: PathBuf,
@@ -33,6 +46,12 @@ pub struct SnapshotPruning {
     pub eligible_bytes: u64,
     pub retained_snapshots: usize,
     pub removed_snapshots: usize,
+    /// Blobs no remaining object references once the eligible snapshots are removed,
+    /// including orphans of interrupted writes. Blobs have no age threshold.
+    pub reclaimable_blobs: usize,
+    pub reclaimable_blob_bytes: u64,
+    pub retained_blobs: usize,
+    pub removed_blobs: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -114,6 +133,14 @@ impl Outcome {
             after: None,
         }
     }
+}
+
+/// Blobs one object load has read, and their directory once it is resolved: checking
+/// the state directories again for every reference would repeat the same system calls.
+#[derive(Default)]
+struct LoadedBlobs {
+    directory: Option<PathBuf>,
+    texts: HashMap<String, String>,
 }
 
 struct TargetFile {
@@ -218,12 +245,16 @@ impl Storage {
         self.in_state(|| regular_or_missing(&self.object_path(kind, id)?))
     }
 
+    /// Large strings are written to the blob store before the object that references them,
+    /// so an interruption can orphan a blob but never publish a dangling reference.
     pub fn put<T: Serialize>(&self, kind: &str, id: &str, value: &T) -> Result<(), Error> {
         self.in_state(|| {
             let path = self.object_path(kind, id)?;
-            let bytes = encode(value)?;
+            let mut payload = serde_json::to_value(value)?;
             if regular_or_missing(&path)? {
-                if fs::read(path)? == bytes {
+                // Values, not encodings: an inline object written by 0.2.0 and an
+                // externalized one can hold the same value.
+                if self.load(&path)? == payload {
                     return Ok(());
                 }
                 return Err(Error::new(
@@ -231,14 +262,20 @@ impl Storage {
                     "Immutable object already exists",
                 ));
             }
-            let parent = parent(&path)?;
-            let mut staged = temporary(parent)?;
-            staged.write_all(&bytes)?;
-            staged.as_file().sync_all()?;
-            staged
-                .persist_noclobber(&path)
-                .map_err(|error| Error::from(error.error))?;
-            sync_directory(parent)?;
+            let mut blobs = BTreeMap::new();
+            externalize(&mut payload, &mut blobs)?;
+            if !blobs.is_empty() {
+                let directory = self.directory(BLOB_DIRECTORY)?;
+                let mut written = false;
+                for (name, text) in &blobs {
+                    written |= put_blob(&directory, name, text)?;
+                }
+                if written {
+                    sync_directory(&directory)?;
+                }
+            }
+            publish(&path, &encode(&payload)?)?;
+            sync_directory(parent(&path)?)?;
             Ok(())
         })
     }
@@ -252,8 +289,51 @@ impl Storage {
                     format!("Unknown {kind} reference: {id}"),
                 ));
             }
-            decode(&fs::read(path)?)
+            serde_json::from_value(self.load(&path)?)
+                .map_err(|error| Error::new("STORE_CORRUPT", error.to_string()))
         })
+    }
+
+    /// Returns a stored object's checked payload with every blob reference replaced by its
+    /// verified content. Objects written inline by 0.2.0 have no references.
+    fn load(&self, path: &Path) -> Result<Value, Error> {
+        let mut payload = decode(&fs::read(path)?)?;
+        self.rehydrate(&mut payload, &mut LoadedBlobs::default())?;
+        Ok(payload)
+    }
+
+    /// One object can name the same content several times, such as an unchanged output or
+    /// an inspected file, so `loaded` reads and verifies each blob once.
+    fn rehydrate(&self, value: &mut Value, loaded: &mut LoadedBlobs) -> Result<(), Error> {
+        match value {
+            Value::Array(items) => items
+                .iter_mut()
+                .try_for_each(|item| self.rehydrate(item, loaded)),
+            Value::Object(map) => {
+                let Some(name) = blob_reference(map)?.map(str::to_owned) else {
+                    return map
+                        .values_mut()
+                        .try_for_each(|item| self.rehydrate(item, loaded));
+                };
+                let text = match loaded.texts.get(&name) {
+                    Some(text) => text.clone(),
+                    None => {
+                        let directory = match loaded.directory.take() {
+                            Some(directory) => directory,
+                            None => self.directory(BLOB_DIRECTORY)?,
+                        };
+                        let text = get_blob(&directory, &name);
+                        loaded.directory = Some(directory);
+                        let text = text?;
+                        loaded.texts.insert(name, text.clone());
+                        text
+                    }
+                };
+                *value = Value::String(text);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
     }
 
     pub(crate) fn object_ids(&self, kind: &str) -> Result<Vec<String>, Error> {
@@ -299,6 +379,8 @@ impl Storage {
         })
     }
 
+    /// Finds old snapshots outside `retained` and the blobs no remaining object would
+    /// reference; `apply` removes both, snapshots first, after validating everything.
     pub(crate) fn prune_snapshots(
         &self,
         retained: &BTreeSet<String>,
@@ -348,6 +430,10 @@ impl Storage {
             eligible_bytes: 0,
             retained_snapshots: 0,
             removed_snapshots: 0,
+            reclaimable_blobs: 0,
+            reclaimable_blob_bytes: 0,
+            retained_blobs: 0,
+            removed_blobs: 0,
         };
         for id in self.object_ids("snapshots")? {
             let snapshot: Snapshot = self.get("snapshots", &id)?;
@@ -376,6 +462,23 @@ impl Storage {
                 });
             }
         }
+        let removed = result
+            .eligible
+            .iter()
+            .map(|candidate| candidate.snapshot.as_str())
+            .collect();
+        let (reclaimable, retained_blobs) = self.unreferenced_blobs(&removed)?;
+        result.retained_blobs = retained_blobs;
+        result.reclaimable_blobs = reclaimable.len();
+        result.reclaimable_blob_bytes = reclaimable
+            .iter()
+            .try_fold(0u64, |total, (_, bytes)| total.checked_add(*bytes))
+            .ok_or_else(|| {
+                Error::new(
+                    "RESOURCE_LIMIT",
+                    "Blob storage size exceeds the supported range",
+                )
+            })?;
         // Validate all retained history and candidates before unlinking any snapshot.
         // The coordinator lock excludes cooperating readers and request publication.
         if apply {
@@ -387,19 +490,107 @@ impl Storage {
                     result.removed_snapshots += 1;
                 }
                 sync_directory(&self.directory("snapshots")?)?;
+                // Blobs go after the snapshots that referenced them, so an interruption
+                // leaves only orphans for the next prune, never a dangling reference.
+                if !reclaimable.is_empty() {
+                    let directory = self.directory(BLOB_DIRECTORY)?;
+                    for (name, _) in &reclaimable {
+                        let path = blob_path(&directory, name)?;
+                        regular_or_missing(&path)?;
+                        fs::remove_file(path)?;
+                        result.removed_blobs += 1;
+                    }
+                    sync_directory(&directory)?;
+                }
                 Ok::<_, Error>(())
             })();
             if let Err(error) = removal {
                 return Err(Error::new(
                     "PRUNE_INCOMPLETE",
                     format!(
-                        "Removed {} snapshots before pruning failed: {error}; rerun a dry run to inspect remaining candidates",
-                        result.removed_snapshots
+                        "Removed {} snapshots and {} blobs before pruning failed: {error}; rerun a dry run to inspect remaining candidates",
+                        result.removed_snapshots, result.removed_blobs
                     ),
                 ));
             }
         }
         Ok(result)
+    }
+
+    /// Lists blobs that no object references once the `removed` snapshots are gone, with
+    /// their sizes, and counts the blobs that stay. Scans every state subdirectory of
+    /// objects rather than the known kinds, so a new kind cannot lose its blobs. The caller
+    /// holds the coordinator lock, so every blob a writer stored is already referenced.
+    fn unreferenced_blobs(
+        &self,
+        removed: &BTreeSet<&str>,
+    ) -> Result<(Vec<(String, u64)>, usize), Error> {
+        self.in_state(|| {
+            let mut referenced = BTreeSet::new();
+            for entry in fs::read_dir(&self.state)? {
+                let entry = entry?;
+                let kind = entry.file_name();
+                if ["journals", "uncertain", BLOB_DIRECTORY]
+                    .iter()
+                    .any(|excluded| kind == *excluded)
+                {
+                    continue;
+                }
+                let file_type = entry.file_type()?;
+                if file_type.is_symlink()
+                    && fs::metadata(entry.path()).is_ok_and(|metadata| metadata.is_dir())
+                {
+                    return Err(Error::new(
+                        "UNSAFE_STATE_PATH",
+                        "State directories must be real directories inside the workspace",
+                    ));
+                }
+                if !file_type.is_dir() {
+                    continue;
+                }
+                for object in fs::read_dir(entry.path())? {
+                    let path = object?.path();
+                    if path.extension().is_none_or(|extension| extension != "json") {
+                        continue;
+                    }
+                    regular_or_missing(&path)?;
+                    if kind == "snapshots"
+                        && path
+                            .file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .is_some_and(|id| removed.contains(id))
+                    {
+                        continue;
+                    }
+                    blob_references(&decode(&fs::read(&path)?)?, &mut referenced)?;
+                }
+            }
+            let directory = self.directory(BLOB_DIRECTORY)?;
+            let mut unreferenced = Vec::new();
+            let mut retained = 0;
+            for entry in fs::read_dir(&directory)? {
+                let path = entry?.path();
+                // Interrupted writes leave staged temporary files, never partial blobs.
+                let Some(name) = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| is_blob_name(name))
+                else {
+                    continue;
+                };
+                regular_or_missing(&path)?;
+                if referenced.remove(name) {
+                    retained += 1;
+                } else {
+                    unreferenced.push((name.to_owned(), fs::symlink_metadata(&path)?.len()));
+                }
+            }
+            if let Some(name) = referenced.first() {
+                return Err(missing_blob(name));
+            }
+            unreferenced.sort_unstable();
+            Ok((unreferenced, retained))
+        })
     }
 
     /// The caller must hold the coordinator lock throughout receipt lookup and commit.
@@ -1107,6 +1298,139 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Error> {
     }
     serde_json::from_value(checked.payload)
         .map_err(|error| Error::new("STORE_CORRUPT", error.to_string()))
+}
+
+/// Stages `bytes` beside `path`, syncs them, and links them without replacing an existing
+/// file. The caller syncs the directory.
+fn publish(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    let mut staged = temporary(parent(path)?)?;
+    staged.write_all(bytes)?;
+    staged.as_file().sync_all()?;
+    staged
+        .persist_noclobber(path)
+        .map_err(|error| Error::from(error.error))?;
+    Ok(())
+}
+
+/// Moves every string of at least `BLOB_THRESHOLD` bytes into `blobs`, keyed by digest,
+/// leaving a reference in its place.
+fn externalize(value: &mut Value, blobs: &mut BTreeMap<String, String>) -> Result<(), Error> {
+    match value {
+        Value::String(text) if text.len() >= BLOB_THRESHOLD => {
+            let text = std::mem::take(text);
+            let name = digest(text.as_bytes());
+            *value = Value::Object(Map::from_iter([(
+                BLOB_KEY.to_owned(),
+                Value::String(name.clone()),
+            )]));
+            blobs.entry(name).or_insert(text);
+            Ok(())
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .try_for_each(|item| externalize(item, blobs)),
+        Value::Object(map) => {
+            if map.len() == 1 && map.contains_key(BLOB_KEY) {
+                return Err(Error::new(
+                    "INVALID_OBJECT",
+                    "Stored values must not contain a single-key \"$blob\" object; that form is reserved for blob references",
+                ));
+            }
+            map.values_mut()
+                .try_for_each(|item| externalize(item, blobs))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Recognizes the reserved reference form. Any other single-key `$blob` object is damage.
+fn blob_reference(map: &Map<String, Value>) -> Result<Option<&str>, Error> {
+    if map.len() != 1 {
+        return Ok(None);
+    }
+    match map.get(BLOB_KEY) {
+        None => Ok(None),
+        Some(Value::String(name)) if is_blob_name(name) => Ok(Some(name)),
+        Some(_) => Err(Error::new(
+            "STORE_CORRUPT",
+            "Stored object contains an invalid blob reference",
+        )),
+    }
+}
+
+fn blob_references(value: &Value, names: &mut BTreeSet<String>) -> Result<(), Error> {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .try_for_each(|item| blob_references(item, names)),
+        Value::Object(map) => match blob_reference(map)? {
+            Some(name) => {
+                names.insert(name.to_owned());
+                Ok(())
+            }
+            None => map
+                .values()
+                .try_for_each(|item| blob_references(item, names)),
+        },
+        _ => Ok(()),
+    }
+}
+
+fn is_blob_name(name: &str) -> bool {
+    name.len() == 64
+        && name
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn blob_path(directory: &Path, name: &str) -> Result<PathBuf, Error> {
+    safe_component(name)?;
+    Ok(directory.join(name))
+}
+
+/// Stores `text` under its digest unless that blob exists, in which case it already holds
+/// these bytes; its length is a cheap check against damage. Returns whether it wrote.
+fn put_blob(directory: &Path, name: &str, text: &str) -> Result<bool, Error> {
+    let path = blob_path(directory, name)?;
+    if !regular_or_missing(&path)? {
+        publish(&path, text.as_bytes())?;
+        return Ok(true);
+    }
+    if fs::symlink_metadata(&path)?.len() != text.len() as u64 {
+        return Err(Error::new(
+            "STORE_CORRUPT",
+            format!("Stored blob {name} does not match the length of its content"),
+        ));
+    }
+    Ok(false)
+}
+
+/// Reads a blob and proves it holds the UTF-8 text its name commits to.
+fn get_blob(directory: &Path, name: &str) -> Result<String, Error> {
+    let path = blob_path(directory, name)?;
+    if !regular_or_missing(&path)? {
+        return Err(missing_blob(name));
+    }
+    let bytes = fs::read(path)?;
+    if digest(&bytes) != name {
+        return Err(Error::new(
+            "STORE_CORRUPT",
+            format!("Stored blob {name} does not match its content digest"),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        Error::new(
+            "STORE_CORRUPT",
+            format!("Stored blob {name} is not valid UTF-8"),
+        )
+    })
+}
+
+fn missing_blob(name: &str) -> Error {
+    Error::new(
+        "STORE_CORRUPT",
+        format!("A stored object references blob {name}, which is missing"),
+    )
 }
 
 fn safe_component(value: &str) -> Result<(), Error> {

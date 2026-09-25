@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::env;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, PoisonError};
@@ -20,7 +20,7 @@ use tokio_util::{
     codec::{FramedWrite, LinesCodec},
     sync::CancellationToken,
 };
-use ultra_edit::{Workspace, mcp::McpServer};
+use ultra_edit::{Workspace, mcp::McpServer, shell_guard};
 
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const INVALID_TOOL_CALL: &str =
@@ -32,12 +32,20 @@ fn main() -> ExitCode {
     if arguments.len() == 1 && (arguments[0] == "--help" || arguments[0] == "-h") {
         println!(
             "ultra-edit-mcp {}\nUsage: ultra-edit-mcp --root WORKSPACE\n\
-             Or: ultra-edit-mcp --claude-context SessionStart|SubagentStart\n\n\
+             Or: ultra-edit-mcp --claude-context SessionStart|SubagentStart\n\
+             Or: ultra-edit-mcp --claude-hook PreToolUse\n\n\
              Serve MCP over stdio inside one fixed existing workspace.\n\
              JSON-RPC lines are limited to 16 MiB. Protocol output uses stdout; errors use stderr.\n\
              Cancellation or disconnection does not imply rollback; query receipts before retrying.\n\
-             --claude-context prints plugin hook JSON and exits without opening a workspace.",
-            env!("CARGO_PKG_VERSION")
+             --claude-context prints plugin hook JSON and exits without opening a workspace.\n\
+             --claude-hook PreToolUse reads Claude Code hook JSON from stdin and denies Bash and\n\
+             PowerShell commands that write file content into the project through the shell\n\
+             (heredoc, here-string, echo or Set-Content redirection, inline interpreter writes,\n\
+             sed -i, -replace rewrites). Targets certainly outside CLAUDE_PROJECT_DIR (or the\n\
+             event's cwd) are allowed, as is anything it cannot parse.\n\
+             {}=allow disables the guard.",
+            env!("CARGO_PKG_VERSION"),
+            shell_guard::ESCAPE_HATCH
         );
         return ExitCode::SUCCESS;
     }
@@ -64,9 +72,22 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--claude-hook")
+    {
+        // Claude Code blocks the tool call on exit code 2, so a misconfigured
+        // guard reports a non-blocking error rather than denying every command.
+        if arguments.len() != 2 || arguments[1] != "PreToolUse" {
+            eprintln!("--claude-hook requires exactly PreToolUse");
+            return ExitCode::from(1);
+        }
+        guard_shell_writes();
+        return ExitCode::SUCCESS;
+    }
     if arguments.len() != 2 || arguments[0] != "--root" {
         eprintln!(
-            "Usage: ultra-edit-mcp --root WORKSPACE (or --claude-context EVENT / --help / --version)"
+            "Usage: ultra-edit-mcp --root WORKSPACE (or --claude-context EVENT / --claude-hook EVENT / --help / --version)"
         );
         return ExitCode::from(2);
     }
@@ -96,6 +117,69 @@ fn main() -> ExitCode {
     }
 }
 
+/// Answers a `PreToolUse` hook: prints a deny decision for a Bash or
+/// PowerShell command that writes file content into the project through the
+/// shell, and nothing otherwise. Every failure allows the call, because a
+/// broken guard must never block a session.
+fn guard_shell_writes() {
+    let mut input = Vec::new();
+    // Read before deciding so the host never writes into a closed pipe.
+    let limit = MAX_MESSAGE_BYTES as u64 + 1;
+    let read = io::stdin().lock().take(limit).read_to_end(&mut input);
+    if read.is_err()
+        || input.len() > MAX_MESSAGE_BYTES
+        || env::var_os(shell_guard::ESCAPE_HATCH).is_some_and(|value| value == "allow")
+    {
+        return;
+    }
+    let Ok(event) = serde_json::from_slice::<serde_json::Value>(&input) else {
+        return;
+    };
+    let classify = match event["tool_name"].as_str() {
+        Some("Bash") => shell_guard::classify_bash,
+        Some("PowerShell") => shell_guard::classify_powershell,
+        _ => return,
+    };
+    let Some(command) = event["tool_input"]["command"].as_str() else {
+        return;
+    };
+    let scope = guard_scope(event["cwd"].as_str());
+    // A classifier bug must not turn into a hook error on every shell call.
+    let Some(finding) = std::panic::catch_unwind(|| classify(command, &scope))
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    let output = serde_json::json!({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": shell_guard::deny_reason(&finding),
+    }});
+    let mut stdout = io::stdout().lock();
+    if serde_json::to_writer(&mut stdout, &output).is_ok() {
+        let _ = writeln!(stdout);
+    }
+}
+
+/// The project the guard protects: `CLAUDE_PROJECT_DIR` when it is set and
+/// absolute, else the event's working directory when that is absolute, else
+/// none. It carries the environment values that write targets may expand.
+fn guard_scope(cwd: Option<&str>) -> shell_guard::Scope {
+    let project = env::var("CLAUDE_PROJECT_DIR").ok();
+    let root = project
+        .as_deref()
+        .filter(|root| shell_guard::is_absolute(root))
+        .or(cwd.filter(|cwd| shell_guard::is_absolute(cwd)));
+    let scope = root.map(shell_guard::Scope::new).unwrap_or_default();
+    shell_guard::SCOPE_VARIABLES
+        .into_iter()
+        .fold(scope, |scope, name| match env::var(name) {
+            Ok(value) => scope.with_variable(name, &value),
+            Err(_) => scope,
+        })
+}
+
 async fn serve(workspace: Workspace) -> Result<(), Box<dyn std::error::Error>> {
     let failed = CancellationToken::new();
     let transport = StdioTransport {
@@ -106,7 +190,7 @@ async fn serve(workspace: Workspace) -> Result<(), Box<dyn std::error::Error>> {
         output: Arc::new(ProtocolOutput {
             writer: Mutex::new(FramedWrite::new(tokio::io::stdout(), LinesCodec::new())),
             failed: failed.clone(),
-            in_flight: std::sync::Mutex::new(HashSet::new()),
+            in_flight: std::sync::Mutex::new(InFlight::default()),
             answered: Notify::new(),
         }),
     };
@@ -127,15 +211,30 @@ struct ProtocolOutput {
     // Request IDs the SDK still owes a reply for: a second request reusing one
     // is refused instead of losing a reply, and input that ends while one is
     // outstanding is answered instead of dropped.
-    in_flight: std::sync::Mutex<HashSet<serde_json::Value>>,
+    in_flight: std::sync::Mutex<InFlight>,
     answered: Notify,
+}
+
+#[derive(Default)]
+struct InFlight {
+    ids: HashSet<serde_json::Value>,
+    // Replies whose IDs are free again but whose bytes are still being written.
+    writing: usize,
 }
 
 impl ProtocolOutput {
     async fn send(&self, message: impl serde::Serialize) -> Result<(), io::Error> {
-        // Protocol errors and SDK replies share this writer. Check failure under
-        // the lock so queued sends never reuse a broken output stream.
         let mut writer = self.writer.lock().await;
+        self.write(&mut writer, message).await
+    }
+
+    /// Protocol errors and SDK replies share the writer. Checking failure while
+    /// the caller holds it keeps queued sends from reusing a broken stream.
+    async fn write(
+        &self,
+        writer: &mut FramedWrite<tokio::io::Stdout, LinesCodec>,
+        message: impl serde::Serialize,
+    ) -> Result<(), io::Error> {
         if self.failed.is_cancelled() {
             return Err(io::Error::other("MCP transport has failed"));
         }
@@ -150,38 +249,58 @@ impl ProtocolOutput {
         result
     }
 
-    /// Sends an SDK reply and frees the request ID it answers. Freeing it in the
-    /// same step as the write keeps the ID reusable as soon as a client can see
-    /// the reply, and holds a drain open until those bytes are out.
+    /// Sends an SDK reply and frees the request ID it answers. The ID is freed
+    /// under the writer lock before the write, because a client may reuse it the
+    /// moment it reads the reply; a drain still waits until those bytes are out.
     async fn reply(&self, message: TxJsonRpcMessage<RoleServer>) -> Result<(), io::Error> {
-        let answered = answered_id(&message);
-        let result = self.send(message).await;
-        if let Some(id) = answered {
-            self.release(&id);
-        }
-        result
+        let mut writer = self.writer.lock().await;
+        let _writing = answered_id(&message).and_then(|id| Writing::start(self, &id));
+        self.write(&mut writer, message).await
     }
 
     /// Records a request ID as awaiting a reply; false means it already is.
     fn accept(&self, id: &serde_json::Value) -> bool {
-        self.pending().insert(id.clone())
+        self.in_flight().ids.insert(id.clone())
     }
 
     fn release(&self, id: &serde_json::Value) {
-        self.pending().remove(id);
+        self.in_flight().ids.remove(id);
         self.answered.notify_one();
     }
 
     fn awaits_reply(&self) -> bool {
-        !self.pending().is_empty()
+        let in_flight = self.in_flight();
+        !in_flight.ids.is_empty() || in_flight.writing > 0
     }
 
-    fn pending(&self) -> std::sync::MutexGuard<'_, HashSet<serde_json::Value>> {
+    fn in_flight(&self) -> std::sync::MutexGuard<'_, InFlight> {
         // These IDs are bookkeeping: a poisoned set must not stop the transport
         // from answering the requests it still holds.
         self.in_flight
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Holds a drain open while a reply whose ID is already free is written, and
+/// releases it even if that write is dropped.
+struct Writing<'a>(&'a ProtocolOutput);
+
+impl<'a> Writing<'a> {
+    fn start(output: &'a ProtocolOutput, id: &serde_json::Value) -> Option<Self> {
+        let mut in_flight = output.in_flight();
+        if !in_flight.ids.remove(id) {
+            return None;
+        }
+        in_flight.writing += 1;
+        Some(Self(output))
+    }
+}
+
+impl Drop for Writing<'_> {
+    fn drop(&mut self) {
+        self.0.in_flight().writing -= 1;
+        self.0.answered.notify_one();
     }
 }
 

@@ -3,17 +3,19 @@
 **A Rust-powered Claude Code plugin for coordinated, verifiable edits across
 multiple existing UTF-8 files.**
 
-Claude loves to use heredoc for file editing and multi-patching because Claude Code's
-own edit tool is not good enough to perform verifiable, deterministic multi-tool edits. 
-Claude Code's auto-permission-mode also adds an instruction to the end of the system
-prompt telling it to attempt to use python, bash, and heredoc for file editing. 
-The problem is that Claude Code's Windows Bash tool is broken, it constantly drops one
-of each //, as well as <, >, .., and more. This tool gives it a multi-edit tool that is
-as good as, if not better than Claude's native edit tool, as well as Bash/Python.
+Claude often edits files through Bash heredocs and inline Python instead of its
+Edit tool, especially for changes that span several files. Claude Code's auto mode
+encourages this: its system prompt says small, mechanical file changes can be
+made with sed, heredocs, or short scripts instead of Read, Edit, or Write. On
+Windows that route corrupts files. The Bash tool has been observed dropping
+backslashes (one of each `\\` pair), `<`, `>`, `..`, and more from command
+payloads before the shell parses them, so quoting does not help.
 
-Install the plugin once and its guidance loads automatically for sessions, resumes,
-compaction, and subagents. Claude sends focused changes directly to the local
-engine for matching, byte preservation, validation, and durable receipts.
+Ultra Edit gives Claude a multi-file edit tool that never touches a shell. Changes
+travel as MCP JSON arguments to a local Rust engine, are checked against immutable
+snapshots of the original files, and land with durable receipts. A hook blocks
+project file writes through Bash and PowerShell, and the plugin's guidance loads
+automatically for sessions, resumes, compaction, and subagents.
 
 ## Quickstart
 
@@ -36,8 +38,8 @@ claude plugin install ultra-edit@ultra-edit
 
 The repository's catalog pins the latest release's multi-platform plugin archive
 by SHA-256. Claude Code downloads that archive and installs it in its versioned
-plugin cache with the MCP server, automatic context hooks, skill, licenses, and
-native executables together.
+plugin cache with the MCP server, context and shell-guard hooks, skill, licenses,
+and native executables together.
 
 ### 3. Start Claude Code
 
@@ -72,7 +74,8 @@ for source builds, session-only loading, and troubleshooting.
 | Coordinate changes | File-specific replacement calls | One batch planned against the original snapshots of multiple files |
 | Replace repeated text | Explicit `replace_all` | Explicit scope and expected occurrence count |
 | File changed since reading | May proceed if the old text still matches uniquely | Reject the batch if any base is stale at preflight |
-| Recover an edit | Claude Code session checkpoints | Persistent request receipts, retry identity, and conditional undo |
+| Old text almost matches | A single whitespace or indentation difference misses | Up to three near-miss candidates with their exact current text and lines |
+| Recover an edit | Claude Code session checkpoints | Persistent request receipts, replay of identical requests, and conditional undo |
 
 Native Edit is already a useful tool for isolated replacements; see its
 [documented behavior](https://code.claude.com/docs/en/tools-reference#edit-tool-behavior)
@@ -87,24 +90,111 @@ the requested source, and direct MCP arguments avoid shell quoting and generated
 editing code. These are concrete ways to reduce payloads compared with heredoc
 rewrites; actual token and cost savings depend on the task, model, and retries.
 Snapshots and tool instructions also cost context. No model-level token-savings
-percentage or speed advantage over native Edit has been measured yet.
+percentage or speed advantage over native Edit has been measured yet; the
+[evaluation harness](eval/README.md) exists to measure exactly that.
 
-The routing rules are always-loaded **prompt guidance while the plugin and its
-hooks are enabled**, not a Bash permission block. Hooks add context rather than
-rewriting Claude's system prompt. See the
-[canonical instructions](plugin/claude-code/instructions.md) and
-[Claude Code hook behavior](https://code.claude.com/docs/en/hooks#add-context-for-claude).
+### What you give up
 
-## Rust engine and performance
+Claude Code gives its own Edit and Write tools some integrations that an MCP
+edit tool does not get:
 
-The plugin's persistent MCP server and standalone JSON CLI share the same native
-Rust engine. The server calls it directly, without launching a shell, script
-interpreter, CLI process, or another model for each edit. Literal matching,
-snapshot checks, output construction, and journaled persistence run locally.
+- **`/rewind` checkpoints** track only Claude's file-editing tools, so Ultra Edit
+  writes cannot be rewound there. Use `ultra_edit_undo` or git instead. See
+  [checkpoint limitations](https://code.claude.com/docs/en/checkpointing#limitations).
+- **Hooks matched on `Edit|Write`**, such as formatters and linters in
+  `PostToolUse`, do not run for Ultra Edit writes. Add the Ultra Edit tool name,
+  as listed by `/mcp`, to those matchers.
+- **IDE diff review** in the VS Code and JetBrains integrations shows native edits
+  only.
+- **Per-path Edit permission rules**, such as `Edit(secrets/**)`, do not apply.
+  Ultra Edit confines edits to its workspace root and relies on Claude Code's
+  MCP tool permissions.
 
-Measured on Windows 11, a Ryzen 7 7800X3D, and a local NVMe SSD, using a release
-build. These are the **ranges of median times from three runs**, each with three
-warmups and 31 measured samples:
+## How an edit works
+
+Claude reads a focused snapshot, then sends every related change in one request.
+A snapshot is an immutable copy of the file; the response lists editable span IDs
+such as `r12` (line 12) or `m1` (a search match):
+
+```json
+{ "path": "src/retry.rs", "selection": { "kind": "range", "first": 10, "last": 14 } }
+```
+
+The edit names that snapshot as its base. Request and change IDs are optional;
+the engine derives them from the request, so repeating an identical call returns
+the recorded result with `"replayed": true` instead of writing twice.
+
+```json
+{
+  "files": [{
+    "base": "s_RETURNED_SNAPSHOT",
+    "changes": [
+      { "target": { "kind": "span", "span": "r12", "expect": "const retries = 2;" }, "text": "const retries = 3;" },
+      { "target": { "kind": "exact", "old": "const delayMs = 100;" }, "text": "const delayMs = 250;" }
+    ]
+  }]
+}
+```
+
+Every target resolves against the original bytes, and the whole batch is
+rejected if any target is missing, ambiguous, overlapping, or stale. When a
+target is not found or an `expect` guard fails, the diagnostic lists up to three
+candidates with their exact current text and lines: the text outside a wrong
+scope, a region that differs only in whitespace or line endings, or one at least
+70% similar, so the model can copy text instead of guessing. To edit
+distant parts of one file in one batch, a range read can continue an earlier
+snapshot, keeping its spans. Receipts report `committed`, `partial`,
+`not_committed`, or `outcome_unknown` per file; nothing outside the declared spans
+changes, including line endings, BOMs, and trailing whitespace.
+
+The [skill](plugin/claude-code/skills/edit/SKILL.md) and its references describe
+the MCP tools; the [reference](docs/reference.md) covers the full CLI and engine
+contract, persistence, crash reconciliation, and limits.
+
+## Shell-write guard
+
+The plugin registers a `PreToolUse` hook for Claude Code's Bash and PowerShell
+tools. It parses each command and denies ones that write content embedded in
+the command into project files:
+
+- heredocs, here-strings, and `echo`/`printf`, `Write-Output`, or string
+  literals redirected, `tee`d, or passed to `Set-Content`, `Add-Content`,
+  `Out-File`, or `New-Item -Value`;
+- inline Python, Node, Perl, Ruby, PHP, or PowerShell code that calls file-write
+  APIs, including .NET's `[IO.File]::WriteAllText`;
+- in-place editors such as `sed -i` and `perl -pi`, and `Get-Content` text
+  rewritten with `-replace` or `.Replace()` and written back;
+- patches or edit JSON piped into `patch`, `git apply`, or `ultra-edit`.
+
+Only writes that may land in the project count. The project is
+`CLAUDE_PROJECT_DIR`, or the hook event's working directory. Targets certainly
+outside it are allowed: `$GITHUB_OUTPUT` and the other runner files, `/dev/null`
+and `$null`, and absolute paths elsewhere such as `/etc/hosts`, `~/.bashrc`, or
+`$TMPDIR` and `$env:TEMP` files. Paths are compared lexically, and Windows drive,
+UNC, and Git Bash `/c/…` paths ignore case. Relative paths, other variables, and
+globs count as inside.
+
+The deny reason tells Claude to use Ultra Edit, native Edit, or Write instead.
+Ordinary output redirection (`cargo test > log.txt`, `git diff > d.patch`),
+plain copies, and heredocs passed to commands that don't write them to files
+(`git commit -F -`, Claude Code's `git commit -m "$(cat <<'EOF' …)"` pattern)
+are allowed. The guard allows anything it cannot parse and is not a sandbox: it
+misses dynamic commands, redirects on grouped commands, rewrites through
+temporary files, scripts already on disk, and symlinks into the project.
+
+To turn the guard off, set `ULTRA_EDIT_SHELL_WRITES=allow` in Claude Code's
+environment, for example `"env": {"ULTRA_EDIT_SHELL_WRITES": "allow"}` in
+`settings.json`. Setting it inside a shell command has no effect.
+
+## Performance
+
+The plugin's persistent MCP server and standalone JSON CLI share one native Rust
+engine. The server calls it directly, without launching a shell, script
+interpreter, CLI process, or another model for each edit.
+
+Measured with version 0.1.0 on Windows 11, a Ryzen 7 7800X3D, and a local NVMe SSD,
+using a release build. These are the **ranges of median times from three runs**,
+each with three warmups and 31 measured samples:
 
 | Operation | Workload | Median time |
 | --- | --- | --- |
@@ -114,49 +204,18 @@ warmups and 31 measured samples:
 
 The file operations include normal hashing, persistence, and sync calls. Timings
 exclude model latency, MCP transport, and CLI startup; the planning row also
-excludes file I/O and snapshot creation. Disk timings varied across runs, so
-these are local measurements, not a general speed guarantee.
+excludes file I/O and snapshot creation.
 
-The benchmark also exposed an avoidable allocation: focused reads used to create
-line-reference strings for every line. The scanner now produces byte ranges and
-creates references only for selected lines, avoiding **99,990 unnecessary line-ID
-strings** in the 100,000-line fixture. Whole-file stale checks and persisted
-original bytes remain intact. See [methodology and before/after results](docs/performance.md).
-
-Reproduce the measurements in disposable temporary workspaces:
+`.ultra-edit` now stores large strings once, by SHA-256, so re-reading an
+unchanged file writes only a small snapshot. In one measured session of six
+focused reads of a 1 MB file and a two-file edit, state fell from 10.0 MB to
+2.2 MB. See
+[methodology and results](docs/performance.md), and reproduce the timings in
+disposable workspaces:
 
 ```text
 cargo run --locked --release --example benchmark
 ```
-
-## Run
-
-Rust 1.89 or newer is required. The checked-in `Cargo.lock` fixes dependency
-versions. From this directory:
-
-```text
-cargo build --locked
-cargo run --locked --example walkthrough
-cargo run --locked -- --help
-```
-
-The walkthrough edits disposable files in its own temporary directory and shows
-preview, commit, retry, and undo. It checks the file bytes at each stage and does
-not edit this project. Headings, grouped file changes, and red/green edits make
-the terminal output easier to scan. The walkthrough uses conventional Windows
-display paths; the CLI and MCP response contract is described below.
-
-Color is automatic on a terminal and disabled for redirected output or a nonempty
-`NO_COLOR` environment variable. To override automatic detection:
-
-```text
-cargo run --locked --example walkthrough -- --color=always
-cargo run --locked --example walkthrough -- --color=never
-```
-
-The JSON CLI and plain report functions remain free of ANSI sequences. Hosts can
-opt into `report::terminal` for human output; report budgets count printable text
-before styling.
 
 ## Claude Code
 
@@ -173,477 +232,30 @@ Then, from the project Claude should edit, load that prepared directory:
 claude --plugin-dir /absolute/path/to/ultra-edit/plugin/claude-code
 ```
 
-Quote a plugin path containing spaces. The plugin starts its own
-`${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp` with separate arguments
-`["--root", "${CLAUDE_PROJECT_DIR}"]`. Claude Code substitutes the plugin and
-project roots; the native Windows launcher resolves the `.exe` filename. Hook
-commands use the same plugin-local executable and separate argument arrays,
-without a shell. The root is fixed for that server; it is not a model tool
-argument. See the official
-[Claude Code MCP documentation](https://code.claude.com/docs/en/mcp).
-
-Use `/mcp` to check the server connection, then make an ordinary edit request.
-The plugin automatically tells Claude to **ALWAYS use direct Ultra Edit MCP
-calls for coordinated edits to two or more existing UTF-8 files**, and never
-write file contents through Bash heredocs or inline editing scripts. Native
-Write remains appropriate for new files or isolated full rewrites; native Edit
-or Ultra Edit can handle isolated targeted edits. Required tools being unavailable
-or denied is a blocker to report, not a reason to change editing routes.
+The plugin starts `${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp` with the
+arguments `["--root", "${CLAUDE_PROJECT_DIR}"]`; hook commands run the same
+executable with their own argument arrays, without a shell. The root is fixed for
+that server and is not a tool argument.
 
 The [canonical instructions](plugin/claude-code/instructions.md) load through
 `SessionStart` hooks on startup, resume, clear, compaction, and fork, plus
-`SubagentStart` for delegated work. No slash command is required;
-`/ultra-edit:edit` loads optional workflow detail. This supplies prompt context,
-not forced tool enforcement. The shell rule addresses a user-reported Bash
-backslash-loss observation from 2026-09-05; this project has not established that
-behavior for every Claude host.
-
-Inspect the hook's exact context without starting a server or opening a workspace:
+`SubagentStart` for delegated work. They tell Claude to **always use Ultra Edit
+for coordinated edits to two or more existing UTF-8 files**, to use Write for new
+files and native Edit or Ultra Edit for isolated edits, and to report unavailable
+tools instead of falling back to shell writes. No slash command is required;
+`/ultra-edit:edit` loads optional workflow detail. Inspect the exact context
+without starting a server:
 
 ```text
 /absolute/plugin/directory/runtime/ultra-edit-mcp --claude-context SessionStart
 ```
 
-On Windows, use the installed `runtime/ultra-edit-mcp.exe` path with PowerShell's
-`&` operator; the [host setup guide](plugin/claude-code/skills/edit/references/claude-code.md#automatic-routing-context)
-has an example. The executable embeds these instructions at build time. Copied
-source plugins require manual updates: rebuild, stage the matching executables,
-update the complete plugin copy, then start a new Claude session. Marketplace
-installs use the update commands in [Quickstart](#quickstart). `--plugin-dir`
-loads the prepared plugin only for that session.
-
-The normal flow is a focused `ultra_edit_snapshot`, a batch `ultra_edit`, and
-outcome inspection; `ultra_edit_status` retrieves receipts and explicit evidence.
-Native Read/Grep can guide exploration, but the edit's base must come from an
-Ultra Edit snapshot. Preview/commit, repair, and conditional undo are separate
-tools. Diff review, crash inspection, and explicit operator reconciliation are
-also available through MCP.
-
-The plugin supplies context hooks without permission grants and does not
-inherit native Edit's per-path permission policy. Keep `.ultra-edit` local and
-outside version control because it stores complete source history. See the
-[complete workflow and routing index](plugin/claude-code/skills/edit/SKILL.md),
-[Claude Code setup](plugin/claude-code/skills/edit/references/claude-code.md), and
-[MCP adapter contract](docs/mcp-adapter.md).
-
-## CLI
-
-The workspace defaults to the current directory. Use the **same canonical root**
-for every cooperating process. References, original bytes, candidates, requests,
-and journals are persisted under that workspace's `.ultra-edit` directory.
-The bare `ultra-edit` commands in this README assume a separately available CLI.
-With the self-contained plugin, replace that name with the full installed
-`runtime/ultra-edit` path (`runtime/ultra-edit.exe` on Windows, invoked with `&`
-in PowerShell). The plugin does not add it to `PATH`.
-
-```text
-ultra-edit --root WORKSPACE read PATH [EXPECTED_BYTES]
-ultra-edit --root WORKSPACE read-range PATH FIRST LAST
-ultra-edit --root WORKSPACE search PATH QUERY [OFFSET [SNAPSHOT]]
-ultra-edit --root WORKSPACE prepare < request.json
-ultra-edit --root WORKSPACE edit < request.json
-ultra-edit --root WORKSPACE commit PLAN
-ultra-edit --root WORKSPACE retry PLAN NEW_REQUEST_ID
-ultra-edit --root WORKSPACE repair < corrections.json
-ultra-edit --root WORKSPACE receipt REQUEST_ID
-ultra-edit --root WORKSPACE inspect PLAN
-ultra-edit --root WORKSPACE reconcile < resolution.json
-ultra-edit --root WORKSPACE get REFERENCE
-ultra-edit --root WORKSPACE diff PLAN
-ultra-edit --root WORKSPACE undo PLAN NEW_REQUEST_ID
-ultra-edit --root WORKSPACE prune-snapshots OLDER_THAN_SECONDS [--apply]
-```
-
-The redirection examples use a POSIX shell. In PowerShell, pipe JSON through
-`Get-Content -Raw request.json | ... prepare`. Use UTF-8 when piping Unicode.
-The executable produced by `cargo build` is `target/debug/ultra-edit.exe` on
-Windows and `target/debug/ultra-edit` on Unix.
-
-`read` returns the complete, unnormalized text, a `snapshot` ID, a SHA-256 digest,
-and snapshot-local span references. `spans` summarizes the disclosed reference
-IDs, collapsing consecutive line IDs: `["r0", "r1..r400"]`, or `["r0", "r1"]` for
-an empty file. `lines` lists each disclosed line body as `"r12 | const retries = 2;"`,
-so a line can be chosen without counting newlines; whole-file `r0` has no listing
-entry and a blank line reads `"r14 | "`. `r0` covers the whole file, including any
-UTF-8 BOM. `r1`, `r2`, etc. cover individual line bodies, excluding the BOM and
-CRLF/LF terminators. A trailing newline does not create another line reference.
-A blank line body exposes a zero-width line span. An empty file has zero-width
-`r0` and `r1`; a BOM-only file has a zero-width `r1` after the BOM. Any returned
-zero-width span permits insertion at its position. Byte offsets stay server-side:
-`get SNAPSHOT` evidence retains each span's UTF-8 byte `start`/`end`, and the
-compiler validates their boundaries.
-
-Full reads default to at most 24,000 source UTF-8 bytes and 400 lines. Larger
-files return `READ_TOO_LARGE`, reporting both the byte count and the line count so
-the exceeded limit is visible, before generating line references or serializing a
-snapshot. Use a range or search, or deliberately pass the exact current source
-byte count as `EXPECTED_BYTES` (MCP `selection.expected_bytes`) to permit a larger
-response. A changed byte count returns `READ_SIZE_CHANGED`; the 16 MiB source
-ceiling still applies. This override can produce a large response, including all
-line references. Full, range, and search responses all use `snapshot`; stored
-snapshot evidence and the Rust `Snapshot` type retain their internal `id` field.
-On Windows, emitted filesystem `path` fields, diagnostic and warning `file`
-fields, and diff headers use conventional drive or UNC display spelling. Normal
-extended-length prefixes remain only in stored objects and internal path identity
-checks. Other verbatim namespaces remain unchanged, and JSON still escapes
-backslashes according to JSON syntax.
-
-To read a small region, use `read-range src/retry.rs 12 18`. Line numbers are
-one-based and inclusive. It returns `snapshot`, `path`, `digest`, file totals,
-the exact selected `text`, absolute byte `start`/`end` of the selection, the
-summarized editable `spans` — `["r12..r18", "selection"]`, where `r12`…`r18` are
-individual line bodies and `selection` is the entire selected range — and a
-`lines` listing such as `"r12 | const retries = 2;"`. Copy replacement bodies
-from that listing or from `text`; `text` remains the exact selected bytes for
-`expect` guards and multi-line `exact` targets. The text excludes the leading BOM
-and the last selected line's terminator; original newlines **inside** the range
-are included unchanged.
-Empty and BOM-only files have an empty line 1. Invalid ranges fail explicitly.
-Focused reads allow at most 200 lines and 6,000 source Unicode characters. They
-reject oversized selections instead of issuing references to clipped text,
-directing an oversized selection to a smaller range, a search, or an explicit
-`EXPECTED_BYTES` full read rather than a plain full read that may also be over
-its limits. For a very long line, search for its exact target.
-
-`search src/retry.rs RETRIES` performs case-sensitive literal search in one file.
-The response contains `snapshot`, `path`, `digest`, the exact `query`, `offset`,
-`stale`, `next_offset`, `total_matches`, `omitted_matches`, and up to 20 `matches`
-in byte order. Each
-match has an editable `span` (`m1`, `m2`, etc.), a one-based starting line number,
-and `before`/`after` context fragments of at most 80 Unicode characters, stopping
-at CR or LF. The exact target text of every match is `query`; fragments are only
-context and have no span references. Overlapping matches are counted (`aa` has
-two starting positions in `aaa`). Queries may contain literal newlines and
-Unicode, and must contain 1–1,000 Unicode characters. No matches is a successful
-search with an empty match list. Continue with the returned `next_offset` and
-`snapshot`, for example `search src/retry.rs RETRIES 20 s_RETURNED_ID`. Offsets
-count matches from zero; span IDs retain absolute ordinals (`m21`–`m40` on the
-second page). `next_offset: null` marks the end. `omitted_matches` counts all
-matches absent from this page, including earlier pages.
-
-Supplying `SNAPSHOT` searches its immutable original bytes even if current file
-contents have changed. The requested path must still resolve to that snapshot's
-file; removed or redirected targets fail explicitly. Omitting `SNAPSHOT` captures
-fresh bytes, so offsets alone do not guarantee continuity across external edits.
-A fresh search reports `stale: false`; a continued page reports `stale: true` once
-the file no longer matches the retained source, meaning an edit against that
-snapshot is rejected with `STALE_SNAPSHOT`, so read the file again instead.
-Each page creates its own snapshot, which retains the references of the snapshot
-it continued as well as its own page's matches. One edit request using the last
-page's snapshot can therefore target every match disclosed while paging, within
-the one-entry-per-file rule. Continuing with a different `query` drops the
-previous query's match references, whose absolute ordinals no longer apply, and
-keeps line references. Edits still reject stale source bytes.
-
-Use either response's `snapshot` as an edit request's `base`, then target a
-returned span, or scope an exact search to `selection` or a returned line.
-Focused snapshots retain the whole original file internally for byte
-preservation and stale detection, but persist **only the disclosed references**:
-there is no hidden `r0`, unshown line reference, or omitted match reference.
-Unscoped exact replacements still search the complete original file; use an
-explicit scope to restrict matching. `get SNAPSHOT` explicitly retrieves the full
-stored source as evidence. Each read/search captures a new snapshot; references
-remain valid across process restarts, and a change anywhere in the file makes
-their original base stale. Combine changes to one file using one base snapshot.
-
-An edit request uses snapshot IDs returned by `read`:
-
-```json
-{
-  "request_id": "edit-42",
-  "files": [{
-    "base": "s_REPLACE_WITH_RETURNED_ID",
-    "changes": [
-      {
-        "id": "retries",
-        "target": { "kind": "exact", "old": "const retries = 2;" },
-        "text": "const retries = 3;"
-      },
-      {
-        "id": "delay",
-        "target": { "kind": "span", "span": "r5", "expect": "const delayMs = 100;" },
-        "text": "const delayMs = 250;"
-      }
-    ]
-  }]
-}
-```
-
-Every change ID is unique across the entire request. Available targets:
-
-| Target | Contract |
-| --- | --- |
-| `{"kind":"exact","old":"text"}` | Exactly one occurrence in the original file. |
-| `{"kind":"exact","old":"text","scope":"r5"}` | Exactly one occurrence contained in a disclosed span. |
-| `{"kind":"all","old":"text","scope":"r0","expected":3}` | Explicit scope and exact positive count of non-overlapping, left-to-right replacements. |
-| `{"kind":"span","span":"r5"}` | Replace that span with literal `text`. |
-| `{"kind":"span","span":"r5","expect":"old line"}` | Replace only if the selected original bytes equal `expect` exactly. |
-
-`scope` is a disclosed span ID such as `r5`, `selection`, or `m2`, never literal
-source text. Obtain an arbitrary line region with a range snapshot and use its
-`selection`; inline `{first,last}` scopes are not supported. Prefer `exact` or
-add `span.expect` when a mistaken positional ID should fail instead of replacing
-the wrong text. An expectation mismatch returns `EXPECTED_TEXT_MISMATCH`.
-
-Empty exact search strings are rejected. Use a returned zero-width span with
-`expect: ""` for insertion where one exists. Line snapshots do not synthesize a
-zero-width target at every boundary. Because line spans exclude terminators, to
-insert a new `inserted` line between `first\r\nsecond`, either replace `first`
-with `first\r\ninserted` or replace `second` with `inserted\r\nsecond`,
-preferably guarded by `span.expect`. The untouched line ending supplies the other
-separator.
-
-For the same reason, replacing a line span with `""` only blanks that line; its
-terminator remains. To **delete** a line, read a range that also covers the
-following line, then either match the line and its actual line ending as exact
-text inside `selection` — `{"kind":"exact","old":"gamma\n","scope":"selection"}`,
-using `"gamma\r\n"` in CRLF source — or replace the `selection` of that line and
-its neighbour with the surviving neighbour's body alone. `selection` excludes only
-the **last** selected line's terminator, so the deleted line must not be the last
-line of the selection.
-
-`exact` ambiguity checks and search count overlapping starts: `aa` occurs at two
-starts in `aaa`. For `TARGET_AMBIGUOUS`, `actual` remains that overlapping-start
-count; the message also gives the non-overlapping count required by a corresponding
-same-scope `{"kind":"all"}` target, for example
-`found 6 overlapping starts (4 non-overlapping)`. `all` counts and replaces those
-non-overlapping matches from left to right: `aa` in `aaaa` requires `expected: 2`,
-and eight spaces contain four replacements of `"  "`.
-Use the parenthesized value only with the same `old` and disclosed scope. Because
-`all` requires a scope, an unscoped `exact` from a focused snapshot may require a
-new snapshot and request that disclose the intended region. Overlapping
-replacements from different changes and
-coincident insertions reject the entire batch. This initial compiler also rejects
-insertions that touch either boundary of another replacement; combine them into
-one change. Adjacent nonempty replacements are allowed.
-
-Replacement strings are literal UTF-8, including `$`, backslashes, tabs, Unicode
-forms, trailing spaces, and supplied newlines. There is **no newline conversion**:
-write `\r\n` if newly inserted text should use CRLF. All undeclared bytes remain
-identical. Invalid UTF-8 is rejected explicitly; UTF-16 and other encodings are
-not decoded. No formatter, shell command, or model runs inside the engine.
-Ready plans and receipts carry nonblocking `NUL_BYTE` and `MIXED_LINE_ENDINGS`
-warnings when candidate output contains NUL or both CRLF and bare LF. Warnings
-also report pre-existing conditions retained in the candidate; they do not alter
-bytes or reject the request. Inspect them before committing a preview.
-
-## Preview, repair, retry, and undo
-
-`prepare` writes an immutable preview and returns a `p...` reference, or retains
-the failed request and diagnostics under a `d...` reference. It changes no target
-files. `edit` performs prepare and commit in one call.
-
-`commit PLAN` applies the stored output only if every current base still matches.
-A stale file rejects the complete preflight, even if an identical search string
-now appears elsewhere. Snapshot identity is the canonical logical path plus exact
-bytes; recreating a file at that same path with identical bytes is accepted.
-Symlink retargeting to a different canonical path is rejected at commit.
-
-Repair replaces changes by ID in their original positions, then recompiles the
-whole batch against its original snapshots under a new request ID:
-
-```json
-{
-  "reference": "d_REPLACE_WITH_RETURNED_ID",
-  "request_id": "edit-43",
-  "changes": [{
-    "id": "retries",
-    "target": { "kind": "exact", "old": "const retries = 1;" },
-    "text": "const retries = 3;"
-  }]
-}
-```
-
-Corrections cannot add unknown IDs or change retained snapshots. A stale base
-requires a fresh read and request. Repair closes after **any commit attempt**.
-For an environmental failure, fix the cause and use
-`retry PLAN NEW_REQUEST_ID` (MCP `ultra_edit_retry`). New journals must provide
-durable proof that no target was written: either preflight completed unsuccessfully
-with no write intent, or every file records a failed replacement the engine confirmed
-had left the original bytes and file identity in place (`REPLACEMENT_FAILED`) or was
-never attempted. It clones
-the exact candidate and original bases into a new plan, then attempts that plan;
-no re-snapshot or matching is performed. The old request, journal, and failed
-receipt remain unchanged. Partial, uncertain, and interrupted failures are
-ineligible, as are staging failures and post-staging stale bases. Older journals
-lack a phase marker: a completed journal with no write intent and recognized
-preflight errors is accepted, including an indistinguishable single-file stale
-recheck before writing. Absence of write intent proves no target mutation in
-that legacy case. New source bytes still fail the usual stale checks.
-
-Repeating an identical request ID returns its original preview, draft, or recorded
-receipt, including across process restarts. Different arguments under that ID
-fail. Repeating `prepare` or `repair` after a commit surfaces that receipt as well.
-References are random and workspace-local; missing references fail explicitly.
-
-`undo PLAN NEW_REQUEST_ID` restores the original bytes of confirmed committed
-files only if they still equal the recorded candidate. It is another journaled,
-idempotent batch. Newer work causes rejection. Partial receipts can undo their
-confirmed files. An uncertain plan remains unavailable for automatic undo;
-reconcile to permit fresh edits, then restore any desired original bytes through
-a new, explicit edit. Reconciliation does not establish which uncertain writes
-happened.
-
-## Persistence and evidence
-
-The filesystem adapter holds one workspace lock across an operation, validates
-all targets, stages each candidate beside its target, syncs it, rechecks its base,
-then uses the platform's [rename replacement](https://doc.rust-lang.org/std/fs/fn.rename.html).
-Canonical path aliases and hardlink aliases cannot produce competing candidates
-within one batch. Read-only files fail preflight. A candidate identical to the
-current bytes is confirmed without staging or renaming, so an effectively empty
-edit leaves file identity, timestamps, and explicit ACLs untouched.
-
-The adapter appends checksummed, synced journal records before and after each
-write. It stops after the first persistence failure. A replacement that reports an
-error is reobserved under the same lock: the original bytes and file identity mean
-`not_committed` with `REPLACEMENT_FAILED`, the candidate bytes mean `committed`, and
-anything else stays `outcome_unknown`. Receipts distinguish
-`committed`, `not_committed`, `partial`, and `outcome_unknown`, with per-file
-outcomes. Counts describe confirmed committed change IDs; replace-all occurrences
-are separate regions of one change. `intended_digest` identifies the **intended**
-candidate and is evidence of actual output only for confirmed committed files.
-Each committed file also carries `after`: a snapshot reference holding the bytes
-that were written, with no disclosed spans, usable as the base of a follow-up
-unscoped `exact` edit or search page without reading the file again.
-The CLI's `validation: "not_requested"` means no external validation command was
-run. MCP receipt responses omit this unconfigurable field. Run project checks
-separately; a confirmed write is not evidence that tests passed.
-
-A missing durable outcome after a write intent is `outcome_unknown`, even when
-current bytes happen to match the candidate. Repeating that plan returns its
-recorded/recovered outcome without writing. Any unresolved uncertain journal
-blocks new mutations throughout the workspace. Each commit indexes its plan with an
-empty marker file under `.ultra-edit/uncertain` before its first write and removes it
-once a complete certain outcome is recorded, so later mutations read only the journals
-still listed there instead of the whole history. Stale markers are resolved from their
-journals automatically; do not add or delete them by hand.
-`JOURNAL_UNCERTAIN` errors carry the request
-and plan references with explicit `outcome_unknown`; retrieve their evidence.
-The operator workflow below records a resolution while retaining that uncertainty.
-
-Compact reports default to 60 lines and 6,000 Unicode characters, including long
-single lines. CLI diagnostics show at most six shortened entries. `get` retrieves
-full plans/drafts/snapshots/inspections; `receipt` retrieves every file outcome.
-`diff` returns a unified diff with changed regions, surrounding context, deletions,
-and missing-final-newline markers. MCP `ultra_edit_diff` takes `{plan, offset?}`
-and returns at most 6,000 Unicode characters with `next_offset` for continuation;
-diff offsets count characters, whereas search offsets count matches. Its quoted
-paths are for inspection; patch import is not implemented. Explicit evidence
-commands are not subject to compact-report limits.
-
-Diff computation has bounded work: at most 200,000 changed-middle line references,
-edit distance 1,024, and 64 MiB of line-comparison bytes. If a bound is reached,
-the diff shows the complete changed middle as one coarse hunk while retaining
-common outer context. It remains complete but may include unchanged interior lines.
-
-To review reclaimable snapshot storage, run `prune-snapshots 604800` for objects
-older than seven days. The JSON result lists `eligible` snapshot IDs and their
-stored-object `bytes`, `eligible_bytes`, and retained/removed snapshot counts;
-these byte counts include serialization overhead. Add `--apply` to rescan and
-remove eligible standalone snapshots under the workspace lock. Pruned standalone
-references become unavailable. Retained plans, drafts, and inspections keep their
-required snapshots, retained journals keep the committed-output snapshots their
-receipts name, and request, receipt, journal, and resolution history stays.
-Uncertain or invalid recovery evidence blocks pruning; it is not a shortcut for
-resolving a failed edit.
-
-Exit codes are `0` for successful reads/previews/commits/reconciliations, `2` for
-rejected requests or command/output errors, and `3` for commits that are not fully confirmed.
-Inspect JSON `commit` and `error.code`, not the exit code alone. If output is lost,
-retrieve the receipt by request ID before attempting another mutation.
-
-## Crash reconciliation
-
-`inspect PLAN` captures an immutable `i...` inspection. It includes the complete
-plan (original text and intended output), exact journal bytes and digest, the
-historical receipt or its diagnostic, and current state for every target. UTF-8
-evidence uses `{"encoding":"utf8","text":"..."}`; non-UTF-8 evidence uses
-`{"encoding":"binary","bytes":[255,0]}`. Missing targets are recorded explicitly.
-`get INSPECTION` retrieves the saved evidence after a restart. Inspection writes
-only workspace state, never target files.
-
-MCP `ultra_edit_inspect` accepts `{plan}` and returns a compact description with
-the inspection reference. Retrieve complete inspection evidence using
-`ultra_edit_status` with `query.kind: "evidence"` and that reference. After
-reviewing the evidence, submit an explicit operator decision through
-`ultra_edit_reconcile` or the CLI:
-
-```json
-{
-  "inspection": "i_REPLACE_WITH_RETURNED_ID",
-  "decision": "accept_current",
-  "note": "Reviewed the journal and all current files; accept this state and prepare fresh edits."
-}
-```
-
-```powershell
-Get-Content -Raw resolution.json | ultra-edit --root WORKSPACE reconcile
-```
-
-`accept_current` acknowledges the inspected file states as the starting point for
-further work. It makes **no claim about historical execution** and performs no
-target writes. An operator note containing 1–1,000 Unicode characters and some
-non-whitespace text is required. No automatic acceptance or replay occurs.
-
-The engine holds the workspace coordinator lock, rechecks exact journal bytes
-and every observed target state, and publishes one immutable resolution for that
-plan using the checksummed, synced object store. Changed evidence produces
-`STALE_INSPECTION`; inspect again before deciding. Torn or corrupt regular journals
-can be acknowledged when their immutable plan remains available. The original
-journal and receipt remain unchanged: an unknown outcome stays unknown, and a
-corrupt historical receipt continues to return its error.
-
-Once every uncertain plan has a valid resolution, new mutations are allowed and
-still pass their usual base checks. Other unresolved journals keep the workspace
-blocked. Repeating the exact reconciliation request returns the original record,
-including after later edits or a process restart. A different request for an
-already resolved plan returns `RECONCILIATION_CONFLICT`. `inspect PLAN` also shows
-the recorded resolution, including its original request, when one exists.
-
-Current files may be binary or safely absent, but redirected paths, directories,
-unreadable files, or excessive data produce `unavailable` observations and prevent
-acceptance. Each file and journal is limited to 16 MiB; current file bytes total at
-most 64 MiB per inspection. Missing paths are checked through their nearest
-existing ancestor to prevent accepting a redirected location. Inspection does not
-make binary or missing files editable through the existing-file UTF-8 adapter.
-
-Keep the plan, inspection, resolution, and original journal intact. Changed or
-missing journal evidence after reconciliation blocks further mutation and cannot
-reactivate the original plan. Missing or corrupt immutable state requires
-restoring that evidence; reconciliation does not repair the state store. The
-coordinator protects cooperating processes only, and observations do not exclude
-arbitrary external writers. Conditional base checks still apply to every later edit.
-
-## Initial limits
-
-- The lock coordinates clients using the same workspace root. It does not exclude
-  arbitrary external writers or coordinate overlapping workspace roots. A final
-  byte check followed by rename is not a compare-and-swap operation.
-- Single-file replacement visibility depends on the backing filesystem. Multiple
-  file replacements are not an atomic transaction. Windows file and journal
-  contents are synced for process-crash recovery; portable directory flushing is
-  unavailable through `std`, so power-loss durability is not promised.
-- File permissions are copied. Ownership, ACLs, extended attributes, timestamps,
-  and hardlink relationships are not preserved by replacement. This first adapter
-  targets ordinary source files; richer metadata preservation needs platform work.
-- Workspace operations permit 64 files and 64 MiB of base text per batch; each file
-  and candidate is limited to 16 MiB. The compiler permits 1,000 changes, 10,000
-  resolved spans, and 16 MiB of inserted bytes per plan. It stops discovering
-  conflicts after 128 overlap diagnostics with an explicit limit diagnostic.
-  Exceeding a limit rejects the batch. CLI input is limited to 16 MiB.
-- `.ultra-edit` retains complete source history. The `prune-snapshots` command
-  previews old standalone snapshots that no retained plan,
-  draft, or inspection needs; add `--apply` to delete the listed eligible objects.
-  This is explicit maintenance, not automatic collection. Keep recovery evidence
-  and request history intact; pruning does not delete them.
-  Opening a workspace also writes `.ultra-edit/.gitignore`, which ignores everything
-  under it, and a `CACHEDIR.TAG` marker for backup tools. Both are created once and
-  never overwritten, so local edits to them survive.
-  Keep it local and exclude it from version control in workspaces you edit. The
-  state directory is trusted local storage, not a security boundary against a
-  hostile process running as the same user. New Unix state directories/files use
-  owner-only permissions; Windows state inherits the workspace ACLs.
+On Windows, run `runtime/ultra-edit-mcp.exe` with PowerShell's `&` operator. The
+executable embeds the instructions at build time, so copied source plugins need
+rebuilt executables and a fresh session after updates. Keep `.ultra-edit` local
+and out of version control; it stores source history and ignores itself with its
+own `.gitignore`. See the [host setup guide](plugin/claude-code/skills/edit/references/claude-code.md)
+and the [MCP adapter contract](docs/mcp-adapter.md).
 
 ## Development
 
@@ -657,69 +269,59 @@ cd ~/src/ultra-edit
 ```
 
 To contribute through a fork, use `gh repo fork subashc2023/ultra-edit --clone`
-instead; GitHub CLI configures your fork as `origin` and this repository as
-`upstream`. The [source-build guide](plugin/claude-code/skills/edit/references/claude-code.md#connect-a-source-build)
-has complete Windows and Unix staging, persistent-copy, and session-only commands.
+instead. The [source-build guide](plugin/claude-code/skills/edit/references/claude-code.md#connect-a-source-build)
+has Windows and Unix staging, persistent-copy, and session-only commands.
+
+```text
+cargo build --locked
+cargo run --locked --example walkthrough
+cargo run --locked -- --help
+```
+
+The walkthrough edits disposable files in its own temporary directory and shows
+preview, commit, retry, and undo, checking the bytes at each stage. Color is
+automatic on a terminal; pass `-- --color=always` or `-- --color=never` to
+override it. The JSON CLI never emits ANSI sequences.
+
+Run the same gates as CI before sending a change:
 
 ```text
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
-cargo check --locked --all-targets
 cargo test --locked --all-targets
 cargo test --locked --doc
 python -m unittest discover -s scripts/tests -v
 ```
 
-Tests cover byte preservation, original-snapshot matching, overlapping ambiguity,
-order independence, stale previews, repaired conflicts, durable retry identity,
-conditional undo, path aliases, report limits, and injected persistence/journal
-failures. Focused read/search tests cover disclosed references, Unicode and
-line-ending boundaries, overlapping matches, and resource limits. CLI tests
-launch separate processes to exercise persistent state. Reconciliation tests
-cover interrupted and corrupt journals, changed observations, binary/missing
-targets, retained historical outcomes, concurrent decisions, and restart recovery.
-MCP process tests cover tool discovery, focused batch edits, stale bases, malformed
-arguments and frames, buffered messages, root confinement, restart retries,
-cancellation, and uncertain receipts.
+Tests cover byte preservation, original-snapshot matching, overlap and ambiguity
+rules, stale bases, repair, derived request IDs and replay, conditional undo, path
+aliases, near-miss candidates, range and search continuation, blob storage and
+collection, report limits, injected persistence and journal failures, crash
+reconciliation, the MCP transport, and the shell-write guard. CLI and MCP tests
+launch separate processes to exercise persistent state.
 
-`compiler.rs` is pure planning; `reading.rs` constructs focused source views;
-`storage.rs` owns persistence and recovery; `storage/reconciliation.rs` captures
-evidence and records operator resolutions; `workspace.rs` owns the
-reference/request protocol; `report.rs` formats evidence;
-`main.rs` is the thin CLI. `mcp.rs` declares the typed MCP tools and compact
-results; `bin/ultra-edit-mcp.rs` runs the fixed-root stdio server. Use `Workspace`
-for coordinated host integration; low-level `Storage` calls require the caller
-to hold its coordinator lock.
+`compiler.rs` is pure planning and `candidates.rs` finds near misses;
+`reading.rs` builds focused views; `workspace.rs` owns the reference and request
+protocol; `storage.rs` owns persistence, blobs, and recovery, with
+`storage/reconciliation.rs` for operator resolutions; `report.rs` formats
+evidence; `shell_guard.rs` classifies Bash commands, with `shell_guard/` for
+PowerShell and the project scope; `main.rs` is the CLI;
+`mcp.rs` declares the MCP tools; `bin/ultra-edit-mcp.rs` runs the stdio server and
+the hook modes. Use `Workspace` for host integration; low-level `Storage` calls
+require the caller to hold its coordinator lock.
 
-Claude Code 2.1.263 passed an automatic-routing smoke test on 2026-09-07: the
-`SessionStart` hook loaded the policy, and an ordinary request produced snapshots
-and one two-file MCP edit without invoking the skill. Native Read, Edit, Write,
-and Bash remained available. Exact output checks passed for literal backslashes,
-regex and escape text, Windows paths, BOM, CRLF/LF, trailing spaces, and a missing
-final newline. The earlier skill-driven smoke also verified receipt retrieval.
-A separate persistent-install smoke confirmed discovery without `--plugin-dir`
-and exact final bytes. Claude guessed span IDs incorrectly on its first batch,
-then undid it and submitted a corrected batch; the exactly-one-edit assertion
-failed. This demonstrates persistent routing and recovery, not reliable
-first-attempt target selection. See the [validation details](docs/mcp-adapter.md#validation).
-The next milestone is a broader evaluation of Claude Code edit tasks: correct
-bytes, appropriate tool selection, stale-base handling, and recovery after lost
-output. Use those results to improve the MCP contract and focused instructions
-before adding more editing modes. Platform metadata support remains a separate
-limitation to address when ordinary source-file replacement is insufficient.
+The next milestone is the model-level evaluation: run the
+[harness](eval/README.md) on Windows, locally or with the manual `Eval` workflow,
+against native editing and native editing with only the guard, then use the
+results to decide which tools and instructions earn their context. Earlier live checks are recorded under
+[validation](docs/mcp-adapter.md#validation); in one, Claude guessed span IDs
+wrongly on its first batch and recovered with undo.
 
-File creation, deletion, rename, general editor adapters, contextual patches,
-regex, semantic refactors, and rebasing are outside the current edit-only scope.
-The [broader historical design](docs/ULTRA-EDIT.md) is retained for reference;
-those features are not the next delivery milestones.
-
-Workspace-wide search and arbitrary byte-range reads remain deferred until a
-concrete workflow needs them. Single-file search now pages through all matches.
-See [experiment follow-ups](docs/followups.md) for the report's resolved issues,
-current limitations, and deferred extensions.
-
-The tag-driven release process and its local gates are documented in
-[Releasing](docs/releasing.md).
+File creation, deletion, rename, contextual patches, regex, semantic refactors,
+and rebasing are outside the current scope. The
+[historical design](docs/ULTRA-EDIT.md) and
+[experiment follow-ups](docs/followups.md) record earlier decisions. The
+tag-driven release process is documented in [Releasing](docs/releasing.md).
 
 ## License
 

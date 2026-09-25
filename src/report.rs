@@ -524,6 +524,58 @@ pub fn display_paths(value: &mut Value) {
     }
 }
 
+/// Compact diagnostics for CLI and MCP responses: at most six, with bounded strings,
+/// so inline output cannot grow with source size. Candidate text stays complete or
+/// absent, never clipped, so it can be copied; drafts keep every diagnostic.
+pub fn diagnostic_summaries(diagnostics: &[crate::Diagnostic]) -> Vec<Value> {
+    diagnostics
+        .iter()
+        .take(6)
+        .map(|diagnostic| {
+            let mut summary = serde_json::json!({
+                "code": truncated(&diagnostic.code, 80),
+                "file": diagnostic.file.as_deref().map(|path| truncated(path, 500)),
+                "change_id": diagnostic.change_id.as_deref().map(|id| truncated(id, 80)),
+                "message": truncated(&diagnostic.message, 240),
+                "expected": diagnostic.expected,
+                "actual": diagnostic.actual,
+            });
+            if !diagnostic.candidates.is_empty() {
+                summary["candidates"] =
+                    serde_json::json!(diagnostic.candidates.iter().take(3).collect::<Vec<_>>());
+            }
+            summary
+        })
+        .collect()
+}
+
+/// Compact warnings for CLI and MCP responses, bounded like diagnostics.
+pub fn warning_summaries(warnings: &[crate::Diagnostic]) -> Vec<Value> {
+    warnings
+        .iter()
+        .take(6)
+        .map(|warning| {
+            serde_json::json!({
+                "code": truncated(&warning.code, 80),
+                "file": warning.file.as_deref().map(|path| truncated(path, 500)),
+                "message": truncated(&warning.message, 240),
+            })
+        })
+        .collect()
+}
+
+/// Marks a response as a recorded result returned without a new attempt; the
+/// field is omitted otherwise.
+pub fn flag_replayed(value: &mut Value, replayed: bool) {
+    if replayed {
+        value["replayed"] = Value::Bool(true);
+    }
+}
+
+fn truncated(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
 fn display_path(path: &str, limit: usize) -> String {
     let path = path_for_display(path);
     let characters = path.chars();

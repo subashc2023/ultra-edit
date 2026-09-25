@@ -7,6 +7,7 @@ Call `ultra_edit_snapshot` with one existing `path` and one `selection`:
 | Selection | Shape | Returned editable references |
 | --- | --- | --- |
 | Inclusive line range | `{"kind":"range","first":12,"last":18}` | `spans: ["r12..r18", "selection"]`, plus one `lines` entry per line |
+| Range continuing a snapshot | `{"kind":"range","first":40,"last":42,"snapshot":"s…"}` | The prior snapshot's references plus these lines, e.g. `spans: ["r12..r18", "r40..r42", "selection"]`; `lines` for this range only |
 | Literal search | `{"kind":"search","query":"RETRIES","offset":0}` | Returned match spans `m1`, `m2`, etc., each with its line number |
 | Complete file | `{"kind":"full"}` | `spans: ["r0", "r1..r400"]`, where `r0` is all bytes and `r1`… are line bodies, plus `lines`; within the default full-read limits |
 
@@ -37,8 +38,23 @@ but excludes the last selected line's terminator. A trailing newline adds no
 extra line reference. A blank line has a zero-width line span; an empty file has
 zero-width `r0` and `r1`, and a BOM-only file has a zero-width `r1` after its BOM.
 Any returned zero-width span permits insertion at that position.
-Ranges allow at most 200 lines and 6,000 source Unicode characters. Oversized
-selections fail rather than silently clipping editable text.
+Each range read allows at most 200 lines and 6,000 source Unicode characters.
+Oversized selections fail rather than silently clipping editable text.
+
+To edit distant regions of one file in one request, read range A, then read
+range B with A's `snapshot` in its selection. The read uses the bytes A's
+snapshot retained, even if the file changed since, and mints a new snapshot that
+keeps every span A disclosed plus B's lines. Use B's snapshot as the file's
+single base and target A's and B's `r{n}` IDs in one file entry. Its `spans`
+summarizes every targetable ID in disclosure order, while `lines`, `text`,
+`start`, and `end` describe only B. `selection` always covers the latest range.
+Ranges and searches can continue each other's snapshots, and a range can
+continue a full read. The path must still resolve to the snapshot's file.
+`stale` is false for a fresh read; on a continuation, `true` means the file no
+longer matches the retained bytes or cannot be read, so an edit against that
+base is rejected with `STALE_SNAPSHOT`: read again instead of editing. Two
+separately read snapshots of one file cannot share a request (`TARGET_ALIAS`);
+without continuation, keep one base and target text with an unscoped exact `old`.
 
 Search is case-sensitive and literal, with 1–1,000 Unicode characters in `query`.
 It counts overlapping occurrences and returns at most 20 matches per page in
@@ -57,20 +73,15 @@ text is `query`. Continue with the returned `next_offset` and `snapshot`:
 }
 ```
 
-`offset` counts matches from zero, and `next_offset: null` marks the end.
-Later pages retain absolute match IDs (`m21` etc.) and receive new snapshots that
-also retain the earlier pages' match references and any line references of the
-snapshot they continued. One `ultra_edit` request using the LAST page's snapshot
-can therefore address every match disclosed while paging through it; a request
-still allows only one entry per file. Continuing with a different `query` drops
-the previous query's match references, whose ordinals no longer apply.
-`omitted_matches` counts all matches outside the current page, including
-preceding ones. A supplied snapshot keeps the original source fixed across
-external file edits; omitting it reads fresh bytes. The requested path must still
-resolve to the same file. `stale: true` means the file no longer matches that
-retained source, so an edit against this snapshot is rejected with
-`STALE_SNAPSHOT`: read again instead of editing. An empty match list is
-successful but grants no target.
+`offset` counts matches from zero, and `next_offset: null` marks the end. Like a
+continued range, a later page reads the retained bytes, and its snapshot keeps
+the references disclosed before it; match IDs stay absolute (`m21` etc.). One
+`ultra_edit` request using the LAST page's snapshot can therefore address every
+match paged through. Continuing with a different `query` drops the previous
+query's match references, whose ordinals no longer apply. `omitted_matches`
+counts all matches outside the current page, including preceding ones. Omitting
+`snapshot` reads fresh bytes. An empty match list is successful but grants no
+target.
 
 ## Choose the replacement target
 
@@ -131,3 +142,27 @@ An insertion touching either boundary of another replacement also conflicts in
 this version; express the intended result as one replacement. Adjacent nonempty
 replacements are allowed. Changing request order cannot make an overlapping
 batch valid, because every target refers to the original snapshot.
+
+## When a target is not found
+
+`TARGET_NOT_FOUND` on an `exact` or `all` target, and `EXPECTED_TEXT_MISMATCH` on
+a span, can carry up to three `candidates` with `kind`, `line`, `end_line`,
+`text`, and `similarity`. Lines are 1-based and inclusive, numbered like `r{n}`.
+`text` is the exact current bytes; above 2,000 characters it is omitted, never
+clipped, so read `line..end_line` instead. The first tier with results wins:
+
+| `kind` | Found | Use |
+| --- | --- | --- |
+| `exact` | The unmet `expect` text elsewhere, or a scoped target's text outside its scope | For `expect`, copy `text` into `old`; for a scope, pick a scope that contains the line or drop it. |
+| `whitespace` | Text equal after CRLF→LF, dropping trailing spaces/tabs, and collapsing space/tab runs | Copy `text` verbatim; it keeps the file's indentation, such as `"\tlet x = 1;"`. Write the replacement with the file's tabs and line endings. |
+| `similar` | Text at least 70% similar (`similarity` gives the percentage) | Confirm it is the intended region first; it can be a different line of similar shape. |
+
+A scoped target first checks whether its exact text occurs elsewhere in the file,
+since an off-by-one scope is a common miss; otherwise a missing target is searched
+within its scope, or the whole file if unscoped. An `expect` mismatch searches
+the whole snapshot, and its message quotes what the span holds. Send
+`ultra_edit_repair` with the draft `reference`, replacing only the failed change
+ID. Copied text may occur more than once; add a scope if the repair reports
+`TARGET_AMBIGUOUS`. Ambiguous targets and count mismatches where something matched
+get no candidates, and only the first six failed targets of a request are
+searched.

@@ -1,9 +1,10 @@
 # MCP adapter and Claude Code package
 
 Ultra Edit exposes the existing `Workspace` API through a local stdio MCP server.
-The Claude Code plugin distributes its server configuration, context hooks, and
-a small usage skill. The Rust engine remains responsible for snapshots, planning,
-conditional commit, retry identity, receipts, and recovery.
+The Claude Code plugin distributes its server configuration, context hooks, a
+shell guard hook, and a small usage skill. The Rust engine remains responsible
+for snapshots, planning, conditional commit, retry identity, receipts, and
+recovery.
 
 ## Start and scope
 
@@ -78,19 +79,30 @@ enters a separate worktree. From another working directory, pass the intended
 file's absolute path to snapshot. An intended file outside that root is a blocker;
 never substitute a relative path that would edit the parent checkout instead.
 
-The same executable also serves a non-MCP hook mode:
+The same executable also serves non-MCP hook modes:
 
 ```text
 /absolute/plugin/directory/runtime/ultra-edit-mcp --claude-context SessionStart
 /absolute/plugin/directory/runtime/ultra-edit-mcp --claude-context SubagentStart
+/absolute/plugin/directory/runtime/ultra-edit-mcp --claude-hook PreToolUse
 ```
 
-Each prints hook JSON containing the requested `hookEventName` and the embedded
-editing policy as `additionalContext`, then exits without opening a workspace.
-No `--root` is needed in this mode. The policy is compiled into the executable,
-so plugin instruction updates require rebuilding and staging matching binaries
-as well as manually updating the complete installed plugin copy. Generated
-`runtime/` binaries are excluded from source control.
+Each `--claude-context` mode prints hook JSON containing the requested
+`hookEventName` and the embedded editing policy as `additionalContext`, then
+exits without opening a workspace. `--claude-hook PreToolUse` reads Claude
+Code's hook JSON from stdin. For a Bash or PowerShell command that writes
+content embedded in the command into project files, it prints a
+`permissionDecision: "deny"` with a reason; otherwise it prints nothing. The
+project is `CLAUDE_PROJECT_DIR` from its environment, or else the event's `cwd`,
+and targets certainly outside it are allowed. Malformed input, other tools,
+parse failures, and internal errors allow the call, and
+`ULTRA_EDIT_SHELL_WRITES=allow` in its environment disables it. The
+[host setup guide](../plugin/claude-code/skills/edit/references/claude-code.md#automatic-routing-context)
+lists what it blocks, allows, and misses. No `--root` is needed in these modes.
+The policy is compiled into the executable, so plugin instruction updates require
+rebuilding and staging matching binaries as well as manually updating the
+complete installed plugin copy. Generated `runtime/` binaries are excluded from
+source control.
 
 ## Tools
 
@@ -98,38 +110,54 @@ The names below are server-side names; the host may add a namespace.
 
 | Tool | Arguments | Engine operation |
 | --- | --- | --- |
-| `ultra_edit_snapshot` | `{path, selection: {kind: "range", first, last}}`, `{path, selection: {kind: "search", query, offset?, snapshot?}}`, or `{path, selection: {kind: "full", expected_bytes?}}` | Focused range, paged literal search, or bounded full read |
-| `ultra_edit` | `EditRequest`: `{request_id, files: [{base, changes: [{id, target, text}]}]}` | Prepare and commit through `edit` |
+| `ultra_edit_snapshot` | `{path, selection: {kind: "range", first, last, snapshot?}}`, `{path, selection: {kind: "search", query, offset?, snapshot?}}`, or `{path, selection: {kind: "full", expected_bytes?}}` | Focused range, paged literal search, or bounded full read; `snapshot` continues a prior snapshot |
+| `ultra_edit` | `EditRequest`: `{request_id?, files: [{base, changes: [{id?, target, text}]}]}` | Prepare and commit through `edit` |
 | `ultra_edit_status` | `{query: {kind: "receipt", request_id, full?: boolean}}` or `{query: {kind: "evidence", reference}}` | Retrieve a compact outcome (default), full receipt (`full: true`), or explicit evidence |
 | `ultra_edit_prepare` | The same direct `EditRequest` as `ultra_edit` | Persist a preview or rejected draft |
 | `ultra_edit_commit` | `{plan}` | Commit the stored candidate |
-| `ultra_edit_retry` | `{plan, request_id}` | Retry a failure that proves no target write (failed preflight, or `REPLACEMENT_FAILED` with the target unchanged) under a new ID, retaining the exact original candidate |
-| `ultra_edit_repair` | `{reference, request_id, changes}` | Replace retained changes by ID and prepare again |
-| `ultra_edit_undo` | `{plan, request_id}` | Conditionally restore confirmed committed files |
+| `ultra_edit_retry` | `{plan, request_id}` | Retry a failure that proves no target write (failed preflight, or `REPLACEMENT_FAILED` with the target unchanged) under a required new ID, retaining the exact original candidate |
+| `ultra_edit_repair` | `{reference, request_id?, changes}` | Replace retained changes by ID and prepare again |
+| `ultra_edit_undo` | `{plan, request_id?}` | Conditionally restore confirmed committed files |
 | `ultra_edit_diff` | `{plan, offset?}` | Read a unified diff in pages of at most 6,000 Unicode characters |
 | `ultra_edit_inspect` | `{plan}` | Persist current recovery evidence and return a compact description and inspection reference |
 | `ultra_edit_reconcile` | `{inspection, decision: "accept_current", note}` | Record an explicit reviewed operator decision; never automatically accept an uncertain outcome |
 
 Ordinary work uses snapshot → edit → outcome inspection, with status for receipt
-details or lost responses. Mutation results carry compact reports and references;
-full source, diagnostics, and candidates require explicit evidence retrieval.
-Every snapshot response uses `snapshot` for its base. Full reads default to
-24,000 source bytes and 400 lines; an exact `expected_bytes` deliberately permits
-a larger response up to the existing source-file limit. Search pages use
-zero-based match offsets and return `next_offset`; supply the returned snapshot
-to keep searching its immutable bytes. Each page discloses only its own editable
-matches. Diff offsets instead count Unicode characters in the complete diff.
-Read the [skill's complete example](../plugin/claude-code/skills/edit/SKILL.md)
-and [contract](../plugin/claude-code/skills/edit/references/contract.md) for precise
+details. After a lost response, repeat the identical call. Mutation results carry
+compact reports and references; full source, all diagnostics, and prepared output
+require explicit evidence retrieval. Every snapshot response uses `snapshot` for
+its base. Full reads default to 24,000 source bytes and 400 lines; an exact
+`expected_bytes` deliberately permits a larger response up to the existing
+source-file limit. Search pages use zero-based match offsets and return
+`next_offset`. A range or search that supplies a prior `snapshot` reads its
+retained bytes, reports `stale`, and returns a new snapshot that keeps every
+reference already disclosed, so one base can address distant ranges and every
+match paged through. Diff offsets instead count Unicode characters in the
+complete diff.
+
+`request_id` is optional except for retry. An omitted or empty request ID is
+derived from the operation and its arguments (`auto-` plus 32 hex characters),
+and an omitted change `id` becomes its `"{file}.{change}"` position, such as
+`"1.2"`. Repair corrections still name the change they replace. An explicit ID
+must be new for repair, undo, and retry. Read the
+[skill's complete example](../plugin/claude-code/skills/edit/SKILL.md) and
+[contract](../plugin/claude-code/skills/edit/references/contract.md) for precise
 request semantics. Inspect the returned `commit`, request ID, and plan ID rather
 than treating a successful transport exchange as confirmed persistence.
 
 Engine results contain structured JSON and equivalent JSON text. Compact completed
 results use `{kind: "completed", request_id, plan_id, commit, report}`. A
 preparation uses `kind: "ready"` or `"rejected"`, with `request_id`, `reference`,
-`ready`, diagnostic count, compact diagnostics, and a report. Receipt requests
-with `full: true` return `{kind: "receipt", receipt}`; a recorded request without
-a receipt returns `{kind: "receipt_unavailable", request_id, receipt: null}`.
+`ready`, diagnostic count, compact diagnostics, and a report. `request_id` is the
+derived ID when the call omitted one. A result returned for an already recorded
+request without a new commit attempt adds `replayed: true` (omitted otherwise),
+and its report begins with a replay notice; a replay never writes target files.
+Each of the first six compact diagnostics can carry up to three `candidates`,
+`{kind, line, end_line, text?, similarity?}`, for a missing `exact`/`all` target
+or a failed span `expect`; full drafts carry them for every diagnostic. Receipt
+requests with `full: true` return `{kind: "receipt", receipt}`; a recorded
+request without a receipt returns
+`{kind: "receipt_unavailable", request_id, receipt: null}`.
 Evidence uses the engine's `{kind, value}` shape. Engine errors use
 `{kind: "error", error: {code, message}, request_id, plan_id, commit}`.
 Malformed tool arguments and protocol errors can use the MCP SDK's standard
@@ -149,8 +177,8 @@ backslashes according to JSON syntax.
 
 Rejected or incompletely committed mutation calls set MCP `isError`. Successful
 status reads do not set it merely because a historical receipt describes a
-failure. Cancellation or disconnection cannot establish rollback; inspect the
-original request's receipt before starting new work.
+failure. Cancellation or disconnection cannot establish rollback; repeat the
+identical call or inspect its receipt before starting new work.
 
 Every tool schema has an object at its root. The `selection` and `query` fields
 contain the typed alternatives for snapshot and status requests, respectively.
@@ -164,11 +192,11 @@ dispatcher, automatic reconciliation, or model-supplied workspace root.
 ## Instruction layout
 
 The [canonical routing policy](../plugin/claude-code/instructions.md) is loaded
-by the plugin's [hooks](../plugin/claude-code/hooks/hooks.json). `SessionStart`
-has no matcher, so it covers every session start source, including startup,
-resume, clear, compaction, and fork. `SubagentStart` supplies the same policy to
-subagents. Claude Code receives this as context before the first prompt; an
-ordinary edit request requires no skill invocation. See the official
+by the plugin's context [hooks](../plugin/claude-code/hooks/hooks.json).
+`SessionStart` has no matcher, so it covers every session start source,
+including startup, resume, clear, compaction, and fork. `SubagentStart` supplies
+the same policy to subagents. Claude Code receives this as context before the
+first prompt; an ordinary edit request requires no skill invocation. See the official
 [hook context contract](https://code.claude.com/docs/en/hooks#add-context-for-claude).
 
 The policy requires direct Ultra Edit MCP calls for coordinated changes across
@@ -177,8 +205,11 @@ generated-content redirection, inline scripts, or shell-piped edit JSON. Native
 tools remain available for new files and isolated edits. If required MCP tools
 are unavailable or denied, Claude is instructed to report the blocker. The
 backslash concern comes from a user's 2026-09-05 Bash observation, not a claim
-that this project reproduced it on every host. The hooks inject instructions;
-they do not intercept or block native tools.
+that this project reproduced it on every host. The context hooks inject
+instructions. The `PreToolUse` hook, matched to `Bash|PowerShell`, denies
+commands that write content embedded in the command into project files and
+leaves other tools and commands alone; it is a guard against common patterns,
+not a sandbox.
 Explicit user instructions and host permissions take precedence over plugin
 guidance. Report conflicting workflow instructions; generic advice to use sed
 or heredocs is not a reason to silently abandon the user's explicit Ultra Edit
@@ -211,19 +242,24 @@ python -m unittest discover -s scripts/tests -v
 ```
 
 The Python suite verifies deterministic target and multi-platform archives,
-launcher dispatch, required contents and permissions, version agreement,
-path safety, marketplace pinning, and checksums. Run the repository's configured
-Rust gates from [the README](../README.md#development). The complete tag and
-release procedure is in [Releasing](releasing.md).
-The adapter's process tests cover initialization and tool discovery,
-focused snapshot → edit → receipt, literal bytes, stale bases, retry after
-restart, buffered messages, malformed frames and tool arguments, and
-persistence-error reporting. A real
-Claude Code session is a separate integration check: use a disposable workspace,
-verify `/mcp` connects, confirm hook context loaded, ask for a multi-file edit
-without invoking the skill, inspect exact resulting bytes, and test stale/retry
-behavior. Manifest validation alone does not prove that the host can locate the
-executable or discover and invoke the tools.
+launcher dispatch, required contents, hook entries, and permissions, version
+agreement, path safety, marketplace pinning, and checksums; it also tests the
+evaluation harness offline. Run the repository's configured Rust gates from
+[the README](../README.md#development). The complete tag and release procedure
+is in [Releasing](releasing.md). The adapter's process tests cover
+initialization and tool discovery, focused snapshot → edit → receipt, continued
+ranges, derived IDs and replay, near-miss candidates, literal bytes, stale
+bases, retry after restart, buffered messages, malformed frames and tool
+arguments, hook launches, and persistence-error reporting; the shell-guard tests
+cover the hook's Bash and PowerShell deny, allow, project-scope, and fail-open
+decisions. A real Claude Code session is a separate integration check: use a
+disposable workspace, verify `/mcp` connects, confirm hook context loaded, ask
+for a multi-file edit without invoking the skill, inspect exact resulting bytes,
+and test stale/retry behavior. Manifest validation alone does not prove that the
+host can locate the
+executable or discover and invoke the tools. The
+[evaluation harness](../eval/README.md) compares native editing, native editing
+with only the shell guard, and the full plugin on six fixture tasks.
 
 The initial smoke test passed with Claude Code 2.1.263 on 2026-09-07: the plugin
 server connected, Claude loaded the skill, called snapshot → edit → status,

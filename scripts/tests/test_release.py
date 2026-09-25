@@ -21,6 +21,29 @@ sys.modules[SPEC.name] = release
 SPEC.loader.exec_module(release)
 
 
+def _hook_events() -> dict[str, list[dict[str, object]]]:
+    def group(args: list[str], matcher: str | None = None) -> list[dict[str, object]]:
+        entry: dict[str, object] = {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp",
+                    "args": args,
+                    "timeout": 10,
+                }
+            ]
+        }
+        if matcher is not None:
+            entry["matcher"] = matcher
+        return [entry]
+
+    return {
+        "SessionStart": group(["--claude-context", "SessionStart"]),
+        "SubagentStart": group(["--claude-context", "SubagentStart"]),
+        "PreToolUse": group(["--claude-hook", "PreToolUse"], "Bash|PowerShell"),
+    }
+
+
 class ReleasePackagingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -66,23 +89,7 @@ class ReleasePackagingTests(unittest.TestCase):
         (self.root / "plugin/claude-code/.mcp.json").write_text(
             json.dumps(mcp), encoding="utf-8"
         )
-        hooks = {
-            "hooks": {
-                event: [
-                    {
-                        "hooks": [
-                            {
-                                "type": "command",
-                                "command": "${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp",
-                                "args": ["--claude-context", event],
-                                "timeout": 10,
-                            }
-                        ]
-                    }
-                ]
-                for event in ("SessionStart", "SubagentStart")
-            }
-        }
+        hooks = {"hooks": _hook_events()}
         (self.root / "plugin/claude-code/hooks/hooks.json").write_text(
             json.dumps(hooks), encoding="utf-8"
         )
@@ -172,6 +179,33 @@ class ReleasePackagingTests(unittest.TestCase):
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         with self.assertRaisesRegex(release.ReleaseError, "plugin.json license"):
             release.verify_version("v1.2.3", self.root)
+
+    def test_hooks_config_requires_context_hooks_and_the_shell_guard(self) -> None:
+        release._validate_hooks_config({"hooks": _hook_events()}, "hooks.json")
+        without_guard = _hook_events()
+        del without_guard["PreToolUse"]
+        with self.assertRaisesRegex(release.ReleaseError, "exactly one PreToolUse hook group"):
+            release._validate_hooks_config({"hooks": without_guard}, "hooks.json")
+        # The guard must see both shell tools, named exactly; order and extra
+        # names do not matter.
+        for matcher in ("PowerShell|Bash", "Bash|PowerShell|Monitor"):
+            events = _hook_events()
+            events["PreToolUse"][0]["matcher"] = matcher
+            release._validate_hooks_config({"hooks": events}, "hooks.json")
+        for matcher in (None, "", "*", "Bash", "PowerShell", "Bash|Power.*", "Bash|PowerShell\n", 1):
+            events = _hook_events()
+            if matcher is None:
+                del events["PreToolUse"][0]["matcher"]
+            else:
+                events["PreToolUse"][0]["matcher"] = matcher
+            with self.subTest(matcher=matcher), self.assertRaisesRegex(
+                release.ReleaseError, r"PreToolUse\.matcher must list the tool names 'Bash' and 'PowerShell'"
+            ):
+                release._validate_hooks_config({"hooks": events}, "hooks.json")
+        wrong_mode = _hook_events()
+        wrong_mode["PreToolUse"][0]["hooks"][0]["args"] = ["--claude-context", "PreToolUse"]
+        with self.assertRaisesRegex(release.ReleaseError, r"PreToolUse\.args"):
+            release._validate_hooks_config({"hooks": wrong_mode}, "hooks.json")
 
     def test_packaging_rejects_noncanonical_output_name(self) -> None:
         target_name = "x86_64-unknown-linux-musl"

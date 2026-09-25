@@ -51,14 +51,18 @@ pub struct RangeRead {
     pub snapshot: String,
     pub path: String,
     pub digest: String,
+    /// True when the continued snapshot no longer matches the current file, so
+    /// an edit against it is rejected with `STALE_SNAPSHOT`.
+    pub stale: bool,
     pub total_lines: usize,
     pub total_bytes: usize,
     pub start: usize,
     pub end: usize,
     pub text: String,
-    /// Disclosed reference IDs, with consecutive line IDs collapsed to ranges.
+    /// Every reference ID the snapshot discloses, including those a continued
+    /// snapshot retained, with consecutive line IDs collapsed to ranges.
     pub spans: Vec<String>,
-    /// Each disclosed line as `"{id} | {body}"`.
+    /// Each line of this range as `"{id} | {body}"`.
     pub lines: Vec<String>,
 }
 
@@ -90,6 +94,8 @@ pub struct SearchResult {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EditRequest {
+    /// Omit to derive it from the files.
+    #[serde(default)]
     pub request_id: String,
     pub files: Vec<FileRequest>,
 }
@@ -104,6 +110,8 @@ pub struct FileRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Change {
+    /// Unique per request; omit for its 1-based "{file}.{change}" position, e.g. "1.2".
+    #[serde(default)]
     pub id: String,
     pub target: Target,
     pub text: String,
@@ -146,6 +154,9 @@ pub struct Diagnostic {
     pub expected: Option<usize>,
     pub actual: Option<usize>,
     pub conflicts: Vec<String>,
+    /// Closest current regions for a target that matched nowhere, at most three.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<Candidate>,
 }
 
 impl Diagnostic {
@@ -158,8 +169,36 @@ impl Diagnostic {
             expected: None,
             actual: None,
             conflicts: Vec::new(),
+            candidates: Vec::new(),
         }
     }
+}
+
+/// A current region that nearly matches a failed target. Lines are one-based
+/// and inclusive, numbered like focused reads; byte offsets stay internal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Candidate {
+    pub kind: CandidateKind,
+    pub line: usize,
+    pub end_line: usize,
+    /// Exact current bytes; absent above 2,000 characters rather than clipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Percentage score, present only for `similar` candidates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub similarity: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateKind {
+    /// The unmet expectation occurs literally elsewhere.
+    Exact,
+    /// Equal after line-ending and space/tab normalization.
+    Whitespace,
+    /// Close by edit distance on whitespace-squeezed text.
+    Similar,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,6 +240,8 @@ pub struct Draft {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Preparation {
+    /// The bound request ID, including one derived from an omitted ID.
+    pub request_id: String,
     pub reference: String,
     pub ready: bool,
     pub diagnostics: Vec<Diagnostic>,
@@ -208,6 +249,9 @@ pub struct Preparation {
     pub warnings: Vec<Diagnostic>,
     pub report: String,
     pub receipt: Option<Receipt>,
+    /// The request was already bound and this call attempted nothing new.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replayed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

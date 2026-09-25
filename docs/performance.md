@@ -1,8 +1,11 @@
 # Rust engine performance
 
-Measured September 7, 2026. This benchmark measures the Rust library shared by
-the CLI and the persistent MCP server. It does not measure Claude Code, model
-tokens, model latency, CLI process startup, or MCP transport/serialization.
+Measured September 7, 2026, on Windows. A
+[September 25 follow-up](#blob-store-follow-up-2026-09-25) on Linux measures the
+content-addressed blob store separately. This benchmark measures the Rust
+library shared by the CLI and the persistent MCP server. It does not measure
+Claude Code, model tokens, model latency, CLI process startup, or MCP
+transport/serialization.
 
 ## Reproduce
 
@@ -37,7 +40,9 @@ performance with a long history of retained plans and journals.
 Each changed line replaces `100` with `250` in a uniquely numbered Rust constant.
 Planning and editing use unscoped exact targets. No durability checks, resource
 limits, or syncing are disabled. Returned source-byte counts are not complete
-JSON payload sizes or token counts.
+JSON payload sizes or token counts. These boundaries describe the September 7
+engine; the blob store changed what focused-read persistence writes
+([2026-09-25](#blob-store-follow-up-2026-09-25)).
 
 ## Environment and results
 
@@ -88,8 +93,48 @@ whole-file stale detection, and persistence semantics are unchanged. Existing
 compiler and focused-read tests cover those boundaries.
 
 The improvement adds no dependency and changes no public API. Matching changes,
-plan-storage redesign, and journal-history indexing are deferred until profiling
-establishes a need; they would require separate correctness and recovery checks.
+plan-storage redesign, and journal-history indexing were then deferred until
+profiling established a need. The storage deferral is superseded: snapshots,
+plans, and inspections now share the content-addressed blob store measured
+below, and 0.2.0 indexes uncertain journals under `.ultra-edit/uncertain`.
+
+## Blob store follow-up (2026-09-25)
+
+These figures come from release builds in a shared 4-core Linux container. They
+are not comparable with the Windows figures above. Each pair compares the engine
+before and after the content-addressed blob store, which stores each string of
+at least 4096 UTF-8 bytes once under `.ultra-edit/blobs`.
+
+The focused-read timing boundary changed. `Workspace::read_range` used to
+persist one snapshot object embedding the file's complete bytes. It now writes a
+blob only when the content is new, plus a small snapshot object. Every benchmark
+sample uses a fresh workspace, so each measured read still writes the 5 MB file
+once, as a blob.
+
+Benchmark medians from three alternating runs, as the range of the run medians
+in milliseconds:
+
+| Case | Before | After |
+| --- | --- | --- |
+| Focused read | 84.2–88.1 | 66.8–66.9 |
+| Batch planning | ~10 | ~10 |
+| Snapshots + batch edit | 17.5–18.7 | 19.1–21.5 |
+
+The focused read was about 21% faster, and planning, which does no file I/O, was
+unchanged. The complete edit in a fresh workspace was slower: each new piece of
+content of at least 4 KiB costs an extra file and directory sync.
+
+Workspace state for a 1,080,000-byte, 30,000-line JavaScript file plus a small
+file, measured as the size of `.ultra-edit` in bytes:
+
+| Measured after | Before the blob store | With the blob store |
+| --- | --- | --- |
+| Five six-line range reads | 5,553,807 | 1,084,172 |
+| …then one more read of each file and a two-file edit | 9,998,607 | 2,169,262 |
+
+Re-reading an unchanged file now writes only a small (about 1 KB) snapshot
+object. A one-line edit of a large file adds one blob, the new content, plus
+small objects.
 
 ## Comparisons that need another experiment
 
@@ -99,8 +144,12 @@ A bare Bash or Python substitution also does less work than an edit with retaine
 snapshots, conditional writes, and synced recovery records, so its execution
 time is not an equivalent performance baseline.
 
-A useful future model-level comparison should run the same edit tasks through
-native Edit, shell editing, and Ultra Edit, then measure correct final bytes,
-input/output tokens, tool calls, retries, and total elapsed time. Include the
-plugin's instruction/snapshot overhead and escape-heavy and stale-file cases.
-Token savings and model cost claims should wait for that evidence.
+A model-level comparison runs the same edit tasks through each route. The
+[evaluation harness](../eval/README.md) runs six fixture tasks, including
+escape-heavy, line-ending, and large-file cases, under three arms: `native` (no
+plugin), `native-guard` (native tools plus only the shell guard hook), and
+`ultra-edit` (the full plugin). It scores exact final bytes, first-try success,
+tool calls, tool errors, Bash file writes, turns, tokens, and cost, so the
+plugin's instruction and snapshot overhead counts. It has no stale-file task
+yet. No harness results are recorded here, so token savings and model cost
+claims still wait for that evidence.

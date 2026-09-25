@@ -1,0 +1,152 @@
+name: Eval
+
+# Runs eval/run_eval.py on demand. Every run is a real Claude Code session
+# billed to the ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN repository secret.
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner to evaluate on
+        type: choice
+        options:
+          - ubuntu-24.04
+          - windows-2025
+        default: ubuntu-24.04
+      model:
+        description: Model alias or full name, used by every arm
+        type: string
+        default: sonnet
+      reps:
+        description: Repetitions per task and arm (6 tasks x 3 arms each)
+        type: number
+        default: 1
+      max-total-usd:
+        description: Stop starting runs once recorded spend reaches this
+        type: string
+        default: "5"
+      tasks:
+        description: Space-separated task names; empty runs every task
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: eval-${{ github.ref }}-${{ inputs.runner }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: 1.89.0
+  CLAUDE_CODE_VERSION: 2.1.282
+
+jobs:
+  eval:
+    name: Evaluate on ${{ inputs.runner }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 360
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: rustup toolchain install ${{ env.RUST_VERSION }} --profile minimal
+
+      - name: Build the runtime
+        run: cargo +${{ env.RUST_VERSION }} build --locked --release
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Install Claude Code
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --global "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+          claude --version | grep --fixed-strings "$CLAUDE_CODE_VERSION"
+
+      - name: Check the harness without a model
+        run: python eval/run_eval.py --preflight
+
+      - name: Run the evaluation
+        shell: bash
+        env:
+          API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          MODEL: ${{ inputs.model }}
+          REPS: ${{ inputs.reps }}
+          MAX_TOTAL_USD: ${{ inputs.max-total-usd }}
+          TASKS: ${{ inputs.tasks }}
+        run: |
+          set -euo pipefail
+          if [ -n "$API_KEY" ]; then
+            export ANTHROPIC_API_KEY="$API_KEY"
+          elif [ -n "$OAUTH_TOKEN" ]; then
+            export CLAUDE_CODE_OAUTH_TOKEN="$OAUTH_TOKEN"
+          else
+            echo "::error::Add an ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN repository secret."
+            exit 1
+          fi
+          unset API_KEY OAUTH_TOKEN
+          task_args=()
+          for task in $TASKS; do
+            task_args+=(--task "$task")
+          done
+          python eval/run_eval.py \
+            --model "$MODEL" \
+            --reps "$REPS" \
+            --max-total-usd "$MAX_TOTAL_USD" \
+            --out eval-results \
+            --yes \
+            "${task_args[@]}"
+
+      # The model has a shell, so a transcript could echo its environment.
+      - name: Redact credentials from the results
+        if: always()
+        shell: bash
+        env:
+          API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          python - <<'EOF'
+          import os
+          import pathlib
+
+          secrets = [
+              value.encode()
+              for value in (os.environ.get("API_KEY"), os.environ.get("OAUTH_TOKEN"))
+              if value
+          ]
+          root = pathlib.Path("eval-results")
+          for path in root.rglob("*") if root.is_dir() else ():
+              if not path.is_file():
+                  continue
+              data = path.read_bytes()
+              cleaned = data
+              for secret in secrets:
+                  cleaned = cleaned.replace(secret, b"[redacted]")
+              if cleaned != data:
+                  path.write_bytes(cleaned)
+          EOF
+
+      - name: Publish the summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f eval-results/summary.md ]; then
+            cat eval-results/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: eval-${{ inputs.runner }}-${{ github.run_id }}
+          path: eval-results/
+          if-no-files-found: ignore
+          retention-days: 30

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use ultra_edit::storage::Storage;
+use ultra_edit::workspace::REPLAY_NOTICE;
 use ultra_edit::{PreparedPlan, digest};
 
 #[cfg(windows)]
@@ -167,6 +168,19 @@ fn edit(request_id: &str, base: &Value, span: &str, text: &str) -> Value {
     json!({"request_id":request_id,"files":[{"base":base,"changes":[{
         "id":"change","target":{"kind":"span","span":span},"text":text
     }]}]})
+}
+
+/// What repeating the call that returned `original` returns: the same recorded
+/// result, flagged, with the replay notice leading its report.
+fn replay_of(original: &Value) -> Value {
+    assert!(original.get("replayed").is_none(), "{original}");
+    let mut replay = original.clone();
+    replay["replayed"] = json!(true);
+    replay["report"] = json!(format!(
+        "{REPLAY_NOTICE}\n{}",
+        original["report"].as_str().unwrap()
+    ));
+    replay
 }
 
 #[test]
@@ -559,6 +573,123 @@ fn every_paged_search_match_is_editable_in_one_batch_over_mcp() {
 }
 
 #[test]
+fn continued_ranges_and_searches_edit_distant_lines_under_one_base_over_mcp() {
+    let root = TempDir::new().unwrap();
+    let line = |number: usize| format!("line {number}\n");
+    let original: String = (1..=300).map(line).collect();
+    fs::write(root.path().join("file.txt"), &original).unwrap();
+    let mut client = Client::start(root.path());
+    let tools = client.rpc("tools/list", json!({}))["result"]["tools"].clone();
+    let schema = &tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "ultra_edit_snapshot")
+        .unwrap()["inputSchema"];
+    let range = schema["$defs"]["Selection"]["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|variant| variant["properties"]["kind"]["const"] == "range")
+        .unwrap();
+    assert!(range["properties"]["snapshot"].is_object(), "{range}");
+    assert!(
+        !range["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("snapshot")),
+        "{range}"
+    );
+
+    let first = client.range("file.txt", 2, 2);
+    assert_eq!(first["stale"], false);
+    let continue_range = |first: usize, last: usize, snapshot: &Value| {
+        json!({"path":"file.txt","selection":{
+            "kind":"range","first":first,"last":last,"snapshot":snapshot
+        }})
+    };
+    let last = client.call(
+        "ultra_edit_snapshot",
+        continue_range(299, 299, &first["snapshot"]),
+        false,
+    );
+    assert_eq!(last["stale"], false);
+    assert_eq!(last["text"], "line 299");
+    assert_eq!(last["spans"], json!(["r2", "r299", "selection"]));
+    assert_eq!(last["lines"], json!(["r299 | line 299"]));
+    fs::write(root.path().join("other.txt"), &original).unwrap();
+    let mismatch = client.call(
+        "ultra_edit_snapshot",
+        json!({"path":"other.txt","selection":{
+            "kind":"range","first":1,"last":1,"snapshot":last["snapshot"]
+        }}),
+        true,
+    );
+    assert_eq!(mismatch["error"]["code"], "SNAPSHOT_PATH_MISMATCH");
+
+    // Separate snapshots of one file cannot share a request; the rejection says how.
+    let separate = client.range("file.txt", 299, 299);
+    let mut split = edit("split", &first["snapshot"], "r2", "LINE TWO");
+    split["files"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"base":separate["snapshot"],"changes":[{
+            "id":"other","target":{"kind":"span","span":"r299"},"text":"LINE 299"
+        }]}));
+    let rejected = client.call("ultra_edit", split, true);
+    for code in ["TARGET_ALIAS", "DUPLICATE_TARGET_PATH"] {
+        let diagnostic = rejected["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|diagnostic| diagnostic["code"] == code)
+            .unwrap_or_else(|| panic!("{rejected}"));
+        let message = diagnostic["message"].as_str().unwrap();
+        assert!(message.contains("`snapshot`"), "{diagnostic}");
+        assert!(message.ends_with("`old`."), "clipped: {diagnostic}");
+    }
+
+    // A search continuing the range keeps its line references and selection.
+    let found = client.call(
+        "ultra_edit_snapshot",
+        json!({"path":"file.txt","selection":{
+            "kind":"search","query":"line 150","snapshot":last["snapshot"]
+        }}),
+        false,
+    );
+    assert_eq!(found["stale"], false);
+    assert_eq!(found["matches"][0]["span"]["id"], "m1");
+    let committed = client.call(
+        "ultra_edit",
+        json!({"request_id":"one-base","files":[{"base":found["snapshot"],"changes":[
+            {"id":"two","target":{"kind":"span","span":"r2","expect":"line 2"},"text":"LINE TWO"},
+            {"id":"middle","target":{"kind":"span","span":"m1"},"text":"LINE 150"},
+            {"id":"last","target":{"kind":"span","span":"selection"},"text":"LINE 299"}
+        ]}]}),
+        false,
+    );
+    assert_eq!(committed["commit"], "committed");
+    let expected: String = (1..=300)
+        .map(|number| match number {
+            2 => "LINE TWO\n".into(),
+            150 | 299 => format!("LINE {number}\n"),
+            _ => line(number),
+        })
+        .collect();
+    assert_eq!(
+        fs::read(root.path().join("file.txt")).unwrap(),
+        expected.as_bytes()
+    );
+    let stale = client.call(
+        "ultra_edit_snapshot",
+        continue_range(1, 1, &found["snapshot"]),
+        false,
+    );
+    assert_eq!(stale["stale"], true);
+    client.close();
+}
+
+#[test]
 fn declared_schema_minimums_agree_with_the_runtime_line_and_count_rules() {
     let root = TempDir::new().unwrap();
     fs::write(root.path().join("file.txt"), "one\n").unwrap();
@@ -851,6 +982,51 @@ fn bundled_plugin_launches_hooks_and_mcp_without_path_lookup() {
         );
         assert!(fs::read_dir(root.path()).unwrap().next().is_none());
     }
+    let guards = configuration["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(guards.len(), 1);
+    // Exact tool names: the guard only understands Bash and PowerShell commands.
+    assert_eq!(guards[0]["matcher"], "Bash|PowerShell");
+    let handler = &guards[0]["hooks"][0];
+    assert_eq!(handler["type"], "command");
+    assert_ne!(handler["async"], true);
+    for (tool, command, denied) in [
+        ("Bash", "cat > notes.txt <<'EOF'\nC:\\temp\nEOF", true),
+        ("Bash", "cargo test > log.txt 2>&1", false),
+        (
+            "PowerShell",
+            "@'\nC:\\temp\n'@ | Set-Content notes.txt",
+            true,
+        ),
+        ("PowerShell", "cargo test *> log.txt", false),
+    ] {
+        let mut child = executable(handler)
+            .env_remove("ULTRA_EDIT_SHELL_WRITES")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let event = json!({
+            "hook_event_name": "PreToolUse",
+            "cwd": root.path(),
+            "tool_name": tool,
+            "tool_input": {"command": command},
+        });
+        let mut input = child.stdin.take().unwrap();
+        input.write_all(event.to_string().as_bytes()).unwrap();
+        drop(input);
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty());
+        if denied {
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+            assert_eq!(value["hookSpecificOutput"]["permissionDecision"], "deny");
+        } else {
+            assert!(output.stdout.is_empty());
+        }
+        assert!(fs::read_dir(root.path()).unwrap().next().is_none());
+    }
     let configuration: Value =
         serde_json::from_str(include_str!("../plugin/claude-code/.mcp.json")).unwrap();
     let mut client = Client::connect(executable(&configuration["mcpServers"]["ultra-edit"]));
@@ -907,7 +1083,10 @@ fn focused_batch_edit_preserves_bytes_and_retries_after_restart() {
         false,
     );
     assert_eq!(status, committed);
-    assert_eq!(client.call("ultra_edit", request.clone(), false), committed);
+    assert_eq!(
+        client.call("ultra_edit", request.clone(), false),
+        replay_of(&committed)
+    );
     let receipt = client.call(
         "ultra_edit_status",
         json!({"query":{"kind":"receipt","request_id":"batch","full":true}}),
@@ -1036,8 +1215,71 @@ fn preview_repair_commit_and_conditional_undo_use_retained_plans() {
             json!({"plan":plan,"request_id":"undo"}),
             false
         ),
-        undone
+        replay_of(&undone)
     );
+    client.close();
+}
+
+#[test]
+fn near_miss_targets_return_copyable_candidates_over_mcp() {
+    let root = TempDir::new().unwrap();
+    fs::write(
+        root.path().join("main.rs"),
+        "fn main() {\n\tlet x = 1;\n}\n",
+    )
+    .unwrap();
+    let mut client = Client::start(root.path());
+    let snapshot = client.full("main.rs");
+    let request = json!({"request_id":"near-miss","files":[{"base":snapshot["snapshot"],"changes":[{
+        "id":"x","target":{"kind":"exact","old":"    let x = 1;"},"text":"    let x = 2;"
+    }]}]});
+    let rejected = client.call("ultra_edit", request, true);
+    assert_eq!(rejected["kind"], "rejected");
+    let diagnostic = &rejected["diagnostics"][0];
+    assert_eq!(diagnostic["code"], "TARGET_NOT_FOUND");
+    assert_eq!(
+        diagnostic["candidates"],
+        json!([{"kind":"whitespace","line":2,"end_line":2,"text":"\tlet x = 1;"}])
+    );
+    let message = diagnostic["message"].as_str().unwrap();
+    assert!(message.contains("a candidate at line 2 differs only in whitespace"));
+    let evidence = client.call(
+        "ultra_edit_status",
+        json!({"query":{"kind":"evidence","reference":rejected["reference"]}}),
+        false,
+    );
+    assert_eq!(
+        evidence["value"]["diagnostics"][0]["candidates"],
+        diagnostic["candidates"]
+    );
+    // Replacing just the failed change with the candidate's exact text succeeds.
+    let repaired = client.call(
+        "ultra_edit_repair",
+        json!({"reference":rejected["reference"],"request_id":"near-miss-repaired","changes":[{
+            "id":"x","target":{"kind":"exact","old":diagnostic["candidates"][0]["text"]},
+            "text":"\tlet x = 2;"
+        }]}),
+        false,
+    );
+    assert_eq!(repaired["kind"], "ready");
+    let committed = client.call(
+        "ultra_edit_commit",
+        json!({"plan":repaired["reference"]}),
+        false,
+    );
+    assert_eq!(committed["commit"], "committed");
+    assert_eq!(
+        fs::read_to_string(root.path().join("main.rs")).unwrap(),
+        "fn main() {\n\tlet x = 2;\n}\n"
+    );
+    // Diagnostics with nothing to suggest omit the field.
+    let snapshot = client.full("main.rs");
+    let ambiguous = json!({"request_id":"no-candidates","files":[{"base":snapshot["snapshot"],"changes":[{
+        "id":"n","target":{"kind":"exact","old":"n"},"text":"N"
+    }]}]});
+    let rejected = client.call("ultra_edit_prepare", ambiguous, true);
+    assert_eq!(rejected["diagnostics"][0]["code"], "TARGET_AMBIGUOUS");
+    assert!(rejected["diagnostics"][0].get("candidates").is_none());
     client.close();
 }
 
@@ -1066,10 +1308,13 @@ fn retry_preflight_failure_keeps_original_receipt_and_candidate() {
     let retried = client.call("ultra_edit_retry", arguments.clone(), false);
     assert_eq!(retried["commit"], "committed");
     assert_eq!(fs::read_to_string(&path).unwrap(), "after");
-    assert_eq!(client.call("ultra_edit_retry", arguments, false), retried);
+    assert_eq!(
+        client.call("ultra_edit_retry", arguments, false),
+        replay_of(&retried)
+    );
     assert_eq!(
         client.call("ultra_edit_commit", json!({"plan":plan}), true),
-        failed
+        replay_of(&failed)
     );
     client.close();
 }
@@ -1356,8 +1601,15 @@ fn cancelled_call_can_be_recovered_without_reapplying_the_edit() {
         false,
     );
     assert_eq!(status["commit"], "committed");
-    assert_eq!(recovered, status);
-    assert_eq!(client.call("ultra_edit", request, false), status);
+    // The cancelled worker and the recovery race for the lock; one of them commits.
+    assert!(
+        recovered == status || recovered == replay_of(&status),
+        "{recovered}"
+    );
+    assert_eq!(
+        client.call("ultra_edit", request, false),
+        replay_of(&status)
+    );
     assert_eq!(
         fs::read_to_string(root.path().join("file.txt")).unwrap(),
         "xx"
@@ -1587,5 +1839,183 @@ fn end_of_input_answers_an_accepted_request_before_exiting() {
         snapshot["result"]["structuredContent"]["snapshot"].is_string(),
         "{snapshot}"
     );
+    client.close();
+}
+
+#[test]
+fn request_and_change_ids_are_optional_except_for_retry() {
+    let root = TempDir::new().unwrap();
+    let mut client = Client::start(root.path());
+    let tools = client.rpc("tools/list", json!({}))["result"]["tools"].clone();
+    let schema = |name: &str| {
+        tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is not exposed"))["inputSchema"]
+            .clone()
+    };
+    let required = |schema: &Value| {
+        schema["required"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no required list: {schema}"))
+            .iter()
+            .map(|name| name.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    for name in ["ultra_edit", "ultra_edit_prepare"] {
+        let schema = schema(name);
+        assert_eq!(required(&schema), ["files"], "{name}");
+        assert_eq!(schema["properties"]["request_id"]["type"], "string");
+        let change = &schema["$defs"]["Change"];
+        assert_eq!(required(change), ["target", "text"], "{name}");
+        assert_eq!(change["properties"]["id"]["type"], "string");
+    }
+    assert_eq!(
+        required(&schema("ultra_edit_repair")),
+        ["reference", "changes"]
+    );
+    assert_eq!(required(&schema("ultra_edit_undo")), ["plan"]);
+    assert_eq!(
+        required(&schema("ultra_edit_retry")),
+        ["plan", "request_id"]
+    );
+    let refused = client.rpc(
+        "tools/call",
+        json!({"name":"ultra_edit_retry","arguments":{"plan":"p0"}}),
+    );
+    assert!(
+        refused["error"].is_object() || refused["result"]["isError"] == true,
+        "{refused}"
+    );
+    client.close();
+}
+
+#[test]
+fn omitted_ids_are_derived_and_identical_calls_replay_with_a_flag() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("file.txt");
+    fs::write(&path, "one\n").unwrap();
+    let mut client = Client::start(root.path());
+    let base = client.range("file.txt", 1, 1);
+    let request = json!({"files":[{"base":base["snapshot"],"changes":[
+        {"target":{"kind":"span","span":"selection"},"text":"two"}
+    ]}]});
+    let committed = client.call("ultra_edit", request.clone(), false);
+    assert_eq!(committed["commit"], "committed");
+    assert!(committed.get("replayed").is_none(), "{committed}");
+    let request_id = committed["request_id"].as_str().unwrap().to_owned();
+    assert!(request_id.starts_with("auto-"), "{committed}");
+    assert_eq!(request_id.len(), 37);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "two\n");
+    // Restoring the base bytes would let a new attempt succeed; a replay must not write.
+    fs::write(&path, "one\n").unwrap();
+    let replay = client.call("ultra_edit", request.clone(), false);
+    assert_eq!(replay, replay_of(&committed));
+    assert_eq!(fs::read_to_string(&path).unwrap(), "one\n");
+    assert_eq!(
+        client.call("ultra_edit_prepare", request, false),
+        replay_of(&committed)
+    );
+    assert_eq!(
+        client.call(
+            "ultra_edit_commit",
+            json!({"plan":committed["plan_id"]}),
+            false
+        ),
+        replay_of(&committed)
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), "one\n");
+    let status = client.call(
+        "ultra_edit_status",
+        json!({"query":{"kind":"receipt","request_id":request_id}}),
+        false,
+    );
+    assert_eq!(status, committed);
+    let evidence = client.call(
+        "ultra_edit_status",
+        json!({"query":{"kind":"evidence","reference":committed["plan_id"]}}),
+        false,
+    );
+    assert_eq!(evidence["value"]["request"]["request_id"], request_id);
+    assert_eq!(
+        evidence["value"]["request"]["files"][0]["changes"][0]["id"],
+        "1.1"
+    );
+    // Another request, even on the same base, derives its own ID.
+    let other = json!({"files":[{"base":base["snapshot"],"changes":[
+        {"target":{"kind":"span","span":"selection"},"text":"three"}
+    ]}]});
+    let fresh = client.call("ultra_edit", other, false);
+    assert_ne!(fresh["request_id"], committed["request_id"]);
+    assert!(fresh.get("replayed").is_none(), "{fresh}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "three\n");
+    client.close();
+}
+
+#[test]
+fn rejections_repairs_and_undos_replay_under_derived_ids() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("file.txt");
+    fs::write(&path, "x x\n").unwrap();
+    let mut client = Client::start(root.path());
+    let snapshot = client.full("file.txt");
+    let request = json!({"files":[{"base":snapshot["snapshot"],"changes":[
+        {"target":{"kind":"exact","old":"x"},"text":"y"}
+    ]}]});
+    let rejected = client.call("ultra_edit_prepare", request.clone(), true);
+    assert_eq!(rejected["kind"], "rejected");
+    assert!(rejected.get("replayed").is_none(), "{rejected}");
+    assert_eq!(rejected["diagnostics"][0]["change_id"], "1.1");
+    assert_eq!(
+        client.call("ultra_edit", request, true),
+        replay_of(&rejected)
+    );
+    let unnamed = client.call(
+        "ultra_edit_repair",
+        json!({"reference":rejected["reference"],"changes":[
+            {"target":{"kind":"all","old":"x","scope":"r0","expected":2},"text":"y"}
+        ]}),
+        true,
+    );
+    assert_eq!(unnamed["error"]["code"], "INVALID_REPAIR");
+    let repair = json!({"reference":rejected["reference"],"changes":[
+        {"id":"1.1","target":{"kind":"all","old":"x","scope":"r0","expected":2},"text":"y"}
+    ]});
+    let repaired = client.call("ultra_edit_repair", repair.clone(), false);
+    assert_eq!(repaired["kind"], "ready");
+    assert!(repaired.get("replayed").is_none(), "{repaired}");
+    assert!(
+        repaired["request_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("auto-"),
+        "{repaired}"
+    );
+    assert_ne!(repaired["request_id"], rejected["request_id"]);
+    assert_eq!(
+        client.call("ultra_edit_repair", repair, false),
+        replay_of(&repaired)
+    );
+    let plan = repaired["reference"].clone();
+    let committed = client.call("ultra_edit_commit", json!({"plan":plan}), false);
+    assert!(committed.get("replayed").is_none(), "{committed}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "y y\n");
+    let undone = client.call("ultra_edit_undo", json!({"plan":plan}), false);
+    assert_eq!(undone["commit"], "committed");
+    assert!(undone.get("replayed").is_none(), "{undone}");
+    assert!(
+        undone["request_id"].as_str().unwrap().starts_with("auto-"),
+        "{undone}"
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), "x x\n");
+    // With the committed bytes back, a new undo could succeed; the replay writes nothing.
+    fs::write(&path, "y y\n").unwrap();
+    assert_eq!(
+        client.call("ultra_edit_undo", json!({"plan":plan}), false),
+        replay_of(&undone)
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), "y y\n");
     client.close();
 }

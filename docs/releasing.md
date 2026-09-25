@@ -150,8 +150,10 @@ claude plugin marketplace add subashc2023/ultra-edit
 claude plugin install ultra-edit@ultra-edit
 ```
 
-Start Claude Code in a disposable workspace, inspect `/mcp`, and confirm both the
-`SessionStart` context and one focused snapshot-to-edit flow. Release binaries
+Start Claude Code in a disposable workspace, inspect `/mcp`, and confirm the
+`SessionStart` context, one focused snapshot-to-edit flow, and that the shell
+guard denies a heredoc written to a file (for example, ask Claude to run
+`cat > note.txt <<'EOF'` with some text). Release binaries
 are currently unsigned. Add Authenticode signing and macOS Developer ID signing
 and notarization before promoting the package beyond an unsigned developer
 release.

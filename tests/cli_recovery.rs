@@ -6,6 +6,7 @@ use std::process::{Child, Command, Stdio};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use ultra_edit::storage::Storage;
+use ultra_edit::workspace::REPLAY_NOTICE;
 use ultra_edit::{CommitStatus, FileStatus, PreparedPlan, Receipt, digest, report};
 
 fn start(root: &Path, args: &[&str], input: Option<&Value>) -> Child {
@@ -42,6 +43,19 @@ fn finish(child: Child) -> (i32, Value) {
 
 fn run(root: &Path, args: &[&str], input: Option<&Value>) -> (i32, Value) {
     finish(start(root, args, input))
+}
+
+/// What repeating the command that returned `original` prints: the same recorded
+/// result, flagged, with the replay notice leading its report.
+fn replay_of(original: &Value) -> Value {
+    assert!(original.get("replayed").is_none(), "{original}");
+    let mut replay = original.clone();
+    replay["replayed"] = json!(true);
+    replay["report"] = json!(format!(
+        "{REPLAY_NOTICE}\n{}",
+        original["report"].as_str().unwrap()
+    ));
+    replay
 }
 
 fn prepare(root: &Path, files: &[(&str, &str, &str)], request_id: &str) -> (Value, PreparedPlan) {
@@ -124,6 +138,8 @@ fn interrupted_commit_replays_unknown_without_inferring_from_current_bytes() {
         let (code, committed) = run(root.path(), &["commit", &plan.id], None);
         assert_eq!(code, 3, "{committed}");
         assert_eq!(committed["commit"], "outcome_unknown");
+        // The recorded attempt is returned; nothing new is attempted.
+        assert_eq!(committed["replayed"], true);
         assert_eq!(committed["request_id"], "interrupted-edit");
         assert_eq!(committed["plan_id"], plan.id);
         assert!(
@@ -269,7 +285,13 @@ fn concurrent_commit_processes_return_one_recorded_outcome() {
     let (second_code, second) = finish(second);
     assert_eq!(first_code, 0, "{first}");
     assert_eq!(second_code, 0, "{second}");
-    assert_eq!(first, second);
+    // Exactly one process attempted the commit; the other replayed its receipt.
+    let (first, second) = if first.get("replayed").is_some() {
+        (second, first)
+    } else {
+        (first, second)
+    };
+    assert_eq!(second, replay_of(&first));
     assert_eq!(first["commit"], "committed");
     assert_eq!(
         fs::read_to_string(root.path().join("file.txt")).unwrap(),
@@ -281,7 +303,7 @@ fn concurrent_commit_processes_return_one_recorded_outcome() {
     assert_eq!(receipt["files"][0]["status"], "committed");
     let (code, replay) = run(root.path(), &["edit"], Some(&request));
     assert_eq!(code, 0, "{replay}");
-    assert_eq!(replay, first);
+    assert_eq!(replay, second);
     assert_eq!(
         fs::read_to_string(root.path().join("file.txt")).unwrap(),
         "xx"

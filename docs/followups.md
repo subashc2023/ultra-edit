@@ -91,3 +91,31 @@ The runnable regression coverage is in [reading tests](../tests/reading.rs),
 [Development](../README.md#development); historical benchmark and Claude smoke
 measurements remain documented separately and are not new measurements of these
 follow-ups.
+
+## Later changes (2026-09-25)
+
+Later work goes further on several report items. The [reference](reference.md)
+has the complete contract.
+
+- **Snapshots accumulate:** each string of at least 4096 UTF-8 bytes, such as a
+  file's contents, is stored once in `.ultra-edit/blobs`, so re-reading an
+  unchanged file adds only a small snapshot object. `prune-snapshots` also
+  removes blobs that no remaining object references, with no age threshold. See
+  [Persistence and evidence](reference.md#persistence-and-evidence) and the
+  [storage measurements](performance.md#blob-store-follow-up-2026-09-25).
+- **A mistaken span ID replaced the wrong line:** `EXPECTED_TEXT_MISMATCH` now
+  quotes what the span holds and lists up to three near-miss `candidates`, such
+  as the expected text found on another line. `TARGET_NOT_FOUND` on an `exact`
+  or `all` target lists them too. See [CLI](reference.md#cli).
+- **Editing distant regions of one file:** a range read can continue a prior
+  snapshot, so one base discloses several ranges and one request edits them all.
+  Two separately read snapshots of one file still cannot share a request.
+- **Request-ID friction:** `request_id` and change `id` are optional. Omitted
+  IDs are derived from the arguments, and repeating a recorded call returns its
+  result with `replayed: true`. Retry still needs an explicit new ID. See
+  [Preview, repair, retry, and undo](reference.md#preview-repair-retry-and-undo).
+- **Shell-editing conflicts:** a `PreToolUse` hook now denies Bash and PowerShell
+  commands that write file content into the project through the shell, such as
+  heredoc redirection, `sed -i`, and `Set-Content`, behind the prompt guidance.
+  It fails open and is not a sandbox; see
+  the [host guide](../plugin/claude-code/skills/edit/references/claude-code.md#automatic-routing-context).

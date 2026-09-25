@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
+use crate::candidates;
 use crate::model::{
-    Change, Diagnostic, EditRequest, PreparedFile, PreparedPlan, Replacement, Snapshot, Span,
-    Target, digest, new_id,
+    Candidate, Change, Diagnostic, EditRequest, PreparedFile, PreparedPlan, Replacement, Snapshot,
+    Span, Target, digest, new_id,
 };
 
 pub const MAX_CHANGES: usize = 1_000;
@@ -11,10 +12,19 @@ pub const MAX_REPLACEMENTS: usize = 10_000;
 pub const MAX_OVERLAP_DIAGNOSTICS: usize = 128;
 /// Maximum bytes in each source/output file and in all inserted text across a plan.
 pub const MAX_TEXT_BYTES: usize = 16 * 1024 * 1024;
+/// Source and needle bytes that a request's failed targets may search for
+/// near-miss candidates; failures beyond it are reported without candidates.
+pub const MAX_CANDIDATE_SEARCH_BYTES: usize = 2 * MAX_TEXT_BYTES;
+/// Failed targets per request that search for candidates, as many as a compact
+/// response shows. Each search aligns a bounded number of windows, so this caps
+/// the time a failing request holds the workspace lock.
+pub const MAX_CANDIDATE_SEARCHES: usize = 6;
 
 struct Budget {
     spans_left: usize,
     bytes_left: usize,
+    search_bytes_left: usize,
+    searches_left: usize,
 }
 
 impl Budget {
@@ -32,6 +42,15 @@ impl Budget {
         self.spans_left = spans_left;
         self.bytes_left = bytes_left;
         true
+    }
+
+    /// Runs one candidate search against the request's shared limits.
+    fn candidates(&mut self, search: impl FnOnce(&mut usize) -> Vec<Candidate>) -> Vec<Candidate> {
+        let Some(left) = self.searches_left.checked_sub(1) else {
+            return Vec::new();
+        };
+        self.searches_left = left;
+        search(&mut self.search_bytes_left)
     }
 }
 
@@ -150,6 +169,8 @@ pub fn compile(
     let mut budget = Budget {
         spans_left: MAX_REPLACEMENTS,
         bytes_left: MAX_TEXT_BYTES,
+        search_bytes_left: MAX_CANDIDATE_SEARCH_BYTES,
+        searches_left: MAX_CANDIDATE_SEARCHES,
     };
     let mut overlap_count = 0;
     let mut overlap_limit_reached = false;
@@ -169,7 +190,7 @@ pub fn compile(
                 Some(&base.path),
                 None,
                 "DUPLICATE_TARGET_PATH",
-                "Combine changes to the same target into one file entry",
+                "Only one file entry may target a path. Merge these changes into one entry with one base: continue a range or search with `snapshot` so that base discloses every span they use, or target text with an unscoped exact `old`.",
             ));
         }
         if !validate_snapshot(base, &file.base, &mut diagnostics) {
@@ -462,16 +483,21 @@ fn resolve_change(
         } => (old.as_str(), Some(scope.as_str()), *expected),
         Target::Span { span, expect } => {
             if let Some((start, end)) = scope_range(base, change, Some(span), diagnostics) {
-                if expect
-                    .as_ref()
-                    .is_some_and(|text| text != &base.text[start..end])
-                {
-                    diagnostics.push(at(
+                let actual = &base.text[start..end];
+                if let Some(expect) = expect.as_ref().filter(|text| *text != actual) {
+                    // The span may be the wrong one, so search the whole snapshot.
+                    let whole = 0..base.text.len();
+                    let found = budget.candidates(|search| {
+                        candidates::find(search, &base.text, whole, expect, true)
+                    });
+                    let mut diagnostic = at(
                         Some(&base.path),
                         Some(change),
                         "EXPECTED_TEXT_MISMATCH",
-                        "Span text does not match expect; inspect the original snapshot and choose the intended span",
-                    ));
+                        candidates::mismatch(actual, &found),
+                    );
+                    diagnostic.candidates = found;
+                    diagnostics.push(diagnostic);
                     return;
                 }
                 if !budget.reserve(1, &change.text) {
@@ -522,10 +548,18 @@ fn resolve_change(
         } else {
             "EXPECTED_COUNT_MISMATCH"
         };
+        // Counts explain a target that matched somewhere; only a miss searches.
+        let found = if actual == 0 {
+            budget.candidates(|search| candidates::find_target(search, &base.text, start..end, old))
+        } else {
+            Vec::new()
+        };
         let message = if exact && actual != 0 {
             format!(
                 "Expected {expected} occurrence(s), found {actual} overlapping starts ({non_overlapping} non-overlapping); inspect the snapshot and choose an explicit span or narrower scope"
             )
+        } else if !found.is_empty() {
+            candidates::not_found(expected, &found)
         } else {
             format!(
                 "Expected {expected} occurrence(s), found {actual}; inspect the snapshot and choose an explicit span or narrower scope"
@@ -534,6 +568,7 @@ fn resolve_change(
         let mut diagnostic = at(Some(&base.path), Some(change), code, message);
         diagnostic.expected = Some(expected);
         diagnostic.actual = Some(actual);
+        diagnostic.candidates = found;
         diagnostics.push(diagnostic);
         return;
     }
@@ -575,17 +610,7 @@ fn scan_occurrences(source: &str, old: &str, offset: usize, retained: usize) -> 
     }
     let needle = old.as_bytes();
     // KMP keeps overlapping counts linear even for a long, highly repetitive needle.
-    let mut prefix = vec![0; needle.len()];
-    for index in 1..needle.len() {
-        let mut matched = prefix[index - 1];
-        while matched > 0 && needle[index] != needle[matched] {
-            matched = prefix[matched - 1];
-        }
-        if needle[index] == needle[matched] {
-            matched += 1;
-        }
-        prefix[index] = matched;
-    }
+    let prefix = prefix_table(needle);
     let mut overlapping = 0;
     let mut non_overlapping = 0;
     let mut next_non_overlapping_start = 0;
@@ -616,6 +641,23 @@ fn scan_occurrences(source: &str, old: &str, offset: usize, retained: usize) -> 
         non_overlapping,
         positions,
     }
+}
+
+/// The KMP failure function: for each prefix of `pattern`, the length of its
+/// longest proper prefix that is also a suffix.
+pub(crate) fn prefix_table(pattern: &[u8]) -> Vec<usize> {
+    let mut prefix = vec![0; pattern.len()];
+    for index in 1..pattern.len() {
+        let mut matched = prefix[index - 1];
+        while matched > 0 && pattern[index] != pattern[matched] {
+            matched = prefix[matched - 1];
+        }
+        if pattern[index] == pattern[matched] {
+            matched += 1;
+        }
+        prefix[index] = matched;
+    }
+    prefix
 }
 
 fn resource_limit(base: &Snapshot, change: &Change) -> Diagnostic {

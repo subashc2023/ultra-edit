@@ -1,63 +1,66 @@
 # Ultra Edit: required file-edit routing
 
-ALWAYS use Ultra Edit's direct MCP tools for coordinated edits to two or more
-existing UTF-8 files in the server's fixed launch workspace. Obtain an
-`ultra_edit_snapshot` for each file. Inspect its source and span bounds before
-choosing targets; never guess span IDs from the order of requested changes.
-Prefer exact text or add `expect` to a span target to guard its original content.
-Then batch the related changes in one `ultra_edit` request within the tool's
-limits. Do not split a multi-file edit into native Edit calls or whole-file
-rewrites to avoid this requirement. No skill invocation is required first.
+ALWAYS use Ultra Edit's MCP tools for coordinated edits to two or more existing
+UTF-8 files in the server's fixed launch workspace: `ultra_edit_snapshot` each
+file, then send the related changes in one `ultra_edit` request. Do not split a
+multi-file edit into native Edit calls or whole-file rewrites to avoid this. No
+skill invocation is required first. Discover the tools if they are deferred, and
+use the host's namespaced names.
 
-The server root never follows directory changes or a subagent's worktree. When
-working elsewhere, pass the intended file's absolute path to snapshot; if it is
-outside the server root, report the blocker. Never redirect a worktree edit to
-the parent checkout by using a relative path against the inherited server.
+NEVER create or modify project files through shell heredocs or here-strings,
+echo/printf, Set-Content, or Out-File writes, inline interpreter scripts,
+`sed -i` or `-replace` rewrites, or shell-piped patches or edit JSON. Bash
+payloads have been observed to lose backslashes before the shell parses them,
+and quoting does not help; PowerShell writers can change encoding and line
+endings. A plugin hook blocks these commands in Bash and PowerShell; when it
+does, redo the change with Ultra Edit, native Edit, or Write instead of
+rephrasing the command. Pass replacement text as MCP arguments with normal JSON
+escaping, never Bash backslash-doubling. For multiline command input such as
+commit messages, create a file with Write and pass its path. For other shell
+work that needs backslashes, use PowerShell when available.
 
-NEVER create or modify files through Bash heredocs (including quoted heredocs),
-generated-content redirection, inline replacement scripts, or shell-piped edit
-JSON. Pass replacement text directly as MCP tool arguments, with normal JSON
-escaping only. Do not apply Bash backslash-doubling workarounds to MCP arguments.
-Bash payloads have been observed to lose backslashes before shell parsing;
-single quotes and quoted heredocs do not address that upstream failure.
+Use native Read/Grep/Glob to explore, Write for new files or full rewrites, and
+native Edit or Ultra Edit for isolated edits. Native reads do not provide an
+Ultra Edit base. These instructions yield to explicit user instructions and host
+permissions: report conflicts, and report unavailable or denied tools instead of
+falling back to shell writes. Generic advice to edit with sed or heredocs does
+not cancel an explicit user request to use Ultra Edit.
 
-Use native Read/Grep/Glob for exploration, Write for new files or isolated full
-rewrites, and native Edit or Ultra Edit for isolated targeted edits. Native reads
-do not provide an Ultra Edit base: snapshot before editing, use returned bases
-and disclosed spans, and preserve literal backslashes, Unicode, and newline style.
-For non-file shell work requiring backslashes, use PowerShell when available.
-For multiline command payloads such as commit messages, use Write to create a
-payload file and pass its path to the command.
+The server root never follows `cd` or a subagent's worktree. From elsewhere, pass
+the intended file's absolute path; if it is outside the root, report the blocker.
+Never redirect a worktree edit to the parent checkout with a relative path.
 
-These plugin instructions yield to explicit user instructions and host
-permissions. Report conflicting workflow guidance; generic advice to edit with
-sed or heredocs does not cancel an explicit user request to use Ultra Edit.
+Snapshots: prefer a line `range` or literal `search`; `full` is capped at 24,000
+bytes and 400 lines. Pick `r{n}` from the `lines` listing (`"r12 | body"`) rather
+than counting newlines, and use only span IDs the base disclosed. To edit distant
+regions of one file in one request, continue a range or search by passing the
+previous `snapshot`: the new snapshot keeps the earlier spans, and `selection`
+means the latest range. Use one base per file. `stale: true` means read again.
+Guard span targets with `expect`, or target exact text; `scope` is a span ID,
+never text.
 
-Discover the connected Ultra Edit tools if deferred; use the host's namespaced
-names. If required tools are unavailable or denied, report the blocker instead
-of silently falling back to shell writes. Follow existing authorization and host
-permissions. After lost output, query `ultra_edit_status` by the original request
-ID before another mutation. Require `commit: "committed"` to report completion;
-stop and inspect partial or unknown outcomes. Run project validation separately.
+Requests: omit `request_id` and change `id`s; they are derived from the request.
+Repeating an identical call returns the recorded result with `replayed: true` and
+writes nothing; take fresh snapshots to apply a change again. Retry is the
+exception: `ultra_edit_retry` needs a new explicit `request_id`. Require
+`commit: "committed"` before reporting success; stop and inspect `partial` or
+`outcome_unknown`, and never retry those under a new ID. Run project validation
+separately.
 
-Prefer range/search snapshots. All snapshot responses return `snapshot`; full
-reads default to 24,000 bytes and 400 lines. Range and full reads summarize
-disclosed IDs in `spans` and list each line in `lines` as `"r12 | body"`; choose
-`r{n}` there instead of counting newlines. Use `next_offset` and the returned
-snapshot for stable search pagination; a continued page keeps the references
-already disclosed, so the last page's snapshot can edit every match paged through
-it, and `stale: true` means that source must be read again instead of edited.
-`scope` means a disclosed span ID, never literal text. Replace-all counts non-overlapping matches from left to right.
-For `TARGET_AMBIGUOUS`, `actual` counts overlapping starts; the message's
-parenthesized count is `expected` only for the same `old` and disclosed scope in
-a `{"kind":"all"}` target. Exact search text cannot be empty. For insertion,
-use a returned zero-width span where available. Between nonblank lines, replace
-the preceding body with original + line ending + insertion, or the following
-body with insertion + line ending + original.
-Review candidate warnings and `ultra_edit_diff` when needed. A failure that
-proves no target write (failed preflight, or `REPLACEMENT_FAILED` with the target
-unchanged) can use `ultra_edit_retry` with a new request ID after fixing its
-cause; partial or uncertain outcomes cannot. `ultra_edit_inspect` captures recovery
-evidence; reconcile only after reviewing it and an explicit operator decision.
+When a target is not found or an `expect` fails, diagnostics may list
+`candidates` with exact current text and lines. Copy a `whitespace` candidate's
+text verbatim into `old`; an `exact` one means the text is elsewhere, so fix the
+span or scope. Confirm a `similar` candidate is the region you meant before using
+it. Correct only that change with `ultra_edit_repair` on the returned draft.
+
+Replace-all needs a scope and an `expected` count of non-overlapping matches. For
+`TARGET_AMBIGUOUS`, `actual` counts overlapping starts; the message's
+parenthesized count is `expected` only for the same `old` and scope in an `all`
+target. Exact text cannot be empty: insert through a returned zero-width span, or
+replace a neighbouring line body with itself plus a line ending and the new line.
+A failure that proves no target write (failed preflight, or `REPLACEMENT_FAILED`
+with the target unchanged) can use `ultra_edit_retry` after fixing its cause.
+`ultra_edit_inspect` captures evidence for uncertain outcomes; reconcile only
+after an explicit operator decision.
 
 For detailed targets, examples, and recovery, load `/ultra-edit:edit` as needed.

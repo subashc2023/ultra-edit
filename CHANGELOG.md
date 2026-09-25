@@ -5,6 +5,64 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-25
+
+### Added
+
+- When an `exact` or `all` target is not found, or a span's `expect` fails,
+  diagnostics list up to three `candidates` (`exact`, `whitespace`, or `similar`)
+  with line numbers and the exact current text to copy. A scoped target whose
+  text lies outside its scope reports where it is. Only the first six failed
+  targets of a request are searched. `similar` skips lines that only share a
+  one-line target's shape: short targets need up to 85%, and below 80% a
+  candidate must contain more than half of the target's content words.
+- Range reads can continue a snapshot (`read-range PATH FIRST LAST SNAPSHOT`, MCP
+  `range.snapshot`) and keep its spans, so one request can edit distant regions
+  of a file. Range responses report `stale`.
+- `request_id` and change `id` are optional; omitted IDs are derived from the
+  request (`auto-…` and `"1.2"`). Retry still requires an explicit request ID.
+- Responses mark a recorded result returned without a new attempt with
+  `replayed: true`, and replayed reports start with a notice. CLI preparation
+  output now includes `request_id`, so a derived ID can be used with `receipt`.
+- A `PreToolUse` hook (`ultra-edit-mcp --claude-hook PreToolUse`, matched to
+  `Bash|PowerShell`) denies Bash and PowerShell commands that write file content
+  into the project through the shell, including here-strings, `Set-Content`,
+  `Out-File`, `-replace` rewrites, and .NET write APIs. Writes certainly outside
+  the project (`CLAUDE_PROJECT_DIR`, else the event's `cwd`), such as
+  `$GITHUB_OUTPUT`, `/etc/hosts`, `~/.bashrc`, or temporary files, are allowed.
+  Set `ULTRA_EDIT_SHELL_WRITES=allow` in Claude Code's environment to disable
+  it. The hook allows anything it cannot parse, stops lexing a command after
+  250,000 tokens and allows the rest, and exits with a non-blocking error when
+  misconfigured rather than denying every command.
+- An evaluation harness (`eval/`) compares native editing, native editing with
+  the guard, and Ultra Edit on fixture tasks.
+- A manual Eval workflow runs that harness on a GitHub-hosted Linux or Windows
+  runner with an `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` repository
+  secret, and redacts the secret from the uploaded results.
+- `prune-snapshots` reports and removes unreferenced blobs (`reclaimable_blobs`,
+  `reclaimable_blob_bytes`, `retained_blobs`, `removed_blobs`).
+
+### Changed
+
+- `.ultra-edit` stores each string of 4 KiB or more once, in `blobs/` by SHA-256.
+  Re-reading an unchanged file writes only a small snapshot. State from 0.2.0
+  loads without migration, but earlier versions cannot read state written by this
+  one and fail with `STORE_CORRUPT`; do not mix versions on one workspace.
+- `TARGET_ALIAS`, `DUPLICATE_TARGET_PATH`, and `EXPECTED_TEXT_MISMATCH` messages
+  say how to recover; `EXPECTED_TEXT_MISMATCH` shows the span's actual text.
+- The plugin instructions are shorter and cover the guard, derived IDs,
+  continuation, and candidates.
+- The engine contract moved from the README to `docs/reference.md`, and the
+  README lists what routing edits through MCP gives up.
+- Release packaging requires the shell guard hook, matched to Bash and
+  PowerShell.
+
+### Fixed
+
+- The MCP server freed an answered request ID only after writing the reply, so a
+  client that reused the ID immediately could be refused as a duplicate.
+- The unwritable-state-directory test no longer fails when run as root.
+
 ## [0.2.0] - 2026-09-11
 
 ### Added
@@ -61,5 +119,6 @@ All notable changes to Ultra Edit are documented here. Releases follow
 - A self-hosted Claude Code marketplace package with SHA-256 verification and
   GitHub build-provenance attestations.
 
+[0.3.0]: https://github.com/subashc2023/ultra-edit/releases/tag/v0.3.0
 [0.2.0]: https://github.com/subashc2023/ultra-edit/releases/tag/v0.2.0
 [0.1.0]: https://github.com/subashc2023/ultra-edit/releases/tag/v0.1.0
