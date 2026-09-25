@@ -161,7 +161,7 @@ async fn serve(workspace: Workspace) -> Result<(), Box<dyn std::error::Error>> {
         output: Arc::new(ProtocolOutput {
             writer: Mutex::new(FramedWrite::new(tokio::io::stdout(), LinesCodec::new())),
             failed: failed.clone(),
-            in_flight: std::sync::Mutex::new(HashSet::new()),
+            in_flight: std::sync::Mutex::new(InFlight::default()),
             answered: Notify::new(),
         }),
     };
@@ -182,15 +182,30 @@ struct ProtocolOutput {
     // Request IDs the SDK still owes a reply for: a second request reusing one
     // is refused instead of losing a reply, and input that ends while one is
     // outstanding is answered instead of dropped.
-    in_flight: std::sync::Mutex<HashSet<serde_json::Value>>,
+    in_flight: std::sync::Mutex<InFlight>,
     answered: Notify,
+}
+
+#[derive(Default)]
+struct InFlight {
+    ids: HashSet<serde_json::Value>,
+    // Replies whose IDs are free again but whose bytes are still being written.
+    writing: usize,
 }
 
 impl ProtocolOutput {
     async fn send(&self, message: impl serde::Serialize) -> Result<(), io::Error> {
-        // Protocol errors and SDK replies share this writer. Check failure under
-        // the lock so queued sends never reuse a broken output stream.
         let mut writer = self.writer.lock().await;
+        self.write(&mut writer, message).await
+    }
+
+    /// Protocol errors and SDK replies share the writer. Checking failure while
+    /// the caller holds it keeps queued sends from reusing a broken stream.
+    async fn write(
+        &self,
+        writer: &mut FramedWrite<tokio::io::Stdout, LinesCodec>,
+        message: impl serde::Serialize,
+    ) -> Result<(), io::Error> {
         if self.failed.is_cancelled() {
             return Err(io::Error::other("MCP transport has failed"));
         }
@@ -205,38 +220,58 @@ impl ProtocolOutput {
         result
     }
 
-    /// Sends an SDK reply and frees the request ID it answers. Freeing it in the
-    /// same step as the write keeps the ID reusable as soon as a client can see
-    /// the reply, and holds a drain open until those bytes are out.
+    /// Sends an SDK reply and frees the request ID it answers. The ID is freed
+    /// under the writer lock before the write, because a client may reuse it the
+    /// moment it reads the reply; a drain still waits until those bytes are out.
     async fn reply(&self, message: TxJsonRpcMessage<RoleServer>) -> Result<(), io::Error> {
-        let answered = answered_id(&message);
-        let result = self.send(message).await;
-        if let Some(id) = answered {
-            self.release(&id);
-        }
-        result
+        let mut writer = self.writer.lock().await;
+        let _writing = answered_id(&message).and_then(|id| Writing::start(self, &id));
+        self.write(&mut writer, message).await
     }
 
     /// Records a request ID as awaiting a reply; false means it already is.
     fn accept(&self, id: &serde_json::Value) -> bool {
-        self.pending().insert(id.clone())
+        self.in_flight().ids.insert(id.clone())
     }
 
     fn release(&self, id: &serde_json::Value) {
-        self.pending().remove(id);
+        self.in_flight().ids.remove(id);
         self.answered.notify_one();
     }
 
     fn awaits_reply(&self) -> bool {
-        !self.pending().is_empty()
+        let in_flight = self.in_flight();
+        !in_flight.ids.is_empty() || in_flight.writing > 0
     }
 
-    fn pending(&self) -> std::sync::MutexGuard<'_, HashSet<serde_json::Value>> {
+    fn in_flight(&self) -> std::sync::MutexGuard<'_, InFlight> {
         // These IDs are bookkeeping: a poisoned set must not stop the transport
         // from answering the requests it still holds.
         self.in_flight
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Holds a drain open while a reply whose ID is already free is written, and
+/// releases it even if that write is dropped.
+struct Writing<'a>(&'a ProtocolOutput);
+
+impl<'a> Writing<'a> {
+    fn start(output: &'a ProtocolOutput, id: &serde_json::Value) -> Option<Self> {
+        let mut in_flight = output.in_flight();
+        if !in_flight.ids.remove(id) {
+            return None;
+        }
+        in_flight.writing += 1;
+        Some(Self(output))
+    }
+}
+
+impl Drop for Writing<'_> {
+    fn drop(&mut self) {
+        self.0.in_flight().writing -= 1;
+        self.0.answered.notify_one();
     }
 }
 
