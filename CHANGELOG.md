@@ -11,7 +11,9 @@ All notable changes to Ultra Edit are documented here. Releases follow
   diagnostics list up to three `candidates` (`exact`, `whitespace`, or `similar`)
   with line numbers and the exact current text to copy. A scoped target whose
   text lies outside its scope reports where it is. Only the first six failed
-  targets of a request are searched.
+  targets of a request are searched. `similar` skips lines that only share a
+  one-line target's shape: short targets need up to 85%, and below 80% a
+  candidate must contain most of the target's content words.
 - Range reads can continue a snapshot (`read-range PATH FIRST LAST SNAPSHOT`, MCP
   `range.snapshot`) and keep its spans, so one request can edit distant regions
   of a file. Range responses report `stale`.

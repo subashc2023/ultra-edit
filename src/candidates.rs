@@ -6,12 +6,14 @@
 //! 2. `whitespace`: equal after CRLF becomes LF, spaces and tabs before a line
 //!    ending are dropped, other runs of spaces and tabs become one space, and
 //!    the needle's own leading and trailing spaces and tabs are trimmed.
-//! 3. `similar`: close by edit distance; see `similar_regions`.
+//! 3. `similar`: close by edit distance, and alike in more than shape; see
+//!    `similar_regions`.
 //!
 //! Only failure diagnostics search. Each tier is linear in the searched text,
 //! apart from a fixed number of alignments of bounded size.
 
 use std::cmp::Reverse;
+use std::collections::BTreeMap;
 use std::ops::Range;
 
 use crate::compiler::prefix_table;
@@ -29,6 +31,81 @@ const RANKED_LINES: usize = 8;
 const MAX_ALIGNMENT_CELLS: usize = 4_000_000;
 const MAX_ALIGNED_WINDOW_CHARS: usize = 20_000;
 const MIN_SIMILARITY: usize = 70;
+/// Needles of fewer squeezed characters need more similarity, rising linearly
+/// to `SHORT_NEEDLE_SIMILARITY` at `SHORTEST_NEEDLE_CHARS` or fewer.
+const SHORT_NEEDLE_CHARS: usize = 25;
+const SHORTEST_NEEDLE_CHARS: usize = 12;
+const SHORT_NEEDLE_SIMILARITY: usize = 85;
+/// Below this score, a candidate for a one-line needle must also contain more
+/// than half of the needle's content words.
+const CONTENT_SIMILARITY: usize = 80;
+/// Shorter words are a line's shape rather than its content.
+const CONTENT_WORD_CHARS: usize = 4;
+/// Keywords of at least `CONTENT_WORD_CHARS` characters in common languages,
+/// sorted for binary search: shape rather than content, like punctuation.
+const KEYWORDS: [&str; 61] = [
+    "False",
+    "None",
+    "Self",
+    "Some",
+    "True",
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "crate",
+    "default",
+    "done",
+    "elif",
+    "else",
+    "enum",
+    "esac",
+    "except",
+    "export",
+    "extends",
+    "false",
+    "final",
+    "finally",
+    "from",
+    "func",
+    "function",
+    "global",
+    "impl",
+    "import",
+    "interface",
+    "lambda",
+    "loop",
+    "match",
+    "move",
+    "null",
+    "pass",
+    "private",
+    "protected",
+    "public",
+    "raise",
+    "return",
+    "self",
+    "static",
+    "struct",
+    "super",
+    "switch",
+    "then",
+    "this",
+    "throw",
+    "trait",
+    "true",
+    "type",
+    "unsafe",
+    "void",
+    "where",
+    "while",
+    "with",
+    "yield",
+];
 /// Message characters clients display before clipping.
 const MESSAGE_CHARS: usize = 240;
 /// Escaped characters of actual span text quoted by an expectation mismatch.
@@ -402,8 +479,14 @@ impl Shape {
 /// as `100 * (L - edits) / L` rounded down, where `L` is the longer of the needle
 /// and that substring. When that alignment exceeds its work bound, the unwidened
 /// window is scored whole by bigram Dice instead, as `200 * shared / (a + b)`
-/// rounded down for bigram counts `a` and `b`. Scores of at least 70 are
-/// reported best first, then by position, without overlapping regions.
+/// rounded down for bigram counts `a` and `b`.
+///
+/// A few edits turn a short line, or a line's shape, into an unrelated line, so
+/// a score passes at 70, or up to 85 for a needle shorter than 25 squeezed
+/// characters (`required_similarity`), and a one-line needle's region scoring
+/// below 80 must also contain more than half of the needle's content words
+/// (`shares_content`). Passing regions are reported best first, then by
+/// position, without overlapping regions.
 fn similar_regions(text: &str, scope: &Range<usize>, needle: &str) -> Found {
     if needle.chars().nth(MAX_SIMILAR_NEEDLE_CHARS).is_some() {
         return Vec::new();
@@ -422,11 +505,12 @@ fn similar_regions(text: &str, scope: &Range<usize>, needle: &str) -> Found {
     let needle_lines: Vec<Vec<u8>> = body
         .split('\n')
         .map(|line| {
-            let mut squeezed = Vec::new();
-            squeeze_into(
-                line.strip_suffix('\r').unwrap_or(line).as_bytes(),
-                &mut squeezed,
-            );
+            let line = line.strip_suffix('\r').unwrap_or(line).as_bytes();
+            let mut squeezed = Vec::with_capacity(line.len());
+            squeeze(line, |byte, _| {
+                squeezed.push(byte);
+                true
+            });
             squeezed
         })
         .collect();
@@ -478,6 +562,13 @@ fn similar_regions(text: &str, scope: &Range<usize>, needle: &str) -> Found {
     let latest = lines.len().saturating_sub(height);
     let window_limit = MAX_ALIGNED_WINDOW_CHARS.min(MAX_ALIGNMENT_CELLS / pattern.len());
     let shape = Shape::of(needle);
+    let required = required_similarity(pattern.len());
+    // Several lines hold enough content that the score alone decides.
+    let content: Vec<&str> = if height == 1 {
+        content_words(body).collect()
+    } else {
+        Vec::new()
+    };
     let mut needle_bigrams = None;
     let mut scored = Vec::new();
     for (_, ranked_line) in ranked {
@@ -517,7 +608,11 @@ fn similar_regions(text: &str, scope: &Range<usize>, needle: &str) -> Found {
                 )
             }
         };
-        if let Some((score, region)) = hit {
+        if let Some((score, region)) = hit
+            && usize::from(score) >= required
+            && (usize::from(score) >= CONTENT_SIMILARITY
+                || shares_content(&content, &text[region.clone()]))
+        {
             scored.push((score, placed, shape.widen(bytes, scope, region)));
         }
     }
@@ -540,6 +635,56 @@ fn similar_regions(text: &str, scope: &Range<usize>, needle: &str) -> Found {
     found
 }
 
+/// The least passing score for a needle of `wanted` squeezed characters: 70,
+/// rising linearly below 25 characters to 85 at 12 or fewer, rounded up. At 70,
+/// `let x = foo(a, b);` would find `let y = bar(a, c);`, 72% alike.
+fn required_similarity(wanted: usize) -> usize {
+    let shortfall = SHORT_NEEDLE_CHARS.saturating_sub(wanted.max(SHORTEST_NEEDLE_CHARS));
+    let raise = (SHORT_NEEDLE_SIMILARITY - MIN_SIMILARITY) * shortfall;
+    MIN_SIMILARITY + raise.div_ceil(SHORT_NEEDLE_CHARS - SHORTEST_NEEDLE_CHARS)
+}
+
+/// Maximal runs of letters, digits, and underscores.
+fn words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|character: char| !character.is_alphanumeric() && character != '_')
+        .filter(|word| !word.is_empty())
+}
+
+/// Words that say what a line is about rather than how it is built: at least
+/// four characters, not starting with a digit, and not a keyword.
+fn content_words(text: &str) -> impl Iterator<Item = &str> {
+    words(text).filter(|word| {
+        word.chars().nth(CONTENT_WORD_CHARS - 1).is_some()
+            && !word.starts_with(|character: char| character.is_ascii_digit())
+            && KEYWORDS.binary_search(word).is_err()
+    })
+}
+
+/// Whether `found` has more than half of the needle's `content` words, each
+/// occurrence counted once. `return Err(Error::Timeout);` has the shape of
+/// `return Err(Error::NotFound);` but only one of its two content words. A typo
+/// usually scores `CONTENT_SIMILARITY` or more, so words match exactly.
+fn shares_content(content: &[&str], found: &str) -> bool {
+    if content.is_empty() {
+        return true;
+    }
+    let mut available: BTreeMap<&str, usize> = BTreeMap::new();
+    for word in words(found) {
+        *available.entry(word).or_default() += 1;
+    }
+    let shared = content
+        .iter()
+        .filter(|word| match available.get_mut(**word) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                true
+            }
+            _ => false,
+        })
+        .count();
+    2 * shared > content.len()
+}
+
 /// Line bodies within `scope`, bounded as `compiler::line_ranges` bounds them
 /// for the whole text.
 fn scope_lines<'a>(text: &'a str, scope: &Range<usize>) -> impl Iterator<Item = Range<usize>> + 'a {
@@ -559,23 +704,35 @@ fn scope_lines<'a>(text: &'a str, scope: &Range<usize>) -> impl Iterator<Item = 
         })
 }
 
-/// Appends a line without leading or trailing spaces and tabs, and with each
-/// inner run of them as one space.
-fn squeeze_into(line: &[u8], out: &mut Vec<u8>) {
-    let mut started = false;
-    let mut space = false;
-    for &byte in line {
+/// The squeezing rule: visits one line's squeezed bytes in order, each with the
+/// range of the line it stands for. A visible byte, neither space nor tab,
+/// stands for itself, and a space for a run of spaces and tabs between two
+/// visible bytes; leading and trailing runs are dropped. Both blanks are ASCII,
+/// so every range of UTF-8 text starts on a character boundary. Stops,
+/// returning `false`, as soon as `visit` does.
+///
+/// `Bigrams::compare` runs this on every scope line, so it visits single bytes
+/// and is forced inline: it then compiles to the single loop it replaced, and
+/// callers that ignore ranges pay nothing for them. Measured on the similar
+/// tier, a call cost about 6% more instructions and 10% more memory accesses,
+/// and visiting whole runs of visible bytes about 25% more instructions.
+#[inline(always)]
+fn squeeze(line: &[u8], mut visit: impl FnMut(u8, Range<usize>) -> bool) -> bool {
+    let (mut started, mut space, mut end) = (false, false, 0);
+    for (index, &byte) in line.iter().enumerate() {
         if byte == b' ' || byte == b'\t' {
             space = started;
-        } else {
-            if space {
-                out.push(b' ');
-                space = false;
-            }
-            out.push(byte);
-            started = true;
+            continue;
         }
+        if space && !visit(b' ', end..index) {
+            return false;
+        }
+        if !visit(byte, index..index + 1) {
+            return false;
+        }
+        (started, space, end) = (true, false, index + 1);
     }
+    true
 }
 
 /// Squeezed window text as characters with the source bytes each stands for; a
@@ -590,24 +747,22 @@ fn window_chars(
         if index > 0 {
             chars.push(('\n', lines[index - 1].end..line.start));
         }
-        let mut started = false;
-        let mut run = None;
-        for (offset, character) in text[line.clone()].char_indices() {
-            let at = line.start + offset;
-            if character == ' ' || character == '\t' {
-                if started && run.is_none() {
-                    run = Some(at);
-                }
-                continue;
+        let body = &text[line.clone()];
+        let complete = squeeze(body.as_bytes(), |byte, range| {
+            let at = line.start + range.start;
+            if byte == b' ' {
+                chars.push((' ', at..line.start + range.end));
+            } else if let Some(character) =
+                body.get(range.start..).and_then(|rest| rest.chars().next())
+            {
+                // The later bytes of a character start no slice, so each
+                // character is pushed once, at its first byte.
+                chars.push((character, at..at + character.len_utf8()));
             }
-            if let Some(run) = run.take() {
-                chars.push((' ', run..at));
-            }
-            chars.push((character, at..at + character.len_utf8()));
-            started = true;
-            if chars.len() > limit {
-                return None;
-            }
+            chars.len() <= limit
+        });
+        if !complete {
+            return None;
         }
     }
     (chars.len() <= limit).then_some(chars)
@@ -846,20 +1001,10 @@ impl Bigrams {
             if index > 0 {
                 visit(b'\n');
             }
-            // Squeezes exactly as `squeeze_into` does.
-            let (mut started, mut space) = (false, false);
-            for &byte in &text[line.clone()] {
-                if byte == b' ' || byte == b'\t' {
-                    space = started;
-                    continue;
-                }
-                if space {
-                    visit(b' ');
-                    space = false;
-                }
+            squeeze(&text[line.clone()], |byte, _| {
                 visit(byte);
-                started = true;
-            }
+                true
+            });
         }
         visit(b'\n');
         Tally {
@@ -936,6 +1081,69 @@ mod tests {
         assert_eq!(quoted("it's", 60), "\"it's\"");
         assert_eq!(quoted("abc\u{0}", 4), "\"abc\"…");
         assert_eq!(quoted("…", 1), "\"…\"");
+    }
+
+    #[test]
+    fn squeezing_maps_each_byte_to_the_source_it_stands_for() {
+        let mut visited = Vec::new();
+        assert!(squeeze(b" \ta  \tb c\t ", |byte, range| {
+            visited.push((byte, range));
+            true
+        }));
+        let expected = [
+            (b'a', 2..3),
+            (b' ', 3..6),
+            (b'b', 6..7),
+            (b' ', 7..8),
+            (b'c', 8..9),
+        ];
+        assert_eq!(visited, expected);
+        let mut calls = 0;
+        assert!(!squeeze(b"a b", |_, _| {
+            calls += 1;
+            calls < 2
+        }));
+        assert_eq!(calls, 2);
+        // Window characters keep multi-byte characters whole.
+        let text = "  é\t ü\nx";
+        let expected = [
+            ('é', 2..4),
+            (' ', 4..6),
+            ('ü', 6..8),
+            ('\n', 8..9),
+            ('x', 9..10),
+        ];
+        assert_eq!(window_chars(text, &[0..8, 9..10], 5).unwrap(), expected);
+        assert!(window_chars(text, &[0..8, 9..10], 4).is_none());
+    }
+
+    #[test]
+    fn short_needles_need_more_similarity() {
+        let required: Vec<usize> = [0, 12, 13, 18, 24, 25, 1_000]
+            .into_iter()
+            .map(required_similarity)
+            .collect();
+        assert_eq!(required, [85, 85, 84, 79, 72, 70, 70]);
+    }
+
+    #[test]
+    fn candidates_below_eighty_percent_need_most_content_words() {
+        assert!(KEYWORDS.is_sorted());
+        let content = |text| content_words(text).collect::<Vec<_>>();
+        // Keywords, short words, and numbers are shape; the rest is content.
+        let words = content("return Err(Error::NotFound); // 404 in self.name_1");
+        assert_eq!(words, ["Error", "NotFound", "name_1"]);
+        let words = content("return Err(Error::NotFound);");
+        assert!(!shares_content(&words, "return Err(Error::Timeout);"));
+        assert!(shares_content(&words, "Err(Error::NotFound)"));
+        let words = content("let sum = compute(items);");
+        assert!(shares_content(&words, "let total = compute(items);"));
+        // Each occurrence counts once, and words match exactly.
+        let words = content("total + total + total");
+        assert!(!shares_content(&words, "total + other + Total"));
+        assert!(shares_content(&words, "total + total + other"));
+        // A needle of shape alone has nothing to share.
+        assert!(shares_content(&content("let x = f(a);"), "if y {"));
     }
 
     #[test]

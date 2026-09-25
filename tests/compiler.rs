@@ -1057,6 +1057,48 @@ fn similar_candidates_catch_changed_operators_and_names_but_not_unrelated_text()
 }
 
 #[test]
+fn similar_candidates_need_more_than_a_shared_shape() {
+    let source = "fn lookup(key: &str) -> Result<Value, Error> {\n    let x = foo(a, b);\n    return Err(Error::Timeout);\n    let cache = registry.lookup(key);\n}\n";
+    let base = snapshot("lookup.rs".into(), source.into());
+    // A short line is 72% like another of its shape, and this one shares only
+    // `Error` of its two content words; neither is suggested.
+    for unrelated in ["    let y = bar(a, c);", "    return Err(Error::NotFound);"] {
+        let error = rejected(&base, exact("unrelated", unrelated, "x"));
+        assert!(error.candidates.is_empty(), "{unrelated}: {error:?}");
+    }
+    let typo = rejected(&base, exact("typo", "    return Err(Error::Timout);", "x"));
+    assert_eq!(
+        typo.candidates,
+        [similar((3, 3), "    return Err(Error::Timeout);", 96)]
+    );
+    let short = rejected(&base, exact("short", "let x = fo(a, b);", "x"));
+    assert_eq!(
+        short.candidates,
+        [similar((2, 2), "let x = foo(a, b);", 94)]
+    );
+    let renamed = rejected(
+        &base,
+        exact("renamed", "    let store = registry.lookup(key);", "x"),
+    );
+    assert_eq!(
+        renamed.candidates,
+        [similar((4, 4), "    let cache = registry.lookup(key);", 87)]
+    );
+    // Below 80%, a line that keeps most of its content words still passes.
+    let added = "    let cache = registry.lookup(key, 30, true);";
+    let error = rejected(&base, exact("added", added, "x"));
+    assert_eq!(
+        error.candidates,
+        [similar((4, 4), "    let cache = registry.lookup(key);", 76)]
+    );
+    // Several lines carry their content into the score, which alone decides.
+    let block = "    return Err(Error::NotFound);\n    let entry = registry.lookup(name);";
+    let error = rejected(&base, exact("block", block, "x"));
+    let lines = "    return Err(Error::Timeout);\n    let cache = registry.lookup(key);";
+    assert_eq!(error.candidates, [similar((3, 4), lines, 76)]);
+}
+
+#[test]
 fn expectation_mismatch_quotes_the_span_and_finds_the_expected_text() {
     let base = snapshot(
         "expect.txt".into(),

@@ -260,6 +260,11 @@ results supplies the candidates:
   back as `"\tlet x = 1;"`.
 - `similar`: at least 70% by edit distance on whitespace-squeezed text, with
   bounded work; skipped above 200,000 scope lines or 20,000 needle characters.
+  Needles under 25 squeezed characters need more, up to 85% at 12, and below
+  80% a one-line needle's candidate must also contain more than half of its
+  content words (four or more characters, not numbers or common keywords). A
+  line of the same shape, such as `return Err(Error::Timeout);` for
+  `return Err(Error::NotFound);`, is therefore not suggested.
 
 Only the first six failed targets of a request are searched, within 32 MiB of
 scanned text, so a request with many failures cannot hold the workspace lock
