@@ -117,8 +117,8 @@ claude --plugin-dir "$(Resolve-Path -LiteralPath './plugin/claude-code')"
 `${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp` and supplies
 `["--root", "${CLAUDE_PROJECT_DIR}"]` as separate arguments. Claude Code substitutes
 the plugin and project roots; Windows native launch resolves the `.exe` suffix.
-The context hooks use the same private executable with explicit argument arrays,
-so hook launches do not pass through a shell. The server canonicalizes its root
+The hooks use the same private executable with explicit argument arrays, so hook
+launches do not pass through a shell. The server canonicalizes its root
 once. The plugin directory and later shell working directories do not select
 the edit workspace. See the official
 [MCP configuration documentation](https://code.claude.com/docs/en/mcp) and
@@ -160,9 +160,7 @@ Bash backslash-doubling workarounds to it.
 
 The plugin's [hooks](../../../hooks/hooks.json) inject the policy at
 `SessionStart` with no matcher, including startup, resume, clear, compaction,
-and fork. `SubagentStart` injects it into delegated agents. This is automatically
-loaded prompt context, not a tool-enforcement boundary. No native tool is
-disabled. See the official
+and fork. `SubagentStart` injects it into delegated agents. See the official
 [hook reference](https://code.claude.com/docs/en/hooks#sessionstart).
 
 Inspect the exact installed context in PowerShell:
@@ -187,6 +185,33 @@ update the entire plugin copy, then start a new Claude session. Bundling a
 plugin-root `CLAUDE.md` would not load these instructions automatically; the
 plugin does not edit the user's `CLAUDE.md` or settings files.
 
+A `PreToolUse` hook matched to `Bash` backs the shell rule. It runs
+`ultra-edit-mcp --claude-hook PreToolUse`, which denies commands that write
+content embedded in the command into files:
+
+- heredocs or here-strings passed through programs such as `cat`, `tee`, `sed`,
+  or `awk` and redirected or `tee`d into a file;
+- `echo` or `printf` output redirected or `tee`d into a file;
+- inline Python, Node, Perl, Ruby, PHP, or PowerShell code (`-c`, `-e`,
+  `-Command`, or a heredoc on stdin) that calls a file-write API;
+- in-place editors: `sed -i` (including `-i.bak`, `-I`, and `-ni`), `perl -i`
+  or `-pi`, `ruby -i`, and `gawk -i inplace`;
+- embedded patches or edit JSON piped to `patch`, `git apply`, or
+  `ultra-edit edit|prepare|repair`.
+
+It looks inside shells run with `-c` (three levels deep), `eval`, `$(…)`,
+backticks, `find -exec`, and wrappers such as `env`, `sudo`, `timeout`, and
+`xargs`. It allows ordinary command output redirected to files
+(`cargo test > log.txt`), `/dev/*` and `NUL`, descriptor duplication, heredocs
+to programs that do not write them to files (`git commit -F -`,
+`kubectl apply -f -`, and `git commit -m "$(cat <<'EOF' …)"`), and anything it
+cannot parse. It fails open: malformed input, other tools, parse failures, and
+internal errors allow the call. The deny reason names the pattern and says to
+edit existing files with Ultra Edit or Edit, create files with Write, and put
+multiline command input in a file created with Write; if the user explicitly
+asked for the command, report the block. Each Bash call starts the hook
+executable, which takes a few milliseconds.
+
 ## Root and permissions
 
 Each server uses one fixed root and workspace-local `.ultra-edit` state.
@@ -202,10 +227,23 @@ digest, native Read result, or guessed reference for that base.
 
 MCP tool permissions are controlled by Claude Code. Ultra Edit enforces its own
 canonical-root confinement; it does not inherit native Edit's per-path permission
-rules. This plugin contains no `allowed-tools` grant, permission settings, or hook
-that disables native tools. Do not broaden permissions or switch roots to bypass
-a host denial. See Claude Code's
+rules. This plugin contains no `allowed-tools` grant or permission settings and
+disables no tool; its Bash guard denies only matching commands. Do not broaden
+permissions or switch roots to bypass a host denial, and do not rephrase a
+blocked command to evade the guard. See Claude Code's
 [MCP permission rules](https://code.claude.com/docs/en/permissions).
+
+The guard is not a sandbox. It misses dynamic commands (`$CMD`, `bash -c "$S"`,
+`pwsh -EncodedCommand`), redirects on grouped commands, subshells, loops, or
+`exec >`, rewrites through temporary files (`sed … f > f.tmp && mv f.tmp f`),
+scripts already on disk, interpreter output redirected with `>`, other write
+APIs (`os.open`, `dd of=`, `vim -c`), and the PowerShell tool or `cmd /c`. It
+blocks every `echo` or `printf` into a file, including CI files such as
+`>> "$GITHUB_OUTPUT"`, as well as `echo … | sudo tee /etc/…`, inline data
+scripts that write output files, and write-API names inside strings. To turn it
+off, set `ULTRA_EDIT_SHELL_WRITES=allow` in Claude Code's environment, for
+example `"env": {"ULTRA_EDIT_SHELL_WRITES": "allow"}` in settings.json; setting
+it inside a Bash command has no effect.
 
 ## Troubleshooting
 
@@ -223,8 +261,11 @@ a host denial. See Claude Code's
 | Host permission denied | Respect the denial and report the blocked action; snapshot freshness is not authorization. |
 | Malformed JSON message | The server answers `-32700` and continues; fix JSON escaping. Oversized or invalid-UTF-8 frames are fatal and exit nonzero; reconnect and inspect any in-flight receipt. |
 | Conflicting shell-editing instructions | Follow explicit user instructions and host permissions, report the conflict, and avoid silently replacing the requested Ultra Edit route. |
+| A legitimate Bash command was blocked | Redo a file write with Ultra Edit, Edit, or Write, and put multiline command input in a file created with Write; do not rephrase the command to evade the guard. If the user explicitly asked for that command, report the block; the user can set `ULTRA_EDIT_SHELL_WRITES=allow` in Claude Code's environment. |
+| Every Bash call shows a hook error | The guard executable is missing or cannot launch. Check that the installed plugin's `runtime/` directory holds `ultra-edit-mcp` for this OS and architecture, with executable permission on Unix, and that its `--help` lists `--claude-hook PreToolUse`; rebuild and stage, or reinstall the release. |
 
-The hooks and skill provide guidance, not a guarantee that Claude chooses the
-required tool. The server's tool descriptions and schemas also state the critical
+The context hooks and skill provide guidance, not a guarantee that Claude
+chooses the required tool, and the Bash guard blocks only the patterns it
+recognizes. The server's tool descriptions and schemas also state the critical
 editing contract. The server still validates requests and original bases for
 every edit made through Ultra Edit.

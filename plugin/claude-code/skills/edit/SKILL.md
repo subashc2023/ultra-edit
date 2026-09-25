@@ -30,8 +30,11 @@ exposed by this host.
   a worktree edit to the parent checkout.
 - Replacement `text` is literal. Preserve intended Unicode, whitespace, and
   newline bytes; write `\r\n` for new CRLF text. No regex or newline conversion runs.
-- Reuse the exact request ID and arguments for a retry. Changed intent needs a
-  new ID. After lost output, retrieve the receipt before any new mutation.
+- Omit `request_id` and change `id`. Identical arguments derive the same IDs, so
+  after lost output, repeat the identical call: it returns the recorded result,
+  marked `replayed: true`, without writing again. Pass an explicit new
+  `request_id` only to name a request yourself; `ultra_edit_retry` always
+  requires one.
 - Confirm `commit: "committed"` before reporting all edits applied. `partial`
   and `outcome_unknown` require recovery; stop further mutations on uncertainty.
   Current bytes matching the candidate do not prove historical success.
@@ -43,14 +46,15 @@ exposed by this host.
    Range and full reads summarize disclosed IDs in `spans` (`["r12..r18",
    "selection"]`) and list each line in `lines` as `"r12 | const retries = 2;"`;
    pick `r{n}` from that listing rather than counting newlines in `text`.
-   Use `full` only when the complete file is needed. Combine each file's changes
-   under one base snapshot. Full reads default to 24,000 bytes and 400 lines;
-   oversized reads require a deliberate exact `expected_bytes` override. Search
-   pages return `next_offset`; supply it and the returned `snapshot` to continue
-   the same original bytes. A continued page also retains the references already
-   disclosed, so one request against the last page's snapshot can edit every
-   match paged through it. `stale: true` means that source no longer matches the
-   file, so read again instead of editing.
+   Use `full` only when the complete file is needed. Full reads default to 24,000
+   bytes and 400 lines; oversized reads require a deliberate exact
+   `expected_bytes` override. Combine each file's changes under one base
+   snapshot. To reach a distant region of the same file, continue the read: add
+   the previous `snapshot` to the next range selection, or pass a search page's
+   `next_offset` and `snapshot`. The new snapshot keeps every reference already
+   disclosed (`selection` names only the latest range), so use the last one as
+   the file's base. `stale: true` means the file changed since that source was
+   read, so read again instead of editing.
 2. Call `ultra_edit` with one request containing the intended changes. Use a
    disclosed `span`, or `exact` with an explicit scope when only the inspected
    region should match. Resolve all targets against that base.
@@ -61,10 +65,15 @@ exposed by this host.
    is invalid; insert through a returned zero-width span where available. To add
    a line between nonblank lines, replace the preceding body with original + line
    ending + insertion, or the following body with insertion + line ending + original.
-3. Inspect the returned outcome. Call `ultra_edit_status` with
-   `{"query":{"kind":"receipt","request_id":"..."}}` after lost output;
-   add `"full":true` inside `query` for every file outcome. Run project validation
-   separately; the engine runs no tests.
+   A missing target or failed `expect` can return `candidates`. Copy an `exact`
+   or `whitespace` candidate's `text` verbatim into `old`; confirm a `similar`
+   one is the intended region first. Then call `ultra_edit_repair` with the
+   draft `reference`, replacing only the failed `change_id`.
+3. Inspect the returned outcome. `replayed: true` marks a recorded result; take
+   fresh snapshots to apply a change again. For every file outcome, call
+   `ultra_edit_status` with
+   `{"query":{"kind":"receipt","request_id":"RETURNED_ID","full":true}}`.
+   Run project validation separately; the engine runs no tests.
 
 Example: change a known line in an existing file. First call
 `ultra_edit_snapshot`:
@@ -82,11 +91,9 @@ The placeholder is not a valid snapshot; do not send it literally.
 
 ```json
 {
-  "request_id": "retry-limit-1",
   "files": [{
     "base": "REPLACE_WITH_RETURNED_SNAPSHOT",
     "changes": [{
-      "id": "retry-limit",
       "target": { "kind": "span", "span": "m1", "expect": "const RETRIES: usize = 2;" },
       "text": "const RETRIES: usize = 3;"
     }]
@@ -94,23 +101,23 @@ The placeholder is not a valid snapshot; do not send it literally.
 }
 ```
 
-For the recorded outcome, call `ultra_edit_status`:
-
-```json
-{ "query": { "kind": "receipt", "request_id": "retry-limit-1" } }
-```
+The change gets ID `1.1` (file entry 1, change 1), and the response's
+`request_id` is the derived receipt key.
 
 ## Read only the reference needed
 
 | Task or symptom | Reference |
 | --- | --- |
-| Request identity, byte preservation, limits, or what a receipt proves | [Contract](references/contract.md) |
-| Choose range/search/full; ambiguous matches; replace-all; span overlap | [Targets](references/targets.md) |
-| Preview/diff then commit; correct a batch; preflight retry; inspect/reconcile uncertainty; undo | [Recovery](references/recovery.md) |
-| Connect the plugin; missing tools; fixed workspace root; host permissions | [Claude Code](references/claude-code.md) |
+| Request identity and replay, byte preservation, limits, or what a receipt proves | [Contract](references/contract.md) |
+| Choose range/search/full; continue a range; ambiguous matches; near-miss candidates; replace-all; span overlap | [Targets](references/targets.md) |
+| Preview/diff then commit; correct a batch; lost response; preflight retry; inspect/reconcile uncertainty; undo | [Recovery](references/recovery.md) |
+| Connect the plugin; missing tools; fixed workspace root; host permissions; blocked Bash command | [Claude Code](references/claude-code.md) |
 
-The plugin supplies context hooks without permission grants or tool-blocking
-hooks. Follow the user's existing authorization and this host's permissions.
+The plugin grants no permissions; follow the user's existing authorization and
+this host's permissions. Its PreToolUse hook denies Bash commands that write file
+content, such as heredoc or `echo` redirection into a file, inline interpreter
+writes, and `sed -i`; redo a blocked write with Ultra Edit, Edit, or Write, never
+by rephrasing the command to evade the guard.
 File creation, deletion, and rename are outside this tool's scope. Use native
 Write for new files or isolated full rewrites, and native Edit or Ultra Edit for
 isolated targeted edits. Do not split a coordinated multi-file edit into native
