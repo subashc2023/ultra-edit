@@ -4,6 +4,20 @@ use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use ultra_edit::workspace::REPLAY_NOTICE;
+
+/// What repeating the command that returned `original` prints: the same recorded
+/// result, flagged, with the replay notice leading its report.
+fn replay_of(original: &Value) -> Value {
+    assert!(original.get("replayed").is_none(), "{original}");
+    let mut replay = original.clone();
+    replay["replayed"] = json!(true);
+    replay["report"] = json!(format!(
+        "{REPLAY_NOTICE}\n{}",
+        original["report"].as_str().unwrap()
+    ));
+    replay
+}
 
 #[test]
 fn help_and_version_report_the_package_version() {
@@ -86,7 +100,7 @@ fn read_prepare_commit_receipt_and_undo_work_in_separate_processes() {
     );
     let (code, replay) = run(root.path(), &["edit"], Some(&edit));
     assert_eq!(code, 0);
-    assert_eq!(replay, committed);
+    assert_eq!(replay, replay_of(&committed));
     let (code, receipt) = run(root.path(), &["receipt", "cli-edit"], None);
     assert_eq!(code, 0);
     assert_eq!(receipt["files"][0]["changes_applied"], 1);
@@ -157,6 +171,63 @@ fn canonical_windows_paths_are_display_only_across_cli_responses() {
     let stored: ultra_edit::PreparedPlan = storage.get("plans", plan_id).unwrap();
     assert_eq!(stored.files[0].base.path, canonical);
     assert_eq!(stored.warnings[0].file.as_deref(), Some(canonical.as_str()));
+}
+
+#[test]
+fn omitted_ids_are_derived_and_replays_are_flagged_across_processes() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("file.txt");
+    fs::write(&path, "x x\n").unwrap();
+    let (code, snapshot) = run(root.path(), &["read", "file.txt"], None);
+    assert_eq!(code, 0, "{snapshot}");
+    let ambiguous = json!({"files":[{"base":snapshot["snapshot"],"changes":[
+        {"target":{"kind":"exact","old":"x"},"text":"y"}
+    ]}]});
+    let (code, rejected) = run(root.path(), &["prepare"], Some(&ambiguous));
+    assert_eq!(code, 2, "{rejected}");
+    assert_eq!(rejected["diagnostics"][0]["change_id"], "1.1");
+    let (code, replayed) = run(root.path(), &["edit"], Some(&ambiguous));
+    assert_eq!(code, 2, "{replayed}");
+    assert_eq!(replayed, replay_of(&rejected));
+
+    let repair = json!({"reference":rejected["reference"],"changes":[
+        {"id":"1.1","target":{"kind":"all","old":"x","scope":"r0","expected":2},"text":"y"}
+    ]});
+    let (code, repaired) = run(root.path(), &["repair"], Some(&repair));
+    assert_eq!(code, 0, "{repaired}");
+    assert_eq!(repaired["ready"], true);
+    let (code, replayed) = run(root.path(), &["repair"], Some(&repair));
+    assert_eq!(code, 0, "{replayed}");
+    assert_eq!(replayed, replay_of(&repaired));
+    let plan = repaired["reference"].as_str().unwrap();
+
+    let (code, committed) = run(root.path(), &["commit", plan], None);
+    assert_eq!(code, 0, "{committed}");
+    assert!(committed.get("replayed").is_none(), "{committed}");
+    let request_id = committed["request_id"].as_str().unwrap();
+    assert!(request_id.starts_with("auto-"), "{committed}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "y y\n");
+    let (code, replayed) = run(root.path(), &["commit", plan], None);
+    assert_eq!(code, 0, "{replayed}");
+    assert_eq!(replayed, replay_of(&committed));
+    let (code, receipt) = run(root.path(), &["receipt", request_id], None);
+    assert_eq!(code, 0, "{receipt}");
+    assert_eq!(receipt["plan_id"], plan);
+
+    let (code, usage) = run(root.path(), &["retry", plan], None);
+    assert_eq!(code, 2, "{usage}");
+    assert_eq!(usage["error"]["code"], "USAGE");
+    let (code, undone) = run(root.path(), &["undo", plan], None);
+    assert_eq!(code, 0, "{undone}");
+    assert!(undone.get("replayed").is_none(), "{undone}");
+    assert!(undone["request_id"].as_str().unwrap().starts_with("auto-"));
+    assert_eq!(fs::read_to_string(&path).unwrap(), "x x\n");
+    // With the committed bytes back, a new undo could succeed; the replay writes nothing.
+    fs::write(&path, "y y\n").unwrap();
+    let (code, replayed) = run(root.path(), &["undo", plan], None);
+    assert_eq!(code, 0, "{replayed}");
+    assert_eq!(replayed, replay_of(&undone));
+    assert_eq!(fs::read_to_string(&path).unwrap(), "y y\n");
 }
 
 #[test]

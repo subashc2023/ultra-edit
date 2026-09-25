@@ -90,6 +90,8 @@ pub struct SearchResult {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EditRequest {
+    /// Omit to derive it from the files.
+    #[serde(default)]
     pub request_id: String,
     pub files: Vec<FileRequest>,
 }
@@ -104,6 +106,8 @@ pub struct FileRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Change {
+    /// Unique per request; omit for its 1-based "{file}.{change}" position, e.g. "1.2".
+    #[serde(default)]
     pub id: String,
     pub target: Target,
     pub text: String,
@@ -208,6 +212,9 @@ pub struct Preparation {
     pub warnings: Vec<Diagnostic>,
     pub report: String,
     pub receipt: Option<Receipt>,
+    /// The request was already bound and this call attempted nothing new.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replayed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,8 +1,12 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::time::{Duration, SystemTime};
 
 use tempfile::TempDir;
-use ultra_edit::workspace::{EditResult, Evidence};
+use ultra_edit::workspace::{
+    EditResult, Evidence, REPLAY_NOTICE, receipt_report, repair_request_id, resolve_ids,
+    undo_request_id,
+};
 use ultra_edit::*;
 
 fn setup(text: &str) -> (TempDir, Workspace, Snapshot) {
@@ -41,6 +45,48 @@ fn completed(result: EditResult) -> Receipt {
     }
 }
 
+/// The receipt, whether it was replayed, and the report.
+fn outcome(result: EditResult) -> (Receipt, bool, String) {
+    match result {
+        EditResult::Completed {
+            receipt,
+            replayed,
+            report,
+        } => (receipt, replayed, report),
+        other => panic!("Expected a receipt, got {other:?}"),
+    }
+}
+
+fn stored_request(workspace: &Workspace, reference: &str) -> EditRequest {
+    match workspace.evidence(reference).unwrap() {
+        Evidence::Plan(plan) => plan.request,
+        Evidence::Draft(draft) => draft.request,
+        other => panic!("Expected a plan or draft, got {other:?}"),
+    }
+}
+
+fn change_ids(request: &EditRequest) -> Vec<&str> {
+    request
+        .files
+        .iter()
+        .flat_map(|file| file.changes.iter().map(|change| change.id.as_str()))
+        .collect()
+}
+
+fn journal_count(dir: &TempDir) -> usize {
+    fs::read_dir(dir.path().join(".ultra-edit/journals"))
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .count()
+}
+
 #[test]
 fn preview_commits_exact_candidate_and_retries_survive_restart() {
     let (dir, workspace, snapshot) = setup("\u{feff}one\r\ntwo\nthree  ");
@@ -66,7 +112,12 @@ fn preview_commits_exact_candidate_and_retries_survive_restart() {
     let reopened = Workspace::open(dir.path()).unwrap();
     let repeated_preview = reopened.prepare(request.clone()).unwrap();
     assert_eq!(repeated_preview.receipt.as_ref(), Some(&receipt));
-    assert!(repeated_preview.report.starts_with("committed:"));
+    assert!(repeated_preview.replayed);
+    assert!(
+        repeated_preview
+            .report
+            .starts_with(&format!("{REPLAY_NOTICE}\ncommitted:"))
+    );
     assert_eq!(completed(reopened.edit(request).unwrap()), receipt);
     assert_eq!(reopened.receipt("edit-1").unwrap(), Some(receipt));
     assert_eq!(
@@ -685,4 +736,341 @@ fn pruning_validates_retained_state_and_all_candidates_before_deleting_anything(
         );
         assert!(workspace.evidence(&preview.reference).is_ok());
     }
+}
+
+#[test]
+fn an_omitted_request_id_is_stable_and_every_argument_changes_it() {
+    let (_dir, workspace, snapshot) = setup("one two");
+    let automatic = request("", &snapshot, vec![change("a", "one", "ONE")]);
+    let resolved = resolve_ids(automatic.clone()).unwrap();
+    let id = resolved.request_id.clone();
+    assert_eq!(id.len(), 37, "{id}");
+    assert!(id.starts_with("auto-"), "{id}");
+    assert!(
+        id[5..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{id}"
+    );
+    assert_eq!(resolve_ids(automatic.clone()).unwrap(), resolved);
+    assert_eq!(resolve_ids(resolved.clone()).unwrap(), resolved);
+
+    let other_base = workspace.read("file.txt").unwrap();
+    let mut scoped = automatic.clone();
+    scoped.files[0].changes[0].target = Target::Exact {
+        old: "one".into(),
+        scope: Some("r1".into()),
+    };
+    let variants = [
+        request("", &other_base, vec![change("a", "one", "ONE")]),
+        request("", &snapshot, vec![change("b", "one", "ONE")]),
+        request("", &snapshot, vec![change("a", "two", "ONE")]),
+        request("", &snapshot, vec![change("a", "one", "One")]),
+        request(
+            "",
+            &snapshot,
+            vec![change("a", "one", "ONE"), change("b", "two", "TWO")],
+        ),
+        scoped,
+    ];
+    let mut ids = BTreeSet::from([id.clone()]);
+    for variant in variants {
+        let derived = resolve_ids(variant).unwrap().request_id;
+        assert!(ids.insert(derived.clone()), "{derived} was derived twice");
+    }
+    // Each operation derives under its own domain.
+    for derived in [
+        repair_request_id("", &id, &[]).unwrap(),
+        undo_request_id("", &id).unwrap(),
+    ] {
+        assert!(derived.starts_with("auto-"), "{derived}");
+        assert!(ids.insert(derived.clone()), "{derived} collided");
+    }
+    assert_eq!(
+        resolve_ids(request("explicit", &snapshot, vec![]))
+            .unwrap()
+            .request_id,
+        "explicit"
+    );
+
+    let preview = workspace.prepare(automatic.clone()).unwrap();
+    assert_eq!(stored_request(&workspace, &preview.reference), resolved);
+    let receipt = completed(workspace.edit(automatic).unwrap());
+    assert_eq!(receipt.request_id, id);
+    assert_eq!(workspace.receipt(&id).unwrap(), Some(receipt));
+}
+
+#[test]
+fn an_identical_automatic_request_replays_without_writing_again() {
+    let (dir, workspace, snapshot) = setup("one");
+    let path = dir.path().join("file.txt");
+    let automatic = request("", &snapshot, vec![change("", "one", "two")]);
+    let (receipt, replayed, _) = outcome(workspace.edit(automatic.clone()).unwrap());
+    assert!(!replayed);
+    assert_eq!(receipt.commit, CommitStatus::Committed);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "two");
+    // Restoring the base bytes would let a new attempt succeed; a replay must not write.
+    fs::write(&path, "one").unwrap();
+    let (replay, replayed, report) = outcome(workspace.edit(automatic.clone()).unwrap());
+    assert!(replayed);
+    assert_eq!(replay, receipt);
+    assert_eq!(
+        report,
+        format!("{REPLAY_NOTICE}\n{}", receipt_report(&receipt, false))
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), "one");
+    assert_eq!(journal_count(&dir), 1);
+    drop(workspace);
+    let workspace = Workspace::open(dir.path()).unwrap();
+    let preparation = workspace.prepare(automatic).unwrap();
+    assert!(preparation.replayed);
+    assert_eq!(preparation.receipt, Some(receipt));
+    assert_eq!(fs::read_to_string(&path).unwrap(), "one");
+    assert_eq!(journal_count(&dir), 1);
+}
+
+#[test]
+fn different_automatic_requests_never_reuse_a_request_id() {
+    let (dir, workspace, snapshot) = setup("one two");
+    let first = completed(
+        workspace
+            .edit(request("", &snapshot, vec![change("", "one", "ONE")]))
+            .unwrap(),
+    );
+    let fresh = workspace.read("file.txt").unwrap();
+    let second = completed(
+        workspace
+            .edit(request("", &fresh, vec![change("", "two", "TWO")]))
+            .unwrap(),
+    );
+    assert_eq!(second.commit, CommitStatus::Committed);
+    assert_ne!(first.request_id, second.request_id);
+    // Different arguments on the first base get their own binding and a fresh verdict.
+    let EditResult::Rejected { preparation } = workspace
+        .edit(request("", &snapshot, vec![change("", "two", "2")]))
+        .unwrap()
+    else {
+        panic!("Expected a stale rejection")
+    };
+    assert!(!preparation.replayed);
+    assert!(
+        preparation
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "STALE_SNAPSHOT")
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+        "ONE TWO"
+    );
+}
+
+#[test]
+fn omitted_change_ids_become_their_one_based_positions() {
+    let (dir, workspace, first) = setup("one two");
+    fs::write(dir.path().join("second.txt"), "three").unwrap();
+    let second = workspace.read("second.txt").unwrap();
+    let mut automatic = request(
+        "",
+        &first,
+        vec![change("", "one", "ONE"), change("", "two", "TWO")],
+    );
+    automatic.files.push(FileRequest {
+        base: second.id.clone(),
+        changes: vec![change("", "three", "THREE")],
+    });
+    let preview = workspace.prepare(automatic).unwrap();
+    assert!(preview.ready);
+    let Evidence::Plan(plan) = workspace.evidence(&preview.reference).unwrap() else {
+        panic!("Expected a plan")
+    };
+    assert_eq!(change_ids(&plan.request), ["1.1", "1.2", "2.1"]);
+    assert_eq!(plan.files[0].change_ids, ["1.1", "1.2"]);
+    assert_eq!(plan.files[1].change_ids, ["2.1"]);
+    // Explicit IDs are kept beside derived ones.
+    let mixed = workspace
+        .prepare(request(
+            "",
+            &second,
+            vec![change("mine", "th", "TH"), change("", "ree", "REE")],
+        ))
+        .unwrap();
+    assert!(mixed.ready);
+    assert_eq!(
+        change_ids(&stored_request(&workspace, &mixed.reference)),
+        ["mine", "1.2"]
+    );
+}
+
+#[test]
+fn an_explicit_change_id_that_equals_a_derived_one_is_a_duplicate() {
+    let (_dir, workspace, snapshot) = setup("one two");
+    let rejected = workspace
+        .prepare(request(
+            "",
+            &snapshot,
+            vec![change("1.2", "one", "ONE"), change("", "two", "TWO")],
+        ))
+        .unwrap();
+    assert!(!rejected.ready);
+    let duplicates = rejected
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "DUPLICATE_CHANGE_ID")
+        .collect::<Vec<_>>();
+    assert_eq!(duplicates.len(), 1, "{:?}", rejected.diagnostics);
+    assert_eq!(duplicates[0].change_id.as_deref(), Some("1.2"));
+}
+
+#[test]
+fn repair_and_undo_derive_request_ids_and_an_identical_undo_replays() {
+    let (dir, workspace, snapshot) = setup("one two");
+    let path = dir.path().join("file.txt");
+    let draft = workspace
+        .prepare(request(
+            "",
+            &snapshot,
+            vec![change("", "one", "ONE"), change("", "missing", "TWO")],
+        ))
+        .unwrap();
+    assert!(!draft.ready);
+    let error = workspace
+        .repair(&draft.reference, "", vec![change("", "two", "TWO")])
+        .unwrap_err();
+    assert_eq!(error.code, "INVALID_REPAIR");
+    assert!(error.message.contains("ID of the change it replaces"));
+
+    let corrections = vec![change("1.2", "two", "TWO")];
+    let repaired = workspace
+        .repair(&draft.reference, "", corrections.clone())
+        .unwrap();
+    assert!(repaired.ready);
+    assert!(!repaired.replayed);
+    let repair_id = repair_request_id("", &draft.reference, &corrections).unwrap();
+    assert!(repair_id.starts_with("auto-"));
+    assert_eq!(
+        stored_request(&workspace, &repaired.reference).request_id,
+        repair_id
+    );
+    assert_ne!(
+        stored_request(&workspace, &draft.reference).request_id,
+        repair_id
+    );
+    let repeated = workspace.repair(&draft.reference, "", corrections).unwrap();
+    assert!(repeated.replayed);
+    assert_eq!(repeated.reference, repaired.reference);
+    assert_eq!(
+        repeated.report,
+        format!("{REPLAY_NOTICE}\n{}", repaired.report)
+    );
+
+    let (committed, replayed) = workspace.commit_or_replay(&repaired.reference).unwrap();
+    assert!(!replayed);
+    assert_eq!(fs::read_to_string(&path).unwrap(), "ONE TWO");
+    let (undone, replayed, _) = outcome(workspace.undo(&repaired.reference, "").unwrap());
+    assert!(!replayed);
+    assert_eq!(undone.commit, CommitStatus::Committed);
+    assert_eq!(
+        undone.request_id,
+        undo_request_id("", &repaired.reference).unwrap()
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), "one two");
+    // With the committed bytes back, a new undo could succeed; the replay writes nothing.
+    fs::write(&path, "ONE TWO").unwrap();
+    let (replay, replayed, report) = outcome(workspace.undo(&repaired.reference, "").unwrap());
+    assert!(replayed);
+    assert_eq!(replay, undone);
+    assert!(report.starts_with(REPLAY_NOTICE));
+    assert_eq!(fs::read_to_string(&path).unwrap(), "ONE TWO");
+    assert_eq!(workspace.receipt(&undone.request_id).unwrap(), Some(undone));
+    assert_eq!(
+        workspace.commit_or_replay(&repaired.reference).unwrap(),
+        (committed, true)
+    );
+}
+
+#[test]
+fn retry_still_requires_an_explicit_request_id() {
+    let (dir, workspace, snapshot) = setup("one");
+    let preview = workspace
+        .prepare(request("", &snapshot, vec![change("", "one", "two")]))
+        .unwrap();
+    fs::write(dir.path().join("file.txt"), "changed").unwrap();
+    assert_eq!(
+        workspace.commit(&preview.reference).unwrap().commit,
+        CommitStatus::NotCommitted
+    );
+    fs::write(dir.path().join("file.txt"), "one").unwrap();
+    let error = workspace.retry(&preview.reference, "").unwrap_err();
+    assert_eq!(error.code, "INVALID_REQUEST_ID");
+    assert!(error.message.contains("explicit request ID"), "{error}");
+    assert_eq!(
+        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+        "one"
+    );
+    let (retried, replayed, _) = outcome(workspace.retry(&preview.reference, "retry").unwrap());
+    assert!(!replayed);
+    assert_eq!(retried.commit, CommitStatus::Committed);
+    let (replay, replayed, _) = outcome(workspace.retry(&preview.reference, "retry").unwrap());
+    assert!(replayed);
+    assert_eq!(replay, retried);
+}
+
+#[test]
+fn an_edit_that_commits_a_prepared_plan_is_not_a_replay() {
+    let (dir, workspace, snapshot) = setup("one");
+    let automatic = request("", &snapshot, vec![change("", "one", "two")]);
+    let preview = workspace.prepare(automatic.clone()).unwrap();
+    assert!(preview.ready);
+    assert!(!preview.replayed);
+    let repeated = workspace.prepare(automatic.clone()).unwrap();
+    assert!(repeated.replayed);
+    assert_eq!(repeated.reference, preview.reference);
+    assert_eq!(
+        repeated.report,
+        format!("{REPLAY_NOTICE}\n{}", preview.report)
+    );
+    let (receipt, replayed, report) = outcome(workspace.edit(automatic.clone()).unwrap());
+    assert!(!replayed, "committing the stored plan is a new attempt");
+    assert!(!report.contains(REPLAY_NOTICE));
+    assert_eq!(receipt.plan_id, preview.reference);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+        "two"
+    );
+    let (replay, replayed, _) = outcome(workspace.edit(automatic).unwrap());
+    assert!(replayed);
+    assert_eq!(replay, receipt);
+}
+
+#[test]
+fn a_replay_notice_counts_against_the_report_bounds() {
+    let receipt = Receipt {
+        request_id: "bounded".into(),
+        plan_id: "p0".into(),
+        commit: CommitStatus::Committed,
+        files: (0..100)
+            .map(|index| FileOutcome {
+                path: format!("/workspace/{}{index}.txt", "long-directory/".repeat(8)),
+                before: "s0".into(),
+                intended_digest: "0".into(),
+                after: None,
+                status: FileStatus::Committed,
+                changes_applied: 1,
+                error: None,
+            })
+            .collect(),
+        validation: "not_requested".into(),
+        undo: None,
+        warnings: vec![],
+    };
+    let fresh = receipt_report(&receipt, false);
+    assert_eq!(fresh, report::receipt(&receipt, 60, 6_000));
+    let replayed = receipt_report(&receipt, true);
+    for report in [&fresh, &replayed] {
+        assert_eq!(report.lines().count(), 60, "{report}");
+        assert!(report.chars().count() <= 6_000, "{report}");
+    }
+    assert_eq!(replayed.lines().next(), Some(REPLAY_NOTICE));
+    assert_eq!(replayed.lines().nth(1), fresh.lines().next());
 }
