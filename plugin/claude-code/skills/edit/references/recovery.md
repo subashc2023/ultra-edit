@@ -122,8 +122,9 @@ journal and original/intended/current bytes, then may record `accept_current`
 with an inspection reference and a nonblank note. Reconciliation changes no
 target files, preserves the uncertain historical outcome, and permits fresh
 edits only after all uncertain journals have valid resolutions. This decision
-must not be inferred from an ordinary edit request. Consult the repository
-README's crash-reconciliation procedure when performing this operator task.
+must not be inferred from an ordinary edit request. Consult the crash
+reconciliation section of the repository's `docs/reference.md` when performing
+this operator task.
 
 ## Conditional undo
 
