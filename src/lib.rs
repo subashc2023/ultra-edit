@@ -3,6 +3,7 @@ pub mod mcp;
 pub mod model;
 mod reading;
 pub mod report;
+pub mod shell_guard;
 pub mod storage;
 pub mod workspace;
 

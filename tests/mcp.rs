@@ -851,6 +851,45 @@ fn bundled_plugin_launches_hooks_and_mcp_without_path_lookup() {
         );
         assert!(fs::read_dir(root.path()).unwrap().next().is_none());
     }
+    let guards = configuration["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(guards.len(), 1);
+    // An exact tool-name matcher: the guard only understands Bash commands.
+    assert_eq!(guards[0]["matcher"], "Bash");
+    let handler = &guards[0]["hooks"][0];
+    assert_eq!(handler["type"], "command");
+    assert_ne!(handler["async"], true);
+    for (command, denied) in [
+        ("cat > notes.txt <<'EOF'\nC:\\temp\nEOF", true),
+        ("cargo test > log.txt 2>&1", false),
+    ] {
+        let mut child = executable(handler)
+            .env_remove("ULTRA_EDIT_SHELL_WRITES")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let event = json!({
+            "hook_event_name": "PreToolUse",
+            "cwd": root.path(),
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+        });
+        let mut input = child.stdin.take().unwrap();
+        input.write_all(event.to_string().as_bytes()).unwrap();
+        drop(input);
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty());
+        if denied {
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(value["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+            assert_eq!(value["hookSpecificOutput"]["permissionDecision"], "deny");
+        } else {
+            assert!(output.stdout.is_empty());
+        }
+        assert!(fs::read_dir(root.path()).unwrap().next().is_none());
+    }
     let configuration: Value =
         serde_json::from_str(include_str!("../plugin/claude-code/.mcp.json")).unwrap();
     let mut client = Client::connect(executable(&configuration["mcpServers"]["ultra-edit"]));
