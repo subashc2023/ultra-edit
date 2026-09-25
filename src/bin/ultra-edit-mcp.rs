@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::env;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, PoisonError};
@@ -20,7 +20,7 @@ use tokio_util::{
     codec::{FramedWrite, LinesCodec},
     sync::CancellationToken,
 };
-use ultra_edit::{Workspace, mcp::McpServer};
+use ultra_edit::{Workspace, mcp::McpServer, shell_guard};
 
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const INVALID_TOOL_CALL: &str =
@@ -32,12 +32,18 @@ fn main() -> ExitCode {
     if arguments.len() == 1 && (arguments[0] == "--help" || arguments[0] == "-h") {
         println!(
             "ultra-edit-mcp {}\nUsage: ultra-edit-mcp --root WORKSPACE\n\
-             Or: ultra-edit-mcp --claude-context SessionStart|SubagentStart\n\n\
+             Or: ultra-edit-mcp --claude-context SessionStart|SubagentStart\n\
+             Or: ultra-edit-mcp --claude-hook PreToolUse\n\n\
              Serve MCP over stdio inside one fixed existing workspace.\n\
              JSON-RPC lines are limited to 16 MiB. Protocol output uses stdout; errors use stderr.\n\
              Cancellation or disconnection does not imply rollback; query receipts before retrying.\n\
-             --claude-context prints plugin hook JSON and exits without opening a workspace.",
-            env!("CARGO_PKG_VERSION")
+             --claude-context prints plugin hook JSON and exits without opening a workspace.\n\
+             --claude-hook PreToolUse reads Claude Code hook JSON from stdin and denies Bash\n\
+             commands that write file content through the shell (heredoc or echo redirection,\n\
+             inline interpreter writes, sed -i). It allows anything it cannot parse.\n\
+             {}=allow disables the guard.",
+            env!("CARGO_PKG_VERSION"),
+            shell_guard::ESCAPE_HATCH
         );
         return ExitCode::SUCCESS;
     }
@@ -64,9 +70,17 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
+    if arguments.len() == 2 && arguments[0] == "--claude-hook" {
+        if arguments[1] != "PreToolUse" {
+            eprintln!("--claude-hook requires PreToolUse");
+            return ExitCode::from(2);
+        }
+        guard_bash_writes();
+        return ExitCode::SUCCESS;
+    }
     if arguments.len() != 2 || arguments[0] != "--root" {
         eprintln!(
-            "Usage: ultra-edit-mcp --root WORKSPACE (or --claude-context EVENT / --help / --version)"
+            "Usage: ultra-edit-mcp --root WORKSPACE (or --claude-context EVENT / --claude-hook EVENT / --help / --version)"
         );
         return ExitCode::from(2);
     }
@@ -93,6 +107,47 @@ fn main() -> ExitCode {
             eprintln!("MCP server error: {error}");
             ExitCode::from(2)
         }
+    }
+}
+
+/// Answers a `PreToolUse` hook: prints a deny decision for a Bash command that
+/// writes file content through the shell, and nothing otherwise. Every failure
+/// allows the call, because a broken guard must never block a session.
+fn guard_bash_writes() {
+    let mut input = Vec::new();
+    // Read before deciding so the host never writes into a closed pipe.
+    let limit = MAX_MESSAGE_BYTES as u64 + 1;
+    let read = io::stdin().lock().take(limit).read_to_end(&mut input);
+    if read.is_err()
+        || input.len() > MAX_MESSAGE_BYTES
+        || env::var_os(shell_guard::ESCAPE_HATCH).is_some_and(|value| value == "allow")
+    {
+        return;
+    }
+    let Ok(event) = serde_json::from_slice::<serde_json::Value>(&input) else {
+        return;
+    };
+    if event["tool_name"] != "Bash" {
+        return;
+    }
+    let Some(command) = event["tool_input"]["command"].as_str() else {
+        return;
+    };
+    // A classifier bug must not turn into a hook error on every Bash call.
+    let Some(finding) = std::panic::catch_unwind(|| shell_guard::classify(command))
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    let output = serde_json::json!({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": shell_guard::deny_reason(&finding),
+    }});
+    let mut stdout = io::stdout().lock();
+    if serde_json::to_writer(&mut stdout, &output).is_ok() {
+        let _ = writeln!(stdout);
     }
 }
 
