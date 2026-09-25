@@ -13,6 +13,15 @@ use crate::storage::{SnapshotPruning, Storage};
 const REPORT_LINES: usize = 60;
 const REPORT_CHARS: usize = 6_000;
 
+// Each operation derives request IDs under its own domain, so an edit, repair,
+// and undo key can never coincide.
+const EDIT_DOMAIN: &[u8] = b"ultra-edit:edit:v1\0";
+const REPAIR_DOMAIN: &[u8] = b"ultra-edit:repair:v1\0";
+const UNDO_DOMAIN: &[u8] = b"ultra-edit:undo:v1\0";
+
+/// Leads the report of a replayed result so it cannot pass for a new attempt.
+pub const REPLAY_NOTICE: &str = "Replayed the recorded result; nothing new was attempted. Take fresh snapshots to apply a change again.";
+
 /// Filesystem host. Each operation coordinates with other hosts using the same workspace root.
 pub struct Workspace {
     storage: Storage,
@@ -49,8 +58,17 @@ struct Binding {
 #[derive(Debug, Serialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum EditResult {
-    Rejected { preparation: Preparation },
-    Completed { receipt: Receipt, report: String },
+    Rejected {
+        preparation: Preparation,
+    },
+    Completed {
+        receipt: Receipt,
+        report: String,
+        /// The request was already bound and its recorded receipt was returned
+        /// without a new commit attempt.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        replayed: bool,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -207,45 +225,62 @@ impl Workspace {
         Ok((path, text))
     }
 
+    /// Omitted IDs are resolved first, as by [`resolve_ids`].
     pub fn prepare(&self, request: EditRequest) -> Result<Preparation, Error> {
+        let request = resolve_ids(request)?;
         let _lock = self.storage.lock()?;
         let input = Input::Edit {
             request: request.clone(),
         };
         if let Some(reference) = self.bound(&request.request_id, &input)? {
-            return self.preparation(&reference);
+            return self.preparation(&reference, true);
         }
         self.prepare_new(input, request)
     }
 
+    /// Omitted IDs are resolved first, as by [`resolve_ids`].
     pub fn edit(&self, request: EditRequest) -> Result<EditResult, Error> {
+        let request = resolve_ids(request)?;
         let _lock = self.storage.lock()?;
         let input = Input::Edit {
             request: request.clone(),
         };
         let preparation = match self.bound(&request.request_id, &input)? {
-            Some(reference) => self.preparation(&reference)?,
+            Some(reference) => self.preparation(&reference, true)?,
             None => self.prepare_new(input, request)?,
         };
         self.finish(preparation)
     }
 
     pub fn commit(&self, reference: &str) -> Result<Receipt, Error> {
+        Ok(self.commit_or_replay(reference)?.0)
+    }
+
+    /// Commits like [`Self::commit`], also reporting whether the plan already had a
+    /// receipt, which is then replayed without a new attempt.
+    pub fn commit_or_replay(&self, reference: &str) -> Result<(Receipt, bool), Error> {
         let _lock = self.storage.lock()?;
         let plan = self.plan(reference)?;
         self.commit_plan(&plan)
     }
 
     /// Retries a proven preflight failure as a new request, retaining the exact original candidate.
-    /// The original request, receipt, and journal remain unchanged.
+    /// The original request, receipt, and journal remain unchanged. The request ID is required:
+    /// a derived one would replay the first retry instead of attempting another.
     pub fn retry(&self, reference: &str, request_id: &str) -> Result<EditResult, Error> {
+        if request_id.is_empty() {
+            return Err(Error::new(
+                "INVALID_REQUEST_ID",
+                "Retry requires a new explicit request ID; a derived one would replay an earlier attempt",
+            ));
+        }
         let _lock = self.storage.lock()?;
         let input = Input::Retry {
             reference: reference.into(),
             request_id: request_id.into(),
         };
         if let Some(reference) = self.bound(request_id, &input)? {
-            return self.finish(self.preparation(&reference)?);
+            return self.finish(self.preparation(&reference, true)?);
         }
         let mut plan = self.plan(reference)?;
         self.storage.check_retry(&plan)?;
@@ -260,7 +295,7 @@ impl Workspace {
                 reference: plan.id.clone(),
             },
         )?;
-        self.finish(self.preparation(&plan.id)?)
+        self.finish(self.preparation(&plan.id, false)?)
     }
 
     pub fn inspect(&self, reference: &str) -> Result<Inspection, Error> {
@@ -379,20 +414,22 @@ impl Workspace {
     }
 
     /// Corrections replace changes in their original positions and retain the original snapshots.
+    /// An empty request ID is derived, as by [`repair_request_id`].
     pub fn repair(
         &self,
         reference: &str,
         request_id: &str,
         changes: Vec<Change>,
     ) -> Result<Preparation, Error> {
+        let request_id = repair_request_id(request_id, reference, &changes)?;
         let _lock = self.storage.lock()?;
         let input = Input::Repair {
             reference: reference.into(),
-            request_id: request_id.into(),
+            request_id: request_id.clone(),
             changes: changes.clone(),
         };
-        if let Some(reference) = self.bound(request_id, &input)? {
-            return self.preparation(&reference);
+        if let Some(reference) = self.bound(&request_id, &input)? {
+            return self.preparation(&reference, true);
         }
         let mut request = match self.evidence_unlocked(reference)? {
             Evidence::Plan(plan) => {
@@ -426,6 +463,12 @@ impl Workspace {
         }
         let mut corrections = BTreeMap::new();
         for change in changes {
+            if change.id.is_empty() {
+                return Err(Error::new(
+                    "INVALID_REPAIR",
+                    "Each correction requires the ID of the change it replaces",
+                ));
+            }
             let id = change.id.clone();
             if corrections.insert(id, change).is_some() {
                 return Err(Error::new(
@@ -461,7 +504,7 @@ impl Workspace {
                 ),
             ));
         }
-        request.request_id = request_id.into();
+        request.request_id = request_id;
         self.prepare_new(input, request)
     }
 
@@ -487,14 +530,16 @@ impl Workspace {
     }
 
     /// Restores confirmed writes only, conditional on their recorded after-bytes.
+    /// An empty request ID is derived, as by [`undo_request_id`].
     pub fn undo(&self, reference: &str, request_id: &str) -> Result<EditResult, Error> {
+        let request_id = undo_request_id(request_id, reference)?;
         let _lock = self.storage.lock()?;
         let input = Input::Undo {
             reference: reference.into(),
-            request_id: request_id.into(),
+            request_id: request_id.clone(),
         };
-        if let Some(reference) = self.bound(request_id, &input)? {
-            return self.finish(self.preparation(&reference)?);
+        if let Some(reference) = self.bound(&request_id, &input)? {
+            return self.finish(self.preparation(&reference, true)?);
         }
         let plan = self.plan(reference)?;
         let receipt = self
@@ -533,10 +578,7 @@ impl Workspace {
                 "There are no confirmed writes to undo",
             ));
         }
-        let request = EditRequest {
-            request_id: request_id.into(),
-            files,
-        };
+        let request = EditRequest { request_id, files };
         self.finish(self.prepare_new(input, request)?)
     }
 
@@ -550,13 +592,17 @@ impl Workspace {
         Ok(report::diff(&self.plan(reference)?))
     }
 
+    /// A new plan cannot have a receipt yet, so a replayed commit implies a bound request.
     fn finish(&self, preparation: Preparation) -> Result<EditResult, Error> {
         if !preparation.ready {
             return Ok(EditResult::Rejected { preparation });
         }
-        let receipt = self.commit_plan(&self.plan(&preparation.reference)?)?;
-        let report = report::receipt(&receipt, REPORT_LINES, REPORT_CHARS);
-        Ok(EditResult::Completed { receipt, report })
+        let (receipt, replayed) = self.commit_plan(&self.plan(&preparation.reference)?)?;
+        Ok(EditResult::Completed {
+            report: receipt_report(&receipt, replayed),
+            receipt,
+            replayed,
+        })
     }
 
     fn bound(&self, request_id: &str, input: &Input) -> Result<Option<String>, Error> {
@@ -685,7 +731,7 @@ impl Workspace {
                 reference: reference.clone(),
             },
         )?;
-        self.preparation(&reference)
+        self.preparation(&reference, false)
     }
 
     fn plan(&self, reference: &str) -> Result<PreparedPlan, Error> {
@@ -698,11 +744,12 @@ impl Workspace {
         self.storage.get("plans", reference)
     }
 
-    fn commit_plan(&self, plan: &PreparedPlan) -> Result<Receipt, Error> {
+    /// Also returns whether the receipt was already recorded, so nothing was attempted.
+    fn commit_plan(&self, plan: &PreparedPlan) -> Result<(Receipt, bool), Error> {
         if let Some(receipt) = self.recorded_receipt(plan)? {
-            return Ok(receipt);
+            return Ok((receipt, true));
         }
-        self.storage.commit(plan).map_err(|mut error| {
+        let receipt = self.storage.commit(plan).map_err(|mut error| {
             error.request_id = Some(plan.request.request_id.clone());
             error.plan_id = Some(plan.id.clone());
             error.commit = Some(
@@ -713,7 +760,8 @@ impl Workspace {
                 },
             );
             error
-        })
+        })?;
+        Ok((receipt, false))
     }
 
     fn recorded_receipt(&self, plan: &PreparedPlan) -> Result<Option<Receipt>, Error> {
@@ -744,14 +792,15 @@ impl Workspace {
         }
     }
 
-    fn preparation(&self, reference: &str) -> Result<Preparation, Error> {
+    /// `replayed` marks a bound request answered without any new attempt.
+    fn preparation(&self, reference: &str, replayed: bool) -> Result<Preparation, Error> {
         match self.evidence_unlocked(reference)? {
             Evidence::Plan(plan) => {
                 let receipt = self.recorded_receipt(&plan)?;
-                let report = match &receipt {
-                    Some(receipt) => report::receipt(receipt, REPORT_LINES, REPORT_CHARS),
-                    None => report::preview(&plan, REPORT_LINES, REPORT_CHARS),
-                };
+                let report = bounded(replayed, |lines, chars| match &receipt {
+                    Some(receipt) => report::receipt(receipt, lines, chars),
+                    None => report::preview(&plan, lines, chars),
+                });
                 Ok(Preparation {
                     reference: plan.id.clone(),
                     ready: true,
@@ -759,19 +808,23 @@ impl Workspace {
                     warnings: plan.warnings,
                     report,
                     receipt,
+                    replayed,
                 })
             }
             Evidence::Draft(draft) => Ok(Preparation {
                 reference: draft.id.clone(),
                 ready: false,
-                report: format!(
-                    "Rejected: {} diagnostic(s); no target files changed. Inspect draft {}.",
-                    draft.diagnostics.len(),
-                    draft.id
-                ),
+                report: bounded(replayed, |_, _| {
+                    format!(
+                        "Rejected: {} diagnostic(s); no target files changed. Inspect draft {}.",
+                        draft.diagnostics.len(),
+                        draft.id
+                    )
+                }),
                 diagnostics: draft.diagnostics,
                 warnings: vec![],
                 receipt: None,
+                replayed,
             }),
             Evidence::Snapshot(_) | Evidence::Inspection(_) => Err(Error::new(
                 "INVALID_REFERENCE",
@@ -779,6 +832,78 @@ impl Workspace {
             )),
         }
     }
+}
+
+/// Fills each empty change ID with its 1-based `"{file}.{change}"` position, then an
+/// empty request ID with a key derived from the resolved files, so identical requests
+/// share one binding. Explicit IDs are kept, so a clash with a derived change ID remains
+/// `DUPLICATE_CHANGE_ID`. Resolving a resolved request changes nothing.
+pub fn resolve_ids(mut request: EditRequest) -> Result<EditRequest, Error> {
+    for (file_index, file) in request.files.iter_mut().enumerate() {
+        for (change_index, change) in file.changes.iter_mut().enumerate() {
+            if change.id.is_empty() {
+                change.id = format!("{}.{}", file_index + 1, change_index + 1);
+            }
+        }
+    }
+    if request.request_id.is_empty() {
+        request.request_id = derived_id(EDIT_DOMAIN, &request.files)?;
+    }
+    Ok(request)
+}
+
+/// The request ID a repair binds: the explicit one, or one derived from its
+/// reference and corrections.
+pub fn repair_request_id(
+    request_id: &str,
+    reference: &str,
+    changes: &[Change],
+) -> Result<String, Error> {
+    if !request_id.is_empty() {
+        return Ok(request_id.into());
+    }
+    derived_id(REPAIR_DOMAIN, &(reference, changes))
+}
+
+/// The request ID an undo binds: the explicit one, or one derived from its plan, so
+/// repeating an undo of the same plan replays its recorded result.
+pub fn undo_request_id(request_id: &str, reference: &str) -> Result<String, Error> {
+    if !request_id.is_empty() {
+        return Ok(request_id.into());
+    }
+    derived_id(UNDO_DOMAIN, &reference)
+}
+
+/// `"auto-"` and the first 128 bits, in hex, of SHA-256 over the domain separator and
+/// the canonical JSON of the arguments.
+fn derived_id(domain: &[u8], arguments: &impl Serialize) -> Result<String, Error> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    serde_json::to_writer(&mut hasher, arguments)?;
+    Ok(format!(
+        "auto-{}",
+        &format!("{:x}", hasher.finalize())[..32]
+    ))
+}
+
+/// The compact receipt report, led by [`REPLAY_NOTICE`] when it was replayed.
+pub fn receipt_report(receipt: &Receipt, replayed: bool) -> String {
+    bounded(replayed, |lines, chars| {
+        report::receipt(receipt, lines, chars)
+    })
+}
+
+/// Renders a report within the compact bounds; a replay notice counts against them.
+fn bounded(replayed: bool, render: impl FnOnce(usize, usize) -> String) -> String {
+    if !replayed {
+        return render(REPORT_LINES, REPORT_CHARS);
+    }
+    let notice = REPLAY_NOTICE.chars().count() + 1;
+    format!(
+        "{REPLAY_NOTICE}\n{}",
+        render(REPORT_LINES - 1, REPORT_CHARS - notice)
+    )
 }
 
 fn validate_request_id(request_id: &str) -> Result<(), Error> {

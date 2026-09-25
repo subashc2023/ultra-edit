@@ -99,8 +99,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Returned the original receipt; file bytes are unchanged.");
 
     println!("\n{}", report::terminal("4 / 4  Undo", color));
-    let EditResult::Completed { receipt, report } =
-        workspace.undo(&preview.reference, "example-undo")?
+    let EditResult::Completed {
+        receipt, report, ..
+    } = workspace.undo(&preview.reference, "example-undo")?
     else {
         return Err("Undo unexpectedly rejected".into());
     };
