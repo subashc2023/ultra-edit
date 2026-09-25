@@ -41,11 +41,14 @@ pub(crate) fn read_full(
     Ok(snapshot(path, text))
 }
 
+/// `retained` carries the references a continued snapshot already disclosed, so
+/// one request can address distant ranges of the same immutable source.
 pub(crate) fn read_range(
     path: String,
     text: String,
     first: usize,
     last: usize,
+    mut retained: Vec<Span>,
 ) -> Result<(Snapshot, RangeRead), Error> {
     if first == 0 || first > last {
         return Err(Error::new(
@@ -55,11 +58,11 @@ pub(crate) fn read_range(
     }
     let too_many_lines = last - first >= MAX_RANGE_LINES;
     let mut total_lines = 0;
-    let mut spans = Vec::new();
+    let mut disclosed = Vec::new();
     for (index, range) in line_ranges(&text).enumerate() {
         total_lines = index + 1;
         if !too_many_lines && (first..=last).contains(&total_lines) {
-            spans.push(Span {
+            disclosed.push(Span {
                 id: format!("r{total_lines}"),
                 start: range.start,
                 end: range.end,
@@ -79,8 +82,8 @@ pub(crate) fn read_range(
             "A focused read supports at most 200 lines; choose a smaller range",
         ));
     }
-    let start = spans[0].start;
-    let end = spans[spans.len() - 1].end;
+    let start = disclosed[0].start;
+    let end = disclosed[disclosed.len() - 1].end;
     let selected = &text[start..end];
     if selected.chars().take(MAX_RANGE_CHARS + 1).count() > MAX_RANGE_CHARS {
         // A plain full read may be over its own limits; the exact byte count is not.
@@ -92,6 +95,11 @@ pub(crate) fn read_range(
             ),
         ));
     }
+    let lines = line_listing(&disclosed, &text);
+    // `selection` always names the most recent range; a retained one would be
+    // ambiguous. The line references it covered remain.
+    retained.retain(|span| span.id != "selection");
+    let mut spans = disclose(retained, disclosed);
     spans.push(Span {
         id: "selection".into(),
         start,
@@ -109,15 +117,30 @@ pub(crate) fn read_range(
         snapshot: snapshot.id.clone(),
         path: snapshot.path.clone(),
         digest: snapshot.digest.clone(),
+        stale: false,
         total_lines,
         total_bytes: snapshot.text.len(),
         start,
         end,
         text: snapshot.text[start..end].into(),
         spans: span_summary(&snapshot.spans),
-        lines: line_listing(&snapshot.spans, &snapshot.text),
+        lines,
     };
     Ok((snapshot, view))
+}
+
+/// Appends newly disclosed spans to the references a continued snapshot retains.
+/// Re-reading a range or page must not duplicate a reference it already has.
+fn disclose(mut spans: Vec<Span>, disclosed: impl IntoIterator<Item = Span>) -> Vec<Span> {
+    for span in disclosed {
+        if !spans
+            .iter()
+            .any(|known| (&known.id, known.start, known.end) == (&span.id, span.start, span.end))
+        {
+            spans.push(span);
+        }
+    }
+    spans
 }
 
 /// Summarizes disclosed span IDs, collapsing consecutive line IDs into
@@ -232,16 +255,8 @@ pub(crate) fn search(
         })
         .collect();
     // Only complete disclosed targets receive references. Context fragments and
-    // omitted matches do not grant a whole-file or line reference. Re-requesting
-    // a page must not duplicate a reference the retained snapshot already has.
-    let mut spans = retained;
-    for hit in &matches {
-        if !spans.iter().any(|span| {
-            (&span.id, span.start, span.end) == (&hit.span.id, hit.span.start, hit.span.end)
-        }) {
-            spans.push(hit.span.clone());
-        }
-    }
+    // omitted matches do not grant a whole-file or line reference.
+    let spans = disclose(retained, matches.iter().map(|hit| hit.span.clone()));
     let snapshot = Snapshot {
         id: new_id("s"),
         path,

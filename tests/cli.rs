@@ -254,6 +254,74 @@ fn malformed_focused_read_arguments_are_rejected_without_mutation() {
 }
 
 #[test]
+fn a_continued_range_edits_distant_lines_under_one_base_across_processes() {
+    let help = Command::new(env!("CARGO_BIN_EXE_ultra-edit"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8(help.stdout)
+            .unwrap()
+            .contains("read-range PATH FIRST LAST [SNAPSHOT]")
+    );
+    let root = TempDir::new().unwrap();
+    fs::write(root.path().join("source.txt"), "first\nmiddle\nlast\n").unwrap();
+    let (code, first) = run(root.path(), &["read-range", "source.txt", "1", "1"], None);
+    assert_eq!(code, 0, "{first}");
+    assert_eq!(first["stale"], false);
+    let base = first["snapshot"].as_str().unwrap();
+    let (code, last) = run(
+        root.path(),
+        &["read-range", "source.txt", "3", "3", base],
+        None,
+    );
+    assert_eq!(code, 0, "{last}");
+    assert_eq!(last["stale"], false);
+    assert_eq!(last["text"], "last");
+    assert_eq!(last["spans"], json!(["r1", "r3", "selection"]));
+    assert_eq!(last["lines"], json!(["r3 | last"]));
+    let continued = last["snapshot"].as_str().unwrap();
+    for (args, error) in [
+        (
+            vec!["read-range", "source.txt", "2", "2", continued, "extra"],
+            "USAGE",
+        ),
+        (
+            vec!["read-range", "source.txt", "2", "2", "p-invalid"],
+            "INVALID_REFERENCE",
+        ),
+        (
+            vec!["read-range", "source.txt", "2", "4", continued],
+            "INVALID_LINE_RANGE",
+        ),
+    ] {
+        let (code, rejected) = run(root.path(), &args, None);
+        assert_eq!(code, 2, "{args:?}: {rejected}");
+        assert_eq!(rejected["error"]["code"], error, "{args:?}: {rejected}");
+    }
+    let request = json!({"request_id":"distant-lines","files":[{"base":continued,"changes":[
+        {"id":"first","target":{"kind":"span","span":"r1"},"text":"FIRST"},
+        {"id":"last","target":{"kind":"span","span":"selection"},"text":"LAST"}
+    ]}]});
+    let (code, committed) = run(root.path(), &["edit"], Some(&request));
+    assert_eq!(code, 0, "{committed}");
+    assert_eq!(committed["commit"], "committed");
+    assert_eq!(
+        fs::read(root.path().join("source.txt")).unwrap(),
+        b"FIRST\nmiddle\nLAST\n"
+    );
+    // The committed edit changed the file, so continuing its old base is stale.
+    let (code, stale) = run(
+        root.path(),
+        &["read-range", "source.txt", "2", "2", continued],
+        None,
+    );
+    assert_eq!(code, 0, "{stale}");
+    assert_eq!(stale["stale"], true);
+    assert_eq!(stale["text"], "middle");
+}
+
+#[test]
 fn a_rejected_batch_identifies_the_file_that_failed() {
     let root = TempDir::new().unwrap();
     fs::write(root.path().join("one.txt"), "one\n").unwrap();

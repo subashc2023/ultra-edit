@@ -100,11 +100,33 @@ impl Workspace {
         first: usize,
         last: usize,
     ) -> Result<RangeRead, Error> {
+        self.read_range_page(path, first, last, None)
+    }
+
+    /// Supply a prior snapshot to read another range of its immutable source. The
+    /// new snapshot keeps every reference that snapshot disclosed, so one request
+    /// can edit distant regions of a file; `selection` covers only this range.
+    pub fn read_range_page(
+        &self,
+        path: impl AsRef<Path>,
+        first: usize,
+        last: usize,
+        snapshot: Option<&str>,
+    ) -> Result<RangeRead, Error> {
         let _lock = self.storage.lock()?;
-        let (path, text) = self.read_source(path.as_ref())?;
-        let (snapshot, view) = reading::read_range(path, text, first, last)?;
+        let (path, text, retained, stale) = match snapshot {
+            Some(reference) => {
+                let (base, stale) = self.continued(path.as_ref(), reference)?;
+                (base.path, base.text, base.spans, stale)
+            }
+            None => {
+                let (path, text) = self.read_source(path.as_ref())?;
+                (path, text, Vec::new(), false)
+            }
+        };
+        let (snapshot, view) = reading::read_range(path, text, first, last, retained)?;
         self.storage.put("snapshots", &snapshot.id, &snapshot)?;
-        Ok(view)
+        Ok(RangeRead { stale, ..view })
     }
 
     /// Counts overlapping literal matches and discloses up to 20 exact editable
@@ -126,20 +148,7 @@ impl Workspace {
         let _lock = self.storage.lock()?;
         let (path, text, retained, stale) = match snapshot {
             Some(reference) => {
-                if !reference.starts_with('s') {
-                    return Err(Error::new(
-                        "INVALID_REFERENCE",
-                        "Search pagination requires a snapshot reference",
-                    ));
-                }
-                let base: Snapshot = self.storage.get("snapshots", reference)?;
-                let resolved = self.storage.resolve(path.as_ref())?;
-                if resolved != Path::new(&base.path) {
-                    return Err(Error::new(
-                        "SNAPSHOT_PATH_MISMATCH",
-                        "The search path does not identify the supplied snapshot's file",
-                    ));
-                }
+                let (base, stale) = self.continued(path.as_ref(), reference)?;
                 // A match reference keeps its absolute ordinal only while the query
                 // that numbered it is unchanged; a line reference is query-independent.
                 let retained = base
@@ -151,11 +160,6 @@ impl Workspace {
                     })
                     .cloned()
                     .collect();
-                // An unreadable file can no longer match the retained source bytes.
-                let stale = !self
-                    .storage
-                    .read(&resolved)
-                    .is_ok_and(|current| current == base.text);
                 (base.path, base.text, retained, stale)
             }
             None => {
@@ -166,6 +170,31 @@ impl Workspace {
         let (snapshot, result) = reading::search(path, text, query, offset, retained)?;
         self.storage.put("snapshots", &snapshot.id, &snapshot)?;
         Ok(SearchResult { stale, ..result })
+    }
+
+    /// Loads the snapshot a range or search continues, with whether it is stale:
+    /// the current file no longer matches its retained source.
+    fn continued(&self, path: &Path, reference: &str) -> Result<(Snapshot, bool), Error> {
+        if !reference.starts_with('s') {
+            return Err(Error::new(
+                "INVALID_REFERENCE",
+                "Continuing a read requires a snapshot reference",
+            ));
+        }
+        let base: Snapshot = self.storage.get("snapshots", reference)?;
+        let resolved = self.storage.resolve(path)?;
+        if resolved != Path::new(&base.path) {
+            return Err(Error::new(
+                "SNAPSHOT_PATH_MISMATCH",
+                "The path does not identify the supplied snapshot's file",
+            ));
+        }
+        // An unreadable file can no longer match the retained source bytes.
+        let stale = !self
+            .storage
+            .read(&resolved)
+            .is_ok_and(|current| current == base.text);
+        Ok((base, stale))
     }
 
     fn read_source(&self, path: &Path) -> Result<(String, String), Error> {
@@ -597,7 +626,7 @@ impl Workspace {
                 }
                 for previous in &paths {
                     if same_file::is_same_file(previous, &path)? {
-                        return Err(Error::new("TARGET_ALIAS", "Multiple snapshots address the same target; combine their changes into one file entry"));
+                        return Err(Error::new("TARGET_ALIAS", "Two snapshots address the same file; a span is valid only in the snapshot that disclosed it. Use one base per file: continue a range or search with `snapshot`, or target text with an unscoped exact `old`."));
                     }
                 }
                 paths.push(path.clone());

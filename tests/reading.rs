@@ -28,6 +28,44 @@ fn request(id: &str, base: &str, span: &str, text: &str) -> EditRequest {
     }
 }
 
+/// One file entry replacing each `(span, text)` pair; change IDs are the spans.
+fn span_edits(id: &str, base: &str, changes: &[(&str, &str)]) -> EditRequest {
+    EditRequest {
+        request_id: id.into(),
+        files: vec![FileRequest {
+            base: base.into(),
+            changes: changes
+                .iter()
+                .map(|(span, text)| Change {
+                    id: (*span).into(),
+                    target: Target::Span {
+                        span: (*span).into(),
+                        expect: None,
+                    },
+                    text: (*text).into(),
+                })
+                .collect(),
+        }],
+    }
+}
+
+fn stored(workspace: &Workspace, reference: &str) -> Snapshot {
+    match workspace.evidence(reference).unwrap() {
+        Evidence::Snapshot(base) => base,
+        evidence => panic!("Expected a snapshot, got {evidence:?}"),
+    }
+}
+
+fn ids(base: &Snapshot) -> Vec<&str> {
+    base.spans.iter().map(|span| span.id.as_str()).collect()
+}
+
+fn snapshot_count(dir: &TempDir) -> usize {
+    fs::read_dir(dir.path().join(".ultra-edit/snapshots"))
+        .unwrap()
+        .count()
+}
+
 #[test]
 fn full_reads_require_an_exact_byte_count_to_disclose_large_files() {
     let source = "é".repeat(12_001);
@@ -340,6 +378,335 @@ fn invalid_and_extreme_line_ranges_are_rejected() {
             code
         );
     }
+}
+
+#[test]
+fn a_continued_range_edits_distant_lines_of_one_file_in_one_request() {
+    let line = |number: usize| format!("line {number}\n");
+    let original: String = (1..=30_000).map(line).collect();
+    let (dir, workspace) = setup(&original);
+    let first = workspace.read_range("file.txt", 10, 10).unwrap();
+    assert!(!first.stale);
+    let second = workspace
+        .read_range_page("file.txt", 20_000, 20_000, Some(&first.snapshot))
+        .unwrap();
+    assert_ne!(second.snapshot, first.snapshot);
+    assert_eq!(second.digest, first.digest);
+    assert!(!second.stale);
+    assert_eq!(
+        (second.total_lines, second.total_bytes),
+        (30_000, original.len())
+    );
+    assert_eq!(second.text, "line 20000");
+    assert_eq!(&original[second.start..second.end], second.text);
+    // The summary covers everything the base can target; the listing only this range.
+    assert_eq!(second.spans, ["r10", "r20000", "selection"]);
+    assert_eq!(second.lines, ["r20000 | line 20000"]);
+    // Continuing mints a new snapshot; the one it continued is unchanged.
+    assert_eq!(
+        ids(&stored(&workspace, &first.snapshot)),
+        ["r10", "selection"]
+    );
+
+    let preview = workspace
+        .prepare(span_edits(
+            "distant-lines",
+            &second.snapshot,
+            &[("r10", "LINE TEN"), ("r20000", "LINE TWENTY THOUSAND")],
+        ))
+        .unwrap();
+    assert!(preview.ready, "{:?}", preview.diagnostics);
+    assert_eq!(
+        workspace.commit(&preview.reference).unwrap().commit,
+        CommitStatus::Committed
+    );
+    let expected: String = (1..=30_000)
+        .map(|number| match number {
+            10 => "LINE TEN\n".into(),
+            20_000 => "LINE TWENTY THOUSAND\n".into(),
+            _ => line(number),
+        })
+        .collect();
+    assert_eq!(
+        fs::read(dir.path().join("file.txt")).unwrap(),
+        expected.as_bytes()
+    );
+}
+
+#[test]
+fn separate_snapshots_of_one_file_explain_how_to_share_one_base() {
+    let (dir, workspace) = setup("one\ntwo\nthree\n");
+    let first = workspace.read_range("file.txt", 1, 1).unwrap();
+    let third = workspace.read_range("file.txt", 3, 3).unwrap();
+    let mut split = span_edits("two-bases", &first.snapshot, &[("r1", "ONE")]);
+    split
+        .files
+        .extend(span_edits("unused", &third.snapshot, &[("r3", "THREE")]).files);
+    let rejected = workspace.prepare(split).unwrap();
+    assert!(!rejected.ready);
+    for code in ["TARGET_ALIAS", "DUPLICATE_TARGET_PATH"] {
+        let diagnostic = rejected
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == code)
+            .unwrap_or_else(|| panic!("{code} missing: {:?}", rejected.diagnostics));
+        // Responses clip messages at 240 characters; the remedy must survive that.
+        assert!(diagnostic.message.chars().count() <= 240, "{diagnostic:?}");
+        assert!(diagnostic.message.contains("`snapshot`"), "{diagnostic:?}");
+        assert!(
+            diagnostic.message.contains("unscoped exact `old`"),
+            "{diagnostic:?}"
+        );
+    }
+    // Following that advice, one continued base discloses both lines.
+    let both = workspace
+        .read_range_page("file.txt", 3, 3, Some(&first.snapshot))
+        .unwrap();
+    let preview = workspace
+        .prepare(span_edits(
+            "one-base",
+            &both.snapshot,
+            &[("r1", "ONE"), ("r3", "THREE")],
+        ))
+        .unwrap();
+    assert!(preview.ready, "{:?}", preview.diagnostics);
+    workspace.commit(&preview.reference).unwrap();
+    assert_eq!(
+        fs::read(dir.path().join("file.txt")).unwrap(),
+        b"ONE\ntwo\nTHREE\n"
+    );
+}
+
+#[test]
+fn range_and_search_continuations_keep_each_others_references() {
+    let original = "alpha one\nbeta\nalpha two\ngamma\nalpha three\n";
+    let (dir, workspace) = setup(original);
+    // A range continuing a search keeps its match references.
+    let found = workspace.search("file.txt", "alpha").unwrap();
+    let range = workspace
+        .read_range_page("file.txt", 4, 4, Some(&found.snapshot))
+        .unwrap();
+    assert_eq!(range.spans, ["m1", "m2", "m3", "r4", "selection"]);
+    assert_eq!(range.lines, ["r4 | gamma"]);
+    let preview = workspace
+        .prepare(span_edits(
+            "search-then-range",
+            &range.snapshot,
+            &[("m3", "omega"), ("r4", "GAMMA")],
+        ))
+        .unwrap();
+    assert!(preview.ready, "{:?}", preview.diagnostics);
+    let Evidence::Plan(plan) = workspace.evidence(&preview.reference).unwrap() else {
+        panic!("Expected a plan")
+    };
+    assert_eq!(
+        plan.files[0].output,
+        "alpha one\nbeta\nalpha two\nGAMMA\nomega three\n"
+    );
+    // Searching the same query again keeps every reference without duplicates.
+    let again = workspace
+        .search_page("file.txt", "alpha", 0, Some(&range.snapshot))
+        .unwrap();
+    assert_eq!(
+        ids(&stored(&workspace, &again.snapshot)),
+        ["m1", "m2", "m3", "r4", "selection"]
+    );
+
+    // A search continuing a range keeps its line references and selection.
+    let range = workspace.read_range("file.txt", 2, 2).unwrap();
+    let found = workspace
+        .search_page("file.txt", "alpha", 0, Some(&range.snapshot))
+        .unwrap();
+    assert_eq!(
+        ids(&stored(&workspace, &found.snapshot)),
+        ["r2", "selection", "m1", "m2", "m3"]
+    );
+    let preview = workspace
+        .prepare(span_edits(
+            "range-then-search",
+            &found.snapshot,
+            &[("selection", "BETA"), ("m2", "ALPHA")],
+        ))
+        .unwrap();
+    assert!(preview.ready, "{:?}", preview.diagnostics);
+    workspace.commit(&preview.reference).unwrap();
+    assert_eq!(
+        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+        "alpha one\nBETA\nALPHA two\ngamma\nalpha three\n"
+    );
+
+    // A range continuing a full read keeps the whole-file and every line reference.
+    let full = workspace.read("file.txt").unwrap();
+    let range = workspace
+        .read_range_page("file.txt", 2, 3, Some(&full.id))
+        .unwrap();
+    assert_eq!(range.spans, ["r0", "r1..r5", "selection"]);
+    assert_eq!(range.lines, ["r2 | BETA", "r3 | ALPHA two"]);
+    assert_eq!(stored(&workspace, &range.snapshot).spans.len(), 7);
+}
+
+#[test]
+fn a_continued_range_replaces_selection_and_adds_only_new_lines() {
+    let (dir, workspace) = setup("a\nb\nc\nd\ne\n");
+    let first = workspace.read_range("file.txt", 2, 3).unwrap();
+    let overlapping = workspace
+        .read_range_page("file.txt", 3, 4, Some(&first.snapshot))
+        .unwrap();
+    assert_eq!(overlapping.spans, ["r2..r4", "selection"]);
+    assert_eq!(overlapping.lines, ["r3 | c", "r4 | d"]);
+    assert_eq!(overlapping.text, "c\nd");
+    let repeated = workspace
+        .read_range_page("file.txt", 3, 4, Some(&overlapping.snapshot))
+        .unwrap();
+    assert_eq!(
+        stored(&workspace, &repeated.snapshot).spans,
+        stored(&workspace, &overlapping.snapshot).spans
+    );
+    let later = workspace
+        .read_range_page("file.txt", 5, 5, Some(&repeated.snapshot))
+        .unwrap();
+    assert_eq!(later.spans, ["r2..r5", "selection"]);
+    assert_eq!((later.text.as_str(), later.start, later.end), ("e", 8, 9));
+    // `selection` names only the latest range, so it is never ambiguous.
+    let base = stored(&workspace, &later.snapshot);
+    assert_eq!(ids(&base), ["r2", "r3", "r4", "r5", "selection"]);
+    let selection = &base.spans[4];
+    assert_eq!((selection.start, selection.end, selection.line), (8, 9, 5));
+    let preview = workspace
+        .prepare(span_edits(
+            "latest-selection",
+            &later.snapshot,
+            &[("r2", "B"), ("selection", "E")],
+        ))
+        .unwrap();
+    assert!(preview.ready, "{:?}", preview.diagnostics);
+    workspace.commit(&preview.reference).unwrap();
+    assert_eq!(
+        fs::read(dir.path().join("file.txt")).unwrap(),
+        b"a\nB\nc\nd\nE\n"
+    );
+}
+
+#[test]
+fn continued_ranges_read_retained_bytes_and_report_stale_sources() {
+    let original = "one\ntwo\nthree\n";
+    let (dir, workspace) = setup(original);
+    let first = workspace.read_range("file.txt", 1, 1).unwrap();
+    fs::write(dir.path().join("file.txt"), "one\nTWO\nthree\n").unwrap();
+    let continued = workspace
+        .read_range_page("file.txt", 2, 2, Some(&first.snapshot))
+        .unwrap();
+    // A continuation reads the retained source, so it can no longer be edited.
+    assert!(continued.stale);
+    assert_eq!(continued.digest, first.digest);
+    assert_eq!(continued.lines, ["r2 | two"]);
+    let rejected = workspace
+        .prepare(request("stale-range", &continued.snapshot, "r2", "2"))
+        .unwrap();
+    assert!(
+        rejected
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "STALE_SNAPSHOT"),
+        "{:?}",
+        rejected.diagnostics
+    );
+    let fresh = workspace.read_range("file.txt", 2, 2).unwrap();
+    assert!(!fresh.stale);
+    assert_eq!(fresh.text, "TWO");
+    // An unreadable file cannot match the retained source either.
+    fs::write(dir.path().join("file.txt"), [0xff, 0xfe]).unwrap();
+    assert!(
+        workspace
+            .read_range_page("file.txt", 3, 3, Some(&first.snapshot))
+            .unwrap()
+            .stale
+    );
+    fs::write(dir.path().join("file.txt"), original).unwrap();
+    let restored = workspace
+        .read_range_page("file.txt", 3, 3, Some(&continued.snapshot))
+        .unwrap();
+    assert!(!restored.stale);
+    assert_eq!(restored.spans, ["r1..r3", "selection"]);
+    assert!(
+        workspace
+            .prepare(request("restored", &restored.snapshot, "r2", "2"))
+            .unwrap()
+            .ready
+    );
+}
+
+#[test]
+fn continued_ranges_require_a_snapshot_of_the_same_file() {
+    let (dir, workspace) = setup("same\n");
+    fs::write(dir.path().join("other.txt"), "same\n").unwrap();
+    let base = workspace.read_range("file.txt", 1, 1).unwrap();
+    let count = snapshot_count(&dir);
+    for (path, reference, code) in [
+        (
+            "other.txt",
+            base.snapshot.as_str(),
+            "SNAPSHOT_PATH_MISMATCH",
+        ),
+        ("missing.txt", base.snapshot.as_str(), "TARGET_MISSING"),
+        ("file.txt", "p-invalid", "INVALID_REFERENCE"),
+        ("file.txt", "s-missing", "REFERENCE_NOT_FOUND"),
+    ] {
+        assert_eq!(
+            workspace
+                .read_range_page(path, 1, 1, Some(reference))
+                .unwrap_err()
+                .code,
+            code
+        );
+    }
+    assert_eq!(snapshot_count(&dir), count);
+    // Any spelling that resolves to the snapshot's file continues it.
+    let continued = workspace
+        .read_range_page("./file.txt", 1, 1, Some(&base.snapshot))
+        .unwrap();
+    assert_eq!(continued.spans, ["r1", "selection"]);
+}
+
+#[test]
+fn continued_ranges_keep_per_read_limits() {
+    let (dir, workspace) = setup(&"x\n".repeat(1_000));
+    let first = workspace.read_range("file.txt", 1, 200).unwrap();
+    let second = workspace
+        .read_range_page("file.txt", 201, 400, Some(&first.snapshot))
+        .unwrap();
+    // Limits bound each read, not the references a snapshot accumulates.
+    assert_eq!(second.spans, ["r1..r400", "selection"]);
+    assert_eq!(second.lines.len(), 200);
+    assert_eq!(second.lines[0], "r201 | x");
+    fs::write(
+        dir.path().join("wide.txt"),
+        format!("short\n{}\n", "é".repeat(6_001)),
+    )
+    .unwrap();
+    let short = workspace.read_range("wide.txt", 1, 1).unwrap();
+    let count = snapshot_count(&dir);
+    for (path, base, first, last, code) in [
+        ("file.txt", &second.snapshot, 401, 601, "READ_TOO_LARGE"),
+        (
+            "file.txt",
+            &second.snapshot,
+            999,
+            1_001,
+            "INVALID_LINE_RANGE",
+        ),
+        ("file.txt", &second.snapshot, 0, 1, "INVALID_LINE_RANGE"),
+        ("wide.txt", &short.snapshot, 2, 2, "READ_TOO_LARGE"),
+    ] {
+        assert_eq!(
+            workspace
+                .read_range_page(path, first, last, Some(base))
+                .unwrap_err()
+                .code,
+            code
+        );
+    }
+    assert_eq!(snapshot_count(&dir), count);
 }
 
 #[test]

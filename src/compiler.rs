@@ -169,7 +169,7 @@ pub fn compile(
                 Some(&base.path),
                 None,
                 "DUPLICATE_TARGET_PATH",
-                "Combine changes to the same target into one file entry",
+                "Only one file entry may target a path. Merge these changes into one entry with one base: continue a range or search with `snapshot` so that base discloses every span they use, or target text with an unscoped exact `old`.",
             ));
         }
         if !validate_snapshot(base, &file.base, &mut diagnostics) {

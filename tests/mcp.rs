@@ -559,6 +559,123 @@ fn every_paged_search_match_is_editable_in_one_batch_over_mcp() {
 }
 
 #[test]
+fn continued_ranges_and_searches_edit_distant_lines_under_one_base_over_mcp() {
+    let root = TempDir::new().unwrap();
+    let line = |number: usize| format!("line {number}\n");
+    let original: String = (1..=300).map(line).collect();
+    fs::write(root.path().join("file.txt"), &original).unwrap();
+    let mut client = Client::start(root.path());
+    let tools = client.rpc("tools/list", json!({}))["result"]["tools"].clone();
+    let schema = &tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "ultra_edit_snapshot")
+        .unwrap()["inputSchema"];
+    let range = schema["$defs"]["Selection"]["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|variant| variant["properties"]["kind"]["const"] == "range")
+        .unwrap();
+    assert!(range["properties"]["snapshot"].is_object(), "{range}");
+    assert!(
+        !range["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("snapshot")),
+        "{range}"
+    );
+
+    let first = client.range("file.txt", 2, 2);
+    assert_eq!(first["stale"], false);
+    let continue_range = |first: usize, last: usize, snapshot: &Value| {
+        json!({"path":"file.txt","selection":{
+            "kind":"range","first":first,"last":last,"snapshot":snapshot
+        }})
+    };
+    let last = client.call(
+        "ultra_edit_snapshot",
+        continue_range(299, 299, &first["snapshot"]),
+        false,
+    );
+    assert_eq!(last["stale"], false);
+    assert_eq!(last["text"], "line 299");
+    assert_eq!(last["spans"], json!(["r2", "r299", "selection"]));
+    assert_eq!(last["lines"], json!(["r299 | line 299"]));
+    fs::write(root.path().join("other.txt"), &original).unwrap();
+    let mismatch = client.call(
+        "ultra_edit_snapshot",
+        json!({"path":"other.txt","selection":{
+            "kind":"range","first":1,"last":1,"snapshot":last["snapshot"]
+        }}),
+        true,
+    );
+    assert_eq!(mismatch["error"]["code"], "SNAPSHOT_PATH_MISMATCH");
+
+    // Separate snapshots of one file cannot share a request; the rejection says how.
+    let separate = client.range("file.txt", 299, 299);
+    let mut split = edit("split", &first["snapshot"], "r2", "LINE TWO");
+    split["files"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"base":separate["snapshot"],"changes":[{
+            "id":"other","target":{"kind":"span","span":"r299"},"text":"LINE 299"
+        }]}));
+    let rejected = client.call("ultra_edit", split, true);
+    for code in ["TARGET_ALIAS", "DUPLICATE_TARGET_PATH"] {
+        let diagnostic = rejected["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|diagnostic| diagnostic["code"] == code)
+            .unwrap_or_else(|| panic!("{rejected}"));
+        let message = diagnostic["message"].as_str().unwrap();
+        assert!(message.contains("`snapshot`"), "{diagnostic}");
+        assert!(message.ends_with("`old`."), "clipped: {diagnostic}");
+    }
+
+    // A search continuing the range keeps its line references and selection.
+    let found = client.call(
+        "ultra_edit_snapshot",
+        json!({"path":"file.txt","selection":{
+            "kind":"search","query":"line 150","snapshot":last["snapshot"]
+        }}),
+        false,
+    );
+    assert_eq!(found["stale"], false);
+    assert_eq!(found["matches"][0]["span"]["id"], "m1");
+    let committed = client.call(
+        "ultra_edit",
+        json!({"request_id":"one-base","files":[{"base":found["snapshot"],"changes":[
+            {"id":"two","target":{"kind":"span","span":"r2","expect":"line 2"},"text":"LINE TWO"},
+            {"id":"middle","target":{"kind":"span","span":"m1"},"text":"LINE 150"},
+            {"id":"last","target":{"kind":"span","span":"selection"},"text":"LINE 299"}
+        ]}]}),
+        false,
+    );
+    assert_eq!(committed["commit"], "committed");
+    let expected: String = (1..=300)
+        .map(|number| match number {
+            2 => "LINE TWO\n".into(),
+            150 | 299 => format!("LINE {number}\n"),
+            _ => line(number),
+        })
+        .collect();
+    assert_eq!(
+        fs::read(root.path().join("file.txt")).unwrap(),
+        expected.as_bytes()
+    );
+    let stale = client.call(
+        "ultra_edit_snapshot",
+        continue_range(1, 1, &found["snapshot"]),
+        false,
+    );
+    assert_eq!(stale["stale"], true);
+    client.close();
+}
+
+#[test]
 fn declared_schema_minimums_agree_with_the_runtime_line_and_count_rules() {
     let root = TempDir::new().unwrap();
     fs::write(root.path().join("file.txt"), "one\n").unwrap();

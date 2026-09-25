@@ -52,6 +52,9 @@ pub enum Selection {
         first: usize,
         #[schemars(range(min = 1))]
         last: usize,
+        /// Continue this snapshot, keeping its spans, to edit several regions under
+        /// one base; `selection` becomes this range.
+        snapshot: Option<String>,
     },
     /// Literal search, 1..1000 characters; at most 20 editable match spans per page.
     /// A continued page also retains the references its prior snapshot disclosed,
@@ -173,9 +176,16 @@ impl McpServer {
     async fn snapshot(&self, Parameters(request): Parameters<SnapshotRequest>) -> CallToolResult {
         self.operate(Recovery::default(), move |workspace| {
             match request.selection {
-                Selection::Range { first, last } => {
-                    structured(workspace.read_range(request.path, first, last)?)
-                }
+                Selection::Range {
+                    first,
+                    last,
+                    snapshot,
+                } => structured(workspace.read_range_page(
+                    request.path,
+                    first,
+                    last,
+                    snapshot.as_deref(),
+                )?),
                 Selection::Search {
                     query,
                     offset,

@@ -15,7 +15,7 @@ const HELP: &str = concat!(
 Usage: ultra-edit [--root WORKSPACE] COMMAND [ARGS]
 
   read PATH [EXPECTED_BYTES]  Full snapshot; exact byte count opts into a large response
-  read-range PATH FIRST LAST  Read inclusive line bodies with editable range refs
+  read-range PATH FIRST LAST [SNAPSHOT]  Read inclusive line bodies, keeping SNAPSHOT's refs
   search PATH QUERY [OFFSET [SNAPSHOT]]  Page through literal editable matches
   prepare                    Read an edit request from stdin; persist a preview
   edit                       Read an edit request from stdin; prepare and commit
@@ -98,7 +98,7 @@ fn run() -> Result<Option<(Value, u8)>, Error> {
         "read" | "prune-snapshots" => 1..=2,
         "search" => 2..=4,
         "undo" | "retry" => 2..=2,
-        "read-range" => 3..=3,
+        "read-range" => 3..=4,
         "prepare" | "edit" | "repair" | "reconcile" => 0..=0,
         _ => return Err(usage("Unknown command; run --help")),
     };
@@ -124,10 +124,15 @@ fn run() -> Result<Option<(Value, u8)>, Error> {
             0,
         ),
         "read-range" => (
-            serde_json::to_value(workspace.read_range(
+            serde_json::to_value(workspace.read_range_page(
                 PathBuf::from(&args[0]),
                 line_number(argument(1)?)?,
                 line_number(argument(2)?)?,
+                if args.len() == 4 {
+                    Some(argument(3)?)
+                } else {
+                    None
+                },
             )?)?,
             0,
         ),
