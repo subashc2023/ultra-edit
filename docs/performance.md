@@ -147,7 +147,7 @@ time is not an equivalent performance baseline.
 A model-level comparison runs the same edit tasks through each route. The
 [evaluation harness](../eval/README.md) runs six fixture tasks, including
 escape-heavy, line-ending, and large-file cases, under three arms: `native` (no
-plugin), `native-guard` (native tools plus only the Bash guard hook), and
+plugin), `native-guard` (native tools plus only the shell guard hook), and
 `ultra-edit` (the full plugin). It scores exact final bytes, first-try success,
 tool calls, tool errors, Bash file writes, turns, tokens, and cost, so the
 plugin's instruction and snapshot overhead counts. It has no stale-file task

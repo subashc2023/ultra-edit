@@ -50,6 +50,8 @@ ULTRA_PERMISSION_RULE = "mcp__plugin_ultra-edit_ultra-edit"
 KNOWN_PLUGIN_IDS = ("ultra-edit@ultra-edit", "ultra-edit@skills-dir")
 GUARD_HOOK_ARGS = ("--claude-hook", "PreToolUse")
 GUARD_HOOK_TIMEOUT_S = 30
+# The plugin's matcher: the guard classifies Bash and PowerShell commands.
+DEFAULT_GUARD_MATCHER = "Bash|PowerShell"
 RUNTIME_NAMES = ("ultra-edit", "ultra-edit-mcp", "ultra-edit.exe", "ultra-edit-mcp.exe")
 IGNORED_TOP_LEVEL = frozenset({".git", ".ultra-edit"})
 SCORED_OUTCOMES = ("pass", "fail", "timeout")
@@ -757,11 +759,17 @@ def _same_path(left: Any, right: Path) -> bool:
     return isinstance(left, str) and bool(left) and _normalized_path(left) == _normalized_path(str(right))
 
 
+def guarded_tools(matcher: str) -> frozenset[str]:
+    """The shell tools that an exact `A|B` guard matcher names."""
+    return frozenset(matcher.split("|")) & SHELL_TOOLS
+
+
 def check_integrity(
     arm: str,
     transcript: Transcript,
     staged_plugin_dir: Path | None = None,
     hook_events_expected: bool = True,
+    guard_matcher: str = DEFAULT_GUARD_MATCHER,
 ) -> tuple[list[str], list[str]]:
     """Errors mean the run did not test its arm (leaked or missing plugin/hook)."""
     errors: list[str] = []
@@ -821,10 +829,12 @@ def check_integrity(
         failed = [event for event in pre_tool if event.get("outcome") == "error"]
         if failed:
             errors.append(f"guard hook failed {len(failed)} time(s)")
-        bash_calls = [call for call in transcript.tool_calls if call.name == "Bash"]
-        if hook_events_expected and bash_calls and not pre_tool:
+        guarded = guarded_tools(guard_matcher)
+        shell_calls = sorted({call.name for call in transcript.tool_calls if call.name in guarded})
+        if hook_events_expected and shell_calls and not pre_tool:
             errors.append(
-                "Bash was called but no PreToolUse hook event was reported; the guard did not run "
+                f"{' and '.join(shell_calls)} called but no PreToolUse hook event was reported; "
+                "the guard did not run "
                 "(use --no-hook-check if this Claude Code omits PreToolUse hook events)"
             )
     elif arm == "native" and pre_tool:
@@ -945,7 +955,7 @@ def deep_merge(base: Mapping[str, Any], extra: Mapping[str, Any]) -> dict[str, A
 def build_settings(
     arm: str,
     guard_executable: str | None = None,
-    guard_matcher: str = "Bash",
+    guard_matcher: str = DEFAULT_GUARD_MATCHER,
     extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The per-run --settings document. Only native-guard adds a hook."""
@@ -1120,21 +1130,32 @@ def hook_output_denies(returncode: int, stdout: bytes | str) -> bool:
     return hook_denied({"exit_code": returncode, "stdout": text})
 
 
-def check_guard_hook(hook_argv: Sequence[str], cwd: Path, env: Mapping[str, str]) -> list[str]:
-    """Feed the guard synthetic PreToolUse input: it must deny a heredoc write and allow a read."""
-    probes = (
-        ("cat > notes.txt <<'EOF'\nC:\\Temp\\new\\file\nEOF", True),
-        ("git status --short", False),
-    )
+def check_guard_hook(
+    hook_argv: Sequence[str],
+    cwd: Path,
+    env: Mapping[str, str],
+    guard_matcher: str = DEFAULT_GUARD_MATCHER,
+) -> list[str]:
+    """Feed the guard synthetic PreToolUse input: it must deny a heredoc write and allow a
+    read, and likewise a here-string write and a read when the matcher names PowerShell."""
+    probes = [
+        ("Bash", "cat > notes.txt <<'EOF'\nC:\\Temp\\new\\file\nEOF", True),
+        ("Bash", "git status --short", False),
+    ]
+    if "PowerShell" in guarded_tools(guard_matcher):
+        probes += [
+            ("PowerShell", "@'\nC:\\Temp\\new\\file\n'@ | Set-Content notes.txt", True),
+            ("PowerShell", "Get-ChildItem -Name", False),
+        ]
     problems = []
-    for command, should_deny in probes:
+    for tool, command, should_deny in probes:
         payload = {
             "session_id": "ultra-edit-eval-preflight",
             "transcript_path": str(Path(cwd) / "preflight.jsonl"),
             "cwd": str(cwd),
             "permission_mode": "bypassPermissions",
             "hook_event_name": "PreToolUse",
-            "tool_name": "Bash",
+            "tool_name": tool,
             "tool_input": {"command": command, "description": "eval preflight"},
             "tool_use_id": "toolu_eval_preflight",
         }
@@ -1158,7 +1179,7 @@ def check_guard_hook(hook_argv: Sequence[str], cwd: Path, env: Mapping[str, str]
             verdict = "allowed" if should_deny else "denied"
             detail = f" (exit {completed.returncode}; stderr: {stderr})" if stderr else ""
             problems.append(
-                f"guard hook {verdict} {command.splitlines()[0]!r}; expected the opposite{detail}"
+                f"guard hook {verdict} {tool} {command.splitlines()[0]!r}; expected the opposite{detail}"
             )
     if problems and any("usage" in problem.lower() for problem in problems):
         mode = " ".join(GUARD_HOOK_ARGS)
@@ -1201,7 +1222,7 @@ class Config:
     isolate_config: bool = False
     prompt_via: str = "stdin"
     allowed_tools: tuple[str, ...] = DEFAULT_ALLOWED_TOOLS
-    guard_matcher: str = "Bash"
+    guard_matcher: str = DEFAULT_GUARD_MATCHER
     extra_settings: dict[str, Any] | None = None
     work_dir: Path | None = None
     keep_workdirs: bool = False
@@ -1442,6 +1463,7 @@ def run_one(config: Config, spec: RunSpec) -> dict[str, Any]:
         transcript,
         config.staged.root if config.staged and spec.arm == "ultra-edit" else None,
         hook_events_expected=config.hook_check and config.claude.supports("--include-hook-events"),
+        guard_matcher=config.guard_matcher,
     )
     outcome = classify(transcript, comparison, errors, timed_out)
     if setup_error is not None:
@@ -1699,7 +1721,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="fresh CLAUDE_CONFIG_DIR per run; needs ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN",
     )
     parser.add_argument("--extra-settings", type=Path, help="JSON merged into every arm's settings")
-    parser.add_argument("--guard-matcher", default="Bash", help="PreToolUse matcher for the guard hook")
+    parser.add_argument(
+        "--guard-matcher", default=DEFAULT_GUARD_MATCHER, help="PreToolUse matcher for the guard hook"
+    )
     parser.add_argument(
         "--no-hook-check",
         action="store_true",
@@ -1864,7 +1888,7 @@ def _preflight(
                 scratch = Path(tempfile.mkdtemp(prefix="ue-eval-hook-"))
                 try:
                     hook_problems = check_guard_hook(
-                        [str(staged.mcp_executable), *GUARD_HOOK_ARGS], scratch, env
+                        [str(staged.mcp_executable), *GUARD_HOOK_ARGS], scratch, env, args.guard_matcher
                     )
                 finally:
                     remove_tree(scratch)

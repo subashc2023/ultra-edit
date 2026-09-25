@@ -17,7 +17,7 @@ sessions, saves each raw stream-json transcript, and scores the final bytes.
 | Arm | What loads | What it measures |
 | --- | --- | --- |
 | `native` | Claude Code only | The baseline: native Read/Edit/Write/Bash. |
-| `native-guard` | Native tools plus Ultra Edit's Bash guard: a `PreToolUse` hook (matcher `Bash`) running `<staged runtime>/ultra-edit-mcp --claude-hook PreToolUse`, configured in a generated `--settings` file | Whether blocking heredoc, inline-script, `sed -i`, and `echo`/`printf` writes alone improves native editing. |
+| `native-guard` | Native tools plus Ultra Edit's shell guard: a `PreToolUse` hook (matcher `Bash\|PowerShell`, set by `--guard-matcher`) running `<staged runtime>/ultra-edit-mcp --claude-hook PreToolUse`, configured in a generated `--settings` file | Whether blocking heredoc, here-string, inline-script, `sed -i`, `-replace`, and `echo`/`printf`/`Set-Content` writes into the project alone improves native editing. |
 | `ultra-edit` | The full plugin via `--plugin-dir <staged plugin>`: MCP tools, routing hooks, skill | The complete product against both baselines. |
 
 Every arm gets the same prompt, flags, and isolation; only the plugin or hook
@@ -49,8 +49,9 @@ stay byte-identical, and no file may be added or removed.
    inside the results folder. Pass `--runtime-dir DIR` to use another build,
    such as an extracted release's `runtime/`. The `native-guard` arm needs a
    build that supports `--claude-hook PreToolUse`; `--preflight` feeds it a
-   heredoc write and a read and fails if the hook doesn't deny the write and
-   allow the read.
+   Bash heredoc write and a read, plus a PowerShell here-string write and a
+   read when the matcher names PowerShell, and fails if the hook doesn't deny
+   the writes and allow the reads.
 3. Authenticate. The default mode uses your normal login. With
    `--isolate-config`, each run gets an empty `CLAUDE_CONFIG_DIR`, and
    therefore no stored login: set `ANTHROPIC_API_KEY`, or
@@ -81,8 +82,8 @@ Every run is then checked against its `system/init` message and hook events:
   `invalid`.
 - An `ultra-edit` run whose plugin or server did not load, or whose
   `SessionStart` hook failed, is marked `invalid`.
-- A `native-guard` run is marked `invalid` if Bash ran without any
-  `PreToolUse` hook event, or if the hook failed.
+- A `native-guard` run is marked `invalid` if a shell tool that the matcher
+  names ran without any `PreToolUse` hook event, or if the hook failed.
 
 Invalid runs are excluded from the rates and listed in the summary.
 
@@ -152,10 +153,10 @@ login needs). Run `--help` for the full list.
   stdin, so newlines, quotes, and backslashes never pass through `cmd.exe`.
   Prefer `claude.exe`; with `claude.cmd`, avoid `&`, `%`, and `^` in the
   checkout and temp paths.
-- Claude Code needs Git for Windows (Git Bash). It may also offer a PowerShell
-  tool, which the Bash-only guard does not see. The metrics count PowerShell
-  writes (`powershell_write`). If the guard binary understands PowerShell,
-  try `--guard-matcher "Bash|PowerShell"`.
+- Claude Code needs Git for Windows (Git Bash) and may also offer a
+  PowerShell tool. The guard covers both by default (`--guard-matcher Bash`
+  limits it to Bash), and the metrics count PowerShell writes
+  (`powershell_write`).
 - `.gitattributes` marks `eval/tasks/**` as `-text`, so checkouts keep CRLF and
   LF bytes even with `core.autocrlf=true`. Each temporary repository also sets
   `core.autocrlf=false`.

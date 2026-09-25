@@ -111,13 +111,14 @@ The change gets ID `1.1` (file entry 1, change 1), and the response's
 | Request identity and replay, byte preservation, limits, or what a receipt proves | [Contract](references/contract.md) |
 | Choose range/search/full; continue a range; ambiguous matches; near-miss candidates; replace-all; span overlap | [Targets](references/targets.md) |
 | Preview/diff then commit; correct a batch; lost response; preflight retry; inspect/reconcile uncertainty; undo | [Recovery](references/recovery.md) |
-| Connect the plugin; missing tools; fixed workspace root; host permissions; blocked Bash command | [Claude Code](references/claude-code.md) |
+| Connect the plugin; missing tools; fixed workspace root; host permissions; blocked shell command | [Claude Code](references/claude-code.md) |
 
 The plugin grants no permissions; follow the user's existing authorization and
-this host's permissions. Its PreToolUse hook denies Bash commands that write file
-content, such as heredoc or `echo` redirection into a file, inline interpreter
-writes, and `sed -i`; redo a blocked write with Ultra Edit, Edit, or Write, never
-by rephrasing the command to evade the guard.
+this host's permissions. Its PreToolUse hook denies Bash and PowerShell commands
+that write file content into the project, such as heredoc, here-string, `echo`,
+or `Set-Content` writes, inline interpreter writes, `sed -i`, and `-replace`
+rewrites; redo a blocked write with Ultra Edit, Edit, or Write, never by
+rephrasing the command to evade the guard.
 File creation, deletion, and rename are outside this tool's scope. Use native
 Write for new files or isolated full rewrites, and native Edit or Ultra Edit for
 isolated targeted edits. Do not split a coordinated multi-file edit into native
