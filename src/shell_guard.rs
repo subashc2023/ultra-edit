@@ -23,6 +23,11 @@ pub const ESCAPE_HATCH: &str = "ULTRA_EDIT_SHELL_WRITES";
 const MAX_SCRIPT_DEPTH: usize = 3;
 /// How deep command substitutions are parsed before the rest is skipped.
 const MAX_NESTING: usize = 64;
+/// Words, redirections, and PowerShell atoms lexed from one script before the
+/// rest is allowed unread. Real commands stay orders of magnitude below it;
+/// the bound keeps a command of millions of tiny statements from costing
+/// gigabytes of memory and more than the hook's timeout.
+const MAX_TOKENS: usize = 250_000;
 /// Bytes of interpreter code examined for each candidate write call.
 const MAX_CALL_SPAN: usize = 512;
 /// Program names longer than this are shortened in the deny reason.
@@ -249,6 +254,8 @@ struct Lexer<'a> {
     /// Backtick bodies, which are classified as separate scripts.
     backticks: Vec<String>,
     nesting: usize,
+    /// Words and redirections lexed so far, bounded by `MAX_TOKENS`.
+    tokens: usize,
 }
 
 impl<'a> Lexer<'a> {
@@ -259,6 +266,7 @@ impl<'a> Lexer<'a> {
             nested: Vec::new(),
             backticks: Vec::new(),
             nesting: 0,
+            tokens: 0,
         }
     }
 
@@ -273,6 +281,11 @@ impl<'a> Lexer<'a> {
         let mut heredocs = Vec::new();
         let mut depth = 0_usize;
         while let Some(byte) = self.peek(0) {
+            if self.tokens > MAX_TOKENS {
+                // Every enclosing list stops as well.
+                self.at = self.source.len();
+                break;
+            }
             match byte {
                 b' ' | b'\t' | b'\r' => self.at += 1,
                 b'\\' if self.peek(1) == Some(b'\n') => self.at += 2,
@@ -353,6 +366,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn push_word(&mut self, commands: &mut [Command]) {
+        self.tokens += 1;
         let word = self.word();
         if let Some(command) = commands.last_mut() {
             command.words.push(word);
@@ -365,6 +379,7 @@ impl<'a> Lexer<'a> {
         heredocs: &mut Vec<Heredoc>,
         descriptor: Option<u32>,
     ) {
+        self.tokens += 1;
         let stdout = matches!(descriptor, None | Some(1));
         let stdin = matches!(descriptor, None | Some(0));
         let redirect = match (self.peek(0), self.peek(1), self.peek(2)) {

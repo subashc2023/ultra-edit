@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use super::{
-    Command, Content, Context, Dialect, Finding, MAX_NESTING, MAX_SCRIPT_DEPTH, Pattern, Scope,
-    Word, inspect, program_name,
+    Command, Content, Context, Dialect, Finding, MAX_NESTING, MAX_SCRIPT_DEPTH, MAX_TOKENS,
+    Pattern, Scope, Word, inspect, program_name,
 };
 
 /// Reserved words after which the next token decides whether a statement is
@@ -167,6 +167,8 @@ struct Lexer<'a> {
     /// Subexpressions inside strings, checked as scripts of their own.
     nested: Vec<Script>,
     nesting: usize,
+    /// Atoms and redirections lexed so far, bounded by `MAX_TOKENS`.
+    tokens: usize,
 }
 
 impl<'a> Lexer<'a> {
@@ -176,6 +178,7 @@ impl<'a> Lexer<'a> {
             at: 0,
             nested: Vec::new(),
             nesting: 0,
+            tokens: 0,
         }
     }
 
@@ -187,6 +190,11 @@ impl<'a> Lexer<'a> {
     fn script(&mut self, close: Option<u8>) -> Script {
         let mut script = vec![vec![Element::default()]];
         loop {
+            if self.tokens > MAX_TOKENS {
+                // Every enclosing script stops as well.
+                self.at = self.source.len();
+                break;
+            }
             let spaced = self.blank();
             let Some(byte) = self.peek(0) else {
                 break;
@@ -290,6 +298,7 @@ impl<'a> Lexer<'a> {
 
     /// Lexes one atom or redirection into `element`.
     fn atom(&mut self, element: &mut Element, spaced: bool) {
+        self.tokens += 1;
         let redirect = match (self.peek(0), self.peek(1)) {
             (Some(b'>'), _) => true,
             (Some(b'*' | b'0'..=b'9'), Some(b'>')) => spaced || element.atoms.is_empty(),
@@ -347,6 +356,7 @@ impl<'a> Lexer<'a> {
             }
             let start = self.at;
             let first = target.atoms.is_empty();
+            self.tokens += 1;
             let kind = self.operand(&target, first);
             target.atoms.push(Atom {
                 kind,
@@ -803,6 +813,7 @@ pub(super) fn scan(script: &str, scope: &Scope, depth: usize) -> Option<Finding>
             depth,
         },
         variables: HashMap::new(),
+        flows: HashMap::new(),
     };
     checker.script(&body).or_else(|| {
         lexer
@@ -1207,24 +1218,25 @@ fn class_name(name: &str) -> String {
 /// Whether an expression rewrites text: `-replace`, `.Replace()`,
 /// `.Insert()`, `.Remove()`, or `+` with a literal.
 fn transforms(atoms: &[Atom]) -> bool {
-    atoms
-        .iter()
-        .enumerate()
-        .any(|(index, atom)| match &atom.kind {
-            // Concatenating a literal adds text to the content.
-            Kind::Bare(text) if text == "+" => atoms[index + 1..]
-                .iter()
-                .any(|atom| matches!(atom.kind, Kind::Quoted(_) | Kind::Here(_))),
-            Kind::Bare(text) => matches!(
-                text.to_ascii_lowercase().as_str(),
-                "-replace" | "-creplace" | "-ireplace"
-            ),
-            Kind::Member(name) => matches!(
-                name.to_ascii_lowercase().as_str(),
-                "insert" | "remove" | "replace"
-            ),
-            _ => false,
-        })
+    // Concatenating a literal adds text to the content: a `+` before any
+    // string or here-string.
+    let mut concatenates = false;
+    atoms.iter().any(|atom| match &atom.kind {
+        Kind::Bare(text) if text == "+" => {
+            concatenates = true;
+            false
+        }
+        Kind::Quoted(_) | Kind::Here(_) => concatenates,
+        Kind::Bare(text) => matches!(
+            text.to_ascii_lowercase().as_str(),
+            "-replace" | "-creplace" | "-ireplace"
+        ),
+        Kind::Member(name) => matches!(
+            name.to_ascii_lowercase().as_str(),
+            "insert" | "remove" | "replace"
+        ),
+        _ => false,
+    })
 }
 
 /// The first argument of the `(...)` call joined to a method name.
@@ -1275,6 +1287,11 @@ struct Checker<'a> {
     /// What assigned variables hold, by key. Assignments apply in source
     /// order, whatever block or branch they are in.
     variables: HashMap<String, Flow>,
+    /// What each pipeline already run outputs, by address. A bracketed
+    /// pipeline is checked as a script and then read again as the value of
+    /// the expression around it, so without this, nested brackets would run
+    /// their inner pipelines once per enclosing level.
+    flows: HashMap<*const Pipeline, Option<Flow>>,
 }
 
 impl Checker<'_> {
@@ -1306,6 +1323,10 @@ impl Checker<'_> {
     /// Runs a pipeline's elements in order and returns what it outputs,
     /// recording what an assignment stores.
     fn flow(&mut self, pipeline: &Pipeline) -> Result<Option<Flow>, Finding> {
+        let key = std::ptr::from_ref(pipeline);
+        if let Some(flow) = self.flows.get(&key) {
+            return Ok(flow.clone());
+        }
         let mut flow = None;
         let mut assigned = Assigned::Nothing;
         for (index, element) in pipeline.iter().enumerate() {
@@ -1330,6 +1351,7 @@ impl Checker<'_> {
             }
             Assigned::Nothing => {}
         }
+        self.flows.insert(key, flow.clone());
         Ok(flow)
     }
 
