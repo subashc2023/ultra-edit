@@ -186,6 +186,9 @@ fn omitted_ids_are_derived_and_replays_are_flagged_across_processes() {
     let (code, rejected) = run(root.path(), &["prepare"], Some(&ambiguous));
     assert_eq!(code, 2, "{rejected}");
     assert_eq!(rejected["diagnostics"][0]["change_id"], "1.1");
+    // The CLI shows a derived ID so its receipt can be queried later.
+    let draft_id = rejected["request_id"].as_str().unwrap();
+    assert!(draft_id.starts_with("auto-"), "{rejected}");
     let (code, replayed) = run(root.path(), &["edit"], Some(&ambiguous));
     assert_eq!(code, 2, "{replayed}");
     assert_eq!(replayed, replay_of(&rejected));
@@ -196,6 +199,11 @@ fn omitted_ids_are_derived_and_replays_are_flagged_across_processes() {
     let (code, repaired) = run(root.path(), &["repair"], Some(&repair));
     assert_eq!(code, 0, "{repaired}");
     assert_eq!(repaired["ready"], true);
+    let repair_id = repaired["request_id"].as_str().unwrap();
+    assert!(
+        repair_id.starts_with("auto-") && repair_id != draft_id,
+        "{repaired}"
+    );
     let (code, replayed) = run(root.path(), &["repair"], Some(&repair));
     assert_eq!(code, 0, "{replayed}");
     assert_eq!(replayed, replay_of(&repaired));
@@ -205,7 +213,7 @@ fn omitted_ids_are_derived_and_replays_are_flagged_across_processes() {
     assert_eq!(code, 0, "{committed}");
     assert!(committed.get("replayed").is_none(), "{committed}");
     let request_id = committed["request_id"].as_str().unwrap();
-    assert!(request_id.starts_with("auto-"), "{committed}");
+    assert_eq!(request_id, repair_id, "{committed}");
     assert_eq!(fs::read_to_string(&path).unwrap(), "y y\n");
     let (code, replayed) = run(root.path(), &["commit", plan], None);
     assert_eq!(code, 0, "{replayed}");

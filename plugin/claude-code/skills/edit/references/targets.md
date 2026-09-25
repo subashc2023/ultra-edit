@@ -153,14 +153,16 @@ clipped, so read `line..end_line` instead. The first tier with results wins:
 
 | `kind` | Found | Use |
 | --- | --- | --- |
-| `exact` | The unmet `expect` text elsewhere | Copy `text` into `old`. |
+| `exact` | The unmet `expect` text elsewhere, or a scoped target's text outside its scope | For `expect`, copy `text` into `old`; for a scope, pick a scope that contains the line or drop it. |
 | `whitespace` | Text equal after CRLF→LF, dropping trailing spaces/tabs, and collapsing space/tab runs | Copy `text` verbatim; it keeps the file's indentation, such as `"\tlet x = 1;"`. Write the replacement with the file's tabs and line endings. |
 | `similar` | Text at least 70% similar (`similarity` gives the percentage) | Confirm it is the intended region first; it can be a different line of similar shape. |
 
-A missing target is searched within the change's scope, or the whole file if
-unscoped. An `expect` mismatch searches the whole snapshot, and its message
-quotes what the span holds. Send `ultra_edit_repair` with the draft `reference`,
-replacing only the failed change ID. Copied text may occur more than once; add a
-scope if the repair reports `TARGET_AMBIGUOUS`. Ambiguous targets and count
-mismatches where something matched get no candidates, and the search is bounded
-per request, so a later failure can have none.
+A scoped target first checks whether its exact text occurs elsewhere in the file,
+since an off-by-one scope is a common miss; otherwise a missing target is searched
+within its scope, or the whole file if unscoped. An `expect` mismatch searches
+the whole snapshot, and its message quotes what the span holds. Send
+`ultra_edit_repair` with the draft `reference`, replacing only the failed change
+ID. Copied text may occur more than once; add a scope if the repair reports
+`TARGET_AMBIGUOUS`. Ambiguous targets and count mismatches where something matched
+get no candidates, and only the first six failed targets of a request are
+searched.

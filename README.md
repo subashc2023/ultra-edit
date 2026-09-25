@@ -38,8 +38,8 @@ claude plugin install ultra-edit@ultra-edit
 
 The repository's catalog pins the latest release's multi-platform plugin archive
 by SHA-256. Claude Code downloads that archive and installs it in its versioned
-plugin cache with the MCP server, automatic context hooks, skill, licenses, and
-native executables together.
+plugin cache with the MCP server, context and shell-guard hooks, skill, licenses,
+and native executables together.
 
 ### 3. Start Claude Code
 
@@ -137,10 +137,11 @@ the recorded result with `"replayed": true` instead of writing twice.
 ```
 
 Every target resolves against the original bytes, and the whole batch is
-rejected if any target is missing, ambiguous, overlapping, or stale. When an
-`exact` target is not found, the diagnostic lists up to three candidates: regions
-that match except for whitespace or line endings, or are at least 70% similar,
-with their exact current text so the model can copy it instead of guessing. To edit
+rejected if any target is missing, ambiguous, overlapping, or stale. When a
+target is not found or an `expect` guard fails, the diagnostic lists up to three
+candidates with their exact current text and lines: the text outside a wrong
+scope, a region that differs only in whitespace or line endings, or one at least
+70% similar, so the model can copy text instead of guessing. To edit
 distant parts of one file in one batch, a range read can continue an earlier
 snapshot, keeping its spans. Receipts report `committed`, `partial`,
 `not_committed`, or `outcome_unknown` per file; nothing outside the declared spans
@@ -196,8 +197,9 @@ exclude model latency, MCP transport, and CLI startup; the planning row also
 excludes file I/O and snapshot creation.
 
 `.ultra-edit` now stores large strings once, by SHA-256, so re-reading an
-unchanged file writes only a small snapshot. Six focused reads and one edit of a
-1 MB file used to leave 10.0 MB of state; they now leave 2.2 MB. See
+unchanged file writes only a small snapshot. In one measured session of six
+focused reads of a 1 MB file and a two-file edit, state fell from 10.0 MB to
+2.2 MB. See
 [methodology and results](docs/performance.md), and reproduce the timings in
 disposable workspaces:
 

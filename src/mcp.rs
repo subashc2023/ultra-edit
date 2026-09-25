@@ -236,11 +236,8 @@ impl McpServer {
             Err(error) => return failed(error),
         };
         let recovery = Recovery::request(&request.request_id, true);
-        self.operate(recovery, move |workspace| {
-            let request_id = request.request_id.clone();
-            edited(workspace.edit(request)?, &request_id)
-        })
-        .await
+        self.operate(recovery, move |workspace| edited(workspace.edit(request)?))
+            .await
     }
 
     #[tool(
@@ -290,8 +287,7 @@ impl McpServer {
         };
         let recovery = Recovery::request(&request.request_id, false);
         self.operate(recovery, move |workspace| {
-            let request_id = request.request_id.clone();
-            prepared(workspace.prepare(request)?, &request_id)
+            prepared(workspace.prepare(request)?)
         })
         .await
     }
@@ -332,12 +328,7 @@ impl McpServer {
     async fn retry(&self, Parameters(request): Parameters<RetryRequest>) -> CallToolResult {
         self.operate(
             Recovery::request(&request.request_id, true),
-            move |workspace| {
-                edited(
-                    workspace.retry(&request.plan, &request.request_id)?,
-                    &request.request_id,
-                )
-            },
+            move |workspace| edited(workspace.retry(&request.plan, &request.request_id)?),
         )
         .await
     }
@@ -445,10 +436,7 @@ impl McpServer {
             };
         let recovery = Recovery::request(&request_id, false);
         self.operate(recovery, move |workspace| {
-            prepared(
-                workspace.repair(&request.reference, &request_id, request.changes)?,
-                &request_id,
-            )
+            prepared(workspace.repair(&request.reference, &request_id, request.changes)?)
         })
         .await
     }
@@ -470,7 +458,7 @@ impl McpServer {
         };
         let recovery = Recovery::request(&request_id, true);
         self.operate(recovery, move |workspace| {
-            edited(workspace.undo(&request.plan, &request_id)?, &request_id)
+            edited(workspace.undo(&request.plan, &request_id)?)
         })
         .await
     }
@@ -510,93 +498,46 @@ fn structured(value: impl Serialize) -> Result<CallToolResult, Error> {
     Ok(tool_result(serde_json::to_value(value)?, false))
 }
 
-fn edited(result: EditResult, request_id: &str) -> Result<CallToolResult, Error> {
+fn edited(result: EditResult) -> Result<CallToolResult, Error> {
     match result {
-        EditResult::Rejected { preparation } => prepared(preparation, request_id),
+        EditResult::Rejected { preparation } => prepared(preparation),
         EditResult::Completed {
             receipt, replayed, ..
         } => Ok(completed(receipt, true, replayed)),
     }
 }
 
-fn prepared(preparation: Preparation, request_id: &str) -> Result<CallToolResult, Error> {
+fn prepared(preparation: Preparation) -> Result<CallToolResult, Error> {
     if let Some(receipt) = preparation.receipt {
         return Ok(completed(receipt, true, preparation.replayed));
     }
-    let diagnostics = preparation
-        .diagnostics
-        .iter()
-        .take(6)
-        .map(|diagnostic| {
-            let mut summary = json!({
-                "code": clipped(&diagnostic.code, 80),
-                "file": diagnostic.file.as_deref().map(|path| clipped(path, 500)),
-                "change_id": diagnostic.change_id.as_deref().map(|id| clipped(id, 80)),
-                "message": clipped(&diagnostic.message, 240),
-                "expected": diagnostic.expected,
-                "actual": diagnostic.actual,
-            });
-            // Candidate text is complete or absent, never clipped, so it can be copied.
-            if !diagnostic.candidates.is_empty() {
-                summary["candidates"] =
-                    json!(diagnostic.candidates.iter().take(3).collect::<Vec<_>>());
-            }
-            summary
-        })
-        .collect::<Vec<_>>();
-    let value = json!({
+    let mut value = json!({
         "kind": if preparation.ready { "ready" } else { "rejected" },
-        "request_id": request_id,
+        "request_id": preparation.request_id,
         "reference": preparation.reference,
         "ready": preparation.ready,
         "diagnostic_count": preparation.diagnostics.len(),
-        "diagnostics": diagnostics,
+        "diagnostics": report::diagnostic_summaries(&preparation.diagnostics),
         "warning_count": preparation.warnings.len(),
-        "warnings": warning_summary(&preparation.warnings),
+        "warnings": report::warning_summaries(&preparation.warnings),
         "report": preparation.report,
     });
-    Ok(tool_result(
-        replay_flagged(value, preparation.replayed),
-        !preparation.ready,
-    ))
+    report::flag_replayed(&mut value, preparation.replayed);
+    Ok(tool_result(value, !preparation.ready))
 }
 
 fn completed(receipt: Receipt, mutation: bool, replayed: bool) -> CallToolResult {
-    let value = json!({
+    let mut value = json!({
         "kind": "completed",
         "request_id": receipt.request_id,
         "plan_id": receipt.plan_id,
         "commit": receipt.commit,
         "warning_count": receipt.warnings.len(),
-        "warnings": warning_summary(&receipt.warnings),
+        "warnings": report::warning_summaries(&receipt.warnings),
         "report": receipt_report(&receipt, replayed),
     });
-    tool_result(
-        replay_flagged(value, replayed),
-        mutation && receipt.commit != CommitStatus::Committed,
-    )
-}
-
-/// Marks a recorded result returned without a new attempt; omitted otherwise to save tokens.
-fn replay_flagged(mut value: Value, replayed: bool) -> Value {
-    if replayed {
-        value["replayed"] = Value::Bool(true);
-    }
-    value
-}
-
-fn warning_summary(warnings: &[crate::Diagnostic]) -> Vec<serde_json::Value> {
-    warnings
-        .iter()
-        .take(6)
-        .map(|warning| {
-            json!({
-                "code": clipped(&warning.code, 80),
-                "file": warning.file.as_deref().map(|path| clipped(path, 500)),
-                "message": clipped(&warning.message, 240),
-            })
-        })
-        .collect()
+    report::flag_replayed(&mut value, replayed);
+    tool_result(value, mutation && receipt.commit != CommitStatus::Committed)
 }
 
 fn failed(error: Error) -> CallToolResult {

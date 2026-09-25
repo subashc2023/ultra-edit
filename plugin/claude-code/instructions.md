@@ -45,9 +45,10 @@ exception: `ultra_edit_retry` needs a new explicit `request_id`. Require
 `outcome_unknown`, and never retry those under a new ID. Run project validation
 separately.
 
-When a target is not found, diagnostics may list `candidates` with exact current
-text and line numbers. Copy an `exact` or `whitespace` candidate's text verbatim
-into `old`; confirm a `similar` candidate is the region you meant before using
+When a target is not found or an `expect` fails, diagnostics may list
+`candidates` with exact current text and lines. Copy a `whitespace` candidate's
+text verbatim into `old`; an `exact` one means the text is elsewhere, so fix the
+span or scope. Confirm a `similar` candidate is the region you meant before using
 it. Correct only that change with `ultra_edit_repair` on the returned draft.
 
 Replace-all needs a scope and an `expected` count of non-overlapping matches. For

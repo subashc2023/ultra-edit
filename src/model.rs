@@ -240,6 +240,8 @@ pub struct Draft {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Preparation {
+    /// The bound request ID, including one derived from an omitted ID.
+    pub request_id: String,
     pub reference: String,
     pub ready: bool,
     pub diagnostics: Vec<Diagnostic>,

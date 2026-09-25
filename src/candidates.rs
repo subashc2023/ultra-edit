@@ -14,6 +14,7 @@
 use std::cmp::Reverse;
 use std::ops::Range;
 
+use crate::compiler::prefix_table;
 use crate::model::{Candidate, CandidateKind};
 
 const MAX_CANDIDATES: usize = 3;
@@ -72,12 +73,43 @@ pub(crate) fn find(
     located(text, kind, found)
 }
 
+/// Candidates for an `exact` or `all` target with no occurrence in `scope`. A
+/// scope that excludes the text is a common miss, such as an off-by-one line, so
+/// literal occurrences elsewhere come first as `exact`; otherwise the scope is
+/// searched like any failed target.
+pub(crate) fn find_target(
+    budget: &mut usize,
+    text: &str,
+    scope: Range<usize>,
+    needle: &str,
+) -> Vec<Candidate> {
+    let whole = 0..text.len();
+    if scope != whole && !needle.is_empty() {
+        let Some(left) = budget.checked_sub(text.len().saturating_add(needle.len())) else {
+            return Vec::new();
+        };
+        *budget = left;
+        let found = exact_regions(text, &whole, needle);
+        if !found.is_empty() {
+            return located(text, CandidateKind::Exact, found);
+        }
+    }
+    find(budget, text, scope, needle, false)
+}
+
 /// Completes a message for a target with no occurrences and some candidates.
+/// `exact` candidates here lie outside the target's scope.
 pub(crate) fn not_found(expected: usize, candidates: &[Candidate]) -> String {
-    format!(
-        "Expected {expected} occurrence(s), found 0; {}",
-        advice(candidates)
-    )
+    match candidates.first() {
+        Some(first) if first.kind == CandidateKind::Exact => format!(
+            "Expected {expected} occurrence(s) in the scope, found 0; the text is outside it, first at {}. Use a scope that contains the intended occurrence {REPAIR}.",
+            place(first)
+        ),
+        _ => format!(
+            "Expected {expected} occurrence(s), found 0; {}",
+            advice(candidates)
+        ),
+    }
 }
 
 /// Describes an unmet span expectation, quoting the text the span selected.
@@ -102,11 +134,7 @@ fn advice(candidates: &[Candidate]) -> String {
     };
     let (count, line) = (candidates.len(), first.line);
     let many = count > 1;
-    let place = if line == first.end_line {
-        format!("line {line}")
-    } else {
-        format!("lines {line}-{}", first.end_line)
-    };
+    let place = place(first);
     let percent = first.similarity.unwrap_or_default();
     let finding = match (first.kind, many) {
         (CandidateKind::Exact, false) => format!("the expected text is at {place}"),
@@ -134,6 +162,14 @@ fn advice(candidates: &[Candidate]) -> String {
         (_, true, true) => "Copy the intended one's exact text into `old`",
     };
     format!("{finding}. {action} {REPAIR}.")
+}
+
+fn place(candidate: &Candidate) -> String {
+    if candidate.line == candidate.end_line {
+        format!("line {}", candidate.line)
+    } else {
+        format!("lines {}-{}", candidate.line, candidate.end_line)
+    }
 }
 
 /// Source text on one line, escaped like a Rust string literal and clipped at
@@ -307,21 +343,6 @@ impl Iterator for Normalized<'_> {
             return Some((byte, start..start + 1));
         }
     }
-}
-
-fn prefix_table(pattern: &[u8]) -> Vec<usize> {
-    let mut prefix = vec![0; pattern.len()];
-    for index in 1..pattern.len() {
-        let mut matched = prefix[index - 1];
-        while matched > 0 && pattern[index] != pattern[matched] {
-            matched = prefix[matched - 1];
-        }
-        if pattern[index] == pattern[matched] {
-            matched += 1;
-        }
-        prefix[index] = matched;
-    }
-    prefix
 }
 
 /// Needle edges that normalization discards. A candidate region absorbs the

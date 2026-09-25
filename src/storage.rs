@@ -135,6 +135,14 @@ impl Outcome {
     }
 }
 
+/// Blobs one object load has read, and their directory once it is resolved: checking
+/// the state directories again for every reference would repeat the same system calls.
+#[derive(Default)]
+struct LoadedBlobs {
+    directory: Option<PathBuf>,
+    texts: HashMap<String, String>,
+}
+
 struct TargetFile {
     path: PathBuf,
     identity: Handle,
@@ -290,17 +298,13 @@ impl Storage {
     /// verified content. Objects written inline by 0.2.0 have no references.
     fn load(&self, path: &Path) -> Result<Value, Error> {
         let mut payload = decode(&fs::read(path)?)?;
-        self.rehydrate(&mut payload, &mut HashMap::new())?;
+        self.rehydrate(&mut payload, &mut LoadedBlobs::default())?;
         Ok(payload)
     }
 
     /// One object can name the same content several times, such as an unchanged output or
     /// an inspected file, so `loaded` reads and verifies each blob once.
-    fn rehydrate(
-        &self,
-        value: &mut Value,
-        loaded: &mut HashMap<String, String>,
-    ) -> Result<(), Error> {
+    fn rehydrate(&self, value: &mut Value, loaded: &mut LoadedBlobs) -> Result<(), Error> {
         match value {
             Value::Array(items) => items
                 .iter_mut()
@@ -311,11 +315,17 @@ impl Storage {
                         .values_mut()
                         .try_for_each(|item| self.rehydrate(item, loaded));
                 };
-                let text = match loaded.get(&name) {
+                let text = match loaded.texts.get(&name) {
                     Some(text) => text.clone(),
                     None => {
-                        let text = get_blob(&self.directory(BLOB_DIRECTORY)?, &name)?;
-                        loaded.insert(name, text.clone());
+                        let directory = match loaded.directory.take() {
+                            Some(directory) => directory,
+                            None => self.directory(BLOB_DIRECTORY)?,
+                        };
+                        let text = get_blob(&directory, &name);
+                        loaded.directory = Some(directory);
+                        let text = text?;
+                        loaded.texts.insert(name, text.clone());
                         text
                     }
                 };

@@ -1216,3 +1216,41 @@ fn diagnostics_without_candidates_keep_their_serialized_form() {
     let decoded: [Diagnostic; 2] = serde_json::from_value(encoded).unwrap();
     assert_eq!(decoded, [whitespace, similar]);
 }
+
+#[test]
+fn a_scope_that_misses_the_text_points_to_where_it_is() {
+    // An off-by-one scope must not suggest a similar line inside the scope when
+    // the exact text sits just outside it.
+    let base = snapshot(
+        "main.rs".into(),
+        "fn main() {\n    let y = 2;\n    let x = 1;\n}\n".into(),
+    );
+    let error = rejected(&base, scoped("x", "    let x = 1;", "r2"));
+    assert_eq!(error.code, "TARGET_NOT_FOUND");
+    assert_eq!(
+        error.candidates,
+        [candidate(CandidateKind::Exact, (3, 3), "    let x = 1;")]
+    );
+    assert!(
+        error.message.contains("outside it, first at line 3"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn candidate_searches_per_request_are_capped() {
+    let base = snapshot("cap.txt".into(), "\tvalue = 1\n".into());
+    let changes = (0..10)
+        .map(|index| exact(&format!("c{index}"), "  value = 1", "x"))
+        .collect();
+    let errors = compile(&request(&base, changes), &bases(&base)).unwrap_err();
+    assert_eq!(errors.len(), 10);
+    let searched: Vec<_> = errors
+        .iter()
+        .map(|error| !error.candidates.is_empty())
+        .collect();
+    let cap = ultra_edit::compiler::MAX_CANDIDATE_SEARCHES;
+    assert!(searched[..cap].iter().all(|found| *found), "{searched:?}");
+    assert!(searched[cap..].iter().all(|found| !found), "{searched:?}");
+}

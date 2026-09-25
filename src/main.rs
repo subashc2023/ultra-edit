@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use ultra_edit::workspace::{EditResult, receipt_report};
-use ultra_edit::{Change, CommitStatus, Error, FullRead, Preparation, Workspace};
+use ultra_edit::{Change, CommitStatus, Error, FullRead, Preparation, Workspace, report};
 
 const HELP: &str = concat!(
     "ultra-edit ",
@@ -34,7 +34,7 @@ Output is JSON. Exit codes: 0 successful read/preview/commit/reconciliation, 2 r
 3 commit not fully confirmed. References and receipts live in WORKSPACE/.ultra-edit.
 Omitted request_id (except for retry) and change ids are derived from the request; an
 identical request returns its recorded result, marked \"replayed\": true.
-See README.md for request schemas, preservation policy, and initial limitations.
+See docs/reference.md for request schemas, preservation policy, and limits.
 "
 );
 
@@ -60,7 +60,7 @@ fn main() -> ExitCode {
             )
         }
     };
-    ultra_edit::report::display_paths(&mut value);
+    report::display_paths(&mut value);
     let stdout = io::stdout();
     let mut writer = stdout.lock();
     if serde_json::to_writer_pretty(&mut writer, &value).is_err() || writeln!(writer).is_err() {
@@ -227,35 +227,18 @@ fn preparation(preparation: Preparation) -> (Value, u8) {
         return completed(receipt, preparation.replayed);
     }
     let code = if preparation.ready { 0 } else { 2 };
-    let diagnostic_summary = preparation.diagnostics.iter().take(6).map(|diagnostic| {
-        // Full strings/counts remain in the draft; inline diagnostics cannot grow with source size.
-        let mut summary = json!({
-            "code": diagnostic.code.chars().take(80).collect::<String>(),
-            "file": diagnostic.file.as_ref().map(|path| path.chars().take(500).collect::<String>()),
-            "change_id": diagnostic.change_id.as_ref().map(|id| id.chars().take(80).collect::<String>()),
-            "message": diagnostic.message.chars().take(240).collect::<String>(),
-            "expected": diagnostic.expected,
-            "actual": diagnostic.actual,
-        });
-        // Candidate text is complete or absent, never clipped, so it can be copied.
-        if !diagnostic.candidates.is_empty() {
-            summary["candidates"] = json!(diagnostic.candidates.iter().take(3).collect::<Vec<_>>());
-        }
-        summary
-    }).collect::<Vec<_>>();
-    let output = (
-        json!({
-            "reference": preparation.reference,
-            "ready": preparation.ready,
-            "diagnostic_count": preparation.diagnostics.len(),
-            "diagnostics": diagnostic_summary,
-            "warning_count": preparation.warnings.len(),
-            "warnings": warning_summary(&preparation.warnings),
-            "report": preparation.report,
-        }),
-        code,
-    );
-    replay_flagged(output, preparation.replayed)
+    let mut value = json!({
+        "request_id": preparation.request_id,
+        "reference": preparation.reference,
+        "ready": preparation.ready,
+        "diagnostic_count": preparation.diagnostics.len(),
+        "diagnostics": report::diagnostic_summaries(&preparation.diagnostics),
+        "warning_count": preparation.warnings.len(),
+        "warnings": report::warning_summaries(&preparation.warnings),
+        "report": preparation.report,
+    });
+    report::flag_replayed(&mut value, preparation.replayed);
+    (value, code)
 }
 
 fn edited(result: EditResult) -> (Value, u8) {
@@ -273,32 +256,14 @@ fn completed(receipt: ultra_edit::Receipt, replayed: bool) -> (Value, u8) {
     } else {
         3
     };
-    let output = (
-        json!({
-            "request_id": receipt.request_id,
-            "plan_id": receipt.plan_id,
-            "commit": receipt.commit,
-            "warning_count": receipt.warnings.len(),
-            "warnings": warning_summary(&receipt.warnings),
-            "report": receipt_report(&receipt, replayed),
-        }),
-        code,
-    );
-    replay_flagged(output, replayed)
-}
-
-/// Marks a recorded result returned without a new attempt; omitted otherwise.
-fn replay_flagged((mut value, code): (Value, u8), replayed: bool) -> (Value, u8) {
-    if replayed {
-        value["replayed"] = Value::Bool(true);
-    }
+    let mut value = json!({
+        "request_id": receipt.request_id,
+        "plan_id": receipt.plan_id,
+        "commit": receipt.commit,
+        "warning_count": receipt.warnings.len(),
+        "warnings": report::warning_summaries(&receipt.warnings),
+        "report": receipt_report(&receipt, replayed),
+    });
+    report::flag_replayed(&mut value, replayed);
     (value, code)
-}
-
-fn warning_summary(warnings: &[ultra_edit::Diagnostic]) -> Vec<Value> {
-    warnings.iter().take(6).map(|warning| json!({
-        "code": warning.code.chars().take(80).collect::<String>(),
-        "file": warning.file.as_ref().map(|path| path.chars().take(500).collect::<String>()),
-        "message": warning.message.chars().take(240).collect::<String>(),
-    })).collect()
 }

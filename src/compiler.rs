@@ -3,8 +3,8 @@ use std::ops::Range;
 
 use crate::candidates;
 use crate::model::{
-    Change, Diagnostic, EditRequest, PreparedFile, PreparedPlan, Replacement, Snapshot, Span,
-    Target, digest, new_id,
+    Candidate, Change, Diagnostic, EditRequest, PreparedFile, PreparedPlan, Replacement, Snapshot,
+    Span, Target, digest, new_id,
 };
 
 pub const MAX_CHANGES: usize = 1_000;
@@ -15,11 +15,16 @@ pub const MAX_TEXT_BYTES: usize = 16 * 1024 * 1024;
 /// Source and needle bytes that a request's failed targets may search for
 /// near-miss candidates; failures beyond it are reported without candidates.
 pub const MAX_CANDIDATE_SEARCH_BYTES: usize = 2 * MAX_TEXT_BYTES;
+/// Failed targets per request that search for candidates, as many as a compact
+/// response shows. Each search aligns a bounded number of windows, so this caps
+/// the time a failing request holds the workspace lock.
+pub const MAX_CANDIDATE_SEARCHES: usize = 6;
 
 struct Budget {
     spans_left: usize,
     bytes_left: usize,
     search_bytes_left: usize,
+    searches_left: usize,
 }
 
 impl Budget {
@@ -37,6 +42,15 @@ impl Budget {
         self.spans_left = spans_left;
         self.bytes_left = bytes_left;
         true
+    }
+
+    /// Runs one candidate search against the request's shared limits.
+    fn candidates(&mut self, search: impl FnOnce(&mut usize) -> Vec<Candidate>) -> Vec<Candidate> {
+        let Some(left) = self.searches_left.checked_sub(1) else {
+            return Vec::new();
+        };
+        self.searches_left = left;
+        search(&mut self.search_bytes_left)
     }
 }
 
@@ -156,6 +170,7 @@ pub fn compile(
         spans_left: MAX_REPLACEMENTS,
         bytes_left: MAX_TEXT_BYTES,
         search_bytes_left: MAX_CANDIDATE_SEARCH_BYTES,
+        searches_left: MAX_CANDIDATE_SEARCHES,
     };
     let mut overlap_count = 0;
     let mut overlap_limit_reached = false;
@@ -472,8 +487,9 @@ fn resolve_change(
                 if let Some(expect) = expect.as_ref().filter(|text| *text != actual) {
                     // The span may be the wrong one, so search the whole snapshot.
                     let whole = 0..base.text.len();
-                    let search = &mut budget.search_bytes_left;
-                    let found = candidates::find(search, &base.text, whole, expect, true);
+                    let found = budget.candidates(|search| {
+                        candidates::find(search, &base.text, whole, expect, true)
+                    });
                     let mut diagnostic = at(
                         Some(&base.path),
                         Some(change),
@@ -534,8 +550,7 @@ fn resolve_change(
         };
         // Counts explain a target that matched somewhere; only a miss searches.
         let found = if actual == 0 {
-            let search = &mut budget.search_bytes_left;
-            candidates::find(search, &base.text, start..end, old, false)
+            budget.candidates(|search| candidates::find_target(search, &base.text, start..end, old))
         } else {
             Vec::new()
         };
@@ -595,17 +610,7 @@ fn scan_occurrences(source: &str, old: &str, offset: usize, retained: usize) -> 
     }
     let needle = old.as_bytes();
     // KMP keeps overlapping counts linear even for a long, highly repetitive needle.
-    let mut prefix = vec![0; needle.len()];
-    for index in 1..needle.len() {
-        let mut matched = prefix[index - 1];
-        while matched > 0 && needle[index] != needle[matched] {
-            matched = prefix[matched - 1];
-        }
-        if needle[index] == needle[matched] {
-            matched += 1;
-        }
-        prefix[index] = matched;
-    }
+    let prefix = prefix_table(needle);
     let mut overlapping = 0;
     let mut non_overlapping = 0;
     let mut next_non_overlapping_start = 0;
@@ -636,6 +641,23 @@ fn scan_occurrences(source: &str, old: &str, offset: usize, retained: usize) -> 
         non_overlapping,
         positions,
     }
+}
+
+/// The KMP failure function: for each prefix of `pattern`, the length of its
+/// longest proper prefix that is also a suffix.
+pub(crate) fn prefix_table(pattern: &[u8]) -> Vec<usize> {
+    let mut prefix = vec![0; pattern.len()];
+    for index in 1..pattern.len() {
+        let mut matched = prefix[index - 1];
+        while matched > 0 && pattern[index] != pattern[matched] {
+            matched = prefix[matched - 1];
+        }
+        if pattern[index] == pattern[matched] {
+            matched += 1;
+        }
+        prefix[index] = matched;
+    }
+    prefix
 }
 
 fn resource_limit(base: &Snapshot, change: &Change) -> Diagnostic {

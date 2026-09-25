@@ -583,7 +583,8 @@ fn hook_mode_rejects_other_arguments_and_is_documented() {
             .args(args)
             .output()
             .unwrap();
-        assert!(!output.status.success(), "{output:?}");
+        // Exit code 2 would make Claude Code block every Bash call.
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
         assert!(output.stdout.is_empty());
         assert!(!output.stderr.is_empty());
     }

@@ -20,7 +20,7 @@ const REPAIR_DOMAIN: &[u8] = b"ultra-edit:repair:v1\0";
 const UNDO_DOMAIN: &[u8] = b"ultra-edit:undo:v1\0";
 
 /// Leads the report of a replayed result so it cannot pass for a new attempt.
-pub const REPLAY_NOTICE: &str = "Replayed the recorded result; nothing new was attempted. Take fresh snapshots to apply a change again.";
+pub const REPLAY_NOTICE: &str = "Replayed the recorded result; nothing new was attempted. To try again, pass a new explicit request_id, or for an edit, take fresh snapshots.";
 
 /// Filesystem host. Each operation coordinates with other hosts using the same workspace root.
 pub struct Workspace {
@@ -802,6 +802,7 @@ impl Workspace {
                     None => report::preview(&plan, lines, chars),
                 });
                 Ok(Preparation {
+                    request_id: plan.request.request_id.clone(),
                     reference: plan.id.clone(),
                     ready: true,
                     diagnostics: vec![],
@@ -812,6 +813,7 @@ impl Workspace {
                 })
             }
             Evidence::Draft(draft) => Ok(Preparation {
+                request_id: draft.request.request_id.clone(),
                 reference: draft.id.clone(),
                 ready: false,
                 report: bounded(replayed, |_, _| {

@@ -249,8 +249,10 @@ exact current bytes, omitted rather than clipped above 2,000 characters.
 `similarity` is a percentage, present only for `similar`. The first tier with
 results supplies the candidates:
 
-- `exact`, for expectation mismatches only: the expected text occurs literally
-  elsewhere.
+- `exact`: an unmet expectation's text occurs literally elsewhere, or a scoped
+  `exact`/`all` target's text occurs outside its scope. A wrong scope, such as an
+  off-by-one line, is checked first, so it is never answered with a similar line
+  inside the scope.
 - `whitespace`: equal after CRLF becomes LF, spaces and tabs before line ends
   are dropped, other space/tab runs collapse to one space, and the needle's own
   leading and trailing spaces and tabs are trimmed. The region includes the
@@ -259,7 +261,9 @@ results supplies the candidates:
 - `similar`: at least 70% by edit distance on whitespace-squeezed text, with
   bounded work; skipped above 200,000 scope lines or 20,000 needle characters.
 
-A request spends at most 32 MiB of candidate search; later failures get none.
+Only the first six failed targets of a request are searched, within 32 MiB of
+scanned text, so a request with many failures cannot hold the workspace lock
+for long; later failures get no candidates.
 For `exact` and `whitespace` candidates, copy `text` verbatim into `old` and
 write the replacement with the file's tabs and line endings. Confirm that a
 `similar` candidate is the intended region first: it can be a structurally
@@ -333,7 +337,8 @@ no new commit attempt; the field is omitted otherwise. This covers `edit`,
 has a receipt (including an interrupted one); `receipt` never sets it. `edit`
 after `prepare` of the identical request commits the stored plan, so it is not a
 replay; a second `edit` is. A replayed report begins "Replayed the recorded result;
-nothing new was attempted. Take fresh snapshots to apply a change again." Exit
+nothing new was attempted. To try again, pass a new explicit request_id, or for
+an edit, take fresh snapshots." Exit
 codes are unchanged, and a replay never writes target files. To apply identical
 content again, take fresh snapshots (a new base derives a new ID) or pass a new
 explicit ID. Different arguments under an explicit ID fail with

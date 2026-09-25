@@ -70,10 +70,15 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
-    if arguments.len() == 2 && arguments[0] == "--claude-hook" {
-        if arguments[1] != "PreToolUse" {
-            eprintln!("--claude-hook requires PreToolUse");
-            return ExitCode::from(2);
+    if arguments
+        .first()
+        .is_some_and(|argument| argument == "--claude-hook")
+    {
+        // Claude Code blocks the tool call on exit code 2, so a misconfigured
+        // guard reports a non-blocking error rather than denying every command.
+        if arguments.len() != 2 || arguments[1] != "PreToolUse" {
+            eprintln!("--claude-hook requires exactly PreToolUse");
+            return ExitCode::from(1);
         }
         guard_bash_writes();
         return ExitCode::SUCCESS;

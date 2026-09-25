@@ -9,17 +9,22 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 - When an `exact` or `all` target is not found, or a span's `expect` fails,
   diagnostics list up to three `candidates` (`exact`, `whitespace`, or `similar`)
-  with line numbers and the exact current text to copy.
+  with line numbers and the exact current text to copy. A scoped target whose
+  text lies outside its scope reports where it is. Only the first six failed
+  targets of a request are searched.
 - Range reads can continue a snapshot (`read-range PATH FIRST LAST SNAPSHOT`, MCP
   `range.snapshot`) and keep its spans, so one request can edit distant regions
   of a file. Range responses report `stale`.
 - `request_id` and change `id` are optional; omitted IDs are derived from the
   request (`auto-…` and `"1.2"`). Retry still requires an explicit request ID.
 - Responses mark a recorded result returned without a new attempt with
-  `replayed: true`, and replayed reports start with a notice.
+  `replayed: true`, and replayed reports start with a notice. CLI preparation
+  output now includes `request_id`, so a derived ID can be used with `receipt`.
 - A `PreToolUse` hook (`ultra-edit-mcp --claude-hook PreToolUse`) denies Bash
   commands that write file content through the shell. Set
-  `ULTRA_EDIT_SHELL_WRITES=allow` in Claude Code's environment to disable it.
+  `ULTRA_EDIT_SHELL_WRITES=allow` in Claude Code's environment to disable it. The
+  hook allows anything it cannot parse, and a misconfigured hook exits with a
+  non-blocking error rather than denying every command.
 - An evaluation harness (`eval/`) compares native editing, native editing with
   the guard, and Ultra Edit on fixture tasks.
 - `prune-snapshots` reports and removes unreferenced blobs (`reclaimable_blobs`,
