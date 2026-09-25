@@ -1,7 +1,10 @@
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use serde_json::json;
 use tempfile::TempDir;
+use ultra_edit::storage::Storage;
 use ultra_edit::workspace::{EditResult, Evidence};
 use ultra_edit::*;
 
@@ -649,6 +652,8 @@ fn pruning_validates_retained_state_and_all_candidates_before_deleting_anything(
         "inspections",
         "snapshots",
         "journals",
+        // Blob collection scans every object directory, including kinds it does not know.
+        "custom",
     ] {
         let (dir, workspace, snapshot) = setup("one");
         let preview = workspace
@@ -685,4 +690,145 @@ fn pruning_validates_retained_state_and_all_candidates_before_deleting_anything(
         );
         assert!(workspace.evidence(&preview.reference).is_ok());
     }
+}
+
+/// Over the blob threshold, with one `before` line.
+fn large(tag: &str) -> String {
+    let mut text = String::from("before\n");
+    for line in 0..300 {
+        text.push_str(&format!("{tag} line {line:04} stays unchanged\n"));
+    }
+    text
+}
+
+fn blob_path(root: &Path, text: &str) -> PathBuf {
+    root.join(".ultra-edit/blobs").join(digest(text.as_bytes()))
+}
+
+#[test]
+fn pruning_removes_unreferenced_and_orphaned_blobs_and_keeps_referenced_ones() {
+    let kept = large("kept");
+    let (dir, workspace, _) = setup(&kept);
+    let planned = workspace.read_range("file.txt", 1, 1).unwrap();
+    let preview = workspace
+        .prepare(EditRequest {
+            request_id: "planned".into(),
+            files: vec![FileRequest {
+                base: planned.snapshot.clone(),
+                changes: vec![Change {
+                    id: "c".into(),
+                    target: Target::Span {
+                        span: "r1".into(),
+                        expect: Some("before".into()),
+                    },
+                    text: "after".into(),
+                }],
+            }],
+        })
+        .unwrap();
+    assert!(preview.ready);
+    let output = kept.replacen("before", "after", 1);
+    let discarded = large("discarded");
+    fs::write(dir.path().join("other.txt"), &discarded).unwrap();
+    workspace.read_range("other.txt", 1, 1).unwrap();
+    // An object publication interrupted after its blob was written leaves an orphan;
+    // one interrupted while staging leaves a temporary file, which is not a blob.
+    let orphan = large("orphan");
+    fs::write(blob_path(dir.path(), &orphan), &orphan).unwrap();
+    let staged = dir.path().join(".ultra-edit/blobs/.ultra-edit-staged");
+    fs::write(&staged, "partial").unwrap();
+    let paths = |texts: &[&str]| {
+        texts
+            .iter()
+            .map(|text| blob_path(dir.path(), text))
+            .collect::<Vec<_>>()
+    };
+
+    let by_age = workspace
+        .prune_snapshots(Duration::from_secs(3600), false)
+        .unwrap();
+    assert!(by_age.eligible.is_empty());
+    assert_eq!(by_age.reclaimable_blobs, 1);
+    assert_eq!(by_age.reclaimable_blob_bytes, orphan.len() as u64);
+    assert_eq!(by_age.retained_blobs, 3);
+
+    let dry_run = workspace.prune_snapshots(Duration::ZERO, false).unwrap();
+    assert_eq!(dry_run.eligible.len(), 2);
+    assert_eq!(dry_run.reclaimable_blobs, 2);
+    assert_eq!(
+        dry_run.reclaimable_blob_bytes,
+        (discarded.len() + orphan.len()) as u64
+    );
+    assert_eq!(dry_run.retained_blobs, 2);
+    assert_eq!(dry_run.removed_blobs, 0);
+    for path in paths(&[&kept, &output, &discarded, &orphan]) {
+        assert!(path.exists(), "{}", path.display());
+    }
+
+    let pruned = workspace.prune_snapshots(Duration::ZERO, true).unwrap();
+    assert_eq!(pruned.removed_snapshots, 2);
+    assert_eq!(pruned.reclaimable_blobs, 2);
+    assert_eq!(pruned.removed_blobs, 2);
+    assert_eq!(pruned.retained_blobs, 2);
+    for path in paths(&[&discarded, &orphan]) {
+        assert!(!path.exists(), "{}", path.display());
+    }
+    for path in paths(&[&kept, &output]) {
+        assert!(path.exists(), "{}", path.display());
+    }
+    assert!(staged.exists());
+    let Evidence::Snapshot(snapshot) = workspace.evidence(&planned.snapshot).unwrap() else {
+        panic!("Expected snapshot evidence")
+    };
+    assert_eq!(snapshot.text, kept);
+    let receipt = workspace.commit(&preview.reference).unwrap();
+    assert_eq!(receipt.commit, CommitStatus::Committed);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+        output
+    );
+    let repeated = workspace.prune_snapshots(Duration::ZERO, true).unwrap();
+    assert_eq!(repeated.reclaimable_blobs, 0);
+    assert_eq!(repeated.removed_blobs, 0);
+    let after = receipt.files[0].after.clone().unwrap();
+    let Evidence::Snapshot(snapshot) = workspace.evidence(&after).unwrap() else {
+        panic!("Expected snapshot evidence")
+    };
+    assert_eq!(snapshot.text, output);
+}
+
+#[test]
+fn pruning_keeps_blobs_of_any_object_kind_and_refuses_missing_blobs() {
+    let (dir, workspace, _) = setup("small");
+    let custom = large("custom");
+    let storage = Storage::open(dir.path()).unwrap();
+    {
+        let _lock = storage.lock().unwrap();
+        storage
+            .put("custom", "c1", &json!({ "text": custom }))
+            .unwrap();
+    }
+    let pruned = workspace.prune_snapshots(Duration::ZERO, true).unwrap();
+    assert_eq!(pruned.removed_snapshots, 1);
+    assert_eq!(pruned.retained_blobs, 1);
+    assert_eq!(pruned.removed_blobs, 0);
+    assert!(blob_path(dir.path(), &custom).exists());
+
+    let other = large("other");
+    fs::write(dir.path().join("other.txt"), &other).unwrap();
+    let unused = workspace.read_range("other.txt", 1, 1).unwrap();
+    let unused_path = dir
+        .path()
+        .join(".ultra-edit/snapshots")
+        .join(format!("{}.json", unused.snapshot));
+    fs::remove_file(blob_path(dir.path(), &custom)).unwrap();
+    for apply in [false, true] {
+        let error = workspace
+            .prune_snapshots(Duration::ZERO, apply)
+            .unwrap_err();
+        assert_eq!(error.code, "STORE_CORRUPT");
+        assert!(error.message.contains(&digest(custom.as_bytes())));
+    }
+    assert!(unused_path.exists());
+    assert!(blob_path(dir.path(), &other).exists());
 }
