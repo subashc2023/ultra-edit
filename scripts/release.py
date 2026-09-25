@@ -226,10 +226,18 @@ def _validate_hooks_config(config: Mapping[str, object], source: str) -> None:
     if not isinstance(hooks, dict):
         raise ReleaseError(f"{source} must contain a hooks object")
     command = "${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp"
-    for event in ("SessionStart", "SubagentStart"):
+    # Context hooks cover every source of their event; the shell-write guard applies to Bash.
+    events = {
+        "SessionStart": (None, ["--claude-context", "SessionStart"]),
+        "SubagentStart": (None, ["--claude-context", "SubagentStart"]),
+        "PreToolUse": ("Bash", ["--claude-hook", "PreToolUse"]),
+    }
+    for event, (matcher, args) in events.items():
         groups = hooks.get(event)
         if not isinstance(groups, list) or len(groups) != 1 or not isinstance(groups[0], dict):
             raise ReleaseError(f"{source} must define exactly one {event} hook group")
+        if groups[0].get("matcher") != matcher:
+            raise ReleaseError(f"{source} {event}.matcher must be {matcher!r}")
         commands = groups[0].get("hooks")
         if not isinstance(commands, list) or len(commands) != 1 or not isinstance(commands[0], dict):
             raise ReleaseError(f"{source} must define exactly one {event} command hook")
@@ -237,7 +245,7 @@ def _validate_hooks_config(config: Mapping[str, object], source: str) -> None:
         expected = {
             "type": "command",
             "command": command,
-            "args": ["--claude-context", event],
+            "args": args,
             "timeout": 10,
         }
         for key, value in expected.items():
