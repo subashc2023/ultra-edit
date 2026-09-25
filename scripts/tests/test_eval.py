@@ -623,7 +623,7 @@ class CommandTests(unittest.TestCase):
             {
                 "PreToolUse": [
                     {
-                        "matcher": "Bash",
+                        "matcher": "Bash|PowerShell",
                         "hooks": [
                             {
                                 "type": "command",
@@ -642,13 +642,11 @@ class CommandTests(unittest.TestCase):
         merged = evaluation.build_settings(
             "native-guard",
             "/opt/ue/ultra-edit-mcp",
-            "Bash|PowerShell",
+            "Bash",
             {"env": {"A": "1"}, "hooks": {"PreToolUse": [{"matcher": "Edit"}]}},
         )
         self.assertEqual(merged["env"], {"A": "1"})
-        self.assertEqual(
-            [entry["matcher"] for entry in merged["hooks"]["PreToolUse"]], ["Bash|PowerShell", "Edit"]
-        )
+        self.assertEqual([entry["matcher"] for entry in merged["hooks"]["PreToolUse"]], ["Bash", "Edit"])
 
     def test_prompt_argument_follows_print_flag_and_optional_flags_follow_help(self):
         info = evaluation.ClaudeInfo(
@@ -924,7 +922,16 @@ class IntegrityTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertIn("Ultra Edit MCP server still pending at init", warnings)
 
-    def test_guard_arm_requires_hook_events_for_bash_calls(self):
+    def test_guard_arm_requires_hook_events_for_shell_calls(self):
+        powershell = (
+            assistant("m", tool_use("t", "PowerShell", {"command": "Get-ChildItem"})),
+            tool_result("t", "a"),
+        )
+        silent = transcript_from(init_message(), *powershell, result_message())
+        errors, _ = evaluation.check_integrity("native-guard", silent)
+        self.assertTrue(errors and errors[0].startswith("PowerShell called"), errors)
+        # A matcher without PowerShell expects no hook event for it.
+        self.assertEqual(evaluation.check_integrity("native-guard", silent, guard_matcher="Bash"), ([], []))
         bash = (assistant("m", tool_use("t", "Bash", {"command": "ls"})), tool_result("t", "a"))
         silent = transcript_from(init_message(), *bash, result_message())
         errors, _ = evaluation.check_integrity("native-guard", silent)
@@ -961,8 +968,9 @@ class IntegrityTests(unittest.TestCase):
         self.assertEqual(evaluation.classify(max_turns, wrong, [], False), "fail")
 
 
-# A stand-in ultra-edit-mcp whose `--claude-hook PreToolUse` denies heredocs.
-# Any other arguments get a usage error and exit 2, like a build without the mode.
+# A stand-in ultra-edit-mcp whose `--claude-hook PreToolUse` denies heredocs and
+# here-strings. Any other arguments get a usage error and exit 2, like a build
+# without the mode.
 GUARD_RUNTIME = r"""
 import json
 import sys
@@ -978,7 +986,8 @@ args = sys.argv[1:]
 if args == ["--version"]:
     print("ultra-edit-mcp 0.0.0-test")
 elif args == ["--claude-hook", "PreToolUse"]:
-    if "<<" in json.load(sys.stdin)["tool_input"]["command"]:
+    command = json.load(sys.stdin)["tool_input"]["command"]
+    if "<<" in command or "@'" in command:
         print(json.dumps(DENY))
 else:
     sys.stderr.write("Usage: ultra-edit-mcp --root WORKSPACE\n")
@@ -1072,6 +1081,18 @@ class HarnessProcessTests(unittest.TestCase):
         problems = evaluation.check_guard_hook([sys.executable, str(hook), "--unsupported"], self.root, env)
         self.assertTrue(any("git status" in problem for problem in problems), problems)
         self.assertTrue(any("rebuild" in problem for problem in problems), problems)
+        # A runtime that only guards Bash fails the PowerShell probe unless the
+        # matcher leaves PowerShell out.
+        bash_only = self.root / "bash_only_runtime.py"
+        bash_only.write_text(
+            GUARD_RUNTIME.replace("""if "<<" in command or "@'" in command:""", 'if "<<" in command:'),
+            encoding="utf-8",
+        )
+        argv = [sys.executable, str(bash_only), *evaluation.GUARD_HOOK_ARGS]
+        problems = evaluation.check_guard_hook(argv, self.root, env)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("allowed PowerShell", problems[0])
+        self.assertEqual(evaluation.check_guard_hook(argv, self.root, env, "Bash"), [])
 
     @unittest.skipUnless(HAS_GIT, "git is required")
     def test_run_one_scores_exact_bytes_and_records_artifacts(self):
