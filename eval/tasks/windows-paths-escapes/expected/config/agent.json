@@ -1,0 +1,8 @@
+{
+  "name": "acme-agent",
+  "logDir": "D:\\AcmeData\\logs\\current",
+  "cacheDir": "C:\\ProgramData\\Acme\\cache",
+  "shareRoot": "\\\\fs02\\acme$\\drops",
+  "linePattern": "^(\\d{4}-\\d{2}-\\d{2}) \\[([A-Z]+)\\] (.*)$",
+  "banner": "Tab\there, quote \" and newline \\n stay escaped"
+}

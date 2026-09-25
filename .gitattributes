@@ -22,3 +22,6 @@ packaging/launcher.sh text eol=lf
 
 # Keep the catalog byte-identical to the generated release asset it mirrors.
 .claude-plugin/marketplace.json text eol=lf
+
+# Keep evaluation fixtures and expected files byte-exact (CRLF, BOM, tabs, trailing spaces).
+eval/tasks/** -text
