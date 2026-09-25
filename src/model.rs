@@ -51,14 +51,18 @@ pub struct RangeRead {
     pub snapshot: String,
     pub path: String,
     pub digest: String,
+    /// True when the continued snapshot no longer matches the current file, so
+    /// an edit against it is rejected with `STALE_SNAPSHOT`.
+    pub stale: bool,
     pub total_lines: usize,
     pub total_bytes: usize,
     pub start: usize,
     pub end: usize,
     pub text: String,
-    /// Disclosed reference IDs, with consecutive line IDs collapsed to ranges.
+    /// Every reference ID the snapshot discloses, including those a continued
+    /// snapshot retained, with consecutive line IDs collapsed to ranges.
     pub spans: Vec<String>,
-    /// Each disclosed line as `"{id} | {body}"`.
+    /// Each line of this range as `"{id} | {body}"`.
     pub lines: Vec<String>,
 }
 
