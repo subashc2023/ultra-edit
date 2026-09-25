@@ -1204,16 +1204,49 @@ fn class_name(name: &str) -> String {
     }
 }
 
-/// Whether an expression rewrites text with `-replace` or `.Replace()`.
+/// Whether an expression rewrites text: `-replace`, `.Replace()`,
+/// `.Insert()`, `.Remove()`, or `+` with a literal.
 fn transforms(atoms: &[Atom]) -> bool {
-    atoms.iter().any(|atom| match &atom.kind {
-        Kind::Bare(text) => matches!(
-            text.to_ascii_lowercase().as_str(),
-            "-replace" | "-creplace" | "-ireplace"
-        ),
-        Kind::Member(name) => name.eq_ignore_ascii_case("replace"),
-        _ => false,
-    })
+    atoms
+        .iter()
+        .enumerate()
+        .any(|(index, atom)| match &atom.kind {
+            // Concatenating a literal adds text to the content.
+            Kind::Bare(text) if text == "+" => atoms[index + 1..]
+                .iter()
+                .any(|atom| matches!(atom.kind, Kind::Quoted(_) | Kind::Here(_))),
+            Kind::Bare(text) => matches!(
+                text.to_ascii_lowercase().as_str(),
+                "-replace" | "-creplace" | "-ireplace"
+            ),
+            Kind::Member(name) => matches!(
+                name.to_ascii_lowercase().as_str(),
+                "insert" | "remove" | "replace"
+            ),
+            _ => false,
+        })
+}
+
+/// The first argument of the `(...)` call joined to a method name.
+fn first_argument(call: Option<&Atom>) -> Option<&[Atom]> {
+    let Some(Atom {
+        kind: Kind::Group(Bracket::Paren, script),
+        spaced: false,
+        ..
+    }) = call
+    else {
+        return None;
+    };
+    let [pipeline] = script.as_slice() else {
+        return None;
+    };
+    let [element] = pipeline.as_slice() else {
+        return None;
+    };
+    element
+        .atoms
+        .split(|atom| matches!(atom.kind, Kind::Punct(b',')))
+        .next()
 }
 
 /// Attributes embedded content to the program it came from or, for a
@@ -1464,8 +1497,8 @@ impl Checker<'_> {
     }
 
     /// What an expression yields: literal text, a variable's content, a
-    /// bracketed pipeline's output, or a .NET read, rewritten by any
-    /// `-replace` or `.Replace()` that follows.
+    /// bracketed pipeline's output, or a .NET read or regex replacement,
+    /// rewritten by any transform that follows it.
     fn expression(&mut self, atoms: &[Atom]) -> Option<Flow> {
         let first = atoms.first()?;
         let flow = match &first.kind {
@@ -1479,18 +1512,25 @@ impl Checker<'_> {
                 [pipeline] => self.flow(pipeline).ok().flatten()?,
                 _ => return None,
             },
-            Kind::Type(class) => match atoms.get(1).map(|atom| &atom.kind) {
-                Some(Kind::Member(member))
-                    if class_name(class) == "io.file"
-                        && matches!(
-                            member.to_ascii_lowercase().as_str(),
-                            "readalllines" | "readalltext"
-                        ) =>
-                {
-                    Flow::Read
+            Kind::Type(class) => {
+                let Some(Kind::Member(member)) = atoms.get(1).map(|atom| &atom.kind) else {
+                    return None;
+                };
+                match (
+                    class_name(class).as_str(),
+                    member.to_ascii_lowercase().as_str(),
+                ) {
+                    ("io.file", "readalllines" | "readalltext") => Flow::Read,
+                    // `[regex]::Replace(text, ...)` rewrites its first argument.
+                    ("regex" | "text.regularexpressions.regex", "replace") => {
+                        match self.expression(first_argument(atoms.get(2))?)? {
+                            Flow::Read => Flow::Transformed,
+                            flow => flow,
+                        }
+                    }
+                    _ => return None,
                 }
-                _ => return None,
-            },
+            }
             _ => return None,
         };
         Some(match flow {
@@ -1652,26 +1692,7 @@ impl Checker<'_> {
 
     /// Whether a .NET call's first argument may be a path in the project.
     fn call_inside(&self, call: Option<&Atom>) -> bool {
-        let Some(Atom {
-            kind: Kind::Group(Bracket::Paren, script),
-            spaced: false,
-            ..
-        }) = call
-        else {
-            return true;
-        };
-        let [pipeline] = script.as_slice() else {
-            return true;
-        };
-        let [element] = pipeline.as_slice() else {
-            return true;
-        };
-        let path = element
-            .atoms
-            .split(|atom| matches!(atom.kind, Kind::Punct(b',')))
-            .next()
-            .unwrap_or_default();
-        path.is_empty() || self.counts(path)
+        first_argument(call).is_none_or(|path| path.is_empty() || self.counts(path))
     }
 
     /// Whether a write to the path `atoms` name may reach a project file.

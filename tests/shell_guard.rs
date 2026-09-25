@@ -1078,6 +1078,21 @@ const DENIED_POWERSHELL: &[(&str, Pattern, &str)] = &[
         InPlaceEdit,
         "Set-Content",
     ),
+    (
+        "(Get-Content a.txt) + 'new line' | Set-Content a.txt",
+        InPlaceEdit,
+        "Set-Content",
+    ),
+    (
+        "$c = Get-Content a.txt -Raw; $c.Insert(0, \"// header`n\") | Set-Content a.txt",
+        InPlaceEdit,
+        "Set-Content",
+    ),
+    (
+        "[regex]::Replace((Get-Content a.txt -Raw), 'a', 'b') | Set-Content a.txt",
+        InPlaceEdit,
+        "Set-Content",
+    ),
     // .NET write APIs.
     (
         "[IO.File]::WriteAllText(\"a.txt\", \"x\")",
@@ -1173,6 +1188,8 @@ const ALLOWED_POWERSHELL: &[&str] = &[
     "Get-Content a | Set-Content b",
     "Get-Content a.txt -Raw | Set-Content b.txt -NoNewline",
     "(Get-Content a.txt | Select-Object -First 5) | Set-Content b.txt",
+    "(Get-Content a.txt) + (Get-Content b.txt) | Set-Content c.txt",
+    "[regex]::Replace($name, '-', '_') | Set-Content name.txt",
     "$c = Get-Content a.txt -Raw; Set-Content b.txt \"$c\"",
     "Copy-Item a.txt b.txt",
     "echo x > $null",

@@ -201,8 +201,9 @@ content embedded in the command into project files:
 - in PowerShell, here-strings, string literals, or `Write-Output` arguments
   written by `Set-Content` (`sc`), `Add-Content` (`ac`), `Out-File`,
   `Tee-Object`, `New-Item -Value`, `>`, `>>`, or `*>`; `Get-Content` text
-  rewritten by `-replace`, `.Replace()`, or `ForEach-Object` and written back,
-  directly or through a variable; and .NET writes such as
+  rewritten by `-replace`, `[regex]::Replace`, `.Replace()`, `.Insert()`,
+  `.Remove()`, `+` with a literal, an item assignment, or `ForEach-Object` and
+  written back, directly or through a variable; and .NET writes such as
   `[IO.File]::WriteAllText` or `[IO.StreamWriter]::new`. External programs run
   from PowerShell get the Bash checks.
 
