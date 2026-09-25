@@ -129,6 +129,15 @@ python3 eval/run_eval.py --preflight
 python3 eval/run_eval.py --model sonnet --reps 1 --max-total-usd 5
 ```
 
+GitHub Actions: add an `ANTHROPIC_API_KEY` repository secret (a dedicated key
+with a spend limit), or `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`, then
+run the manual `Eval` workflow (`.github/workflows/eval.yml`). It builds the
+runtime on `ubuntu-24.04` or `windows-2025`, installs the pinned Claude Code,
+runs the preflight, then evaluates with the chosen model, repetitions, spend
+limit, and tasks. The runner is a fresh VM, so `bypassPermissions` is contained.
+The job summary shows `summary.md`; the `eval-<runner>-<run id>` artifact holds
+the full results, with the secret's value redacted from every file.
+
 Narrow a run with repeatable `--task NAME` and `--arm NAME`. Pin `--model` so
 every arm uses the same model. Other options: `--max-turns` (default 50),
 `--timeout` seconds per run (default 900), `--effort`, `--keep-workdirs` (keep

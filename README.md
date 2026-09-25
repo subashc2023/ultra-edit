@@ -300,9 +300,9 @@ the hook modes. Use `Workspace` for host integration; low-level `Storage` calls
 require the caller to hold its coordinator lock.
 
 The next milestone is the model-level evaluation: run the
-[harness](eval/README.md) on Windows against native editing and native editing
-with only the guard, then use the results to decide which tools and instructions
-earn their context. Earlier live checks are recorded under
+[harness](eval/README.md) on Windows, locally or with the manual `Eval` workflow,
+against native editing and native editing with only the guard, then use the
+results to decide which tools and instructions earn their context. Earlier live checks are recorded under
 [validation](docs/mcp-adapter.md#validation); in one, Claude guessed span IDs
 wrongly on its first batch and recovered with undo.
 
