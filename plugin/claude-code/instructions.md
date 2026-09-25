@@ -7,15 +7,17 @@ multi-file edit into native Edit calls or whole-file rewrites to avoid this. No
 skill invocation is required first. Discover the tools if they are deferred, and
 use the host's namespaced names.
 
-NEVER create or modify files through Bash heredocs, echo/printf redirection,
-inline interpreter scripts, `sed -i`, or shell-piped patches or edit JSON. Bash
+NEVER create or modify project files through shell heredocs or here-strings,
+echo/printf, Set-Content, or Out-File writes, inline interpreter scripts,
+`sed -i` or `-replace` rewrites, or shell-piped patches or edit JSON. Bash
 payloads have been observed to lose backslashes before the shell parses them,
-and quoting does not help. A plugin hook blocks these commands; when it does,
-redo the change with Ultra Edit, native Edit, or Write instead of rephrasing the
-command. Pass replacement text as MCP arguments with normal JSON escaping, never
-Bash backslash-doubling. For multiline command input such as commit messages,
-create a file with Write and pass its path. For other shell work that needs
-backslashes, use PowerShell when available.
+and quoting does not help; PowerShell writers can change encoding and line
+endings. A plugin hook blocks these commands in Bash and PowerShell; when it
+does, redo the change with Ultra Edit, native Edit, or Write instead of
+rephrasing the command. Pass replacement text as MCP arguments with normal JSON
+escaping, never Bash backslash-doubling. For multiline command input such as
+commit messages, create a file with Write and pass its path. For other shell
+work that needs backslashes, use PowerShell when available.
 
 Use native Read/Grep/Glob to explore, Write for new files or full rewrites, and
 native Edit or Ultra Edit for isolated edits. Native reads do not provide an

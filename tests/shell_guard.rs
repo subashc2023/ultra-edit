@@ -4,7 +4,10 @@ use std::process::{Command, Output, Stdio};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use ultra_edit::shell_guard::{ESCAPE_HATCH, Finding, Pattern, classify, deny_reason};
+use ultra_edit::shell_guard::{
+    ESCAPE_HATCH, Finding, Pattern, SCOPE_VARIABLES, Scope, classify, classify_bash,
+    classify_powershell, deny_reason, is_absolute,
+};
 
 use Pattern::{AppliedContent, GeneratedToFile, HeredocToFile, InPlaceEdit, InlineScriptWrite};
 
@@ -415,6 +418,7 @@ fn deny_reasons_name_the_pattern_and_alternatives_briefly() {
         );
         for expected in [
             "`a-very-long-prog`",
+            "backslashes, line endings, or encoding",
             "ultra_edit",
             "Write",
             "report that the Ultra Edit guard blocked it",
@@ -443,7 +447,9 @@ fn classify_finishes_on_pathological_input() {
     }
 }
 
-fn hook(input: &[u8], escape_hatch: Option<&str>) -> Output {
+/// Runs the hook with the escape hatch and the scope variables unset, apart
+/// from those in `environment`.
+fn hook(input: &[u8], environment: &[(&str, &str)]) -> Output {
     let directory = TempDir::new().unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_ultra-edit-mcp"));
     command
@@ -453,9 +459,10 @@ fn hook(input: &[u8], escape_hatch: Option<&str>) -> Output {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(value) = escape_hatch {
-        command.env(ESCAPE_HATCH, value);
+    for name in SCOPE_VARIABLES {
+        command.env_remove(name);
     }
+    command.envs(environment.iter().copied());
     let mut child = command.spawn().unwrap();
     // The guard may exit before reading everything; that is not a failure here.
     let _ = child.stdin.take().unwrap().write_all(input);
@@ -464,14 +471,14 @@ fn hook(input: &[u8], escape_hatch: Option<&str>) -> Output {
     output
 }
 
-fn bash_event(command: &str) -> Vec<u8> {
-    json!({
+/// A `PreToolUse` event for a shell tool, as Claude Code sends it.
+fn event(tool: &str, command: &str, cwd: Option<&str>) -> Vec<u8> {
+    let mut event = json!({
         "session_id": "abc123",
         "transcript_path": "/tmp/transcript.jsonl",
-        "cwd": "/tmp/project",
         "permission_mode": "default",
         "hook_event_name": "PreToolUse",
-        "tool_name": "Bash",
+        "tool_name": tool,
         "tool_input": {
             "command": command,
             "description": "Write notes",
@@ -479,9 +486,27 @@ fn bash_event(command: &str) -> Vec<u8> {
             "run_in_background": false,
         },
         "tool_use_id": "toolu_01",
-    })
-    .to_string()
-    .into_bytes()
+    });
+    if let Some(cwd) = cwd {
+        event["cwd"] = json!(cwd);
+    }
+    event.to_string().into_bytes()
+}
+
+fn bash_event(command: &str) -> Vec<u8> {
+    event("Bash", command, Some("/tmp/project"))
+}
+
+/// Whether the hook's output is a deny decision.
+fn denied(output: &Output) -> bool {
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    if output.stdout.is_empty() {
+        return false;
+    }
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["hookSpecificOutput"]["permissionDecision"], "deny");
+    true
 }
 
 fn assert_silent_success(output: &Output) {
@@ -492,7 +517,7 @@ fn assert_silent_success(output: &Output) {
 
 #[test]
 fn hook_prints_a_documented_deny_decision() {
-    let output = hook(&bash_event("cat > notes.txt <<'EOF'\nC:\\temp\nEOF"), None);
+    let output = hook(&bash_event("cat > notes.txt <<'EOF'\nC:\\temp\nEOF"), &[]);
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -522,24 +547,28 @@ fn hook_allows_other_commands_and_tools_silently() {
         "tool_name": "Write",
         "tool_input": {"file_path": "/tmp/a.txt", "content": "x", "command": "sed -i s/a/b/ f"},
     });
-    let powershell = json!({
-        "hook_event_name": "PreToolUse",
-        "tool_name": "PowerShell",
-        "tool_input": {"command": "echo x > out.txt"},
-    });
-    for input in [
+    let mut inputs = vec![
         bash_event("cargo test > log.txt 2>&1"),
         bash_event("git commit -F - <<'EOF'\nSubject\nEOF"),
+        event(
+            "PowerShell",
+            "Get-Content a.txt | Select-Object -First 5",
+            None,
+        ),
         other_tool.to_string().into_bytes(),
-        powershell.to_string().into_bytes(),
-    ] {
-        assert_silent_success(&hook(&input, None));
+    ];
+    // Tool names match exactly; only Bash and PowerShell are classified.
+    for tool in ["bash", "powershell", "Monitor", "Edit", ""] {
+        inputs.push(event(tool, "echo x > out.txt", Some("/tmp/project")));
+    }
+    for input in inputs {
+        assert_silent_success(&hook(&input, &[]));
     }
 }
 
 #[test]
 fn hook_fails_open_on_malformed_input() {
-    let inputs: [&[u8]; 10] = [
+    let inputs: [&[u8]; 14] = [
         b"",
         b"{",
         b"not json",
@@ -550,24 +579,36 @@ fn hook_fails_open_on_malformed_input() {
         b"{\"tool_name\":\"Bash\"}",
         b"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":42}}",
         b"{\"tool_name\":\"Bash\",\"tool_input\":\"echo x > out.txt\"}",
+        b"{\"tool_name\":\"PowerShell\"}",
+        b"{\"tool_name\":\"PowerShell\",\"tool_input\":{\"command\":null}}",
+        b"{\"tool_name\":[\"PowerShell\"],\"tool_input\":{\"command\":\"'x' > a.txt\"}}",
+        b"{\"tool_name\":\"PowerShell\",\"tool_input\":{\"command\":\"\\\"unterminated > a.txt\"}}",
     ];
     for input in inputs {
-        assert_silent_success(&hook(input, None));
+        assert_silent_success(&hook(input, &[]));
     }
     let mut truncated = bash_event("echo x > out.txt");
     truncated.pop();
-    assert_silent_success(&hook(&truncated, None));
+    assert_silent_success(&hook(&truncated, &[]));
+    let mut truncated = event("PowerShell", "'x' > out.txt", Some("/tmp/project"));
+    truncated.pop();
+    assert_silent_success(&hook(&truncated, &[]));
 }
 
 #[test]
 fn escape_hatch_allows_shell_writes() {
-    let event = bash_event("sed -i 's/a/b/' src/lib.rs");
-    assert_silent_success(&hook(&event, Some("allow")));
-    for value in ["", "1", "yes", "ALLOW"] {
-        let output = hook(&event, Some(value));
-        assert!(output.status.success(), "{output:?}");
-        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(value["hookSpecificOutput"]["permissionDecision"], "deny");
+    for event in [
+        bash_event("sed -i 's/a/b/' src/lib.rs"),
+        event(
+            "PowerShell",
+            "'x' | Set-Content a.txt",
+            Some("/tmp/project"),
+        ),
+    ] {
+        assert_silent_success(&hook(&event, &[(ESCAPE_HATCH, "allow")]));
+        for value in ["", "1", "yes", "ALLOW"] {
+            assert!(denied(&hook(&event, &[(ESCAPE_HATCH, value)])));
+        }
     }
 }
 
@@ -595,4 +636,807 @@ fn hook_mode_rejects_other_arguments_and_is_documented() {
     let help = String::from_utf8(output.stdout).unwrap();
     assert!(help.contains("--claude-hook PreToolUse"), "{help}");
     assert!(help.contains("ULTRA_EDIT_SHELL_WRITES=allow"), "{help}");
+    assert!(help.contains("PowerShell"), "{help}");
+    assert!(help.contains("CLAUDE_PROJECT_DIR"), "{help}");
+}
+
+/// A project at `/work/repo`; the home and temporary directories lie outside.
+fn unix_scope() -> Scope {
+    Scope::new("/work/repo")
+        .with_variable("CLAUDE_PROJECT_DIR", "/work/repo")
+        .with_variable("HOME", "/home/dev")
+        .with_variable("TMPDIR", "/tmp/")
+}
+
+/// A project at `C:\repo`; the profile and temporary directories lie outside.
+fn windows_scope() -> Scope {
+    Scope::new("C:\\repo")
+        .with_variable("CLAUDE_PROJECT_DIR", "C:\\repo")
+        .with_variable("USERPROFILE", "C:\\Users\\dev")
+        .with_variable("TEMP", "C:\\Users\\dev\\AppData\\Local\\Temp")
+        .with_variable("TMP", "C:\\Users\\dev\\AppData\\Local\\Temp")
+}
+
+/// Bash writes that `unix_scope` places certainly outside the project.
+const OUTSIDE: &[&str] = &[
+    // CI runner files.
+    "echo \"k=v\" >> \"$GITHUB_OUTPUT\"",
+    "echo k=v >> $GITHUB_ENV",
+    "echo /opt/tool/bin >> ${GITHUB_PATH}",
+    "printf '## Done\\n' >> \"${GITHUB_STEP_SUMMARY}\"",
+    "echo k=v >> $GITHUB_STATE",
+    // System, home, and temporary files.
+    "echo x | sudo tee /etc/hosts",
+    "echo '127.0.0.1 app' | sudo tee -a /etc/hosts > /dev/null",
+    "echo 'export A=1' >> ~/.bashrc",
+    "echo 'export A=1' >> \"$HOME/.bashrc\"",
+    "echo 'export A=1' >> ${HOME}/.profile",
+    "cat > /tmp/payload.json <<'EOF'\n{\"a\": 1}\nEOF",
+    "cat > \"$TMPDIR/payload.json\" <<'EOF'\n{}\nEOF",
+    "cat <<'EOF' > ${TMPDIR}request.json\n{}\nEOF",
+    "cat > '/tmp/[x].json' <<'EOF'\n{}\nEOF",
+    "echo x > /work/repo2/a.txt",
+    "echo x > /work/repo/../other/a.txt",
+    "echo x > \"$CLAUDE_PROJECT_DIR/../other/a.txt\"",
+    // In-place editors whose every file operand is outside.
+    "sed -i 's/a/b/' /etc/hosts",
+    "sudo sed -i.bak -e 's/a/b/' /etc/hosts /etc/hostname",
+    "perl -pi -e 's/a/b/' /etc/hosts",
+    "gawk -i inplace '{ print }' ~/notes.txt",
+    "sed --in-pl --expr='s/a/b/' /etc/hosts",
+    "gawk --include inplace -f fix.awk /etc/hosts",
+];
+
+/// Bash writes that `windows_scope` places certainly outside the project.
+const OUTSIDE_WINDOWS: &[&str] = &[
+    "cat > 'D:\\scratch\\payload.json' <<'EOF'\n{}\nEOF",
+    "cat > /d/scratch/payload.json <<'EOF'\n{}\nEOF",
+    "echo x > 'C:\\Users\\dev\\notes.txt'",
+    "echo x > C:/Users/dev/notes.txt",
+    "echo x > '\\\\server\\share\\notes.txt'",
+    "echo x > //server/share/notes.txt",
+    "echo x > 'C:\\repo2\\notes.txt'",
+    "echo x > /c/repo/../other/notes.txt",
+    "sed -i 's/a/b/' 'C:\\Windows\\System32\\drivers\\etc\\hosts'",
+];
+
+/// Bash writes that `unix_scope` cannot place outside the project.
+const INSIDE: &[(&str, Pattern, &str)] = &[
+    (
+        "cat > src/a.rs <<'EOF'\nfn a() {}\nEOF",
+        HeredocToFile,
+        "cat",
+    ),
+    (
+        "cat > /work/repo/src/a.rs <<'EOF'\nx\nEOF",
+        HeredocToFile,
+        "cat",
+    ),
+    (
+        "cat > \"$CLAUDE_PROJECT_DIR/src/a.rs\" <<'EOF'\nx\nEOF",
+        HeredocToFile,
+        "cat",
+    ),
+    (
+        "cat > ${CLAUDE_PROJECT_DIR}/src/a.rs <<'EOF'\nx\nEOF",
+        HeredocToFile,
+        "cat",
+    ),
+    ("echo x > ../x.txt", GeneratedToFile, "echo"),
+    ("echo x > /work/repo", GeneratedToFile, "echo"),
+    (
+        "echo x > /work/./repo/src/../a.txt",
+        GeneratedToFile,
+        "echo",
+    ),
+    ("echo x > /WORK/Repo/a.txt", GeneratedToFile, "echo"),
+    ("echo x > ~/../../work/repo/a.txt", GeneratedToFile, "echo"),
+    ("echo x > \"$UNSET_DIR/a.txt\"", GeneratedToFile, "echo"),
+    ("echo x > $OUT", GeneratedToFile, "echo"),
+    ("echo x > \"$(mktemp)\"", GeneratedToFile, "echo"),
+    ("echo x > /tmp/*.txt", GeneratedToFile, "echo"),
+    ("echo x > /tmp/{a,b}.txt", GeneratedToFile, "echo"),
+    ("echo x > '~/notes.txt'", GeneratedToFile, "echo"),
+    ("echo x > '$HOME/notes.txt'", GeneratedToFile, "echo"),
+    ("echo x > \"$GITHUB_OUTPUT.bak\"", GeneratedToFile, "echo"),
+    ("echo x | tee /etc/hosts src/a.txt", GeneratedToFile, "echo"),
+    ("sed -i 's/a/b/' /etc/hosts src/lib.rs", InPlaceEdit, "sed"),
+    ("sed -i 's/a/b/'", InPlaceEdit, "sed"),
+    // An abbreviated `--expression` still leaves every operand a file.
+    (
+        "sed -i --expr='s/a/b/' src/lib.rs /etc/hosts",
+        InPlaceEdit,
+        "sed",
+    ),
+    (
+        "gawk --incl=inplace '{ print }' src/a.txt",
+        InPlaceEdit,
+        "gawk",
+    ),
+    ("perl -pi -e 's/a/b/' /etc/hosts ./x", InPlaceEdit, "perl"),
+    (
+        "find /etc -name hosts -exec sed -i 's/a/b/' {} +",
+        InPlaceEdit,
+        "sed",
+    ),
+    // Inline interpreter writes are flagged whatever the path.
+    (
+        "python3 -c \"open('/tmp/x.txt', 'w').write('x')\"",
+        InlineScriptWrite,
+        "python3",
+    ),
+];
+
+/// Bash writes that `windows_scope` cannot place outside the project.
+const INSIDE_WINDOWS: &[&str] = &[
+    "cat > 'C:\\repo\\src\\a.rs' <<'EOF'\nx\nEOF",
+    "cat > C:\\\\repo\\\\src\\\\a.rs <<'EOF'\nx\nEOF",
+    "cat > 'c:\\REPO\\Src\\a.rs' <<'EOF'\nx\nEOF",
+    "cat > C:/repo/src/a.rs <<'EOF'\nx\nEOF",
+    "cat > /c/repo/src/a.rs <<'EOF'\nx\nEOF",
+    "cat > /C/Repo/src/a.rs <<'EOF'\nx\nEOF",
+    "cat > '\\\\?\\C:\\repo\\a.rs' <<'EOF'\nx\nEOF",
+    "cat > 'C:\\repo.\\a.rs' <<'EOF'\nx\nEOF",
+    // Unquoted, Bash reads `\t` as `t`: `C:tempx.txt` is drive-relative.
+    "cat > C:\\temp\\x.txt <<'EOF'\nx\nEOF",
+    // Git Bash's mount table decides where `/tmp` is.
+    "cat > /tmp/payload.json <<'EOF'\nx\nEOF",
+    // No HOME was passed in.
+    "echo x > ~/notes.txt",
+];
+
+#[test]
+fn scoped_bash_allows_writes_certainly_outside_the_project() {
+    for (scope, commands) in [(unix_scope(), OUTSIDE), (windows_scope(), OUTSIDE_WINDOWS)] {
+        for command in commands {
+            // Every one is a shell write that an unscoped guard blocks.
+            assert!(classify(command).is_some(), "{command:?}");
+            assert_eq!(classify_bash(command, &scope), None, "{command:?}");
+        }
+    }
+    let temporary = Scope::new("/tmp/repo").with_variable("TMPDIR", "/tmp");
+    assert_eq!(
+        classify_bash("cat > /tmp/payload.json <<'EOF'\n{}\nEOF", &temporary),
+        None
+    );
+    let unc = Scope::new("\\\\server\\share\\repo");
+    assert_eq!(
+        classify_bash("echo x > //SERVER/share/other/a.txt", &unc),
+        None
+    );
+}
+
+#[test]
+fn scoped_bash_denies_writes_that_may_reach_the_project() {
+    let scope = unix_scope();
+    for (command, pattern, program) in INSIDE {
+        let expected = Finding {
+            pattern: *pattern,
+            program: (*program).to_owned(),
+        };
+        assert_eq!(
+            classify_bash(command, &scope),
+            Some(expected),
+            "{command:?}"
+        );
+    }
+    let scope = windows_scope();
+    for command in INSIDE_WINDOWS {
+        assert!(classify_bash(command, &scope).is_some(), "{command:?}");
+    }
+    let temporary = Scope::new("/tmp/repo").with_variable("TMPDIR", "/tmp");
+    for command in [
+        "cat > /tmp/repo/src/a <<'EOF'\nx\nEOF",
+        "cat > $TMPDIR/repo/src/a <<'EOF'\nx\nEOF",
+    ] {
+        assert!(classify_bash(command, &temporary).is_some(), "{command:?}");
+    }
+    let unc = Scope::new("\\\\server\\share\\repo");
+    assert!(classify_bash("echo x > '\\\\SERVER\\Share\\repo\\a.txt'", &unc).is_some());
+}
+
+#[test]
+fn scope_needs_an_absolute_root_and_known_values() {
+    for root in [
+        "/",
+        "/work/repo",
+        "C:\\repo",
+        "c:/repo",
+        "\\\\server\\share\\repo",
+        "\\\\?\\C:\\repo",
+    ] {
+        assert!(is_absolute(root), "{root:?}");
+    }
+    for root in [
+        "",
+        "repo",
+        "./repo",
+        "C:repo",
+        "C:",
+        "\\\\server",
+        "~/repo",
+        "$HOME/repo",
+    ] {
+        assert!(!is_absolute(root), "{root:?}");
+    }
+    // Without an absolute root every file target counts, as before scoping;
+    // discarded output never does.
+    for scope in [Scope::default(), Scope::new("repo"), Scope::new("")] {
+        for command in [
+            "echo x >> \"$GITHUB_OUTPUT\"",
+            "echo x | sudo tee /etc/hosts",
+        ] {
+            assert!(classify_bash(command, &scope).is_some(), "{command:?}");
+        }
+        assert!(classify_powershell("'x' >> $env:GITHUB_OUTPUT", &scope).is_some());
+        assert_eq!(classify_bash("echo x > /dev/null", &scope), None);
+        assert_eq!(classify_powershell("'x' > $null", &scope), None);
+    }
+    // Unset and empty values, and names outside `SCOPE_VARIABLES`, stay unknown.
+    let scope = Scope::new("/work/repo")
+        .with_variable("HOME", "")
+        .with_variable("OUT", "/tmp/out");
+    for command in [
+        "echo x >> ~/.bashrc",
+        "echo x >> $HOME/.bashrc",
+        "echo x >> $TMPDIR/x",
+        "echo x >> $OUT",
+    ] {
+        assert!(classify_bash(command, &scope).is_some(), "{command:?}");
+    }
+    // Under a POSIX root, PowerShell keeps environment names' case and
+    // reads `\` as a separator.
+    let scope = Scope::new("/work/repo").with_variable("HOME", "/home/dev");
+    assert_eq!(
+        classify_powershell("Set-Content $env:HOME/x.txt 'x'", &scope),
+        None
+    );
+    assert_eq!(classify_powershell("'x' > /tmp/x.txt", &scope), None);
+    for command in [
+        "Set-Content $env:home/x.txt 'x'",
+        "'x' > /tmp\\..\\work\\repo\\x.txt",
+    ] {
+        assert!(
+            classify_powershell(command, &scope).is_some(),
+            "{command:?}"
+        );
+    }
+}
+
+const DENIED_POWERSHELL: &[(&str, Pattern, &str)] = &[
+    // Embedded content written by writers and redirections.
+    (
+        "@\"\nparam([string]$Name)\nWrite-Output \"C:\\temp\\$Name\"\n\"@ | Set-Content src/a.ps1",
+        HeredocToFile,
+        "Set-Content",
+    ),
+    (
+        "@'\nline\n'@ | Out-File -FilePath notes.md -Encoding utf8",
+        HeredocToFile,
+        "Out-File",
+    ),
+    (
+        "Set-Content -Path a.txt -Value 'x'",
+        GeneratedToFile,
+        "Set-Content",
+    ),
+    (
+        "Set-Content a.txt 'C:\\temp\\new'",
+        GeneratedToFile,
+        "Set-Content",
+    ),
+    ("sc a.txt -Value:\"x\"", GeneratedToFile, "Set-Content"),
+    (
+        "Add-Content -Path CHANGELOG.md -Value '- entry'",
+        GeneratedToFile,
+        "Add-Content",
+    ),
+    ("ac notes.txt line", GeneratedToFile, "Add-Content"),
+    ("'x' > a.txt", GeneratedToFile, ">"),
+    ("'x' >> a.txt", GeneratedToFile, ">>"),
+    ("'a','b' 1> a.txt", GeneratedToFile, "1>"),
+    ("@'\nx\n'@ *> a.txt", HeredocToFile, "*>"),
+    (
+        "Write-Output 'x' | Out-File a.txt",
+        GeneratedToFile,
+        "Write-Output",
+    ),
+    ("echo x > out.txt", GeneratedToFile, "Write-Output"),
+    (
+        "write 'x' | Out-File -Append a.txt",
+        GeneratedToFile,
+        "Write-Output",
+    ),
+    (
+        "'x' | Tee-Object -FilePath a.txt | Out-Null",
+        GeneratedToFile,
+        "Tee-Object",
+    ),
+    ("'x' | tee a.txt", GeneratedToFile, "Tee-Object"),
+    (
+        "New-Item -Path a.txt -ItemType File -Value 'x'",
+        GeneratedToFile,
+        "New-Item",
+    ),
+    ("ni src/a.txt -Value @'\nx\n'@", HeredocToFile, "New-Item"),
+    (
+        "Out-File -FilePath a.txt -InputObject 'x'",
+        GeneratedToFile,
+        "Out-File",
+    ),
+    (
+        "$text = @'\nx\n'@\nSet-Content -Path a.txt -Value $text",
+        HeredocToFile,
+        "Set-Content",
+    ),
+    (
+        "$lines = 'a', 'b'; $lines | Set-Content a.txt",
+        GeneratedToFile,
+        "Set-Content",
+    ),
+    (
+        "if ($ready) { \"done\" | Out-File status.txt }",
+        GeneratedToFile,
+        "Out-File",
+    ),
+    ("git status && 'x' > a.txt", GeneratedToFile, ">"),
+    (
+        "Set-Content `\n  -Path a.txt `\n  -Value 'x'",
+        GeneratedToFile,
+        "Set-Content",
+    ),
+    ("'x'\n| Set-Content a.txt", GeneratedToFile, "Set-Content"),
+    (
+        "Set-Content \u{2013}Path a.txt \u{2013}Value \u{2018}x\u{2019}",
+        GeneratedToFile,
+        "Set-Content",
+    ),
+    (
+        "Microsoft.PowerShell.Management\\Set-Content a.txt 'x'",
+        GeneratedToFile,
+        "Set-Content",
+    ),
+    (
+        "Invoke-Expression \"Set-Content a.txt 'x'\"",
+        GeneratedToFile,
+        "Set-Content",
+    ),
+    (
+        "function Save { Set-Content a.txt $args[0] }",
+        GeneratedToFile,
+        "Set-Content",
+    ),
+    (
+        "Set-Content 'C:\\REPO\\a.txt' 'x'",
+        GeneratedToFile,
+        "Set-Content",
+    ),
+    (
+        "Set-Content /c/repo/a.txt 'x'",
+        GeneratedToFile,
+        "Set-Content",
+    ),
+    (
+        "Set-Content C:\\Users\\*.txt 'x'",
+        GeneratedToFile,
+        "Set-Content",
+    ),
+    (
+        "Set-Content -Path C:\\Users\\dev\\a.txt, src\\b.txt -Value 'x'",
+        GeneratedToFile,
+        "Set-Content",
+    ),
+    (
+        "Set-Content $PSScriptRoot\\a.txt 'x'",
+        GeneratedToFile,
+        "Set-Content",
+    ),
+    // Read-transform-write rewrites.
+    (
+        "(Get-Content a.txt) -replace 'a','b' | Set-Content a.txt",
+        InPlaceEdit,
+        "Set-Content",
+    ),
+    (
+        "(gc a.txt -Raw).Replace('a', 'b') | sc a.txt",
+        InPlaceEdit,
+        "Set-Content",
+    ),
+    (
+        "Get-Content a.txt | ForEach-Object { $_ -creplace 'a','b' } | Set-Content a.txt",
+        InPlaceEdit,
+        "Set-Content",
+    ),
+    (
+        "cat a.txt | % { $_ } | Out-File a.txt",
+        InPlaceEdit,
+        "Out-File",
+    ),
+    (
+        "$c = Get-Content a.txt -Raw\n$c = $c -ireplace 'a', 'b'\nSet-Content a.txt $c -NoNewline",
+        InPlaceEdit,
+        "Set-Content",
+    ),
+    (
+        "$lines = Get-Content a.txt; $lines[3] = 'x'; $lines | Set-Content a.txt",
+        InPlaceEdit,
+        "Set-Content",
+    ),
+    (
+        "Set-Content a.txt -Value ((Get-Content a.txt) -replace 'a','b')",
+        InPlaceEdit,
+        "Set-Content",
+    ),
+    ("$(type a.txt) -replace 'a','b' > a.txt", InPlaceEdit, ">"),
+    (
+        "[IO.File]::ReadAllText('a.txt') -replace 'a','b' | Set-Content a.txt",
+        InPlaceEdit,
+        "Set-Content",
+    ),
+    (
+        "Get-ChildItem *.cs | ForEach-Object { (Get-Content $_) -replace 'a','b' | Set-Content $_ }",
+        InPlaceEdit,
+        "Set-Content",
+    ),
+    // .NET write APIs.
+    (
+        "[IO.File]::WriteAllText(\"a.txt\", \"x\")",
+        InlineScriptWrite,
+        "PowerShell",
+    ),
+    (
+        "[System.IO.File]::AppendAllLines('a.txt', [string[]]@('x'))",
+        InlineScriptWrite,
+        "PowerShell",
+    ),
+    (
+        "$w = [IO.File]::CreateText('a.txt'); $w.Write('x'); $w.Close()",
+        InlineScriptWrite,
+        "PowerShell",
+    ),
+    (
+        "$w = New-Object System.IO.StreamWriter('a.txt')",
+        InlineScriptWrite,
+        "PowerShell",
+    ),
+    (
+        "$w = New-Object -TypeName IO.StreamWriter -ArgumentList 'a.txt'",
+        InlineScriptWrite,
+        "PowerShell",
+    ),
+    (
+        "$w = [IO.StreamWriter]::new(\"$PWD\\a.txt\")",
+        InlineScriptWrite,
+        "PowerShell",
+    ),
+    // Embedded content applied to files.
+    (
+        "@'\ndiff --git a/f b/f\n'@ | git apply",
+        AppliedContent,
+        "git",
+    ),
+    (
+        "'{\"request_id\":\"r\"}' | ultra-edit edit",
+        AppliedContent,
+        "ultra-edit",
+    ),
+    (
+        "@'\n--- a/f\n+++ b/f\n'@ | patch -p1",
+        AppliedContent,
+        "patch",
+    ),
+    // External programs get the Bash checks.
+    (
+        "python -c \"open('a','w').write('x')\"",
+        InlineScriptWrite,
+        "python",
+    ),
+    (
+        "& 'C:\\Python312\\python.exe' -c \"open('a','w').write('x')\"",
+        InlineScriptWrite,
+        "python",
+    ),
+    (
+        "@'\nopen('a.txt', 'w').write('x')\n'@ | python -",
+        InlineScriptWrite,
+        "python",
+    ),
+    (
+        "node -e \"require('fs').writeFileSync('a.json', '{}')\"",
+        InlineScriptWrite,
+        "node",
+    ),
+    ("sed -i 's/a/b/' src/lib.rs", InPlaceEdit, "sed"),
+    ("perl -pi -e 's/a/b/' src/lib.rs", InPlaceEdit, "perl"),
+    ("bash -c 'cat > a.txt <<EOF\nx\nEOF'", HeredocToFile, "cat"),
+    (
+        "pwsh -NoProfile -Command \"Set-Content a.txt 'x'\"",
+        InlineScriptWrite,
+        "pwsh",
+    ),
+    // PowerShell may already have expanded `$` in a Bash script, so a
+    // variable target there is unknown.
+    (
+        "bash -c 'echo x >> $GITHUB_OUTPUT'",
+        GeneratedToFile,
+        "echo",
+    ),
+];
+
+const ALLOWED_POWERSHELL: &[&str] = &[
+    // Output capture, discarded output, copies, and reads.
+    "git diff > d.patch",
+    "cargo test *> log.txt",
+    "npm test 2>&1 | Tee-Object -FilePath test.log",
+    "Get-ChildItem | Out-File list.txt",
+    "Get-Process | Out-File -FilePath procs.txt -Width 200",
+    "Get-Content a | Set-Content b",
+    "Get-Content a.txt -Raw | Set-Content b.txt -NoNewline",
+    "(Get-Content a.txt | Select-Object -First 5) | Set-Content b.txt",
+    "$c = Get-Content a.txt -Raw; Set-Content b.txt \"$c\"",
+    "Copy-Item a.txt b.txt",
+    "echo x > $null",
+    "'x' | Out-Null",
+    "Write-Output 'x' 2> err.txt",
+    "'x' | Out-File NUL",
+    "Get-Content a.txt | Select-String 'x'",
+    "Write-Host \"a > b; Set-Content x y\"",
+    "# 'x' > a.txt",
+    "<# 'x' > a.txt #> Get-Date",
+    "Set-Content -Path a.txt -Value $data",
+    "Set-Content -Path a.txt -Value (Get-Date)",
+    "$data | ConvertTo-Json | Set-Content config.json",
+    "1..10 | ForEach-Object { \"line $_\" } | Set-Content lines.txt",
+    "New-Item -ItemType Directory -Force -Path out | Out-Null",
+    "New-Item -ItemType SymbolicLink -Path link -Value target",
+    "Tee-Object -Variable log",
+    "@'\nSubject\n'@ | git commit -F -",
+    "git apply --check fix.patch",
+    "python -c \"print(open('a.txt').read())\"",
+    "sed -n '1,20p' src/lib.rs",
+    "Get-Help Set-Content",
+    // Writes certainly outside the project.
+    "Set-Content $env:TEMP\\x.txt 'x'",
+    "Set-Content -Path \"$env:TMP\\payload.json\" -Value '{}'",
+    "'x' > $env:USERPROFILE\\notes.txt",
+    "Add-Content -Path ~\\.gitconfig -Value '[user]'",
+    "Add-Content $HOME\\notes.txt 'x'",
+    "Out-File -FilePath Temp:\\x.txt -InputObject 'x'",
+    "Set-Content -Path D:\\scratch\\a.txt -Value 'x'",
+    "Set-Content -LiteralPath '\\\\server\\share\\a.txt' -Value 'x'",
+    "Set-Content -LiteralPath:$env:TEMP\\x.txt -Value 'x'",
+    "\"k=v\" >> $env:GITHUB_OUTPUT",
+    "Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value '## Done'",
+    "Set-Content Env:\\GREETING 'hi'",
+    "[IO.File]::WriteAllText(\"$env:TEMP\\x.txt\", 'x')",
+    "sed -i 's/a/b/' C:\\Users\\dev\\notes.txt",
+    // Anything the lexer cannot place.
+    "\"unterminated > a.txt",
+    "Set-Content @params",
+    "& $tool 'x' > a.txt",
+];
+
+#[test]
+fn powershell_denies_embedded_content_and_rewrites_written_into_the_project() {
+    let scope = windows_scope();
+    for (command, pattern, program) in DENIED_POWERSHELL {
+        let expected = Finding {
+            pattern: *pattern,
+            program: (*program).to_owned(),
+        };
+        assert_eq!(
+            classify_powershell(command, &scope),
+            Some(expected),
+            "{command:?}"
+        );
+    }
+}
+
+#[test]
+fn powershell_allows_output_capture_copies_and_writes_outside_the_project() {
+    let scope = windows_scope();
+    for command in ALLOWED_POWERSHELL {
+        assert_eq!(classify_powershell(command, &scope), None, "{command:?}");
+    }
+}
+
+#[test]
+fn powershell_run_from_bash_gets_the_powershell_checks() {
+    let scope = unix_scope();
+    for (command, program) in [
+        // The substring check that preceded the PowerShell classifier missed
+        // redirections.
+        ("pwsh -c \"'x' > a.txt\"", "pwsh"),
+        (
+            "pwsh -c 'Get-Content a.txt | % { $_ -replace \"a\", \"b\" } | Set-Content a.txt'",
+            "pwsh",
+        ),
+        (
+            "powershell.exe -NoProfile -Command \"@('a','b') | Tee-Object -FilePath a.txt\"",
+            "powershell",
+        ),
+        ("pwsh -cwa 'Set-Content a.txt $args[0]' x", "pwsh"),
+        (
+            "cat <<'EOF' | pwsh -Command -\nSet-Content a.txt 'x'\nEOF",
+            "pwsh",
+        ),
+        // Bash may already have expanded `$env` inside double quotes.
+        ("pwsh -c \"'x' > $env:GITHUB_OUTPUT\"", "pwsh"),
+    ] {
+        let expected = Finding {
+            pattern: InlineScriptWrite,
+            program: program.to_owned(),
+        };
+        assert_eq!(
+            classify_bash(command, &scope),
+            Some(expected),
+            "{command:?}"
+        );
+    }
+    for command in [
+        "pwsh -c 'Get-ChildItem | Out-File list.txt'",
+        "pwsh -c 'Get-Content a | Set-Content b'",
+        "pwsh -c 'Get-Help Set-Content'",
+        "pwsh -c \"Write-Output 'Set-Content a.txt x'\"",
+        "pwsh -c '\"x\" > /tmp/x.txt'",
+    ] {
+        assert_eq!(classify_bash(command, &scope), None, "{command:?}");
+    }
+}
+
+#[test]
+fn powershell_finishes_on_pathological_input() {
+    let scope = windows_scope();
+    for command in [
+        format!("{}'x' > a.txt{}", "(".repeat(10_000), ")".repeat(10_000)),
+        format!("\"{}\"", "$(".repeat(10_000)),
+        format!("{}x{}", "{".repeat(10_000), "}".repeat(10_000)),
+        format!("x{}|y", "\n".repeat(100_000)),
+        "@'\n".repeat(20_000),
+        "[".repeat(50_000),
+        "<#".repeat(50_000),
+        "`".repeat(50_000),
+        "\"".repeat(50_001),
+        "$".repeat(50_000),
+        "2>".repeat(50_000),
+        "-".repeat(50_000),
+    ] {
+        assert_eq!(
+            classify_powershell(&command, &scope),
+            None,
+            "{:?}",
+            &command[..20]
+        );
+    }
+    let long = format!("@'\n{}'@ | Set-Content a.txt", "line\n".repeat(50_000));
+    assert_eq!(
+        classify_powershell(&long, &scope).map(|finding| finding.pattern),
+        Some(HeredocToFile)
+    );
+    let many = "'x' | Out-Null; ".repeat(20_000) + "'x' > a.txt";
+    assert_eq!(
+        classify_powershell(&many, &scope).map(|finding| finding.pattern),
+        Some(GeneratedToFile)
+    );
+    for command in [
+        "", "`", "'", "\"$(", "@'", "@\"\n", "<#", ">", "2>&", "*>", "|", "||", "&&", "&", ";",
+        "(", ")", "{", "}", "[", "]", "$", "${", "-", "\u{2013}", ".", "::", "=", "@",
+    ] {
+        assert_eq!(classify_powershell(command, &scope), None, "{command:?}");
+    }
+}
+
+#[test]
+fn hook_scopes_writes_to_the_project() {
+    let project = [
+        ("CLAUDE_PROJECT_DIR", "/work/repo"),
+        ("HOME", "/home/dev"),
+        ("TMPDIR", "/tmp"),
+    ];
+    // CLAUDE_PROJECT_DIR takes precedence over the event's cwd.
+    for command in [
+        "echo \"k=v\" >> \"$GITHUB_OUTPUT\"",
+        "echo x | sudo tee /etc/hosts",
+        "echo 'export A=1' >> ~/.bashrc",
+        "cat > /tmp/payload.json <<'EOF'\n{}\nEOF",
+        "sed -i 's/a/b/' /etc/hosts",
+        "cat > /elsewhere/a.rs <<'EOF'\nx\nEOF",
+    ] {
+        let output = hook(&event("Bash", command, Some("/elsewhere")), &project);
+        assert!(!denied(&output), "{command:?}");
+    }
+    for command in [
+        "cat > src/a.rs <<'EOF'\nx\nEOF",
+        "cat > /work/repo/src/a.rs <<'EOF'\nx\nEOF",
+        "cat > \"$CLAUDE_PROJECT_DIR/src/a.rs\" <<'EOF'\nx\nEOF",
+        "echo x > ../x",
+        "echo x > \"$UNSET/x\"",
+    ] {
+        let output = hook(&event("Bash", command, Some("/elsewhere")), &project);
+        assert!(denied(&output), "{command:?}");
+    }
+    // Without an absolute CLAUDE_PROJECT_DIR, the event's cwd is the root.
+    let home = ("HOME", "/home/dev");
+    for environment in [
+        &[home][..],
+        &[("CLAUDE_PROJECT_DIR", "repo"), home][..],
+        &[("CLAUDE_PROJECT_DIR", ""), home][..],
+    ] {
+        let outside = event(
+            "Bash",
+            "cat > /tmp/payload.json <<'EOF'\n{}\nEOF",
+            Some("/work/repo"),
+        );
+        assert!(!denied(&hook(&outside, environment)), "{environment:?}");
+        let inside = event(
+            "Bash",
+            "cat > /work/repo/a.json <<'EOF'\n{}\nEOF",
+            Some("/work/repo"),
+        );
+        assert!(denied(&hook(&inside, environment)), "{environment:?}");
+    }
+    let nested = event(
+        "Bash",
+        "cat > /tmp/repo/src/a <<'EOF'\nx\nEOF",
+        Some("/tmp/repo"),
+    );
+    assert!(denied(&hook(&nested, &[])));
+    // Without any absolute root, every file target counts.
+    for cwd in [None, Some("relative/dir"), Some("")] {
+        let runner = event("Bash", "echo \"k=v\" >> \"$GITHUB_OUTPUT\"", cwd);
+        assert!(denied(&hook(&runner, &[])), "{cwd:?}");
+    }
+    // A Windows root compares drives, shares, and Git Bash paths without case.
+    for (command, inside) in [
+        ("cat > /c/Repo/src/a.rs <<'EOF'\nx\nEOF", true),
+        ("cat > 'C:\\REPO\\src\\a.rs' <<'EOF'\nx\nEOF", true),
+        ("cat > 'D:\\scratch\\a.json' <<'EOF'\nx\nEOF", false),
+        ("cat > /d/scratch/a.json <<'EOF'\nx\nEOF", false),
+    ] {
+        let output = hook(&event("Bash", command, Some("C:\\repo")), &[]);
+        assert_eq!(denied(&output), inside, "{command:?}");
+    }
+}
+
+#[test]
+fn hook_guards_the_powershell_tool() {
+    let windows = [
+        ("CLAUDE_PROJECT_DIR", "C:\\repo"),
+        ("USERPROFILE", "C:\\Users\\dev"),
+        ("TEMP", "C:\\Users\\dev\\AppData\\Local\\Temp"),
+    ];
+    for (command, expected) in [
+        ("@\"\nx\n\"@ | Set-Content src/a.ps1", true),
+        ("Set-Content -Path a.txt -Value 'x'", true),
+        (
+            "(Get-Content a.txt) -replace 'a','b' | Set-Content a.txt",
+            true,
+        ),
+        ("Set-Content C:\\repo\\a.txt 'x'", true),
+        ("git diff > d.patch", false),
+        ("Get-Content a | Set-Content b", false),
+        ("Set-Content $env:TEMP\\x.txt 'x'", false),
+        ("\"k=v\" >> $env:GITHUB_OUTPUT", false),
+    ] {
+        let output = hook(
+            &event("PowerShell", command, Some("C:\\Users\\dev")),
+            &windows,
+        );
+        assert_eq!(denied(&output), expected, "{command:?}");
+    }
+    let output = hook(
+        &event("PowerShell", "'x' > a.txt", Some("C:\\repo")),
+        &windows,
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let reason = value["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap();
+    assert!(
+        reason.starts_with(
+            "Ultra Edit guard blocked `>` output written to a file: shell writes can lose \
+             backslashes, line endings, or encoding."
+        ),
+        "{reason}"
+    );
 }

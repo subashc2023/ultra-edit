@@ -1,12 +1,20 @@
-//! Classifies Bash commands for the Claude Code `PreToolUse` guard.
+//! Classifies Bash and PowerShell commands for the Claude Code `PreToolUse`
+//! guard.
 //!
 //! A command is denied when its text carries file content or edit logic that
-//! the shell writes into files: heredoc and `echo` redirection, inline
-//! interpreter code that calls a file-write API, and in-place editors.
-//! Anything the lexer cannot place with confidence is allowed, because a false
-//! positive blocks legitimate work.
+//! the shell writes into project files: heredoc and `echo` redirection, inline
+//! interpreter code that calls a file-write API, and in-place editors, and
+//! their PowerShell forms. Anything the lexers cannot place with confidence is
+//! allowed, because a false positive blocks legitimate work. A write target
+//! counts as outside the project only when that is certain.
 
 use std::fmt;
+use std::ops::Range;
+
+mod powershell;
+mod scope;
+
+pub use scope::{SCOPE_VARIABLES, Scope, is_absolute};
 
 /// Setting this environment variable to `allow` disables the guard.
 pub const ESCAPE_HATCH: &str = "ULTRA_EDIT_SHELL_WRITES";
@@ -107,27 +115,44 @@ impl fmt::Display for Finding {
 /// The `permissionDecisionReason` shown to Claude for a denied command.
 pub fn deny_reason(finding: &Finding) -> String {
     format!(
-        "Ultra Edit guard blocked {finding}: shell payloads can lose backslashes. Edit existing \
-         files with ultra_edit or native Edit, create files with Write, and put multiline command \
-         input in a file created with Write. If the user explicitly asked for this command, \
-         report that the Ultra Edit guard blocked it; {ESCAPE_HATCH}=allow disables the guard."
+        "Ultra Edit guard blocked {finding}: shell writes can lose backslashes, line endings, or \
+         encoding. Edit existing files with ultra_edit or native Edit; create files, including \
+         multiline command input, with Write. If the user explicitly asked for it, report that \
+         the Ultra Edit guard blocked it; {ESCAPE_HATCH}=allow disables the guard."
     )
 }
 
-/// Returns the first shell file write in a Bash tool command, if any.
+/// Returns the first shell file write in a Bash tool command, counting every
+/// file target as inside the project.
 pub fn classify(command: &str) -> Option<Finding> {
-    scan(&command.replace("\r\n", "\n"), 0)
+    classify_bash(command, &Scope::default())
 }
 
-fn scan(script: &str, depth: usize) -> Option<Finding> {
+/// Returns the first write into the project in a Bash tool command.
+pub fn classify_bash(command: &str, scope: &Scope) -> Option<Finding> {
+    scan(&command.replace("\r\n", "\n"), scope, 0)
+}
+
+/// Returns the first write into the project in a PowerShell tool command.
+pub fn classify_powershell(command: &str, scope: &Scope) -> Option<Finding> {
+    powershell::scan(&command.replace("\r\n", "\n"), scope, 0)
+}
+
+fn scan(script: &str, scope: &Scope, depth: usize) -> Option<Finding> {
     let mut lexer = Lexer::new(script);
     let commands = lexer.list(false);
-    check(&commands, depth)
+    let context = Context {
+        source: script,
+        dialect: Dialect::Bash,
+        scope,
+        depth,
+    };
+    check(&commands, context)
         .or_else(|| {
             lexer
                 .nested
                 .iter()
-                .find_map(|commands| check(commands, depth))
+                .find_map(|commands| check(commands, context))
         })
         .or_else(|| {
             (depth < MAX_SCRIPT_DEPTH)
@@ -135,10 +160,42 @@ fn scan(script: &str, depth: usize) -> Option<Finding> {
                     lexer
                         .backticks
                         .iter()
-                        .find_map(|body| scan(body, depth + 1))
+                        .find_map(|body| scan(body, scope, depth + 1))
                 })
                 .flatten()
         })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dialect {
+    Bash,
+    PowerShell,
+}
+
+/// What checking a lexed script needs besides its commands.
+#[derive(Clone, Copy)]
+struct Context<'a> {
+    /// The script whose bytes word spans index.
+    source: &'a str,
+    dialect: Dialect,
+    scope: &'a Scope,
+    /// How many enclosing `bash -c`, `eval`, backtick, or `pwsh -Command`
+    /// scripts this one runs in.
+    depth: usize,
+}
+
+impl Context<'_> {
+    /// Whether a write to `word` may reach a file inside the project.
+    fn counts(&self, word: &Word) -> bool {
+        let raw = self.source.get(word.span.clone()).unwrap_or_default();
+        is_file(&word.text) && self.scope.inside(self.dialect, raw)
+    }
+
+    /// Whether an in-place editor changes a project file: it has no file
+    /// operand, so the target is unknown, or one that may be inside.
+    fn edits(&self, files: &[&Word]) -> bool {
+        files.is_empty() || files.iter().any(|file| self.counts(file))
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -148,12 +205,14 @@ struct Word {
     text: String,
     /// Whether the word starts with an unquoted `NAME=` assignment.
     assignment: bool,
+    /// Where the word lies in its script, for reading a target's quoting.
+    span: Range<usize>,
 }
 
 #[derive(Debug)]
 enum Redirect {
     /// Output to a path; `stdout` is false for other descriptors.
-    Output { stdout: bool, target: String },
+    Output { stdout: bool, target: Word },
     /// Heredoc or here-string content on standard input.
     Input(String),
     /// Descriptor duplication, input files, and other descriptors.
@@ -313,14 +372,15 @@ impl<'a> Lexer<'a> {
                 self.at += if next == Some(b'>') { 3 } else { 2 };
                 Redirect::Output {
                     stdout: true,
-                    target: self.target().text,
+                    target: self.target(),
                 }
             }
             (Some(b'>'), Some(b'&'), _) => {
                 self.at += 2;
-                let target = self.target().text;
-                if target.starts_with('$')
+                let target = self.target();
+                if target.text.starts_with('$')
                     || target
+                        .text
                         .trim_end_matches('-')
                         .bytes()
                         .all(|byte| byte.is_ascii_digit())
@@ -334,14 +394,14 @@ impl<'a> Lexer<'a> {
                 self.at += 2;
                 Redirect::Output {
                     stdout,
-                    target: self.target().text,
+                    target: self.target(),
                 }
             }
             (Some(b'>'), _, _) => {
                 self.at += 1;
                 Redirect::Output {
                     stdout,
-                    target: self.target().text,
+                    target: self.target(),
                 }
             }
             (Some(b'<'), Some(b'<'), Some(b'<')) => {
@@ -468,7 +528,11 @@ impl<'a> Lexer<'a> {
         }
         let text = String::from_utf8_lossy(&text).into_owned();
         let assignment = is_assignment(&text, plain);
-        Word { text, assignment }
+        Word {
+            text,
+            assignment,
+            span: start..self.at,
+        }
     }
 
     fn double_quoted(&mut self, text: &mut Vec<u8>) {
@@ -688,9 +752,12 @@ fn is_assignment(text: &str, plain: usize) -> bool {
 }
 
 /// Embedded text on a command's standard input, and where it came from.
+#[derive(Clone, Debug)]
 struct Content {
     text: String,
     pattern: Pattern,
+    /// The program the text came from; empty for a PowerShell literal, which
+    /// is attributed to the program that writes it.
     origin: String,
 }
 
@@ -703,10 +770,10 @@ impl Content {
     }
 }
 
-fn check(commands: &[Command], depth: usize) -> Option<Finding> {
+fn check(commands: &[Command], context: Context) -> Option<Finding> {
     let mut piped = None;
     for command in commands {
-        match inspect(command, piped.take(), depth) {
+        match inspect(command, piped.take(), context) {
             Err(finding) => return Some(finding),
             Ok(output) => piped = output.filter(|_| command.piped),
         }
@@ -772,7 +839,7 @@ fn family(program: &str) -> Family {
 fn inspect(
     command: &Command,
     piped: Option<Content>,
-    depth: usize,
+    context: Context,
 ) -> Result<Option<Content>, Finding> {
     let Some((first, arguments)) = resolve(&command.words).split_first() else {
         return Ok(None);
@@ -791,9 +858,9 @@ fn inspect(
             _ => None,
         });
     let stdin = heredoc.or(piped);
-    let to_file = command.redirects.iter().any(
-        |redirect| matches!(redirect, Redirect::Output { stdout: true, target } if is_file(target)),
-    );
+    let to_file = command.redirects.iter().any(|redirect| {
+        matches!(redirect, Redirect::Output { stdout: true, target } if context.counts(target))
+    });
     let found = |pattern| {
         Err(Finding {
             pattern,
@@ -814,18 +881,23 @@ fn inspect(
             }
         }
         Family::Tee => match stdin {
-            Some(content) if tee_writes(arguments) => Err(content.finding()),
+            Some(content) if tee_writes(arguments, context) => Err(content.finding()),
             stdin => Ok(stdin),
         },
-        Family::Sed if sed_in_place(arguments) => found(Pattern::InPlaceEdit),
-        Family::Awk if awk_in_place(arguments) => found(Pattern::InPlaceEdit),
+        Family::Sed if sed_in_place(arguments).is_some_and(|files| context.edits(&files)) => {
+            found(Pattern::InPlaceEdit)
+        }
+        Family::Awk if awk_in_place(arguments).is_some_and(|files| context.edits(&files)) => {
+            found(Pattern::InPlaceEdit)
+        }
         Family::Filter | Family::Sed | Family::Awk => match stdin {
             Some(content) if to_file => Err(content.finding()),
             stdin => Ok(stdin),
         },
         Family::Interpreter(language) => {
             let invocation = invocation(language, &program, arguments);
-            if invocation.in_place {
+            let files = arguments.get(invocation.operands..).unwrap_or_default();
+            if invocation.in_place && context.edits(&files.iter().collect::<Vec<_>>()) {
                 return found(Pattern::InPlaceEdit);
             }
             // Without inline code or a script file, standard input is the program.
@@ -836,18 +908,36 @@ fn inspect(
             } else {
                 stdin.map(|content| content.text).unwrap_or_default()
             };
-            if writes(language, &code) {
+            let writes = match language {
+                // PowerShell code gets the PowerShell tool's checks, reported
+                // as inline code of the program that runs it.
+                Language::PowerShell => {
+                    let foreign;
+                    let scope = match context.dialect {
+                        Dialect::PowerShell => context.scope,
+                        // Bash may already have expanded `$` in the code.
+                        Dialect::Bash => {
+                            foreign = context.scope.foreign();
+                            &foreign
+                        }
+                    };
+                    context.depth < MAX_SCRIPT_DEPTH
+                        && powershell::scan(&code, scope, context.depth + 1).is_some()
+                }
+                _ => writes(language, &code),
+            };
+            if writes {
                 found(Pattern::InlineScriptWrite)
             } else {
                 Ok(None)
             }
         }
         Family::Shell => match shell_script(arguments, stdin) {
-            Some(script) => nested(&script, depth),
+            Some(script) => nested(&script, context),
             None => Ok(None),
         },
-        Family::Eval => nested(&join(arguments), depth),
-        Family::Find => find_exec(arguments, depth),
+        Family::Eval => nested(&join(arguments), context),
+        Family::Find => find_exec(arguments, context),
         Family::Applier if stdin.is_some() && applies(&program, arguments) => {
             found(Pattern::AppliedContent)
         }
@@ -855,10 +945,19 @@ fn inspect(
     }
 }
 
-/// Classifies a script that the command runs, such as `bash -c` text.
-fn nested(script: &str, depth: usize) -> Result<Option<Content>, Finding> {
-    match (depth < MAX_SCRIPT_DEPTH)
-        .then(|| scan(script, depth + 1))
+/// Classifies a Bash script that the command runs, such as `bash -c` text.
+fn nested(script: &str, context: Context) -> Result<Option<Content>, Finding> {
+    let foreign;
+    let scope = match context.dialect {
+        Dialect::Bash => context.scope,
+        // PowerShell may already have expanded `$` in the script.
+        Dialect::PowerShell => {
+            foreign = context.scope.foreign();
+            &foreign
+        }
+    };
+    match (context.depth < MAX_SCRIPT_DEPTH)
+        .then(|| scan(script, scope, context.depth + 1))
         .flatten()
     {
         Some(finding) => Err(finding),
@@ -867,7 +966,7 @@ fn nested(script: &str, depth: usize) -> Result<Option<Content>, Finding> {
 }
 
 /// Checks the commands that `find -exec` and its variants run.
-fn find_exec(arguments: &[Word], depth: usize) -> Result<Option<Content>, Finding> {
+fn find_exec(arguments: &[Word], context: Context) -> Result<Option<Content>, Finding> {
     let mut rest = arguments;
     while let Some(start) = rest
         .iter()
@@ -882,7 +981,7 @@ fn find_exec(arguments: &[Word], depth: usize) -> Result<Option<Content>, Findin
             words: tail[..end].to_vec(),
             ..Command::default()
         };
-        inspect(&command, None, depth)?;
+        inspect(&command, None, context)?;
         rest = &tail[end..];
     }
     Ok(None)
@@ -1027,8 +1126,8 @@ fn join(words: &[Word]) -> String {
         .join(" ")
 }
 
-/// Whether `tee` names an output file other than a device.
-fn tee_writes(arguments: &[Word]) -> bool {
+/// Whether `tee` names an output file that may be in the project.
+fn tee_writes(arguments: &[Word], context: Context) -> bool {
     let mut options = true;
     arguments.iter().any(|word| {
         let text = word.text.as_str();
@@ -1036,37 +1135,59 @@ fn tee_writes(arguments: &[Word]) -> bool {
             options = text != "--";
             return false;
         }
-        text != "-" && is_file(text)
+        text != "-" && context.counts(word)
     })
 }
 
-/// Whether `sed` edits files in place (`-i`, `-i.bak`, `-ni`, `--in-place`).
-fn sed_in_place(arguments: &[Word]) -> bool {
+/// Whether the long option `given` names `option`. GNU getopt accepts any
+/// unambiguous prefix, and an ambiguous one fails before the program runs.
+fn abbreviates(given: &str, option: &str) -> bool {
+    !given.is_empty() && option.starts_with(given)
+}
+
+/// The file operands of `sed` when it edits in place (`-i`, `-i.bak`, `-ni`,
+/// `--in-place`). Without `-e` or `-f`, the first operand is the script.
+fn sed_in_place(arguments: &[Word]) -> Option<Vec<&Word>> {
+    let mut in_place = false;
+    let mut script = false;
+    let mut options = true;
+    let mut operands = Vec::new();
     let mut index = 0;
     while let Some(word) = arguments.get(index) {
         index += 1;
         let text = word.text.as_str();
+        if !options || text == "-" || !text.starts_with('-') {
+            operands.push(word);
+            continue;
+        }
         if text == "--" {
-            break;
+            options = false;
+            continue;
         }
         if let Some(long) = text.strip_prefix("--") {
-            if long == "in-place" || long.starts_with("in-place=") {
-                return true;
-            }
-            if matches!(long, "expression" | "file" | "line-length") {
+            let (name, value) = long
+                .split_once('=')
+                .map_or((long, None), |(name, value)| (name, Some(value)));
+            let is = |option| abbreviates(name, option);
+            in_place |= is("in-place");
+            script |= is("expression") || is("file");
+            if value.is_none() && (is("expression") || is("file") || is("line-length")) {
                 index += 1;
             }
             continue;
         }
-        let Some(cluster) = text.strip_prefix('-') else {
-            continue;
-        };
+        let cluster = &text[1..];
         for (position, flag) in cluster.char_indices() {
             match flag {
-                // BSD sed spells in-place editing `-I` as well.
-                'i' | 'I' => return true,
+                // BSD sed spells in-place editing `-I` as well; the rest of
+                // the cluster is a backup suffix.
+                'i' | 'I' => {
+                    in_place = true;
+                    break;
+                }
                 // The rest of the cluster, or else the next word, is the value.
                 'e' | 'f' | 'l' => {
+                    script |= flag != 'l';
                     index += usize::from(position + 1 == cluster.len());
                     break;
                 }
@@ -1074,21 +1195,69 @@ fn sed_in_place(arguments: &[Word]) -> bool {
             }
         }
     }
-    false
+    if !script && !operands.is_empty() {
+        operands.remove(0);
+    }
+    in_place.then_some(operands)
 }
 
-/// Whether `gawk` loads its in-place extension (`-i inplace`).
-fn awk_in_place(arguments: &[Word]) -> bool {
-    arguments.iter().enumerate().any(|(index, word)| {
+/// The file operands of `gawk` when it loads its in-place extension
+/// (`-i inplace`). Without `-f`, `-e`, or `-E`, the first operand is the
+/// program.
+fn awk_in_place(arguments: &[Word]) -> Option<Vec<&Word>> {
+    let mut in_place = false;
+    let mut program = false;
+    let mut options = true;
+    let mut operands = Vec::new();
+    let mut index = 0;
+    while let Some(word) = arguments.get(index) {
+        index += 1;
         let text = word.text.as_str();
-        let library = match text {
-            "-i" | "--include" => arguments.get(index + 1).map(|word| word.text.as_str()),
-            _ => text
-                .strip_prefix("--include=")
-                .or_else(|| text.strip_prefix("-i")),
+        if !options || text == "-" || !text.starts_with('-') {
+            // Options end at the first operand.
+            options = false;
+            operands.push(word);
+            continue;
+        }
+        if text == "--" {
+            options = false;
+            continue;
+        }
+        // The short flag, or the long option's name, and an attached value.
+        let (flag, long, attached) = match text.strip_prefix("--") {
+            Some(long) => match long.split_once('=') {
+                Some((name, value)) => ("", name, Some(value)),
+                None => ("", long, None),
+            },
+            None => match text.get(1..2).zip(text.get(2..)) {
+                Some((flag, rest)) => (flag, "", (!rest.is_empty()).then_some(rest)),
+                None => continue,
+            },
         };
-        library.is_some_and(|library| library == "inplace" || library == "inplace.awk")
-    })
+        let is = |short: &str, option: &str| flag == short || abbreviates(long, option);
+        let included = is("i", "include");
+        let source = is("f", "file") || is("e", "source") || is("E", "exec");
+        program |= source;
+        let valued = included
+            || source
+            || is("v", "assign")
+            || is("F", "field-separator")
+            || is("l", "load")
+            || is("W", "");
+        let value = match attached {
+            Some(value) => Some(value),
+            None if valued => {
+                index += 1;
+                arguments.get(index - 1).map(|word| word.text.as_str())
+            }
+            None => None,
+        };
+        in_place |= included && matches!(value, Some("inplace" | "inplace.awk"));
+    }
+    if !program && !operands.is_empty() {
+        operands.remove(0);
+    }
+    in_place.then_some(operands)
 }
 
 /// The script a shell runs from `-c` or, with no script file, standard input.
@@ -1176,6 +1345,8 @@ struct Invocation {
     /// Whether a script file runs, so standard input is data rather than code.
     script: bool,
     in_place: bool,
+    /// Where the operands after the options, code, and any script file start.
+    operands: usize,
 }
 
 /// Short-option behavior of a Unix-style interpreter.
@@ -1266,16 +1437,21 @@ fn invocation(language: Language, program: &str, arguments: &[Word]) -> Invocati
         Language::Php => &PHP,
         Language::PowerShell => return powershell(program, arguments),
     };
-    let mut invocation = Invocation::default();
+    let mut invocation = Invocation {
+        operands: arguments.len(),
+        ..Invocation::default()
+    };
     let mut index = 0;
     while let Some(word) = arguments.get(index) {
         index += 1;
         let text = word.text.as_str();
         if text == "-" {
+            invocation.operands = index;
             break;
         }
         if text == "--" {
-            invocation.script = index < arguments.len();
+            invocation.script = invocation.code.is_empty() && index < arguments.len();
+            invocation.operands = index + usize::from(invocation.script);
             break;
         }
         if let Some(long) = text.strip_prefix("--") {
@@ -1299,7 +1475,9 @@ fn invocation(language: Language, program: &str, arguments: &[Word]) -> Invocati
             continue;
         }
         let Some(cluster) = text.strip_prefix('-').filter(|cluster| !cluster.is_empty()) else {
-            invocation.script = true;
+            // With inline code, the first operand is data; otherwise it is the script.
+            invocation.script = invocation.code.is_empty();
+            invocation.operands = index - usize::from(!invocation.script);
             break;
         };
         for (position, flag) in cluster.char_indices() {
@@ -1353,9 +1531,14 @@ fn powershell(program: &str, arguments: &[Word]) -> Invocation {
             }
             break;
         };
-        if matches!(name, "c" | "cwa" | "commandwithargs")
-            || (name.len() >= 3 && "command".starts_with(name))
-        {
+        if matches!(name, "cwa" | "commandwithargs") {
+            // Later words are the script's `$args`.
+            invocation
+                .code
+                .extend(arguments.get(index).map(|word| word.text.clone()));
+            break;
+        }
+        if name == "c" || (name.len() >= 3 && "command".starts_with(name)) {
             // `-Command -` reads the commands from standard input.
             let code = join(&arguments[index..]);
             if code != "-" {
@@ -1434,18 +1617,8 @@ fn writes(language: Language, code: &str) -> bool {
                 || calls(code, "fopen(")
                     .any(|at| call_writes(&code[at + "fopen".len()..], 1, "+abcertwx"))
         }
-        Language::PowerShell => {
-            let code = code.to_ascii_lowercase();
-            [
-                "set-content",
-                "add-content",
-                "out-file",
-                "io.file]::write",
-                "io.file]::append",
-            ]
-            .iter()
-            .any(|name| code.contains(name))
-        }
+        // `inspect` classifies PowerShell code as a script of its own.
+        Language::PowerShell => false,
     }
 }
 

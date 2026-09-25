@@ -38,9 +38,11 @@ fn main() -> ExitCode {
              JSON-RPC lines are limited to 16 MiB. Protocol output uses stdout; errors use stderr.\n\
              Cancellation or disconnection does not imply rollback; query receipts before retrying.\n\
              --claude-context prints plugin hook JSON and exits without opening a workspace.\n\
-             --claude-hook PreToolUse reads Claude Code hook JSON from stdin and denies Bash\n\
-             commands that write file content through the shell (heredoc or echo redirection,\n\
-             inline interpreter writes, sed -i). It allows anything it cannot parse.\n\
+             --claude-hook PreToolUse reads Claude Code hook JSON from stdin and denies Bash and\n\
+             PowerShell commands that write file content into the project through the shell\n\
+             (heredoc, here-string, echo or Set-Content redirection, inline interpreter writes,\n\
+             sed -i, -replace rewrites). Targets certainly outside CLAUDE_PROJECT_DIR (or the\n\
+             event's cwd) are allowed, as is anything it cannot parse.\n\
              {}=allow disables the guard.",
             env!("CARGO_PKG_VERSION"),
             shell_guard::ESCAPE_HATCH
@@ -80,7 +82,7 @@ fn main() -> ExitCode {
             eprintln!("--claude-hook requires exactly PreToolUse");
             return ExitCode::from(1);
         }
-        guard_bash_writes();
+        guard_shell_writes();
         return ExitCode::SUCCESS;
     }
     if arguments.len() != 2 || arguments[0] != "--root" {
@@ -115,10 +117,11 @@ fn main() -> ExitCode {
     }
 }
 
-/// Answers a `PreToolUse` hook: prints a deny decision for a Bash command that
-/// writes file content through the shell, and nothing otherwise. Every failure
-/// allows the call, because a broken guard must never block a session.
-fn guard_bash_writes() {
+/// Answers a `PreToolUse` hook: prints a deny decision for a Bash or
+/// PowerShell command that writes file content into the project through the
+/// shell, and nothing otherwise. Every failure allows the call, because a
+/// broken guard must never block a session.
+fn guard_shell_writes() {
     let mut input = Vec::new();
     // Read before deciding so the host never writes into a closed pipe.
     let limit = MAX_MESSAGE_BYTES as u64 + 1;
@@ -132,14 +135,17 @@ fn guard_bash_writes() {
     let Ok(event) = serde_json::from_slice::<serde_json::Value>(&input) else {
         return;
     };
-    if event["tool_name"] != "Bash" {
-        return;
-    }
+    let classify = match event["tool_name"].as_str() {
+        Some("Bash") => shell_guard::classify_bash,
+        Some("PowerShell") => shell_guard::classify_powershell,
+        _ => return,
+    };
     let Some(command) = event["tool_input"]["command"].as_str() else {
         return;
     };
-    // A classifier bug must not turn into a hook error on every Bash call.
-    let Some(finding) = std::panic::catch_unwind(|| shell_guard::classify(command))
+    let scope = guard_scope(event["cwd"].as_str());
+    // A classifier bug must not turn into a hook error on every shell call.
+    let Some(finding) = std::panic::catch_unwind(|| classify(command, &scope))
         .ok()
         .flatten()
     else {
@@ -154,6 +160,24 @@ fn guard_bash_writes() {
     if serde_json::to_writer(&mut stdout, &output).is_ok() {
         let _ = writeln!(stdout);
     }
+}
+
+/// The project the guard protects: `CLAUDE_PROJECT_DIR` when it is set and
+/// absolute, else the event's working directory when that is absolute, else
+/// none. It carries the environment values that write targets may expand.
+fn guard_scope(cwd: Option<&str>) -> shell_guard::Scope {
+    let project = env::var("CLAUDE_PROJECT_DIR").ok();
+    let root = project
+        .as_deref()
+        .filter(|root| shell_guard::is_absolute(root))
+        .or(cwd.filter(|cwd| shell_guard::is_absolute(cwd)));
+    let scope = root.map(shell_guard::Scope::new).unwrap_or_default();
+    shell_guard::SCOPE_VARIABLES
+        .into_iter()
+        .fold(scope, |scope, name| match env::var(name) {
+            Ok(value) => scope.with_variable(name, &value),
+            Err(_) => scope,
+        })
 }
 
 async fn serve(workspace: Workspace) -> Result<(), Box<dyn std::error::Error>> {

@@ -984,14 +984,20 @@ fn bundled_plugin_launches_hooks_and_mcp_without_path_lookup() {
     }
     let guards = configuration["hooks"]["PreToolUse"].as_array().unwrap();
     assert_eq!(guards.len(), 1);
-    // An exact tool-name matcher: the guard only understands Bash commands.
-    assert_eq!(guards[0]["matcher"], "Bash");
+    // Exact tool names: the guard only understands Bash and PowerShell commands.
+    assert_eq!(guards[0]["matcher"], "Bash|PowerShell");
     let handler = &guards[0]["hooks"][0];
     assert_eq!(handler["type"], "command");
     assert_ne!(handler["async"], true);
-    for (command, denied) in [
-        ("cat > notes.txt <<'EOF'\nC:\\temp\nEOF", true),
-        ("cargo test > log.txt 2>&1", false),
+    for (tool, command, denied) in [
+        ("Bash", "cat > notes.txt <<'EOF'\nC:\\temp\nEOF", true),
+        ("Bash", "cargo test > log.txt 2>&1", false),
+        (
+            "PowerShell",
+            "@'\nC:\\temp\n'@ | Set-Content notes.txt",
+            true,
+        ),
+        ("PowerShell", "cargo test *> log.txt", false),
     ] {
         let mut child = executable(handler)
             .env_remove("ULTRA_EDIT_SHELL_WRITES")
@@ -1003,7 +1009,7 @@ fn bundled_plugin_launches_hooks_and_mcp_without_path_lookup() {
         let event = json!({
             "hook_event_name": "PreToolUse",
             "cwd": root.path(),
-            "tool_name": "Bash",
+            "tool_name": tool,
             "tool_input": {"command": command},
         });
         let mut input = child.stdin.take().unwrap();

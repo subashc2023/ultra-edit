@@ -40,7 +40,7 @@ def _hook_events() -> dict[str, list[dict[str, object]]]:
     return {
         "SessionStart": group(["--claude-context", "SessionStart"]),
         "SubagentStart": group(["--claude-context", "SubagentStart"]),
-        "PreToolUse": group(["--claude-hook", "PreToolUse"], "Bash"),
+        "PreToolUse": group(["--claude-hook", "PreToolUse"], "Bash|PowerShell"),
     }
 
 
@@ -180,16 +180,28 @@ class ReleasePackagingTests(unittest.TestCase):
         with self.assertRaisesRegex(release.ReleaseError, "plugin.json license"):
             release.verify_version("v1.2.3", self.root)
 
-    def test_hooks_config_requires_context_hooks_and_the_bash_guard(self) -> None:
+    def test_hooks_config_requires_context_hooks_and_the_shell_guard(self) -> None:
         release._validate_hooks_config({"hooks": _hook_events()}, "hooks.json")
         without_guard = _hook_events()
         del without_guard["PreToolUse"]
         with self.assertRaisesRegex(release.ReleaseError, "exactly one PreToolUse hook group"):
             release._validate_hooks_config({"hooks": without_guard}, "hooks.json")
-        any_tool = _hook_events()
-        del any_tool["PreToolUse"][0]["matcher"]
-        with self.assertRaisesRegex(release.ReleaseError, r"PreToolUse\.matcher must be 'Bash'"):
-            release._validate_hooks_config({"hooks": any_tool}, "hooks.json")
+        # The guard must see both shell tools, named exactly; order and extra
+        # names do not matter.
+        for matcher in ("PowerShell|Bash", "Bash|PowerShell|Monitor"):
+            events = _hook_events()
+            events["PreToolUse"][0]["matcher"] = matcher
+            release._validate_hooks_config({"hooks": events}, "hooks.json")
+        for matcher in (None, "", "*", "Bash", "PowerShell", "Bash|Power.*", "Bash|PowerShell\n", 1):
+            events = _hook_events()
+            if matcher is None:
+                del events["PreToolUse"][0]["matcher"]
+            else:
+                events["PreToolUse"][0]["matcher"] = matcher
+            with self.subTest(matcher=matcher), self.assertRaisesRegex(
+                release.ReleaseError, r"PreToolUse\.matcher must list the tool names 'Bash' and 'PowerShell'"
+            ):
+                release._validate_hooks_config({"hooks": events}, "hooks.json")
         wrong_mode = _hook_events()
         wrong_mode["PreToolUse"][0]["hooks"][0]["args"] = ["--claude-context", "PreToolUse"]
         with self.assertRaisesRegex(release.ReleaseError, r"PreToolUse\.args"):
