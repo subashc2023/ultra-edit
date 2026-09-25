@@ -146,6 +146,9 @@ pub struct Diagnostic {
     pub expected: Option<usize>,
     pub actual: Option<usize>,
     pub conflicts: Vec<String>,
+    /// Closest current regions for a target that matched nowhere, at most three.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<Candidate>,
 }
 
 impl Diagnostic {
@@ -158,8 +161,36 @@ impl Diagnostic {
             expected: None,
             actual: None,
             conflicts: Vec::new(),
+            candidates: Vec::new(),
         }
     }
+}
+
+/// A current region that nearly matches a failed target. Lines are one-based
+/// and inclusive, numbered like focused reads; byte offsets stay internal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Candidate {
+    pub kind: CandidateKind,
+    pub line: usize,
+    pub end_line: usize,
+    /// Exact current bytes; absent above 2,000 characters rather than clipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Percentage score, present only for `similar` candidates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub similarity: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateKind {
+    /// The unmet expectation occurs literally elsewhere.
+    Exact,
+    /// Equal after line-ending and space/tab normalization.
+    Whitespace,
+    /// Close by edit distance on whitespace-squeezed text.
+    Similar,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

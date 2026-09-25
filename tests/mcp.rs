@@ -1042,6 +1042,69 @@ fn preview_repair_commit_and_conditional_undo_use_retained_plans() {
 }
 
 #[test]
+fn near_miss_targets_return_copyable_candidates_over_mcp() {
+    let root = TempDir::new().unwrap();
+    fs::write(
+        root.path().join("main.rs"),
+        "fn main() {\n\tlet x = 1;\n}\n",
+    )
+    .unwrap();
+    let mut client = Client::start(root.path());
+    let snapshot = client.full("main.rs");
+    let request = json!({"request_id":"near-miss","files":[{"base":snapshot["snapshot"],"changes":[{
+        "id":"x","target":{"kind":"exact","old":"    let x = 1;"},"text":"    let x = 2;"
+    }]}]});
+    let rejected = client.call("ultra_edit", request, true);
+    assert_eq!(rejected["kind"], "rejected");
+    let diagnostic = &rejected["diagnostics"][0];
+    assert_eq!(diagnostic["code"], "TARGET_NOT_FOUND");
+    assert_eq!(
+        diagnostic["candidates"],
+        json!([{"kind":"whitespace","line":2,"end_line":2,"text":"\tlet x = 1;"}])
+    );
+    let message = diagnostic["message"].as_str().unwrap();
+    assert!(message.contains("a candidate at line 2 differs only in whitespace"));
+    let evidence = client.call(
+        "ultra_edit_status",
+        json!({"query":{"kind":"evidence","reference":rejected["reference"]}}),
+        false,
+    );
+    assert_eq!(
+        evidence["value"]["diagnostics"][0]["candidates"],
+        diagnostic["candidates"]
+    );
+    // Replacing just the failed change with the candidate's exact text succeeds.
+    let repaired = client.call(
+        "ultra_edit_repair",
+        json!({"reference":rejected["reference"],"request_id":"near-miss-repaired","changes":[{
+            "id":"x","target":{"kind":"exact","old":diagnostic["candidates"][0]["text"]},
+            "text":"\tlet x = 2;"
+        }]}),
+        false,
+    );
+    assert_eq!(repaired["kind"], "ready");
+    let committed = client.call(
+        "ultra_edit_commit",
+        json!({"plan":repaired["reference"]}),
+        false,
+    );
+    assert_eq!(committed["commit"], "committed");
+    assert_eq!(
+        fs::read_to_string(root.path().join("main.rs")).unwrap(),
+        "fn main() {\n\tlet x = 2;\n}\n"
+    );
+    // Diagnostics with nothing to suggest omit the field.
+    let snapshot = client.full("main.rs");
+    let ambiguous = json!({"request_id":"no-candidates","files":[{"base":snapshot["snapshot"],"changes":[{
+        "id":"n","target":{"kind":"exact","old":"n"},"text":"N"
+    }]}]});
+    let rejected = client.call("ultra_edit_prepare", ambiguous, true);
+    assert_eq!(rejected["diagnostics"][0]["code"], "TARGET_AMBIGUOUS");
+    assert!(rejected["diagnostics"][0].get("candidates").is_none());
+    client.close();
+}
+
+#[test]
 fn retry_preflight_failure_keeps_original_receipt_and_candidate() {
     let root = TempDir::new().unwrap();
     let path = root.path().join("file.txt");

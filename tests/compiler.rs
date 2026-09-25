@@ -1,7 +1,12 @@
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
+use serde_json::json;
 use ultra_edit::compiler::{compile, snapshot};
-use ultra_edit::{Change, EditRequest, FileRequest, Snapshot, Span, Target};
+use ultra_edit::{
+    Candidate, CandidateKind, Change, Diagnostic, Draft, EditRequest, FileRequest, Snapshot, Span,
+    Target,
+};
 
 fn exact(id: &str, old: &str, text: &str) -> Change {
     Change {
@@ -46,6 +51,54 @@ fn add_span(base: &mut Snapshot, id: &str, start: usize, end: usize) {
         end,
         line: 0,
     });
+}
+
+fn scoped(id: &str, old: &str, scope: &str) -> Change {
+    Change {
+        id: id.into(),
+        target: Target::Exact {
+            old: old.into(),
+            scope: Some(scope.into()),
+        },
+        text: "replacement".into(),
+    }
+}
+
+fn guarded(span: &str, expect: &str) -> Change {
+    Change {
+        id: "guarded".into(),
+        target: Target::Span {
+            span: span.into(),
+            expect: Some(expect.into()),
+        },
+        text: "replacement".into(),
+    }
+}
+
+/// Compiles one change that must fail alone and returns its diagnostic.
+fn rejected(base: &Snapshot, change: Change) -> Diagnostic {
+    let mut errors = compile(&request(base, vec![change]), &bases(base)).unwrap_err();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    let error = errors.remove(0);
+    assert!(error.message.chars().count() <= 240, "{}", error.message);
+    error
+}
+
+fn candidate(kind: CandidateKind, lines: (usize, usize), text: &str) -> Candidate {
+    Candidate {
+        kind,
+        line: lines.0,
+        end_line: lines.1,
+        text: Some(text.into()),
+        similarity: None,
+    }
+}
+
+fn similar(lines: (usize, usize), text: &str, similarity: u8) -> Candidate {
+    Candidate {
+        similarity: Some(similarity),
+        ..candidate(CandidateKind::Similar, lines, text)
+    }
 }
 
 #[test]
@@ -863,4 +916,303 @@ fn exact_match_counts_agree_with_exhaustive_unicode_search() {
             }
         }
     }
+}
+
+#[test]
+fn whitespace_candidates_carry_exact_source_text_and_lines() {
+    let base = snapshot("tabs.rs".into(), "fn main() {\n\tlet x = 1;\n}\n".into());
+    let error = rejected(&base, exact("tabs", "    let x = 1;", "    let x = 2;"));
+    assert_eq!(error.code, "TARGET_NOT_FOUND");
+    assert_eq!((error.expected, error.actual), (Some(1), Some(0)));
+    let tab = candidate(CandidateKind::Whitespace, (2, 2), "\tlet x = 1;");
+    assert_eq!(error.candidates, [tab]);
+    assert_eq!(
+        error.message,
+        "Expected 1 occurrence(s), found 0; a candidate at line 2 differs only in whitespace. Copy its exact text into `old` (ultra_edit_repair can replace just this change)."
+    );
+    let copied = exact("tabs", "\tlet x = 1;", "\tlet x = 2;");
+    let plan = compile(&request(&base, vec![copied]), &bases(&base)).unwrap();
+    assert_eq!(plan.files[0].output, "fn main() {\n\tlet x = 2;\n}\n");
+
+    // A multi-line LF needle finds CRLF source, including its final line ending.
+    let base = snapshot(
+        "crlf.txt".into(),
+        "a\r\n  b = 1;\r\n  c = 2;\r\nd\r\n".into(),
+    );
+    let error = rejected(&base, exact("crlf", "  b = 1;\n  c = 2;\n", "x"));
+    let crlf = candidate(
+        CandidateKind::Whitespace,
+        (2, 3),
+        "  b = 1;\r\n  c = 2;\r\n",
+    );
+    assert_eq!(error.candidates, [crlf]);
+    assert!(
+        error
+            .message
+            .contains("a candidate at lines 2-3 differs only")
+    );
+
+    // Trailing spaces on either side, and characters beyond ASCII after a BOM.
+    let base = snapshot("trailing.txt".into(), "let x = 1;   \nlet y = 2;\n".into());
+    let error = rejected(&base, exact("trailing", "let x = 1;\nlet y = 2;", "x"));
+    let spaces = candidate(
+        CandidateKind::Whitespace,
+        (1, 2),
+        "let x = 1;   \nlet y = 2;",
+    );
+    assert_eq!(error.candidates, [spaces]);
+    let base = snapshot("trailing.txt".into(), "let x = 1;\nlet y = 2;\n".into());
+    let error = rejected(&base, exact("trailing", "let x = 1; \t\nlet y = 2;", "x"));
+    let bare = candidate(CandidateKind::Whitespace, (1, 2), "let x = 1;\nlet y = 2;");
+    assert_eq!(error.candidates, [bare]);
+    let base = snapshot("bom.txt".into(), "\u{feff}\tnamé = \"ü\";\n".into());
+    let error = rejected(&base, exact("bom", "  namé  =  \"ü\";", "x"));
+    let unicode = candidate(CandidateKind::Whitespace, (1, 1), "\tnamé = \"ü\";");
+    assert_eq!(error.candidates, [unicode]);
+}
+
+#[test]
+fn candidates_stay_within_the_target_scope() {
+    let base = snapshot("scope.txt".into(), "\tx = 1\ny = 2\n\tx = 1\n".into());
+    let error = rejected(&base, exact("x", "  x = 1", "x"));
+    let lines: Vec<_> = error.candidates.iter().map(|found| found.line).collect();
+    assert_eq!(lines, [1, 3]);
+    assert!(
+        error
+            .message
+            .contains("2 candidates, first at line 1, differ only in whitespace")
+    );
+
+    let error = rejected(&base, scoped("x", "  x = 1", "r2"));
+    assert!(error.candidates.is_empty());
+    assert_eq!(
+        error.message,
+        "Expected 1 occurrence(s), found 0; inspect the snapshot and choose an explicit span or narrower scope"
+    );
+    let error = rejected(&base, scoped("x", "  x = 1", "r3"));
+    let third = candidate(CandidateKind::Whitespace, (3, 3), "\tx = 1");
+    assert_eq!(error.candidates, std::slice::from_ref(&third));
+
+    let all = Change {
+        id: "all".into(),
+        target: Target::All {
+            old: "  x = 1".into(),
+            scope: "r3".into(),
+            expected: 1,
+        },
+        text: "x".into(),
+    };
+    let error = rejected(&base, all);
+    assert_eq!(error.code, "TARGET_NOT_FOUND");
+    assert_eq!(error.candidates, [third]);
+
+    // A span narrower than its line keeps the candidate inside the span.
+    let mut base = snapshot("partial.txt".into(), "let  total = compute();\n".into());
+    add_span(&mut base, "name", 0, 11);
+    let error = rejected(&base, scoped("name", "let total", "name"));
+    let partial = candidate(CandidateKind::Whitespace, (1, 1), "let  total");
+    assert_eq!(error.candidates, [partial]);
+}
+
+#[test]
+fn similar_candidates_catch_changed_operators_and_names_but_not_unrelated_text() {
+    let source = "function check(request) {\n    if (request.role !== \"admin\") {\n        deny();\n    }\n    let total = compute(items);\n}\n";
+    let base = snapshot("check.js".into(), source.into());
+    let error = rejected(
+        &base,
+        exact("op", "    if (request.role === \"admin\") {", "x"),
+    );
+    let operator = similar((2, 2), "    if (request.role !== \"admin\") {", 96);
+    assert_eq!(error.candidates, [operator]);
+    assert_eq!(
+        error.message,
+        "Expected 1 occurrence(s), found 0; a 96% similar candidate is at line 2. Verify it, then copy its exact text into `old` (ultra_edit_repair can replace just this change)."
+    );
+    // A fragment is matched by the corresponding fragment, never a partial word.
+    let error = rejected(&base, exact("fragment", "role === \"admin\"", "x"));
+    assert_eq!(
+        error.candidates,
+        [similar((2, 2), "role !== \"admin\"", 93)]
+    );
+
+    let error = rejected(&base, exact("name", "let sum = compute(items);", "x"));
+    assert_eq!(
+        error.candidates,
+        [similar((5, 5), "let total = compute(items);", 81)]
+    );
+
+    for unrelated in [
+        "fn unrelated_function() -> Result<(), Error> {}",
+        "SELECT name FROM users WHERE id = 7;",
+        "Z",
+    ] {
+        let error = rejected(&base, exact("unrelated", unrelated, "x"));
+        assert!(error.candidates.is_empty(), "{unrelated}: {error:?}");
+        assert!(
+            error
+                .message
+                .ends_with("choose an explicit span or narrower scope")
+        );
+    }
+}
+
+#[test]
+fn expectation_mismatch_quotes_the_span_and_finds_the_expected_text() {
+    let base = snapshot(
+        "expect.txt".into(),
+        "first\tline \"one\"\nsecond\n\tthird line\n".into(),
+    );
+    let error = rejected(&base, guarded("r1", "second"));
+    assert_eq!(error.code, "EXPECTED_TEXT_MISMATCH");
+    let second = candidate(CandidateKind::Exact, (2, 2), "second");
+    assert_eq!(error.candidates, [second]);
+    assert_eq!(
+        error.message,
+        r#"Span holds "first\tline \"one\"", not expect; the expected text is at line 2. Copy its exact text into `old` (ultra_edit_repair can replace just this change)."#
+    );
+
+    // An expectation differing only in whitespace finds its source spelling.
+    let error = rejected(&base, guarded("r1", "    third line"));
+    let third = candidate(CandidateKind::Whitespace, (3, 3), "\tthird line");
+    assert_eq!(error.candidates, [third]);
+
+    // A long selection is clipped on one line; nothing resembles `expect`.
+    let base = snapshot("long.txt".into(), format!("{}\nend\n", "a".repeat(100)));
+    let error = rejected(&base, guarded("r1", "zzz"));
+    assert!(error.candidates.is_empty());
+    assert_eq!(
+        error.message,
+        format!(
+            "Span holds \"{}\"…, not expect; inspect the original snapshot and choose the intended span",
+            "a".repeat(60)
+        )
+    );
+}
+
+#[test]
+fn long_candidates_omit_text_instead_of_clipping() {
+    for (repeat, kept) in [(1_999, true), (2_000, false)] {
+        // The tab plus the body is one character more than the body.
+        let body = "é".repeat(repeat);
+        let base = snapshot("long.txt".into(), format!("start\n\t{body}\nend\n"));
+        let error = rejected(&base, exact("long", &format!("    {body}"), "x"));
+        let found = &error.candidates[0];
+        assert_eq!(
+            (found.kind, found.line, found.end_line),
+            (CandidateKind::Whitespace, 2, 2)
+        );
+        assert_eq!(found.text.clone(), kept.then(|| format!("\t{body}")));
+        let advice = if kept {
+            "Copy its"
+        } else {
+            "Read it and copy its"
+        };
+        assert!(error.message.contains(advice), "{}", error.message);
+    }
+}
+
+#[test]
+fn candidate_order_is_deterministic() {
+    let base = snapshot("order.txt".into(), "\tx = 1\n".repeat(5));
+    let error = rejected(&base, exact("x", "  x = 1", "x"));
+    let lines: Vec<_> = error.candidates.iter().map(|found| found.line).collect();
+    assert_eq!(lines, [1, 2, 3]);
+
+    // Similar candidates run from best score, then by position.
+    let source = "let alpha = 2;\nlet alpha = 12;\nlet alpha = 3;\nlet alpha = 4;\n";
+    let base = snapshot("similar.txt".into(), source.into());
+    let error = rejected(&base, exact("alpha", "let alpha = 1;", "x"));
+    let expected = [
+        similar((2, 2), "let alpha = 12;", 93),
+        similar((1, 1), "let alpha = 2;", 92),
+        similar((3, 3), "let alpha = 3;", 92),
+    ];
+    assert_eq!(error.candidates, expected);
+    assert!(
+        error
+            .message
+            .contains("3 similar candidates, best 93% at line 2")
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            rejected(&base, exact("alpha", "let alpha = 1;", "x")),
+            error
+        );
+    }
+}
+
+#[test]
+fn counted_matches_explain_themselves_without_candidates() {
+    let base = snapshot("counts.txt".into(), "\tx = 1\nx = 1\n x  = 1\n".into());
+    let error = rejected(&base, exact("dup", "x = 1", "y"));
+    assert_eq!(error.code, "TARGET_AMBIGUOUS");
+    assert!(error.candidates.is_empty());
+    let all = Change {
+        id: "all".into(),
+        target: Target::All {
+            old: "x = 1".into(),
+            scope: "r0".into(),
+            expected: 3,
+        },
+        text: "y".into(),
+    };
+    let error = rejected(&base, all);
+    assert_eq!(error.code, "EXPECTED_COUNT_MISMATCH");
+    assert_eq!(error.actual, Some(2));
+    assert!(error.candidates.is_empty());
+}
+
+#[test]
+fn candidate_search_stays_fast_on_large_inputs() {
+    let source: String = (0..100_000)
+        .map(|line| format!("    let value_{line} = compute(input_{line}, {line});\n"))
+        .collect();
+    let base = snapshot("large.rs".into(), source);
+    let started = Instant::now();
+    // Near the end, so every tier scans the whole file before the similar tier ranks it.
+    let near = "    let value_99999 = compute(input_99998, 99999);";
+    let error = rejected(&base, exact("near", near, "x"));
+    let elapsed = started.elapsed();
+    assert_eq!(
+        error.candidates[0],
+        similar(
+            (100_000, 100_000),
+            "    let value_99999 = compute(input_99999, 99999);",
+            97
+        )
+    );
+    // Generous for unoptimized builds on shared runners; quadratic work over
+    // 100,000 lines would take far longer.
+    assert!(elapsed < Duration::from_secs(20), "{elapsed:?}");
+}
+
+#[test]
+fn diagnostics_without_candidates_keep_their_serialized_form() {
+    let legacy = json!({
+        "id": "d1",
+        "request": {"request_id": "legacy", "files": []},
+        "diagnostics": [{
+            "file": "a.txt", "change_id": "c", "code": "TARGET_NOT_FOUND",
+            "message": "Expected 1 occurrence(s), found 0; inspect the snapshot and choose an explicit span or narrower scope",
+            "expected": 1, "actual": 0, "conflicts": [],
+        }],
+    });
+    let draft: Draft = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(draft.diagnostics[0].candidates.is_empty());
+    assert_eq!(serde_json::to_value(&draft).unwrap(), legacy);
+
+    let base = snapshot("tabs.rs".into(), "if (a === b) {\n\tgo();\n}\n".into());
+    let whitespace = rejected(&base, exact("tab", "    go();", "x"));
+    let similar = rejected(&base, exact("op", "if (a !== b) {", "x"));
+    let encoded = serde_json::to_value([&whitespace, &similar]).unwrap();
+    assert_eq!(
+        encoded[0]["candidates"],
+        json!([{"kind": "whitespace", "line": 2, "end_line": 2, "text": "\tgo();"}])
+    );
+    assert_eq!(
+        encoded[1]["candidates"],
+        json!([{"kind": "similar", "line": 1, "end_line": 1, "text": "if (a === b) {", "similarity": 92}])
+    );
+    let decoded: [Diagnostic; 2] = serde_json::from_value(encoded).unwrap();
+    assert_eq!(decoded, [whitespace, similar]);
 }

@@ -215,14 +215,19 @@ fn preparation(preparation: Preparation) -> (Value, u8) {
     let code = if preparation.ready { 0 } else { 2 };
     let diagnostic_summary = preparation.diagnostics.iter().take(6).map(|diagnostic| {
         // Full strings/counts remain in the draft; inline diagnostics cannot grow with source size.
-        json!({
+        let mut summary = json!({
             "code": diagnostic.code.chars().take(80).collect::<String>(),
             "file": diagnostic.file.as_ref().map(|path| path.chars().take(500).collect::<String>()),
             "change_id": diagnostic.change_id.as_ref().map(|id| id.chars().take(80).collect::<String>()),
             "message": diagnostic.message.chars().take(240).collect::<String>(),
             "expected": diagnostic.expected,
             "actual": diagnostic.actual,
-        })
+        });
+        // Candidate text is complete or absent, never clipped, so it can be copied.
+        if !diagnostic.candidates.is_empty() {
+            summary["candidates"] = json!(diagnostic.candidates.iter().take(3).collect::<Vec<_>>());
+        }
+        summary
     }).collect::<Vec<_>>();
     (
         json!({

@@ -485,14 +485,20 @@ fn prepared(preparation: Preparation, request_id: &str) -> Result<CallToolResult
         .iter()
         .take(6)
         .map(|diagnostic| {
-            json!({
+            let mut summary = json!({
                 "code": clipped(&diagnostic.code, 80),
                 "file": diagnostic.file.as_deref().map(|path| clipped(path, 500)),
                 "change_id": diagnostic.change_id.as_deref().map(|id| clipped(id, 80)),
                 "message": clipped(&diagnostic.message, 240),
                 "expected": diagnostic.expected,
                 "actual": diagnostic.actual,
-            })
+            });
+            // Candidate text is complete or absent, never clipped, so it can be copied.
+            if !diagnostic.candidates.is_empty() {
+                summary["candidates"] =
+                    json!(diagnostic.candidates.iter().take(3).collect::<Vec<_>>());
+            }
+            summary
         })
         .collect::<Vec<_>>();
     let value = json!({

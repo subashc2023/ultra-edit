@@ -290,6 +290,47 @@ fn a_rejected_batch_identifies_the_file_that_failed() {
 }
 
 #[test]
+fn near_miss_candidates_appear_in_summaries_and_full_drafts() {
+    let root = TempDir::new().unwrap();
+    fs::write(root.path().join("guard.txt"), "first\nsecond\r\nthird\n").unwrap();
+    let (code, snapshot) = run(root.path(), &["read", "guard.txt"], None);
+    assert_eq!(code, 0, "{snapshot}");
+    let request = json!({"request_id":"cli-near-miss","files":[{"base":snapshot["snapshot"],"changes":[
+        {"id":"guard","target":{"kind":"span","span":"r1","expect":"second"},"text":"2nd"},
+        {"id":"endings","target":{"kind":"exact","old":"second\nthird"},"text":"x"}
+    ]}]});
+    let (code, prepared) = run(root.path(), &["prepare"], Some(&request));
+    assert_eq!(code, 2, "{prepared}");
+    let guard = &prepared["diagnostics"][0];
+    assert_eq!(guard["code"], "EXPECTED_TEXT_MISMATCH");
+    assert_eq!(
+        guard["candidates"],
+        json!([{"kind":"exact","line":2,"end_line":2,"text":"second"}])
+    );
+    let message = guard["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("Span holds \"first\", not expect;"),
+        "{message}"
+    );
+    let endings = &prepared["diagnostics"][1];
+    assert_eq!(
+        endings["candidates"],
+        json!([{"kind":"whitespace","line":2,"end_line":3,"text":"second\r\nthird"}])
+    );
+    let reference = prepared["reference"].as_str().unwrap();
+    let (code, draft) = run(root.path(), &["get", reference], None);
+    assert_eq!(code, 0, "{draft}");
+    assert_eq!(
+        draft["value"]["diagnostics"][0]["candidates"],
+        guard["candidates"]
+    );
+    assert_eq!(
+        draft["value"]["diagnostics"][1]["candidates"],
+        endings["candidates"]
+    );
+}
+
+#[test]
 fn bounded_reads_pagination_and_pruning_flags_work_across_processes() {
     let root = TempDir::new().unwrap();
     fs::write(root.path().join("file.txt"), "x\n".repeat(500)).unwrap();
