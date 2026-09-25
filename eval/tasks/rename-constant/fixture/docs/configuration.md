@@ -1,0 +1,9 @@
+# Configuration
+
+| Setting                | Default | Meaning                               |
+| ---------------------- | ------- | ------------------------------------- |
+| `MAX_RETRIES`          | 3       | Retries after the first failed fetch. |
+| `MAX_RETRIES_PER_HOST` | 2       | Retry budget shared by one host.      |
+| `BACKOFF_SECONDS`      | 0.5     | Base delay between attempts.          |
+
+Raising `MAX_RETRIES` also raises the worst-case latency of `fetch`.
