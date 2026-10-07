@@ -37,8 +37,15 @@ Desktop Commander needs extra isolation:
 
 - Its arm sets `HOME` to `install/dc-home`, so it never reads or changes your own
   `~/.claude-server-commander` configuration.
-- `DESKTOP_COMMANDER_DISABLE_TELEMETRY=1` turns telemetry off, and the setup
-  script clears the welcome-onboarding flags in the arm's config.
+- `DESKTOP_COMMANDER_DISABLE_TELEMETRY=1` turns telemetry off.
+- Desktop Commander can append onboarding and feedback-survey messages to tool
+  results, depending on remote feature flags and usage counters that all runs
+  share. The arm passes `--no-onboarding`, and the setup script sets
+  `onboarding_injection: false` and `feedbackGiven: true`, so every run sees the
+  same tool output.
+- The setup script writes `allowedDirectories: []`, Desktop Commander's shipped
+  default, which allows every directory. Without that key it allows only `HOME`,
+  which here is `dc-home`, and rejects every edit in the run's repository.
 - On every start it downloads Chrome, for its PDF tools, unless a copy is
   cached. The setup script downloads it once (about 400 MB) so that
   parallel runs don't race on the same download. Set

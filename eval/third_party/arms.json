@@ -6,13 +6,25 @@
       "mcp_server": {
         "type": "stdio",
         "command": "{third_party_dir}/node_modules/.bin/mcp-server-filesystem",
-        "args": ["{repo}"],
+        "args": [
+          "{repo}"
+        ],
         "env": {}
       },
-      "edit_tools": ["edit_file", "write_file"],
-      "required_tools": ["edit_file"],
+      "edit_tools": [
+        "edit_file",
+        "write_file"
+      ],
+      "required_tools": [
+        "edit_file"
+      ],
       "append_system_prompt": "For this session the Edit, Write, MultiEdit, and NotebookEdit tools are unavailable. Make every file change with the filesystem MCP server's tools, such as edit_file.",
-      "disallowed_tools": ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+      "disallowed_tools": [
+        "Edit",
+        "Write",
+        "MultiEdit",
+        "NotebookEdit"
+      ]
     },
     "desktop-commander": {
       "description": "Desktop Commander 0.2.52 (@wonderwhy-er/desktop-commander): edit_block replaces old_string with new_string, with an expected replacement count and fuzzy-match feedback.",
@@ -20,16 +32,28 @@
       "mcp_server": {
         "type": "stdio",
         "command": "{third_party_dir}/node_modules/.bin/desktop-commander",
-        "args": [],
+        "args": [
+          "--no-onboarding"
+        ],
         "env": {
           "HOME": "{third_party_dir}/dc-home",
           "DESKTOP_COMMANDER_DISABLE_TELEMETRY": "1"
         }
       },
-      "edit_tools": ["edit_block", "write_file"],
-      "required_tools": ["edit_block"],
+      "edit_tools": [
+        "edit_block",
+        "write_file"
+      ],
+      "required_tools": [
+        "edit_block"
+      ],
       "append_system_prompt": "For this session the Edit, Write, MultiEdit, and NotebookEdit tools are unavailable. Make every file change with the desktop-commander MCP server's tools, such as edit_block.",
-      "disallowed_tools": ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+      "disallowed_tools": [
+        "Edit",
+        "Write",
+        "MultiEdit",
+        "NotebookEdit"
+      ]
     },
     "mcp-text-editor": {
       "description": "mcp-text-editor 1.2.2 (PyPI): line-range reads with content hashes, and hash-checked line-range patches.",
@@ -47,9 +71,16 @@
         "append_text_file_contents",
         "create_text_file"
       ],
-      "required_tools": ["patch_text_file_contents"],
+      "required_tools": [
+        "patch_text_file_contents"
+      ],
       "append_system_prompt": "For this session the Edit, Write, MultiEdit, and NotebookEdit tools are unavailable. Make every file change with the text-editor MCP server's tools, such as patch_text_file_contents.",
-      "disallowed_tools": ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+      "disallowed_tools": [
+        "Edit",
+        "Write",
+        "MultiEdit",
+        "NotebookEdit"
+      ]
     }
   }
 }

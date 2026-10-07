@@ -28,8 +28,8 @@ fi
 
 # Desktop Commander keeps its state under $HOME/.claude-server-commander. The
 # arm points HOME at dc-home so runs never read or change the user's own config.
-# Telemetry is also disabled by DESKTOP_COMMANDER_DISABLE_TELEMETRY in arms.json;
-# the welcome-onboarding flags are cleared so no onboarding text enters tool results.
+# Telemetry is also disabled by DESKTOP_COMMANDER_DISABLE_TELEMETRY in arms.json,
+# and the arm passes --no-onboarding.
 dc_config="$dest/dc-home/.claude-server-commander"
 mkdir -p "$dc_config"
 python3 - "$dc_config/config.json" <<'PY'
@@ -44,6 +44,12 @@ config.update({
     "telemetryEnabled": False,
     "pendingWelcomeOnboarding": False,
     "welcomeOnboardingEligible": False,
+    # No onboarding or feedback-survey text injected into tool results.
+    "onboarding_injection": False,
+    "feedbackGiven": True,
+    # Desktop Commander's shipped default: an empty list allows every directory.
+    # Without the key it falls back to allowing only $HOME, which is dc-home here.
+    "allowedDirectories": [],
 })
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(config, handle, indent=2)
