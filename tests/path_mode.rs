@@ -233,7 +233,9 @@ fn unreadable_paths_are_diagnosed_per_file_and_nothing_is_written() {
                 .unwrap(),
         );
         assert_eq!(codes(&outcome), [code], "{path}");
-        assert_eq!(outcome.diagnostics[0].file.as_deref(), Some(path));
+        // Paths are normalized with the platform's separator, so compare components.
+        let file = outcome.diagnostics[0].file.as_deref().unwrap();
+        assert_eq!(std::path::Path::new(file), std::path::Path::new(path));
         assert_eq!(read(&dir, "a.txt"), "one\n");
     }
 }
