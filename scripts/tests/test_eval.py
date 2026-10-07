@@ -1880,6 +1880,33 @@ class RichMetricsTests(unittest.TestCase):
         self.assertEqual((plain["edit_calls"], plain["tool_errors"]), (0, 1))
 
 
+    def test_masked_and_missing_viewer_edit_outcomes(self):
+        edit = "mcp__text-editor__patch_text_file_contents"
+        hidden = "python3 - <<'EOF'\nimport pathlib\npathlib.Path('a').write_text('x')\nEOF\ngit diff --stat"
+        viewer = "sed -i 's/a/b/' a\nxxd a"
+        broken = "sed -i 's/a/b/' a"
+        transcript = transcript_from(
+            init_message(tools=("Bash", edit)),
+            assistant("m1", tool_use("t1", "Bash", {"command": hidden})),
+            tool_result("t1", "Traceback (most recent call last):\nAssertionError"),
+            assistant("m2", tool_use("t2", "Bash", {"command": viewer})),
+            tool_result("t2", "Exit code 127\n/bin/bash: line 2: xxd: command not found", is_error=True),
+            assistant("m3", tool_use("t3", "Bash", {"command": broken})),
+            tool_result("t3", "Exit code 127\n/bin/bash: line 1: sed: command not found", is_error=True),
+            assistant("m4", tool_use("t4", edit, {"file_path": "a", "patches": []})),
+            tool_result("t4", json.dumps({"result": "error", "reason": "Content range hash mismatch"})),
+            result_message(),
+        )
+        metrics = evaluation.compute_metrics(transcript, (edit,))
+        # The traceback and the error inside the MCP result are masked failures; a missing
+        # xxd after a sed that ran is not a failed edit; a missing sed is.
+        self.assertEqual(
+            (metrics["edit_calls"], metrics["edit_failures"], metrics["masked_edit_failures"]), (4, 3, 2)
+        )
+        self.assertEqual(metrics["tool_errors"], 2)
+        self.assertFalse(evaluation.first_attempt(metrics, correct=True))
+
+
 class SpreadSummaryTests(unittest.TestCase):
     def records(self):
         return [

@@ -1000,6 +1000,62 @@ def shell_edit_kinds(command: Any) -> list[str]:
     return sorted(kinds)
 
 
+# Output that shows a failed edit although the tool reported success. Bash returns the
+# exit status of its last command, so `python3 edit.py; git diff` hides the script's
+# traceback, and git apply or perl print errors from a command that still exits 0.
+_MASKED_SHELL = re.compile(
+    r"Traceback \(most recent call last\)|^\w*Error: |error: patch failed|patch does not apply"
+    r"|^sed: -e expression|^sed: can't read|Can't open .*: No such file|No such file or directory",
+    re.M,
+)
+_MISSING_COMMAND = re.compile(r"(?:^|[\s:])([\w.+-]+): command not found", re.M)
+# Programs whose absence means a shell edit could not run (a missing xxd or od cannot).
+WRITE_PROGRAMS = frozenset(
+    {"python", "python3", "py", "perl", "sed", "gsed", "awk", "gawk", "git", "patch", "node", "tee"}
+)
+
+
+def mcp_reported_error(text: str) -> str | None:
+    """The reason in a {"result": "error", "reason": ...} that an MCP server returned as a
+    successful result (mcp-text-editor does this), else None."""
+    data = _json_object(text)
+    nested = data.get("result") if isinstance(data, dict) else None
+    if isinstance(nested, list):
+        for block in nested:
+            inner = _json_object(block.get("text")) if isinstance(block, dict) else None
+            if inner is not None:
+                data = inner
+                break
+    if not isinstance(data, dict):
+        return None
+    for candidate in [data, *(value for value in data.values() if isinstance(value, dict))]:
+        if candidate.get("result") == "error":
+            return str(candidate.get("reason") or "error")
+    return None
+
+
+def edit_call_failed(call: ToolCall, result: ToolResult | None) -> tuple[bool, bool]:
+    """(failed, masked) for an edit call that is not Ultra Edit's.
+
+    masked: the tool reported success but its output shows the edit failed. A shell edit
+    whose only error is a missing viewer (`sed -i ... && xxd f` without xxd) did write,
+    so it is not a failed edit although the tool reported an error."""
+    if result is None:
+        return (False, False)
+    text = result.text or ""
+    shell = call.name in SHELL_TOOLS
+    if result.is_error:
+        missing = set(_MISSING_COMMAND.findall(text))
+        if shell and text.startswith("Exit code 127") and missing and not (missing & WRITE_PROGRAMS):
+            return (False, False)
+        return (True, False)
+    if shell and _MASKED_SHELL.search(text):
+        return (True, True)
+    if call.name.startswith("mcp__") and mcp_reported_error(text) is not None:
+        return (True, True)
+    return (False, False)
+
+
 def hook_denied(event: Mapping[str, Any]) -> bool:
     if event.get("exit_code") == 2:
         return True
@@ -1166,6 +1222,9 @@ def compute_metrics(transcript: Transcript, edit_tools: Collection[str] = ()) ->
             counts["tool_errors"] += 1
         if is_edit:
             counts["edit_calls"] += 1
+            if not ultra:
+                failed, masked = edit_call_failed(call, result)
+                counts["masked_edit_failures"] += masked
             if failed:
                 counts["edit_failures"] += 1
     final = transcript.result or {}
@@ -1178,6 +1237,7 @@ def compute_metrics(transcript: Transcript, edit_tools: Collection[str] = ()) ->
         "tool_errors": counts["tool_errors"],
         "edit_calls": counts["edit_calls"],
         "edit_failures": counts["edit_failures"],
+        "masked_edit_failures": counts["masked_edit_failures"],
         "bash_write_attempts": counts["bash_write_attempts"],
         "bash_writes": counts["bash_writes"],
         "bash_writes_blocked": counts["bash_writes_blocked"],
@@ -2438,6 +2498,7 @@ METRIC_COLUMNS = (
     "tool_errors",
     "edit_calls",
     "edit_failures",
+    "masked_edit_failures",
     "shell_calls",
     "shell_errors",
     "bash_write_attempts",

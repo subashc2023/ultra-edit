@@ -271,8 +271,12 @@ Metrics:
 - **Correct**: exact final bytes, ignoring `.git/` and `.ultra-edit/`.
 - **First try**: correct, with no failed edit call, rejected or non-committed
   Ultra Edit result, or Ultra Edit recovery call (undo, repair, retry,
-  reconcile, inspect). A second native Edit that silently fixes an earlier
-  successful one is not detected.
+  reconcile, inspect). A failed edit call includes a masked one
+  (`masked_edit_failures`): the tool reported success, but its output shows a
+  script traceback, a `git apply` or `perl` error, or an MCP server's
+  `{"result": "error"}`. A shell edit whose only error is a missing viewer
+  (`sed -i ... && xxd f` without `xxd`) is not a failed edit. A second native
+  Edit that silently fixes an earlier successful one is not detected.
 - **Tool calls, Edit calls, Tool errors**: edit calls are Edit, Write,
   MultiEdit, NotebookEdit, content-writing shell commands (Bash writes, below),
   other shell edits (`shell_edit_kinds`: `patch_apply` for `git apply` or

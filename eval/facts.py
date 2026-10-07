@@ -90,13 +90,6 @@ ERROR_CLASSES = (
     ("patch_failed", re.compile(r"patch does not apply|patch failed|corrupt patch|while searching for", re.I)),
     ("validation", re.compile(r"InputValidationError|invalid_type|Invalid arguments", re.I)),
 )
-# Output that shows a failure although the tool reported success (bash returns the exit
-# status of its last command, so `python3 edit.py; git diff` hides the script's failure).
-MASKED = re.compile(
-    r"Traceback \(most recent call last\)|^\w*Error: |error: patch failed|patch does not apply"
-    r"|^sed: -e expression|^sed: can't read|No such file or directory",
-    re.M,
-)
 _EXCEPTION = re.compile(r"^(\w+(?:Error|Exception))\b", re.M)
 
 
@@ -122,41 +115,11 @@ def write_program(command: str, kinds: Sequence[str] = ()) -> str:
     return "other"
 
 
-# Programs whose absence means the edit itself could not run.
-WRITERS = frozenset({"python", "python3", "perl", "sed", "gsed", "awk", "gawk", "git", "patch", "node", "tee"})
-_MISSING = re.compile(r"(?:^|[\s:])([\w.+-]+): command not found", re.M)
-
-
-def edit_failed(step: Mapping[str, Any], text: str = "") -> bool:
-    """A failed edit step, except a shell edit whose only failure is a missing viewer
-    (`... && xxd file` without xxd): the write ran, the check after it did not."""
-    if not step["error"]:
-        return False
-    if step["error"] == "command_not_found" and step["channel"] and step["channel"].startswith("bash:"):
-        missing = set(_MISSING.findall(text))
-        return not missing or bool(missing & WRITERS)
-    return True
-
-
 def _text_editor_error(text: str) -> str | None:
-    """mcp-text-editor reports failures inside a successful result: {"result": "error", ...}."""
-    data = harness._json_object(text)
-    nested = data.get("result") if isinstance(data, dict) else None
-    if isinstance(nested, list):
-        for block in nested:
-            if isinstance(block, dict) and isinstance(block.get("text"), str):
-                inner = harness._json_object(block["text"])
-                if isinstance(inner, dict):
-                    data = inner
-                    break
-    if not isinstance(data, dict):
+    reason = harness.mcp_reported_error(text)
+    if reason is None:
         return None
-    candidates = [data] + [value for value in data.values() if isinstance(value, dict)]
-    for candidate in candidates:
-        if candidate.get("result") == "error":
-            reason = str(candidate.get("reason") or "error")
-            return "text_editor:" + re.sub(r"[^a-z]+", "_", reason.lower()).strip("_")[:40]
-    return None
+    return "text_editor:" + re.sub(r"[^a-z]+", "_", reason.lower()).strip("_")[:40]
 
 
 def _ultra_error(text: str, structured: Any) -> str | None:
@@ -195,7 +158,7 @@ def error_class(call, ultra_status: str | None) -> tuple[str | None, bool]:
         if text.startswith("Exit code"):
             return ("shell_exit", False)
         return ("other", False)
-    if call.name in harness.SHELL_TOOLS and MASKED.search(text):
+    if call.name in harness.SHELL_TOOLS and harness._MASKED_SHELL.search(text):
         exception = _EXCEPTION.search(text)
         if "Traceback" in text and exception:
             return (f"python:{exception.group(1)}", True)
@@ -286,6 +249,8 @@ def steps_for(transcript, stream: Path, edit_tools: Sequence[str]) -> list[dict[
         if kind == "verify" and call.name in READ_TOOLS:
             features = features + ["reread"]
         failure, masked = error_class(call, status)
+        if masked and kind != "edit":
+            failure, masked = None, False  # output-based detection only applies to edits
         result = call.result
         step = {
             "i": len(steps),
@@ -300,7 +265,12 @@ def steps_for(transcript, stream: Path, edit_tools: Sequence[str]) -> list[dict[
             "error": failure,
             "masked": masked,
         }
-        step["failed"] = kind == "edit" and edit_failed(step, result.text if result is not None else "")
+        if kind != "edit":
+            step["failed"] = False
+        elif ultra:
+            step["failed"] = failure is not None
+        else:
+            step["failed"] = harness.edit_call_failed(call, result)[0]
         steps.append(step)
         if kind == "edit" and not step["failed"]:
             edited = True
