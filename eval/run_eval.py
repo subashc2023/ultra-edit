@@ -187,6 +187,9 @@ INFRA_ERRORS = frozenset(
         "cloud_credential_error",
     }
 )
+# API errors worth retrying after a pause: the run never got a fair attempt.
+TRANSIENT_ERRORS = frozenset({"rate_limit", "overloaded", "server_error"})
+RETRY_BASE_DELAY_S = 60.0
 
 
 class EvalError(RuntimeError):
@@ -1781,6 +1784,8 @@ class Config:
     third_party_servers: frozenset[str] = frozenset()
     third_party_dir: Path = DEFAULT_THIRD_PARTY_INSTALL
     disabled_plugins: tuple[str, ...] = ()
+    transient_retries: int = 0
+    retry_delay_s: float = RETRY_BASE_DELAY_S
 
     def spec(self, arm: str) -> ArmSpec:
         if arm not in self.arm_specs:
@@ -2565,6 +2570,30 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="repeatable; adds enabledPlugins {ID: false} to every run's settings",
     )
     parser.add_argument("--jobs", type=int, default=1, help="runs in parallel")
+    parser.add_argument(
+        "--transient-retries",
+        type=int,
+        default=3,
+        help="restart a run that failed on a rate limit or overload, after a pause that doubles each time",
+    )
+    parser.add_argument(
+        "--retry-delay", type=float, default=RETRY_BASE_DELAY_S, help="first pause, in seconds"
+    )
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        metavar="RESULTS_DIR",
+        help="continue an evaluation in RESULTS_DIR: run the planned runs that have no record "
+        "or an infrastructure error, keep the rest",
+    )
+    parser.add_argument(
+        "--rerun-arm",
+        action="append",
+        dest="rerun_arms",
+        default=[],
+        metavar="NAME",
+        help="with --resume, also rerun every recorded run of this arm (repeatable)",
+    )
     parser.add_argument("--reps", type=int, default=1, help="repetitions per task and arm")
     parser.add_argument("--model", help="model alias or full name; recorded from init either way")
     parser.add_argument("--effort", choices=EFFORT_LEVELS, help="passed to claude --effort")
@@ -2903,7 +2932,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         arms = tuple(spec.name for spec in specs)
         tasks = discover_tasks(args.tasks_dir, args.tasks)
         plan = plan_runs(tasks, arms, args.reps, None if args.no_shuffle else args.seed)
-        out_dir = Path(args.out) if args.out else DEFAULT_RESULTS_DIR / _timestamp()
+        if args.resume and args.out:
+            raise EvalError("use either --resume RESULTS_DIR or --out, not both")
+        if args.rerun_arms and not args.resume:
+            raise EvalError("--rerun-arm needs --resume")
+        out_dir = Path(args.resume or args.out or DEFAULT_RESULTS_DIR / _timestamp())
         if args.dry_run:
             return _dry_run(args, tasks, specs, plan, out_dir)
         extra = _load_extra_settings(args.extra_settings)
@@ -2916,14 +2949,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             _report(notes, problems)
             _print("preflight passed" if not problems else "preflight failed")
             return 0 if not problems else 1
-        if out_dir.exists() and any(out_dir.iterdir()):
-            raise EvalError(f"results directory is not empty: {out_dir}")
+        if args.resume:
+            if not (out_dir / "runs.jsonl").exists():
+                raise EvalError(f"nothing to resume: no runs.jsonl in {out_dir}")
+        elif out_dir.exists() and any(out_dir.iterdir()):
+            raise EvalError(f"results directory is not empty: {out_dir} (use --resume to continue it)")
         out_dir.mkdir(parents=True, exist_ok=True)
         info, staged, problems, notes = _preflight(args, specs, out_dir, extra)
         _report(notes, problems)
         if problems or info is None:
             return 1
-        if not _confirm(len(plan), args.yes):
+        kept: list[dict[str, Any]] = []
+        if args.resume:
+            unknown = sorted(set(args.rerun_arms) - set(arms))
+            if unknown:
+                raise EvalError(f"--rerun-arm names arms outside this plan: {', '.join(unknown)}")
+            kept, todo = resume_plan(out_dir, plan, args.rerun_arms, apply=False)
+            if todo and not _confirm(len(todo), args.yes):
+                return 1
+            kept, plan = resume_plan(out_dir, plan, args.rerun_arms)
+            _print(f"resuming {out_dir}: keeping {len(kept)} recorded run(s), starting {len(plan)}")
+            if not plan:
+                _print(write_results(kept, out_dir))
+                return 0
+        elif not _confirm(len(plan), args.yes):
             return 1
         config = Config(
             claude=info,
@@ -2948,8 +2997,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             third_party_servers=registry.third_party_servers,
             third_party_dir=Path(args.third_party_dir),
             disabled_plugins=tuple(args.disable_plugins),
+            transient_retries=max(0, args.transient_retries),
+            retry_delay_s=max(0.0, args.retry_delay),
         )
-        return execute(config, plan, args, arms, tasks)
+        return execute(config, plan, args, arms, tasks, kept)
     except EvalError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -2958,10 +3009,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 class RunLog:
     """Appends finished runs to runs.jsonl under a lock and tracks recorded spend."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, kept: Sequence[dict[str, Any]] = ()) -> None:
         self.path = path
         self.lock = threading.Lock()
-        self.records: list[dict[str, Any]] = []
+        self.records: list[dict[str, Any]] = list(kept)
         self.spent = 0.0
 
     def add(self, record: dict[str, Any]) -> None:
@@ -2970,6 +3021,48 @@ class RunLog:
                 handle.write(json.dumps(record) + "\n")
             self.records.append(record)
             self.spent += record["metrics"].get("cost_usd") or 0.0
+
+
+def transient_failure(record: Mapping[str, Any]) -> bool:
+    """An infrastructure failure caused by API load, such as a rate limit."""
+    if record.get("outcome") != "infra_error":
+        return False
+    errors = record.get("metrics", {}).get("api_errors") or []
+    return any(error in TRANSIENT_ERRORS for error in errors)
+
+
+def archive_run_dir(out_dir: Path, run_id: str) -> Path | None:
+    """Move a run's directory aside (runs/<id>.attempt-N) so the run can start again."""
+    run_dir = Path(out_dir) / "runs" / run_id
+    if not run_dir.exists():
+        return None
+    attempt = 1
+    while (target := run_dir.with_name(f"{run_id}.attempt-{attempt}")).exists():
+        attempt += 1
+    run_dir.rename(target)
+    return target
+
+
+def run_with_retries(config: Config, spec: RunSpec) -> dict[str, Any]:
+    """run_one, repeated after an exponential pause while it fails on a transient API error.
+
+    Earlier attempts stay in runs/<id>.attempt-N; the record counts them and their cost."""
+    record = run_one(config, spec)
+    retries = 0
+    earlier_cost = 0.0
+    while transient_failure(record) and retries < config.transient_retries and not _STOPPING.is_set():
+        earlier_cost += record["metrics"].get("cost_usd") or 0.0
+        delay = config.retry_delay_s * (2**retries)
+        if _STOPPING.wait(delay):
+            break
+        archive_run_dir(config.out_dir, spec.run_id)
+        retries += 1
+        record = run_one(config, spec)
+    if retries:
+        record["transient_retries"] = retries
+        record["transient_retry_cost_usd"] = round(earlier_cost, 6)
+        _write_json(config.out_dir / "runs" / spec.run_id / "result.json", record)
+    return record
 
 
 def run_plan(
@@ -3022,7 +3115,7 @@ def run_plan(
                     text = label(index, spec)
                     if jobs == 1:
                         _print(f"{text} ...")
-                    in_flight[pool.submit(run_one, config, spec)] = (index, text)
+                    in_flight[pool.submit(run_with_retries, config, spec)] = (index, text)
                 if not in_flight:
                     break
                 # A timeout keeps Ctrl+C responsive where untimed waits block it (Windows).
@@ -3038,12 +3131,47 @@ def run_plan(
     return skipped
 
 
+def resume_plan(
+    out_dir: Path, plan: Sequence[RunSpec], rerun_arms: Collection[str] = (), apply: bool = True
+) -> tuple[list[dict[str, Any]], list[RunSpec]]:
+    """Split a planned evaluation into recorded runs to keep and runs to (re)start.
+
+    A run is started again when it has no record, its record is an infrastructure
+    error, or its arm is in rerun_arms. With apply, their old directories are moved
+    aside and runs.jsonl keeps only the kept records."""
+    records = (
+        {record["run_id"]: record for record in load_records(out_dir)}
+        if (Path(out_dir) / "runs.jsonl").exists()
+        else {}
+    )
+    planned = {spec.run_id for spec in plan}
+    kept, todo = [], []
+    for spec in plan:
+        record = records.get(spec.run_id)
+        if record is not None and record.get("outcome") != "infra_error" and spec.arm not in rerun_arms:
+            kept.append(record)
+        else:
+            todo.append(spec)
+    for run_id, record in records.items():
+        if run_id not in planned:
+            kept.append(record)  # runs outside this plan's selection stay as recorded
+    if not apply:
+        return kept, todo
+    for spec in todo:
+        archive_run_dir(out_dir, spec.run_id)
+    with open(Path(out_dir) / "runs.jsonl", "w", encoding="utf-8") as handle:
+        for record in kept:
+            handle.write(json.dumps(record) + "\n")
+    return kept, todo
+
+
 def execute(
     config: Config,
     plan: Sequence[RunSpec],
     args: argparse.Namespace,
     arms: Sequence[str],
     tasks: Sequence[Task],
+    kept: Sequence[dict[str, Any]] = (),
 ) -> int:
     manifest = {
         "created": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
@@ -3066,8 +3194,14 @@ def execute(
             if key not in ("dry_run", "preflight", "summarize", "yes")
         },
     }
-    _write_json(config.out_dir / "manifest.json", manifest)
-    log = RunLog(config.out_dir / "runs.jsonl")
+    manifest_path = config.out_dir / "manifest.json"
+    if kept and manifest_path.exists():
+        previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["resumed_from"] = {
+            key: previous.get(key) for key in ("created", "harness_commit", "options")
+        }
+    _write_json(manifest_path, manifest)
+    log = RunLog(config.out_dir / "runs.jsonl", kept)
     try:
         run_plan(config, plan, log, args.jobs, args.max_total_usd)
     except KeyboardInterrupt:

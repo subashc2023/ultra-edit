@@ -174,6 +174,25 @@ def main():
     init["tools"] = [tool for tool in init["tools"] if tool not in disallowed]
     emit(init)
 
+    # plan["rate_limited"] = {arm: N}: the first N attempts of each run of that arm
+    # end with an API rate-limit error, as a busy API would.
+    limited = plan.get("rate_limited", {}).get(arm, 0)
+    if limited:
+        counter = pathlib.Path(os.environ["FAKE_CLAUDE_PLAN"]).with_name(f"attempts-{run_name}")
+        attempts = int(counter.read_text()) if counter.exists() else 0
+        counter.write_text(str(attempts + 1))
+        if attempts < limited:
+            emit(
+                {
+                    "type": "assistant",
+                    "error": "rate_limit",
+                    "message": {"id": "msg_limited", "role": "assistant", "content": [], "usage": {}},
+                    "parent_tool_use_id": None,
+                }
+            )
+            emit({"type": "result", "subtype": "error_during_execution", "is_error": True, "num_turns": 1})
+            return
+
     for entry in settings.get("hooks", {}).get("PreToolUse", []):
         hook = entry["hooks"][0]
         for index, command in enumerate(("git status --short", "cat > notes.txt <<'EOF'\nx\nEOF")):

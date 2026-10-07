@@ -209,7 +209,19 @@ each run has its own temporary repository, the plugin is staged once, and
 results are appended to `runs.jsonl` as runs finish. With `--max-total-usd`, no
 new run starts once recorded spend reaches the limit; runs in flight finish and
 are recorded, and the number of skipped runs is printed. Parallel sessions
-share rate limits, so a high `--jobs` can add `api_retries` and wall time.
+share rate limits, so a high `--jobs` can add `api_retries` and wall time, or
+end runs with a `rate_limit` error once Claude Code's own retries give up. Such
+a run (rate limit, overload, or server error) starts again after a pause of
+`--retry-delay` seconds (default 60), doubling each time, up to
+`--transient-retries` times (default 3). Earlier attempts stay in
+`runs/<id>.attempt-N`, and the record counts them in `transient_retries` and
+`transient_retry_cost_usd`.
+
+`--resume RESULTS_DIR`, with the same `--task`, `--arm`, `--reps`, and `--seed`
+as the original run, keeps every recorded run and starts the planned runs that
+have no record or ended in `infra_error`. `--rerun-arm NAME` also restarts every
+run of that arm, for example after fixing its configuration. Replaced runs'
+directories move to `runs/<id>.attempt-N`.
 Other options: `--max-turns` (default 50),
 `--timeout` seconds per run (default 900), `--effort`, `--keep-workdirs` (keep
 the temporary repositories for inspection), and `--extra-settings FILE` (JSON

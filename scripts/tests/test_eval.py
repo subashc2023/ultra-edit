@@ -2083,6 +2083,65 @@ class ParallelAndThirdPartyRunTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--disallowedTools") + 1], "Edit,Write,MultiEdit,NotebookEdit")
         self.assertIn("sed", argv[argv.index("--append-system-prompt") + 1])
 
+    def test_rate_limited_runs_are_retried_and_their_attempts_kept(self):
+        self.write_plan(rate_limited={"native": 2})
+        out = self.root / "results"
+        out.mkdir()
+        config = self.config(out)
+        config.transient_retries = 3
+        config.retry_delay_s = 0.01
+        plan = evaluation.plan_runs([self.task], ["native", "shell-sed"], 1, seed=None)
+        log = evaluation.RunLog(out / "runs.jsonl")
+        with redirect_stdout(io.StringIO()):
+            evaluation.run_plan(config, plan, log, jobs=2)
+        records = {r["arm"]: r for r in evaluation.load_records(out)}
+        self.assertEqual(records["native"]["outcome"], "pass")
+        self.assertEqual(records["native"]["transient_retries"], 2)
+        self.assertNotIn("transient_retries", records["shell-sed"])
+        runs = out / "runs"
+        self.assertTrue((runs / "markdown-hard-breaks__native__r1.attempt-1" / "stream.jsonl").exists())
+        self.assertTrue((runs / "markdown-hard-breaks__native__r1.attempt-2").exists())
+        self.assertFalse((runs / "markdown-hard-breaks__native__r1.attempt-3").exists())
+
+    def test_retries_stop_after_the_limit(self):
+        self.write_plan(rate_limited={"native": 9})
+        out = self.root / "results"
+        out.mkdir()
+        config = self.config(out)
+        config.transient_retries = 1
+        config.retry_delay_s = 0.01
+        plan = evaluation.plan_runs([self.task], ["native"], 1, seed=None)
+        with redirect_stdout(io.StringIO()):
+            evaluation.run_plan(config, plan, evaluation.RunLog(out / "runs.jsonl"))
+        [record] = evaluation.load_records(out)
+        self.assertEqual((record["outcome"], record["transient_retries"]), ("infra_error", 1))
+
+    def test_resume_reruns_infrastructure_errors_and_named_arms_only(self):
+        out = self.root / "results"
+        out.mkdir()
+        arms = ["native", "shell-sed", "shell-python"]
+        plan = evaluation.plan_runs([self.task], arms, 1, seed=None)
+        self.write_plan(rate_limited={"native": 1})
+        config = self.config(out)
+        with redirect_stdout(io.StringIO()):
+            evaluation.run_plan(config, plan, evaluation.RunLog(out / "runs.jsonl"))
+        first = {r["arm"]: r for r in evaluation.load_records(out)}
+        self.assertEqual(first["native"]["outcome"], "infra_error")
+        kept, todo = evaluation.resume_plan(out, plan, ["shell-python"], apply=False)
+        self.assertEqual(sorted(spec.arm for spec in todo), ["native", "shell-python"])
+        self.assertEqual(len(evaluation.load_records(out)), 3, "a dry resume plan changes nothing")
+        kept, todo = evaluation.resume_plan(out, plan, ["shell-python"])
+        self.assertEqual([r["arm"] for r in kept], ["shell-sed"])
+        self.assertEqual([r["arm"] for r in evaluation.load_records(out)], ["shell-sed"])
+        self.assertTrue((out / "runs" / "markdown-hard-breaks__native__r1.attempt-1").exists())
+        log = evaluation.RunLog(out / "runs.jsonl", kept)
+        with redirect_stdout(io.StringIO()):
+            evaluation.run_plan(config, todo, log)
+        records = {r["arm"]: r for r in evaluation.load_records(out)}
+        self.assertEqual(sorted(records), sorted(arms))
+        self.assertTrue(all(r["outcome"] == "pass" for r in records.values()))
+        self.assertEqual(len(log.records), 3)
+
     def test_a_harness_error_in_one_run_does_not_stop_the_others(self):
         self.write_plan()
         out = self.root / "results"
