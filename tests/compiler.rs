@@ -1842,6 +1842,7 @@ fn lines_change(id: &str, lines: [usize; 2], expect: Option<&str>, text: &str) -
         target: Target::Lines {
             lines,
             expect: expect.map(str::to_owned),
+            expect_last: None,
         },
         text: text.into(),
     }
@@ -1998,25 +1999,46 @@ fn lines_past_the_end_explain_the_phantom_line() {
     assert_eq!(error.message, "Lines [0,1] must satisfy 1 <= first <= last");
 }
 
+fn ends_change(id: &str, lines: [usize; 2], ends: [&str; 2], text: &str) -> Change {
+    Change {
+        id: id.into(),
+        target: Target::Lines {
+            lines,
+            expect: Some(ends[0].into()),
+            expect_last: Some(ends[1].into()),
+        },
+        text: text.into(),
+    }
+}
+
 #[test]
-fn line_expect_is_a_line_wise_prefix_that_ignores_line_endings() {
+fn line_expect_compares_whole_lines_ignoring_line_endings() {
     for eol in ["\n", "\r\n"] {
         let text = settings(12, eol);
         let base = spanless(&text);
-        for expect in [
-            "    setting_5 = 5",
-            "    setting_5 = 5\n",
-            "    setting_5 = 5\n    setting_6 = 6",
-            "    setting_5 = 5\r\n    setting_6 = 6\r\n",
+        for change in [
+            lines_change(
+                "c",
+                [5, 6],
+                Some("    setting_5 = 5\n    setting_6 = 6"),
+                "    done",
+            ),
+            lines_change(
+                "c",
+                [5, 6],
+                Some("    setting_5 = 5\r\n    setting_6 = 6\r\n"),
+                "    done",
+            ),
+            ends_change(
+                "c",
+                [5, 6],
+                ["    setting_5 = 5", "    setting_6 = 6\n"],
+                "    done",
+            ),
         ] {
-            let plan = compile(
-                &request(
-                    &base,
-                    vec![lines_change("c", [5, 6], Some(expect), "    done")],
-                ),
-                &bases(&base),
-            )
-            .unwrap_or_else(|errors| panic!("{expect:?}: {errors:?}"));
+            let id = format!("{:?}", change.target);
+            let plan = compile(&request(&base, vec![change]), &bases(&base))
+                .unwrap_or_else(|errors| panic!("{id}: {errors:?}"));
             assert_eq!(
                 plan.files[0].output,
                 text.replace(
@@ -2025,6 +2047,10 @@ fn line_expect_is_a_line_wise_prefix_that_ignores_line_endings() {
                 )
             );
         }
+        // A base that disclosed the lines takes `expect` as a prefix of the range.
+        let full = snapshot("full.txt".into(), text.clone());
+        let change = lines_change("c", [5, 6], Some("    setting_5 = 5"), "    done");
+        assert!(compile(&request(&full, vec![change]), &bases(&full)).is_ok());
         let plan = compile(
             &request(
                 &base,
@@ -2039,7 +2065,7 @@ fn line_expect_is_a_line_wise_prefix_that_ignores_line_endings() {
                 .contains(&format!("setting_7 = 7{eol}    added{eol}    setting_8"))
         );
     }
-    // A shifted line number points to where the expected text is.
+    // A shifted line number points to where the expected lines are.
     let base = spanless(&settings(12, "\n"));
     let error = rejected(
         &base,
@@ -2052,7 +2078,36 @@ fn line_expect_is_a_line_wise_prefix_that_ignores_line_endings() {
     );
     assert_eq!(
         error.message,
-        "Line 5 holds \"    setting_5 = 5\", not expect; it is at line 6, so use those line numbers (ultra_edit_repair can replace just this change)."
+        "Line 5 holds \"    setting_5 = 5\", not expect; it is at line 6 now, so use lines [6,6] if the whole range moved (ultra_edit_repair can replace just this change)."
+    );
+    // The new range for a moved head keeps the range's length.
+    let error = rejected(
+        &base,
+        ends_change("c", [4, 6], ["    setting_5 = 5", "    setting_7 = 7"], "x"),
+    );
+    assert!(
+        error
+            .message
+            .contains("it is at line 5 now, so use lines [5,7] if the whole range moved"),
+        "{}",
+        error.message
+    );
+    // A line added inside the range moves its end, which the last lines catch.
+    let mut grown: Vec<String> = settings(12, "\n").lines().map(str::to_owned).collect();
+    grown.insert(6, "    extra = 0".into());
+    let grown = spanless(&(grown.join("\n") + "\n"));
+    let error = rejected(
+        &grown,
+        ends_change("c", [5, 8], ["    setting_5 = 5", "    setting_8 = 8"], ""),
+    );
+    assert_eq!(error.code, "EXPECTED_TEXT_MISMATCH");
+    assert_eq!(
+        error.message,
+        "Line 8 holds \"    setting_7 = 7\", not the expected last lines; it is at line 9 now, so the range is [5,9] (ultra_edit_repair can replace just this change)."
+    );
+    assert_eq!(
+        error.candidates,
+        [candidate(CandidateKind::Exact, (9, 9), "    setting_8 = 8")]
     );
     // Whitespace is compared exactly; a near miss asks for a corrected expect.
     let error = rejected(
@@ -2071,6 +2126,12 @@ fn line_expect_is_a_line_wise_prefix_that_ignores_line_endings() {
         error.message
     );
     assert!(error.message.contains("into expect"), "{}", error.message);
+    // Part of a line is not a line, and is not answered with its own line number.
+    let error = rejected(&base, lines_change("c", [5, 5], Some("    setting_5"), "x"));
+    assert_eq!(
+        error.message,
+        "Line 5 holds \"    setting_5 = 5\", not expect; expect compares whole lines, and its text is only part of line 5; give whole lines (ultra_edit_repair can replace just this change)."
+    );
     // The lines above an insertion guard it; more lines than exist is explained.
     let error = rejected(
         &base,
@@ -2094,50 +2155,67 @@ fn line_expect_is_a_line_wise_prefix_that_ignores_line_endings() {
             "x",
         ),
     );
-    assert_eq!(
-        error.message,
-        "expect has 2 lines but lines [5,5] have 1; it gives the first lines of the range"
-    );
+    assert_eq!(error.message, "expect has 2 lines but lines [5,5] have 1");
 }
 
 #[test]
-fn undisclosed_lines_need_an_expect_strong_enough_to_catch_a_shift() {
+fn undisclosed_lines_need_an_expect_that_reaches_the_last_line() {
     let text = "fn a() {\n    one();\n}\n}\nfn b() {}\n";
     let base = spanless(text);
-    let error = rejected(&base, lines_change("c", [3, 4], None, ""));
-    assert_eq!(error.code, "LINE_GUARD_REQUIRED");
-    assert_eq!(
-        error.message,
-        "Lines 3-4 were not disclosed by this base, so their numbers may be stale; add expect with the first line you expect there, at least 8 visible characters"
-    );
-    let error = rejected(&base, insert("c", 2, None, "x"));
-    assert_eq!(
-        error.message,
-        "Line 2 was not disclosed by this base, so its number may be stale; add expect with the line you expect there, at least 8 visible characters"
-    );
-    let error = rejected(&base, lines_change("c", [3, 4], Some("}"), ""));
-    assert_eq!(error.code, "LINE_GUARD_WEAK");
-    assert_eq!(
-        error.message,
-        "expect \"}\" has under 8 visible characters, so it could still match after a line shift; extend it with the following lines of the range, or target the text with `old`"
-    );
+    for (change, code, message) in [
+        (
+            lines_change("c", [3, 4], None, ""),
+            "LINE_GUARD_REQUIRED",
+            "Lines 3-4 were not disclosed by this base, so the numbers may be stale; give expect as [first line, last line] with their current text, or every line, at least 8 visible characters",
+        ),
+        (
+            lines_change("c", [3, 4], Some("fn a() {"), ""),
+            "LINE_GUARD_REQUIRED",
+            "Lines 3-4 were not disclosed by this base, so the numbers may be stale; expect checks only the first 1, missing a shift inside the range: give it as [first line, last line], or every line, at least 8 visible characters",
+        ),
+        (
+            insert("c", 2, None, "x"),
+            "LINE_GUARD_REQUIRED",
+            "Line 2 was not disclosed by this base, so the numbers may be stale; add expect with line 2's current text, at least 8 visible characters",
+        ),
+        (
+            ends_change("c", [3, 4], ["}", "}"], ""),
+            "LINE_GUARD_WEAK",
+            "expect \"} }\" has under 8 visible characters, so it could still match after a line shift; widen the range to take in a neighbouring line, repeating it in `new` and `expect`, or target the text with `old`",
+        ),
+        (
+            insert("c", 0, Some("fn a() {"), "x"),
+            "EXPECTED_TEXT_MISMATCH",
+            "after:0 inserts at the top of the file, so no line precedes it for expect to guard; omit expect",
+        ),
+    ] {
+        let error = rejected(&base, change);
+        assert_eq!(
+            (error.code.as_str(), error.message.as_str()),
+            (code, message)
+        );
+    }
     let error = rejected(&base, insert("c", 3, Some("}\n"), "x"));
     assert_eq!(error.code, "LINE_GUARD_WEAK");
     assert!(error.message.contains("extend it with the lines above"));
-    // Lines together reach the minimum, and the top of the file needs no guard.
+    let error = rejected(&base, lines_change("c", [2, 2], Some("    one();"), "x"));
+    assert_eq!(error.code, "LINE_GUARD_WEAK");
     assert!(
-        compile(
-            &request(
-                &base,
-                vec![
-                    insert("top", 0, None, "// top"),
-                    insert("c", 3, Some("fn a() {\n    one();\n}"), "x"),
-                ]
-            ),
-            &bases(&base)
-        )
-        .is_ok()
+        error.message.contains("widen the range"),
+        "{}",
+        error.message
     );
+    // Lines together reach the minimum, and the top of the file needs no guard.
+    for changes in [
+        vec![
+            insert("top", 0, None, "// top"),
+            insert("c", 3, Some("fn a() {\n    one();\n}"), "x"),
+        ],
+        vec![insert("top", 0, Some(""), "// top")],
+        vec![ends_change("c", [1, 2], ["fn a() {", "    one();"], "")],
+    ] {
+        compile(&request(&base, changes), &bases(&base)).unwrap();
+    }
     // A base that disclosed the lines needs no expect, and a weak one is fine.
     let full = snapshot("full.txt".into(), text.into());
     for change in [
@@ -2146,6 +2224,21 @@ fn undisclosed_lines_need_an_expect_strong_enough_to_catch_a_shift() {
     ] {
         let plan = compile(&request(&full, vec![change]), &bases(&full)).unwrap();
         assert_eq!(plan.files[0].output, "fn a() {\n    one();\nfn b() {}\n");
+    }
+    // An empty file has no line to guard, and the advice says how to insert.
+    let empty = spanless("");
+    for change in [
+        lines_change("c", [1, 1], None, "x"),
+        insert("c", 1, Some(""), "x"),
+    ] {
+        let error = rejected(&empty, change);
+        assert!(
+            error
+                .message
+                .contains("the file is empty, so insert with after:0"),
+            "{}",
+            error.message
+        );
     }
 }
 
@@ -2251,7 +2344,26 @@ fn in_restricts_old_to_whole_lines() {
     let error = rejected(&base, scoped([2, 2]));
     assert_eq!(error.code, "TARGET_NOT_FOUND");
     assert_eq!(error.candidates[0].kind, CandidateKind::Exact);
-    assert_eq!(rejected(&base, scoped([5, 6])).code, "LINE_OUT_OF_RANGE");
+    let error = rejected(&base, scoped([5, 6]));
+    assert_eq!(error.code, "LINE_OUT_OF_RANGE");
+    // A search scope past the end is not advice to append.
+    assert!(
+        error
+            .message
+            .ends_with("end `in` at line 3 or earlier, or drop it to search the whole file"),
+        "{}",
+        error.message
+    );
+    // A final line feed in `old` ends its line, so the hint holds that line alone.
+    let error = rejected(
+        &snapshot("in.txt".into(), "x = 1\nx = 1\ny = 2\n".into()),
+        exact("c", "x = 1\n", "x = 9\n"),
+    );
+    assert!(
+        error.message.ends_with("or restrict it with \"in\":[1,1]"),
+        "{}",
+        error.message
+    );
     let all = Change {
         id: "c".into(),
         target: Target::All {
@@ -2396,4 +2508,41 @@ fn an_eol_warning_names_a_bounded_number_of_changes() {
         "{}",
         warning.message
     );
+}
+
+#[test]
+fn a_change_whose_old_holds_a_cr_stays_literal_so_crlf_converts_to_lf() {
+    let base = snapshot("crlf.txt".into(), "a\r\nb\r\n".into());
+    let count = |old: &str, text: &str, expected| Change {
+        id: "c".into(),
+        target: Target::All {
+            old: old.into(),
+            scope: None,
+            expected,
+            lines: None,
+        },
+        text: text.into(),
+    };
+    for (change, output) in [
+        (count("\r\n", "\n", 2), "a\nb\n"),
+        (exact("c", "a\r\nb", "a\nb"), "a\nb\r\n"),
+    ] {
+        let plan = compile(&request(&base, vec![change]), &bases(&base)).unwrap();
+        assert_eq!(plan.files[0].output, output);
+        assert!(
+            plan.warnings
+                .iter()
+                .all(|warning| warning.code != "EOL_ADAPTED"),
+            "{:?}",
+            plan.warnings
+        );
+    }
+    // Text copied from a view that hides the CR is still adapted.
+    let plan = compile(
+        &request(&base, vec![exact("c", "a\nb", "A\nB")]),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(plan.files[0].output, "A\r\nB\r\n");
+    assert_eq!(plan.warnings[0].code, "EOL_ADAPTED");
 }

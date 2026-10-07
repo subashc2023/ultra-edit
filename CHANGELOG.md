@@ -18,6 +18,38 @@ All notable changes to Ultra Edit are documented here. Releases follow
   changed since warns `REPLAYED_FILE_CHANGED`. Stored plans and drafts keep the
   0.3.0 shape, a base per file.
 
+- Shorthand changes: `{"old","new"}` with optional `"count":N` (replace exactly
+  N occurrences, anywhere in the file unless restricted) and `"in"` (lines
+  `[a,b]` or a span ID), `{"span","new","expect"}`, `{"lines":[a,b],"new",
+  "expect"}`, and `{"after":n,"new","expect"}`; `text` is an alias of `new`. The
+  verbose `{"target":{…},"text":…}` form is still accepted and remains the
+  stored form, so every spelling of a change derives the same request ID and
+  0.3.0 stores load unchanged. Malformed changes are refused while parsing with
+  a message naming the accepted form.
+- Line targets: `lines` replaces or deletes whole lines by the numbers native
+  Read shows, and `after` inserts whole lines, so inserting or deleting a line
+  no longer needs a neighbouring line restated. Replacement text without a final
+  line feed keeps the replaced line's ending, a missing final newline stays
+  missing, and the empty line Read shows after a final newline stands for the
+  last line. `expect` on a line target is compared line by line, ignoring line
+  endings. Unless the base disclosed the lines (a `path` file discloses none),
+  it is required, must reach the range's last line, as every line or as
+  `[first line, last line]`, and needs at least 8 visible characters
+  (`LINE_GUARD_REQUIRED`, `LINE_GUARD_WEAK`), so a stale line number, including
+  a line added inside the range, is rejected rather than applied, and the
+  message gives the current range.
+  New diagnostics: `LINE_OUT_OF_RANGE`, `EMPTY_INSERTION`, and an
+  `OVERLAPPING_CHANGES` message naming the single `lines` change to send.
+- Line-ending adaptation: in a file whose every line ends in CRLF, `old`, `new`,
+  and `expect` text holding LF but no CR is matched and written as CRLF, with an
+  `EOL_ADAPTED` warning. Native Read hides the CR, so multi-line text copied
+  from it never matched such a file before. Text holding a CR, changes whose
+  `old` holds one (so CRLF can still be converted to LF), mixed files, and undo
+  stay literal; an undo's draft can no longer be repaired, since a repair
+  would plan new text instead of the recorded bytes.
+- A request refused while parsing names the change, as in `file 2, change 3:
+  give `new` or `text`, not both`, and duplicate keys in a verbose `target` are
+  rejected as in 0.3.0.
 - Span ranges `rA..rB` work as a `span` or `scope` when the base disclosed
   every line from A to B, such as the `r146..r150` a range read lists in
   `spans`. A range runs from the start of line A's body to the end of line B's,
@@ -37,13 +69,14 @@ All notable changes to Ultra Edit are documented here. Releases follow
   that starts past the last line still fails. The benchmark saw five such
   failures, each costing a round trip.
 - The plugin's session routing card is rewritten path-first and cut from 4,191
-  to under 2,048 bytes, and the server instructions from 1,431 to 613
+  to under 2,048 bytes, and the server instructions from 1,431 to about 650
   characters. The edit skill now covers recovery and span targets; ordinary
   edits need only the card.
-- `ultra_edit_snapshot` and `ultra_edit` carry `_meta: {"anthropic/alwaysLoad":
-  true}`, so Claude Code loads their schemas up front instead of behind a
-  `ToolSearch` round trip, which the benchmark measured at about 0.9 extra API
-  calls per editing session. Recovery tools stay deferred.
+- `ultra_edit` carries `_meta: {"anthropic/alwaysLoad": true}`, so Claude Code
+  loads its schema up front instead of behind a `ToolSearch` round trip, which
+  the benchmark measured at about 0.9 extra API calls per editing session.
+  `ultra_edit_snapshot`, which path mode makes unnecessary for ordinary edits,
+  and the recovery tools stay deferred.
 - Diagnostic messages, which are free text, now say more. `UNKNOWN_SPAN` lists
   what the base discloses (`lines 146-150, 1875-1879; selection = lines
   1875-1879`) and answers IDs of other shapes, such as `146-150`, with the shapes

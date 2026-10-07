@@ -1363,6 +1363,7 @@ fn a_lines_edit_commits_and_undo_restores_the_bytes() {
         target: Target::Lines {
             lines: [2, 3],
             expect: None,
+            expect_last: None,
         },
         text: "Y\nZ".into(),
     };

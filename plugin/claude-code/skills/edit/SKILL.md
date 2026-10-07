@@ -21,9 +21,11 @@ exposed by this host.
   output. The server root stays fixed after directory changes or a subagent's
   worktree change; never use a relative path that would redirect a worktree edit
   to the parent checkout, and report files outside the root.
-- Replacement `text` is literal. Preserve intended Unicode, whitespace, and
-  newline bytes; Read hides `\r`, so write `\r\n` for multi-line text in CRLF
-  files. No regex or newline conversion runs.
+- Replacement text is literal. Preserve intended Unicode, whitespace, and
+  newline bytes; no regex or formatting runs. One exception: in a file whose
+  lines all end in CRLF, which Read shows without `\r`, text holding LF but no
+  CR is matched and written as CRLF, with an `EOL_ADAPTED` warning, unless the
+  change's `old` holds a `\r`.
 - Omit `request_id` and change `id`. Identical arguments derive the same IDs, so
   after lost output, repeat the identical call: it returns the recorded result,
   marked `replayed: true`, without writing again. A `REPLAYED_FILE_CHANGED`
@@ -43,19 +45,24 @@ exposed by this host.
    {
      "files": [{
        "path": "/abs/src/retry.rs",
-       "changes": [{
-         "target": { "kind": "exact", "old": "const RETRIES: usize = 2;" },
-         "text": "const RETRIES: usize = 3;"
-       }]
+       "changes": [
+         { "old": "const RETRIES: usize = 2;", "new": "const RETRIES: usize = 3;" },
+         { "lines": [40, 42], "expect": ["fn backoff(attempt: u32) {", "}"], "new": "" },
+         { "after": 3, "expect": "use std::time::Duration;", "new": "use std::thread;" }
+       ]
      }]
    }
    ```
 
-   An unscoped `exact` `old` must occur exactly once in the file; add
-   neighbouring lines until it does. `all` replaces exactly `expected`
-   non-overlapping occurrences within `scope`; with `path`, the scope is `r0`,
-   the whole file. Empty exact text is invalid: to insert, put a neighbouring
-   line in `old` and keep it in `text`.
+   `old` must occur exactly once in the file; add neighbouring text until it
+   does, or restrict it to whole lines with `"in": [first, last]`. With
+   `"count": N` it replaces exactly N non-overlapping occurrences. `lines`
+   replaces whole lines by Read's numbers (`""` deletes them; text without a
+   final newline keeps the last line's ending) and `after: n` inserts whole lines
+   after line n (0 is the top). Both need `expect`, compared without line
+   endings: line n's current text, line a's for a one-line range, or
+   `[line a, line b]` (or every line) for a longer one, with at least 8 visible
+   characters in all, so a stale line number is rejected, not applied.
 3. Inspect the outcome. A rejection wrote nothing; its diagnostics can list
    `candidates` with the current text and lines. Copy an `exact` or `whitespace`
    candidate's `text` verbatim into `old`, confirm a `similar` one is the
@@ -71,8 +78,9 @@ focused `selection`: an inclusive line `range`, or a literal `search`. Range and
 full reads summarize disclosed IDs in `spans` (`["r12..r18", "selection"]`) and
 list each line in `lines` as `"r12 | const retries = 2;"`; pick `r{n}` from
 that listing rather than counting newlines. Pass the returned `snapshot` as the
-file's `base` and target a disclosed `span` (guard it with `expect`) or scope an
-`exact` target to one. To reach a distant region of the same file, continue the
+file's `base` and target a disclosed span, `{"span": "r12..r14", "expect": ...,
+"new": ...}` (`expect` is byte-exact here), or restrict `old` to one with
+`"in": "r12"`. Line targets on lines this base disclosed need no `expect`. To reach a distant region of the same file, continue the
 read with the previous `snapshot`; the new snapshot keeps every reference
 already disclosed. `stale: true` means read again. `full` defaults to 24,000
 bytes and 400 lines; larger reads need an exact `expected_bytes`.

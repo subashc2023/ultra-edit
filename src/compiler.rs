@@ -5,8 +5,8 @@ use std::ops::{Range, RangeInclusive};
 
 use crate::candidates;
 use crate::model::{
-    Candidate, Change, Diagnostic, EditRequest, PreparedFile, PreparedPlan, Replacement, Snapshot,
-    Span, Target, digest, new_id,
+    Candidate, CandidateKind, Change, Diagnostic, EditRequest, PreparedFile, PreparedPlan,
+    Replacement, Snapshot, Span, Target, digest, new_id,
 };
 use crate::reading;
 
@@ -202,6 +202,19 @@ pub(crate) fn adapt_eol(crlf: bool, text: &str) -> Cow<'_, str> {
 
 fn adapts(text: &str) -> bool {
     text.contains('\n') && !text.contains('\r')
+}
+
+/// Whether a change's text stays literal for an all-CRLF base: its `old` or span
+/// `expect` holds a CR, so its author sees the CRs, and LF in its text is meant,
+/// as when converting CRLF to LF.
+fn literal(change: &Change) -> bool {
+    match &change.target {
+        Target::Exact { old, .. } | Target::All { old, .. } => old.contains('\r'),
+        Target::Span { expect, .. } => expect
+            .as_deref()
+            .is_some_and(|expect| expect.contains('\r')),
+        Target::Lines { .. } | Target::Insert { .. } => false,
+    }
 }
 
 /// The range a line target replaces and the text it writes there, derived from the
@@ -529,7 +542,6 @@ pub fn compile_with(
             warn_adapted(&base.path, &context.adapted, &mut warnings);
             // Neighbours are judged in the output, where an adjacent change's text
             // may stand beside this one instead of the original bytes.
-            let crlf = context.crlf();
             let mut edges = Vec::new();
             for (id, range) in placed {
                 if let Some(change) = targets.get(id) {
@@ -537,6 +549,7 @@ pub fn compile_with(
                         Target::Exact { old, .. } | Target::All { old, .. } => old,
                         _ => continue,
                     };
+                    let crlf = context.crlf() && !literal(change);
                     let (old, new) = (adapt_eol(crlf, old), adapt_eol(crlf, &change.text));
                     for edge in whitespace_edges(&output, &range, &old, &new) {
                         let junction = match edge {
@@ -1078,13 +1091,22 @@ impl<'a> FileContext<'a> {
     fn out_of_range(&self, change: &Change, line: usize) -> Diagnostic {
         let lines = self.lines();
         let total = lines.count();
+        let advice = match change.target {
+            Target::Exact { .. } | Target::All { .. } => {
+                format!("end `in` at line {total} or earlier, or drop it to search the whole file")
+            }
+            _ if lines.body(1).start == self.base.text.len() => {
+                "the file is empty; insert with after:0".to_owned()
+            }
+            _ => format!("use after:{total} to append"),
+        };
         let message = if lines.terminator(&self.base.text, total).is_empty() {
             format!(
-                "Line {line} is past the end: the file has {total} lines and no final line ending; use after:{total} to append"
+                "Line {line} is past the end: the file has {total} lines and no final line ending; {advice}"
             )
         } else {
             format!(
-                "Line {line} is past the end: the file has {total} lines; native Read also shows an empty line {} after the final line ending, which holds no text; use after:{total} to append",
+                "Line {line} is past the end: the file has {total} lines; native Read also shows an empty line {} after the final line ending, which holds no text; {advice}",
                 total + 1
             )
         };
@@ -1162,7 +1184,7 @@ fn resolve_change<'a>(
     budget: &mut Budget,
 ) {
     let base = context.base;
-    let crlf = context.crlf();
+    let crlf = context.crlf() && !literal(change);
     let text = adapt_eol(crlf, &change.text);
     let adapted = matches!(text, Cow::Owned(_))
         || match &change.target {
@@ -1206,8 +1228,12 @@ fn resolve_change<'a>(
             }
             return;
         }
-        Target::Lines { lines, expect } => match context.line_bounds(change, *lines, diagnostics) {
-            Some((first, last)) => (Guard::Prefix { first, last }, expect),
+        Target::Lines {
+            lines,
+            expect,
+            expect_last,
+        } => match context.line_bounds(change, *lines, diagnostics) {
+            Some((first, last)) => (Guard::Prefix { first, last }, (expect, expect_last)),
             None => return,
         },
         Target::Insert { after, expect } => {
@@ -1221,21 +1247,19 @@ fn resolve_change<'a>(
             if change.text.is_empty() {
                 return;
             }
-            (Guard::Above { line }, expect)
+            (Guard::Above { line }, (expect, &None))
         }
         Target::Exact { .. } | Target::All { .. } => {
             resolve_exact(context, change, &text, replacements, diagnostics, budget);
             return;
         }
     };
-    if !line_guard(
-        context,
-        change,
-        guard,
-        expect.as_deref(),
-        diagnostics,
-        budget,
-    ) {
+    let (expect, expect_last) = expect;
+    let expect = Expect {
+        head: expect.as_deref(),
+        tail: expect_last.as_deref(),
+    };
+    if !line_guard(context, change, guard, expect, diagnostics, budget) {
         return;
     }
     let found = derived_replacement(&base.text, context.lines(), &change.target, &text);
@@ -1342,7 +1366,8 @@ fn resolve_exact(
             let noun = if lines.len() == 1 { "line" } else { "lines" };
             // The first match's whole lines: a line scope that holds it alone.
             let first = lines[0];
-            let last = first + old.matches('\n').count();
+            // A final line feed ends the match's last line, which `in` already includes.
+            let last = first + old.strip_suffix('\n').unwrap_or(old).matches('\n').count();
             let lines: Vec<_> = lines.iter().map(usize::to_string).collect();
             let more = if actual > starts.len() {
                 " and later"
@@ -1409,118 +1434,291 @@ enum Guard {
     Above { line: usize },
 }
 
-/// Checks a line target's `expect`, and requires one, at least `MIN_GUARD_CHARS`
-/// visible characters long, unless the base disclosed every addressed line: line
-/// numbers from elsewhere may be stale. `expect` is compared line by line, ignoring
-/// line endings, so text copied from a view that hides `\r` still guards CRLF lines.
+/// A line target's guard: the text of its first lines and, for `lines`, of its
+/// last lines, each compared line by line without line endings.
+#[derive(Clone, Copy)]
+struct Expect<'a> {
+    head: Option<&'a str>,
+    tail: Option<&'a str>,
+}
+
+/// Checks a line target's `expect`. Unless the base disclosed every addressed line,
+/// line numbers from elsewhere may be stale, so one is required: for `lines`, it
+/// must reach the range's last line, either by giving every line or by giving the
+/// last lines too, and it needs `MIN_GUARD_CHARS` visible characters in all.
+/// Comparing line by line, ignoring line endings, lets text copied from a view
+/// that hides `\r` guard CRLF lines.
 fn line_guard(
     context: &FileContext,
     change: &Change,
     guard: Guard,
-    expect: Option<&str>,
+    expect: Expect,
     diagnostics: &mut Vec<Diagnostic>,
     budget: &mut Budget,
 ) -> bool {
     let base = context.base;
-    let addressed = match guard {
-        Guard::Prefix { first, last } => Some(first..=last),
-        Guard::Above { line: 0 } => None,
-        Guard::Above { line } => Some(line..=line),
-    };
-    let required = addressed.is_some_and(|lines| !context.disclosed(lines));
-    let Some(expect) = expect else {
-        if required {
-            let finding = match guard {
-                Guard::Prefix { first, last } if first != last => format!(
-                    "Lines {first}-{last} were not disclosed by this base, so their numbers may be stale; add expect with the first line you expect there"
-                ),
-                Guard::Prefix { first: line, .. } | Guard::Above { line } => format!(
-                    "Line {line} was not disclosed by this base, so its number may be stale; add expect with the line you expect there"
-                ),
-            };
-            diagnostics.push(at(
-                Some(&base.path),
-                Some(change),
-                "LINE_GUARD_REQUIRED",
-                format!("{finding}, at least {MIN_GUARD_CHARS} visible characters"),
-            ));
-        }
-        return !required;
-    };
-    let pieces = expected_lines(expect);
     let lines = context.lines();
-    let count = pieces.len();
-    let checked = match guard {
-        Guard::Prefix { first, last } => {
-            (count <= last - first + 1).then(|| first..=first + count - 1)
-        }
-        Guard::Above { line } => (count <= line).then(|| line + 1 - count..=line),
+    let reject = |diagnostics: &mut Vec<Diagnostic>, code: &str, message: String| {
+        diagnostics.push(at(Some(&base.path), Some(change), code, message));
+        false
     };
-    let Some(checked) = checked else {
-        let finding = match guard {
+    let head = expect.head.map(expected_lines).unwrap_or_default();
+    let tail = expect.tail.map(expected_lines).unwrap_or_default();
+    let (addressed, extent) = match guard {
+        Guard::Above { line: 0 } => {
+            if head.iter().all(|piece| piece.is_empty()) {
+                return true;
+            }
+            return reject(
+                diagnostics,
+                "EXPECTED_TEXT_MISMATCH",
+                "after:0 inserts at the top of the file, so no line precedes it for expect to guard; omit expect".into(),
+            );
+        }
+        Guard::Prefix { first, last } => (first..=last, last - first + 1),
+        Guard::Above { line } => (line..=line, line),
+    };
+    let required = !context.disclosed(addressed.clone());
+    // An empty file has no line to guard; inserting at the top needs no expect.
+    let empty = lines.body(1).start == base.text.len();
+    let reaches_end = match guard {
+        Guard::Prefix { .. } => head.len() >= extent || (!head.is_empty() && !tail.is_empty()),
+        Guard::Above { .. } => !head.is_empty(),
+    };
+    if required && !reaches_end {
+        let (first, last) = (*addressed.start(), *addressed.end());
+        let lines_named = if first == last {
+            format!("Line {first} was")
+        } else {
+            format!("Lines {first}-{last} were")
+        };
+        let advice = if empty {
+            "the file is empty, so insert with after:0, which needs no expect".to_owned()
+        } else {
+            match guard {
+                Guard::Prefix { .. } if first == last => {
+                    "add expect with the line's current text".to_owned()
+                }
+                Guard::Prefix { .. } if head.is_empty() => {
+                    "give expect as [first line, last line] with their current text, or every line"
+                        .to_owned()
+                }
+                Guard::Prefix { .. } => format!(
+                    "expect checks only the first {}, missing a shift inside the range: give it as [first line, last line], or every line",
+                    head.len()
+                ),
+                Guard::Above { line } => format!("add expect with line {line}'s current text"),
+            }
+        };
+        return reject(
+            diagnostics,
+            "LINE_GUARD_REQUIRED",
+            format!(
+                "{lines_named} not disclosed by this base, so the numbers may be stale; {advice}, at least {MIN_GUARD_CHARS} visible characters"
+            ),
+        );
+    }
+    let fits = match guard {
+        Guard::Prefix { .. } => head.len() <= extent && tail.len() <= extent,
+        Guard::Above { .. } => head.len() <= extent,
+    };
+    if !fits {
+        let message = match guard {
+            Guard::Prefix { first, last } if first == last => format!(
+                "expect has {} lines but lines [{first},{last}] have 1",
+                head.len().max(tail.len())
+            ),
             Guard::Prefix { first, last } => format!(
-                "expect has {count} lines but lines [{first},{last}] have {}; it gives the first lines of the range",
-                last - first + 1
+                "expect has {} lines but lines [{first},{last}] have {extent}; give the range's first and last lines as [first line, last line]",
+                head.len().max(tail.len())
             ),
             Guard::Above { line } => format!(
-                "expect has {count} lines but only {line} precede the insertion; it gives the lines ending at after"
+                "expect has {} lines but only {line} precede the insertion; it gives the lines ending at after",
+                head.len()
             ),
         };
-        diagnostics.push(at(
-            Some(&base.path),
-            Some(change),
-            "EXPECTED_TEXT_MISMATCH",
-            finding,
-        ));
-        return false;
-    };
-    let matched = checked
-        .clone()
-        .zip(&pieces)
-        .all(|(line, piece)| base.text[lines.body(line)] == **piece);
-    if !matched {
-        let actual = &base.text[lines.body(*checked.start()).start..lines.body(*checked.end()).end];
-        // The lines may have moved, so search the whole snapshot for where they are.
-        let needle = adapt_eol(context.crlf(), expect.strip_suffix('\n').unwrap_or(expect));
-        let whole = 0..base.text.len();
-        let found =
-            budget.candidates(|search| candidates::find(search, &base.text, whole, &needle, true));
-        let subject = if checked.start() == checked.end() {
-            format!("Line {}", checked.start())
-        } else {
-            format!("Lines {}-{}", checked.start(), checked.end())
-        };
-        let mut diagnostic = at(
-            Some(&base.path),
-            Some(change),
-            "EXPECTED_TEXT_MISMATCH",
-            candidates::line_mismatch(&subject, actual, &found),
-        );
-        diagnostic.candidates = found;
-        diagnostics.push(diagnostic);
-        return false;
+        return reject(diagnostics, "EXPECTED_TEXT_MISMATCH", message);
     }
-    let visible: usize = pieces
+    let matches_at = |start: usize, pieces: &[&str]| {
+        pieces
+            .iter()
+            .enumerate()
+            .all(|(offset, piece)| base.text[lines.body(start + offset)] == **piece)
+    };
+    // Where the head is, and where the range's last lines are.
+    let head_start = match guard {
+        Guard::Prefix { first, .. } => first,
+        Guard::Above { line } => line + 1 - head.len(),
+    };
+    if !head.is_empty() && !matches_at(head_start, &head) {
+        let found = find_lines(&base.text, lines, &head, 1);
+        let rest = candidates::line_places(&found, |start| match guard {
+            Guard::Prefix { first, last } => {
+                format!(
+                    "use lines [{start},{}] if the whole range moved",
+                    last - first + start
+                )
+            }
+            Guard::Above { .. } => format!("use after:{}", start + head.len() - 1),
+        });
+        let rest = if rest.is_empty() {
+            fuzzy_advice(context, expect.head.unwrap_or_default(), budget)
+        } else {
+            (rest, line_candidates(context, &found, head.len()))
+        };
+        return mismatch_at(
+            context,
+            change,
+            head_start,
+            head.len(),
+            "expect",
+            rest,
+            diagnostics,
+        );
+    }
+    if let Guard::Prefix { first, last } = guard
+        && !tail.is_empty()
+        && !matches_at(last + 1 - tail.len(), &tail)
+    {
+        // The range keeps its start; its end is where the last lines are now.
+        let found = find_lines(&base.text, lines, &tail, first);
+        let rest = candidates::line_places(&found, |start| {
+            format!("the range is [{first},{}]", start + tail.len() - 1)
+        });
+        let rest = if rest.is_empty() {
+            fuzzy_advice(context, expect.tail.unwrap_or_default(), budget)
+        } else {
+            (rest, line_candidates(context, &found, tail.len()))
+        };
+        let tail_start = last + 1 - tail.len();
+        return mismatch_at(
+            context,
+            change,
+            tail_start,
+            tail.len(),
+            "the expected last lines",
+            rest,
+            diagnostics,
+        );
+    }
+    let visible: usize = head
         .iter()
+        .chain(&tail)
         .map(|piece| piece.chars().filter(|ch| !ch.is_whitespace()).count())
         .sum();
     if required && visible < MIN_GUARD_CHARS {
-        let extend = match guard {
-            Guard::Prefix { .. } => "the following lines of the range",
-            Guard::Above { .. } => "the lines above",
+        let advice = if empty {
+            "the file is empty, so insert with after:0, which needs no expect".to_owned()
+        } else {
+            let more = match guard {
+                Guard::Prefix { .. } if head.len() + tail.len() < extent => {
+                    "add more of the range's lines to it"
+                }
+                Guard::Above { .. } if head.len() < extent => "extend it with the lines above",
+                _ => {
+                    "widen the range to take in a neighbouring line, repeating it in `new` and `expect`"
+                }
+            };
+            format!("{more}, or target the text with `old`")
         };
-        diagnostics.push(at(
-            Some(&base.path),
-            Some(change),
+        let quoted = candidates::quoted(
+            &[
+                expect.head.unwrap_or_default(),
+                expect.tail.unwrap_or_default(),
+            ]
+            .join(" "),
+            40,
+        );
+        return reject(
+            diagnostics,
             "LINE_GUARD_WEAK",
             format!(
-                "expect {} has under {MIN_GUARD_CHARS} visible characters, so it could still match after a line shift; extend it with {extend}, or target the text with `old`",
-                candidates::quoted(expect, 40)
+                "expect {quoted} has under {MIN_GUARD_CHARS} visible characters, so it could still match after a line shift; {advice}"
             ),
-        ));
-        return false;
+        );
     }
     true
+}
+
+/// Pushes `EXPECTED_TEXT_MISMATCH` quoting the `count` lines from `start`.
+fn mismatch_at(
+    context: &FileContext,
+    change: &Change,
+    start: usize,
+    count: usize,
+    wanted: &str,
+    (rest, found): (String, Vec<Candidate>),
+    diagnostics: &mut Vec<Diagnostic>,
+) -> bool {
+    let (base, lines) = (context.base, context.lines());
+    let end = start + count - 1;
+    let actual = &base.text[lines.body(start).start..lines.body(end).end];
+    let subject = if start == end {
+        format!("Line {start}")
+    } else {
+        format!("Lines {start}-{end}")
+    };
+    let mut diagnostic = at(
+        Some(&base.path),
+        Some(change),
+        "EXPECTED_TEXT_MISMATCH",
+        candidates::line_mismatch(&subject, actual, wanted, &rest),
+    );
+    diagnostic.candidates = found;
+    diagnostics.push(diagnostic);
+    false
+}
+
+/// Advice and candidates for line-wise text found nowhere as whole lines.
+fn fuzzy_advice(
+    context: &FileContext,
+    text: &str,
+    budget: &mut Budget,
+) -> (String, Vec<Candidate>) {
+    let base = context.base;
+    let needle = adapt_eol(context.crlf(), text.strip_suffix('\n').unwrap_or(text));
+    let whole = 0..base.text.len();
+    let found =
+        budget.candidates(|search| candidates::find(search, &base.text, whole, &needle, true));
+    (candidates::line_advice(&found), found)
+}
+
+/// `exact` candidates for runs of `count` whole lines found at `starts`.
+fn line_candidates(context: &FileContext, starts: &[usize], count: usize) -> Vec<Candidate> {
+    let (text, lines) = (&context.base.text, context.lines());
+    starts
+        .iter()
+        .take(candidates::MAX_CANDIDATES)
+        .map(|&line| {
+            let end_line = line + count - 1;
+            let found = &text[lines.body(line).start..lines.body(end_line).end];
+            Candidate {
+                kind: CandidateKind::Exact,
+                line,
+                end_line,
+                text: (found.chars().count() <= candidates::MAX_TEXT_CHARS).then(|| found.into()),
+                similarity: None,
+            }
+        })
+        .collect()
+}
+
+/// Lines from `from` on where `pieces` occur as consecutive whole line bodies, at
+/// most [`AMBIGUOUS_LINES`] of them.
+fn find_lines(text: &str, lines: &LineIndex, pieces: &[&str], from: usize) -> Vec<usize> {
+    let count = lines.count();
+    if pieces.is_empty() || pieces.len() > count {
+        return Vec::new();
+    }
+    (from.max(1)..=count + 1 - pieces.len())
+        .filter(|&start| {
+            pieces
+                .iter()
+                .enumerate()
+                .all(|(offset, piece)| text[lines.body(start + offset)] == **piece)
+        })
+        .take(AMBIGUOUS_LINES)
+        .collect()
 }
 
 /// A line-wise `expect` as line bodies: split on LF, each without one trailing CR,

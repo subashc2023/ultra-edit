@@ -19,10 +19,10 @@ use std::ops::Range;
 use crate::compiler::prefix_table;
 use crate::model::{Candidate, CandidateKind};
 
-const MAX_CANDIDATES: usize = 3;
+pub(crate) const MAX_CANDIDATES: usize = 3;
 /// Longer regions omit their text rather than clip it, so a partial region is
 /// never copied as a target.
-const MAX_TEXT_CHARS: usize = 2_000;
+pub(crate) const MAX_TEXT_CHARS: usize = 2_000;
 const MAX_SIMILAR_LINES: usize = 200_000;
 const MAX_SIMILAR_NEEDLE_CHARS: usize = 20_000;
 /// Scope lines ranked against the needle, each placing one window.
@@ -225,27 +225,38 @@ pub(crate) fn mismatch(subject: &str, actual: &str, candidates: &[Candidate]) ->
     format!("{subject} holds {actual}, not expect; {rest}")
 }
 
-/// Describes a line target's unmet `expect`, quoting the lines `subject` names.
-/// Where `expect` occurs elsewhere the line numbers are stale, so the advice is to
-/// use that place's numbers; otherwise it is to correct `expect`.
-pub(crate) fn line_mismatch(subject: &str, actual: &str, candidates: &[Candidate]) -> String {
-    let rest = match candidates.first() {
-        None => "read the lines again and correct the line numbers or expect".to_owned(),
-        Some(first) if first.kind == CandidateKind::Exact && candidates.len() == 1 => format!(
-            "it is at {}, so use those line numbers {REPAIR}.",
-            place(first)
-        ),
-        Some(first) if first.kind == CandidateKind::Exact => format!(
-            "it occurs {} times, first at line {}; use the intended place's line numbers {REPAIR}.",
-            candidates.len(),
-            first.line
-        ),
-        Some(_) => advice_into(candidates, "expect"),
-    };
-    let fixed = subject.len() + " holds , not expect; ".len() + rest.chars().count() + 3;
+/// Describes a line target's unmet expectation: what `subject` (such as "Lines
+/// 4-5") holds instead of `wanted` (such as "expect"), then `rest`, the advice.
+pub(crate) fn line_mismatch(subject: &str, actual: &str, wanted: &str, rest: &str) -> String {
+    let fixed = subject.len() + " holds , not ; ".len() + wanted.len() + rest.chars().count() + 3;
     let room = MESSAGE_CHARS.saturating_sub(fixed);
     let actual = quoted(actual, room.min(QUOTED_CHARS));
-    format!("{subject} holds {actual}, not expect; {rest}")
+    format!("{subject} holds {actual}, not {wanted}; {rest}")
+}
+
+/// Advice for line-wise `expect` text found nowhere as whole lines. An `exact`
+/// candidate then lies inside a line, so `expect` was not whole lines.
+pub(crate) fn line_advice(candidates: &[Candidate]) -> String {
+    match candidates.first() {
+        None => "read the lines again and correct the line numbers or expect".to_owned(),
+        Some(first) if first.kind == CandidateKind::Exact => format!(
+            "expect compares whole lines, and its text is only part of {}; give whole lines {REPAIR}.",
+            place(first)
+        ),
+        Some(_) => advice_into(candidates, "expect"),
+    }
+}
+
+/// Where whole-line text was found again: one place, or how many and the first.
+pub(crate) fn line_places(starts: &[usize], retarget: impl Fn(usize) -> String) -> String {
+    match starts {
+        [] => String::new(),
+        [only] => format!("it is at line {only} now, so {} {REPAIR}.", retarget(*only)),
+        [first, ..] => format!(
+            "it occurs {} times, first at line {first}; use the intended place's line numbers {REPAIR}.",
+            starts.len()
+        ),
+    }
 }
 
 /// Explains candidates briefly; the candidates themselves carry every line.
@@ -1097,7 +1108,7 @@ mod tests {
                         not_found(usize::MAX, "a\nb", &candidates),
                         mismatch("Span", &actual, &candidates),
                         mismatch(&lines, &actual, &candidates),
-                        line_mismatch(&lines, &actual, &candidates),
+                        line_mismatch(&lines, &actual, "expect", &line_advice(&candidates)),
                     ] {
                         assert!(message.chars().count() <= MESSAGE_CHARS, "{message}");
                     }
@@ -1105,7 +1116,19 @@ mod tests {
             }
         }
         assert!(mismatch(&lines, &actual, &[]).chars().count() <= MESSAGE_CHARS);
-        assert!(line_mismatch(&lines, &actual, &[]).chars().count() <= MESSAGE_CHARS);
+        assert!(
+            line_mismatch(&lines, &actual, "expect", &line_advice(&[]))
+                .chars()
+                .count()
+                <= MESSAGE_CHARS
+        );
+        let places = line_places(&[line; 3], |_| String::new());
+        assert!(
+            line_mismatch(&lines, &actual, "the expected last line", &places)
+                .chars()
+                .count()
+                <= MESSAGE_CHARS
+        );
         // Ordinary advice leaves the quote its full width.
         let message = mismatch(
             "Span",

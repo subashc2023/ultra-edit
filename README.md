@@ -112,29 +112,30 @@ edit tool does not get:
 
 ## How an edit works
 
-Claude reads a focused snapshot, then sends every related change in one request.
-A snapshot is an immutable copy of the file; the response lists editable span IDs
-such as `r12` (line 12) or `m1` (a search match):
-
-```json
-{ "path": "src/retry.rs", "selection": { "kind": "range", "first": 10, "last": 14 } }
-```
-
-The edit names that snapshot as its base. Request and change IDs are optional;
-the engine derives them from the request, so repeating an identical call returns
-the recorded result with `"replayed": true` instead of writing twice.
+Claude reads files with its own Read tool, then sends every related change, across
+files, in one request that names each file by the same absolute path. Request and
+change IDs are optional; the engine derives them from the request, so repeating an
+identical call returns the recorded result with `"replayed": true` instead of
+writing twice.
 
 ```json
 {
   "files": [{
-    "base": "s_RETURNED_SNAPSHOT",
+    "path": "/work/app/src/retry.rs",
     "changes": [
-      { "target": { "kind": "span", "span": "r12", "expect": "const retries = 2;" }, "text": "const retries = 3;" },
-      { "target": { "kind": "exact", "old": "const delayMs = 100;" }, "text": "const delayMs = 250;" }
+      { "old": "const DELAY_MS: u64 = 100;", "new": "const DELAY_MS: u64 = 250;" },
+      { "lines": [12, 12], "expect": "const RETRIES: u32 = 2;", "new": "const RETRIES: u32 = 3;" },
+      { "after": 3, "expect": "use std::time::Duration;", "new": "use std::thread;" }
     ]
   }]
 }
 ```
+
+`old` must occur exactly once (or `count` times), and `lines`/`after` address
+whole lines by Read's numbers, guarded by `expect`, so a stale line number is
+rejected instead of applied. Span targets on an immutable snapshot from
+`ultra_edit_snapshot` (`r12` for line 12, `m1` for a search match) remain for
+files too large to Read.
 
 Every target resolves against the original bytes, and the whole batch is
 rejected if any target is missing, ambiguous, overlapping, or stale. When a
@@ -144,8 +145,10 @@ scope, a region that differs only in whitespace or line endings, or one at least
 70% similar, so the model can copy text instead of guessing. To edit
 distant parts of one file in one batch, a range read can continue an earlier
 snapshot, keeping its spans. Receipts report `committed`, `partial`,
-`not_committed`, or `outcome_unknown` per file; nothing outside the declared spans
-changes, including line endings, BOMs, and trailing whitespace.
+`not_committed`, or `outcome_unknown` per file; nothing outside the declared
+targets changes, including line endings, BOMs, and trailing whitespace. Text is
+literal, except that a file whose lines all end in CRLF gets CRLF for the LF in
+text copied from a view that hides `\r`.
 
 The [skill](plugin/claude-code/skills/edit/SKILL.md) and its references describe
 the MCP tools; the [reference](docs/reference.md) covers the full CLI and engine

@@ -97,19 +97,20 @@ pub struct EditRequest {
     /// Omit to derive it from the files.
     #[serde(default)]
     pub request_id: String,
+    #[serde(deserialize_with = "numbered_files")]
     pub files: Vec<FileRequest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FileRequest {
-    /// A file inside the workspace, edited like native Edit: the server reads its current
-    /// bytes under the workspace lock as the base. Give `path` or `base`.
+    /// The absolute path you Read; the server reads the file's current bytes. Give `path` or `base`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// A snapshot ID from ultra_edit_snapshot, needed for span targets. Give `path` or `base`.
+    /// A snapshot ID from ultra_edit_snapshot, needed for span targets.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub base: String,
+    #[serde(deserialize_with = "numbered_changes")]
     pub changes: Vec<Change>,
 }
 
@@ -164,6 +165,10 @@ pub enum Target {
         /// The first lines of the range, compared line by line without line endings.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expect: Option<String>,
+        /// The last lines of the range, compared like `expect`, so a range whose
+        /// numbers went stale inside it is caught at its end too.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect_last: Option<String>,
     },
     /// Whole lines inserted after line `after`; 0 inserts before line 1.
     Insert {
@@ -192,8 +197,78 @@ pub struct ChangeInput {
     span: Option<String>,
     lines: Option<serde_json::Value>,
     after: Option<serde_json::Value>,
-    expect: Option<String>,
-    target: Option<serde_json::Value>,
+    expect: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "verbose_target")]
+    target: Option<Target>,
+}
+
+/// Reads a verbose `target` directly, so serde still rejects duplicate keys in it.
+fn verbose_target<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Target>, D::Error> {
+    Target::deserialize(deserializer)
+        .map(Some)
+        .map_err(|error| serde::de::Error::custom(format!("invalid `target`: {error}")))
+}
+
+/// Reads a sequence, prefixing an element's error with its 1-based position, so a
+/// refused batch says which file or change to fix.
+fn numbered<'de, D, T>(deserializer: D, noun: &'static str) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct Numbered<T> {
+        noun: &'static str,
+        element: std::marker::PhantomData<T>,
+    }
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for Numbered<T> {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(formatter, "an array of {}s", self.noun)
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<T>, A::Error> {
+            let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(64));
+            loop {
+                let position = items.len() + 1;
+                match seq.next_element() {
+                    Ok(Some(item)) => items.push(item),
+                    Ok(None) => return Ok(items),
+                    Err(error) => {
+                        let error = error.to_string();
+                        // A change's error inside a file's reads "file 2, change 3: ...".
+                        let separator = if error.starts_with("change ") {
+                            ", "
+                        } else {
+                            ": "
+                        };
+                        return Err(serde::de::Error::custom(format!(
+                            "{} {position}{separator}{error}",
+                            self.noun
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    deserializer.deserialize_seq(Numbered {
+        noun,
+        element: std::marker::PhantomData,
+    })
+}
+
+fn numbered_files<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<FileRequest>, D::Error> {
+    numbered(deserializer, "file")
+}
+
+pub(crate) fn numbered_changes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<Change>, D::Error> {
+    numbered(deserializer, "change")
 }
 
 impl TryFrom<ChangeInput> for Change {
@@ -222,8 +297,6 @@ impl TryFrom<ChangeInput> for Change {
             if shorthand {
                 return Err("change mixes verbose `target` with shorthand fields (old/span/lines/after/in/count/expect); use one form".into());
             }
-            let target = serde_json::from_value(target)
-                .map_err(|error| format!("invalid `target`: {error}"))?;
             let text = text.ok_or("verbose change needs `text` (the replacement; \"\" deletes)")?;
             return Ok(Self {
                 id: input.id,
@@ -257,6 +330,15 @@ impl TryFrom<ChangeInput> for Change {
         } else if input.expect.is_some() {
             return Err("`expect` guards span, lines, or after; with `old`, the old text is already the guard".into());
         }
+        let (expect, expect_last) = match input.expect {
+            None => (None, None),
+            Some(serde_json::Value::String(expect)) => (Some(expect), None),
+            Some(value) if input.lines.is_some() => match expect_pair(value)? {
+                Ok([first, last]) => (Some(first), Some(last)),
+                Err(joined) => (Some(joined), None),
+            },
+            Some(_) => return Err(EXPECT_FORM.into()),
+        };
         let target = if let Some(old) = input.old {
             let (scope, lines) = match input.within {
                 Some(within) => scope_input(within)?,
@@ -272,14 +354,12 @@ impl TryFrom<ChangeInput> for Change {
                 None => Target::Exact { old, scope, lines },
             }
         } else if let Some(span) = input.span {
-            Target::Span {
-                span,
-                expect: input.expect,
-            }
+            Target::Span { span, expect }
         } else if let Some(lines) = input.lines {
             Target::Lines {
                 lines: lines_input(&lines)?,
-                expect: input.expect,
+                expect,
+                expect_last,
             }
         } else {
             let after = input.after.as_ref().and_then(serde_json::Value::as_u64);
@@ -287,7 +367,7 @@ impl TryFrom<ChangeInput> for Change {
                 after: after
                     .and_then(|after| usize::try_from(after).ok())
                     .ok_or("after takes a line number such as 12; 0 inserts before line 1")?,
-                expect: input.expect,
+                expect,
             }
         };
         Ok(Self {
@@ -296,6 +376,29 @@ impl TryFrom<ChangeInput> for Change {
             text,
         })
     }
+}
+
+const EXPECT_FORM: &str =
+    "`expect` takes the current text as a string, or for lines [first line, last line]";
+
+/// Reads an array `expect` of a lines target: two strings are its first and last
+/// lines; any other number of strings are its lines in order, joined.
+fn expect_pair(value: serde_json::Value) -> Result<Result<[String; 2], String>, String> {
+    let serde_json::Value::Array(items) = value else {
+        return Err(EXPECT_FORM.into());
+    };
+    let mut lines = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            serde_json::Value::String(line) => lines.push(line),
+            _ => return Err(EXPECT_FORM.into()),
+        }
+    }
+    Ok(match <[String; 2]>::try_from(lines) {
+        Ok(pair) => Ok(pair),
+        Err(lines) if !lines.is_empty() => Err(lines.join("\n")),
+        Err(_) => return Err(EXPECT_FORM.into()),
+    })
 }
 
 const LINES_FORM: &str = "lines must be [first,last] with 1 <= first <= last, e.g. [146,150]";
@@ -372,24 +475,28 @@ impl schemars::JsonSchema for Change {
 
     fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
         let line = serde_json::json!({"type": "integer", "minimum": 1});
+        let pair =
+            serde_json::json!({"type": "array", "items": line, "minItems": 2, "maxItems": 2});
+        let mut lines = pair.clone();
+        lines["description"] = "Whole lines [first,last] to replace, as Read numbers them.".into();
+        // `text` (an alias of `new`) and the verbose `target` are accepted but not
+        // advertised, so the schema every call pays for teaches one spelling.
         schemars::json_schema!({
             "type": "object",
-            "description": "One of: {old,new} (add count:N to replace N occurrences, in to restrict the search); {span,new}; {lines:[a,b],new} replacing whole lines (\"\" deletes); {after:n,new} inserting lines. Text is literal.",
+            "description": "One of {old,new}, {lines,expect,new}, {after,expect,new}, or {span,new}.",
             "properties": {
-                "id": {"type": "string", "description": "Unique per request; omit for its 1-based \"{file}.{change}\" position, e.g. \"1.2\"."},
-                "old": {"type": "string", "description": "Literal original text; exactly one occurrence unless count is given."},
-                "new": {"type": "string", "description": "Replacement text, written literally."},
-                "count": {"type": "integer", "minimum": 1, "description": "Replace all occurrences of old, which must number exactly this many."},
-                "in": {
-                    "description": "Restricts old to a disclosed span ID or whole lines [first,last].",
-                    "anyOf": [{"type": "string"}, {"type": "array", "items": line, "minItems": 2, "maxItems": 2}]
+                "id": {"type": "string", "description": "Omit; repair names the change to replace, e.g. \"1.2\"."},
+                "old": {"type": "string", "description": "Exact current text; must occur once unless count is given."},
+                "new": {"type": "string", "description": "Replacement text; \"\" deletes."},
+                "count": {"type": "integer", "minimum": 1, "description": "Replace exactly this many occurrences of old."},
+                "in": {"anyOf": [pair, {"type": "string"}], "description": "Restrict old to lines [first,last] or a span ID."},
+                "lines": lines,
+                "after": {"type": "integer", "minimum": 0, "description": "Insert whole lines after this line; 0 is the top."},
+                "expect": {
+                    "anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2}],
+                    "description": "Current text of the line (lines/after), or [first line, last line] of a range; exact bytes for span."
                 },
-                "span": {"type": "string", "description": "A span ID disclosed by this base, e.g. r12 or r12..r18."},
-                "lines": {"type": "array", "items": line, "minItems": 2, "maxItems": 2, "description": "Whole lines [first,last] to replace, terminators included."},
-                "after": {"type": "integer", "minimum": 0, "description": "Insert whole lines after this line; 0 inserts at the top."},
-                "expect": {"type": "string", "description": "Guard for span (exact bytes) or lines/after (the first lines of the range, or those ending at after)."},
-                "text": {"type": "string", "description": "Alias of new."},
-                "target": {"type": "object", "description": "Verbose canonical target; see the reference."}
+                "span": {"type": "string", "description": "A span ID the base disclosed, e.g. r12 or r12..r18."}
             }
         })
     }
@@ -759,6 +866,7 @@ mod tests {
                 Target::Lines {
                     lines: [146, 150],
                     expect: Some("x".into()),
+                    expect_last: None,
                 },
                 json!({"kind":"lines","lines":[146,150],"expect":"x"}),
             ),
@@ -798,7 +906,8 @@ mod tests {
                 parsed.target,
                 Target::Lines {
                     lines: [7, 7],
-                    expect: None
+                    expect: None,
+                    expect_last: None
                 },
                 "{lines}"
             );
@@ -912,6 +1021,66 @@ mod tests {
     }
 
     #[test]
+    fn a_lines_expect_may_give_the_first_and_last_lines() {
+        let parsed = parse(json!({"lines":[3,7],"expect":["fn a() {","}"],"new":""})).unwrap();
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap()["target"],
+            json!({"kind":"lines","lines":[3,7],"expect":"fn a() {","expect_last":"}"})
+        );
+        assert_eq!(
+            parse(serde_json::to_value(&parsed).unwrap()).unwrap(),
+            parsed
+        );
+        // Any other number of lines gives the range's lines in order.
+        let parsed = parse(json!({"lines":[3,5],"expect":["a","b","c"],"new":""})).unwrap();
+        assert_eq!(
+            parsed.target,
+            Target::Lines {
+                lines: [3, 5],
+                expect: Some("a\nb\nc".into()),
+                expect_last: None
+            }
+        );
+        for input in [
+            json!({"after":2,"expect":["a","b"],"new":"x"}),
+            json!({"span":"r1","expect":["a","b"],"new":"x"}),
+            json!({"lines":[1,2],"expect":[],"new":"x"}),
+            json!({"lines":[1,2],"expect":["a",1],"new":"x"}),
+        ] {
+            assert_eq!(parse(input.clone()).unwrap_err(), EXPECT_FORM, "{input}");
+        }
+    }
+
+    #[test]
+    fn errors_name_the_file_and_change_and_a_verbose_target_rejects_duplicate_keys() {
+        let error = serde_json::from_value::<EditRequest>(json!({"files":[
+            {"path":"a","changes":[{"old":"a","new":"b"}]},
+            {"path":"b","changes":[{"old":"a","new":"b"},{"old":"a","new":"b","text":"c"}]}
+        ]}))
+        .unwrap_err()
+        .to_string();
+        assert_eq!(error, "file 2, change 2: give `new` or `text`, not both");
+        let error = serde_json::from_value::<EditRequest>(
+            json!({"files":[{"path":"a","bases":"x","changes":[]}]}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.starts_with("file 1: unknown field `bases`"),
+            "{error}"
+        );
+        let error = serde_json::from_str::<Change>(
+            r#"{"target":{"kind":"exact","old":"keep","old":"drop"},"text":"b"}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.starts_with("invalid `target`: duplicate field `old`"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn the_schema_lists_every_shorthand_field_and_requires_none() {
         let schema = serde_json::to_value(schemars::schema_for!(Change)).unwrap();
         let properties = schema["properties"].as_object().unwrap();
@@ -920,8 +1089,7 @@ mod tests {
         assert_eq!(
             fields,
             [
-                "after", "count", "expect", "id", "in", "lines", "new", "old", "span", "target",
-                "text"
+                "after", "count", "expect", "id", "in", "lines", "new", "old", "span"
             ]
         );
         assert!(schema.get("required").is_none());

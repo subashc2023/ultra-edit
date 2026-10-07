@@ -511,6 +511,19 @@ impl Workspace {
                 ));
             }
         };
+        // An undo restores recorded bytes exactly; a repair would plan new text.
+        let origin = digest(request.request_id.as_bytes());
+        if self.storage.exists("requests", &origin)?
+            && matches!(
+                self.storage.get::<Binding>("requests", &origin)?.input,
+                Input::Undo { .. }
+            )
+        {
+            return Err(Error::new(
+                "INVALID_REFERENCE",
+                "An undo restores recorded bytes and cannot be repaired; once the file holds the undone plan's output again, undo that plan with a new request_id",
+            ));
+        }
         if request_id == request.request_id {
             return Err(Error::new(
                 "REQUEST_ID_REUSED",
@@ -839,6 +852,7 @@ impl Workspace {
     ) -> Result<(EditRequest, BTreeMap<String, Snapshot>), Error> {
         let mut fresh = BTreeMap::new();
         let mut total_bytes = 0usize;
+        let mut read = BTreeSet::new();
         for file in &mut request.files {
             let Some(given) = file.path.clone() else {
                 continue;
@@ -861,7 +875,17 @@ impl Workspace {
                 })
             };
             match resolved {
+                Ok(Some((path, _))) if read.contains(&path) => {
+                    // Reported once here; the entry keeps its path, so nothing else plans it.
+                    let mut diagnostic = Diagnostic::new(
+                        "DUPLICATE_TARGET_PATH",
+                        "This file is named by an earlier entry; list each file once, with all its changes in that entry",
+                    );
+                    diagnostic.file = Some(path);
+                    diagnostics.push(diagnostic);
+                }
                 Ok(Some((path, text))) => {
+                    read.insert(path.clone());
                     // Checked as each file is read, so a batch never holds more than the limit.
                     total_bytes = total_bytes.saturating_add(text.len());
                     if total_bytes > 64 * 1024 * 1024 {
@@ -1036,7 +1060,8 @@ fn needs_base(target: &Target) -> Option<&str> {
         Target::Span { span, .. } => span.as_str(),
         Target::Lines { .. } | Target::Insert { .. } => return None,
     };
-    (span != "r0").then_some(span)
+    // An empty ID is reported once, as EMPTY_SPAN_ID.
+    (!span.trim().is_empty() && span != "r0").then_some(span)
 }
 
 /// Fills each empty change ID with its 1-based `"{file}.{change}"` position, then an

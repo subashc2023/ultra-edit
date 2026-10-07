@@ -922,6 +922,7 @@ fn derived_line_replacements_are_recomputed_before_commit() {
                     Target::Lines {
                         lines: [2, 2],
                         expect: None,
+                        expect_last: None,
                     },
                     "B",
                 ),

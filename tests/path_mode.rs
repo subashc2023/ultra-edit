@@ -284,6 +284,7 @@ fn line_targets_in_a_path_file_need_a_strong_expect() {
         target: Target::Lines {
             lines: range,
             expect: expect.map(str::to_owned),
+            expect_last: None,
         },
         text: "    start();".into(),
     };
@@ -291,8 +292,9 @@ fn line_targets_in_a_path_file_need_a_strong_expect() {
     for (change, code) in [
         (lines([2, 2], None), "LINE_GUARD_REQUIRED"),
         (lines([2, 2], Some("    run();")), "LINE_GUARD_WEAK"),
+        (lines([2, 3], Some("    run();")), "LINE_GUARD_REQUIRED"),
         (
-            lines([2, 3], Some("    serve_forever();")),
+            lines([2, 3], Some("    serve_forever();\n}")),
             "EXPECTED_TEXT_MISMATCH",
         ),
     ] {
@@ -313,6 +315,61 @@ fn line_targets_in_a_path_file_need_a_strong_expect() {
 }
 
 #[test]
+fn a_line_added_inside_a_range_since_the_read_is_caught_at_its_end() {
+    let text = "fn keep() {}\nfn other() {}\nfn remove_me() {\n    step_one();\n    step_two();\n}\nfn tail() {}\n";
+    let (dir, workspace) = setup(&[("a.rs", text)]);
+    // An earlier edit adds a line inside lines 3-6, as the caller read them.
+    receipt(
+        workspace
+            .edit(request(vec![at(
+                "a.rs",
+                vec![exact(
+                    "    step_two();",
+                    "    step_two();\n    step_three();",
+                )],
+            )]))
+            .unwrap(),
+    );
+    let delete = Change {
+        id: String::new(),
+        target: Target::Lines {
+            lines: [3, 6],
+            expect: Some("fn remove_me() {".into()),
+            expect_last: Some("}".into()),
+        },
+        text: String::new(),
+    };
+    let outcome = rejected(
+        workspace
+            .edit(request(vec![at("a.rs", vec![delete.clone()])]))
+            .unwrap(),
+    );
+    assert_eq!(codes(&outcome), ["EXPECTED_TEXT_MISMATCH"]);
+    assert!(
+        outcome.diagnostics[0]
+            .message
+            .contains("it is at line 7 now, so the range is [3,7]"),
+        "{}",
+        outcome.diagnostics[0].message
+    );
+    let mut delete = delete;
+    delete.target = Target::Lines {
+        lines: [3, 7],
+        expect: Some("fn remove_me() {".into()),
+        expect_last: Some("}".into()),
+    };
+    receipt(
+        workspace
+            .edit(request(vec![at("a.rs", vec![delete])]))
+            .unwrap(),
+    );
+    assert_eq!(
+        read(&dir, "a.rs"),
+        "fn keep() {}\nfn other() {}\nfn tail() {}\n"
+    );
+}
+
+#[test]
 fn a_path_edit_undoes() {
     let (dir, workspace) = setup(&[("a.txt", "one\n")]);
     let (done, _) = receipt(
@@ -322,6 +379,81 @@ fn a_path_edit_undoes() {
     );
     receipt(workspace.undo(&done.plan_id, "").unwrap());
     assert_eq!(read(&dir, "a.txt"), "one\n");
+}
+
+#[test]
+fn an_undo_is_never_repaired_into_new_text() {
+    let (dir, workspace) = setup(&[("a.txt", "a\nb\n")]);
+    let count = Change {
+        id: String::new(),
+        target: Target::All {
+            old: "\n".into(),
+            scope: None,
+            expected: 2,
+            lines: None,
+        },
+        text: "\r\n".into(),
+    };
+    let (done, _) = receipt(
+        workspace
+            .edit(request(vec![at("a.txt", vec![count])]))
+            .unwrap(),
+    );
+    assert_eq!(read(&dir, "a.txt"), "a\r\nb\r\n");
+    // The file changes, so the undo is refused and its draft retained.
+    fs::write(dir.path().join("a.txt"), "x\r\n").unwrap();
+    let draft = rejected(workspace.undo(&done.plan_id, "").unwrap());
+    fs::write(dir.path().join("a.txt"), "a\r\nb\r\n").unwrap();
+    let restore = Change {
+        id: "undo-1".into(),
+        target: Target::Span {
+            span: "r0".into(),
+            expect: None,
+        },
+        text: "a\nb\n".into(),
+    };
+    // A repair would plan text, here adapted to CRLF, instead of the recorded bytes.
+    let error = workspace
+        .repair(&draft.reference, "", vec![restore])
+        .unwrap_err();
+    assert_eq!(error.code, "INVALID_REFERENCE");
+    receipt(workspace.undo(&done.plan_id, "undo-again").unwrap());
+    assert_eq!(read(&dir, "a.txt"), "a\nb\n");
+}
+
+#[test]
+fn one_file_named_twice_or_an_empty_span_is_reported_once() {
+    let (dir, workspace) = setup(&[("a.txt", "one\ntwo\n")]);
+    let outcome = rejected(
+        workspace
+            .edit(request(vec![
+                at("a.txt", vec![exact("one", "1")]),
+                at("./a.txt", vec![exact("two", "2")]),
+            ]))
+            .unwrap(),
+    );
+    assert_eq!(codes(&outcome), ["DUPLICATE_TARGET_PATH"]);
+    assert!(
+        outcome.diagnostics[0]
+            .message
+            .contains("list each file once")
+    );
+    let empty = Change {
+        id: String::new(),
+        target: Target::Exact {
+            old: "one".into(),
+            scope: Some(String::new()),
+            lines: None,
+        },
+        text: "1".into(),
+    };
+    let outcome = rejected(
+        workspace
+            .edit(request(vec![at("a.txt", vec![empty])]))
+            .unwrap(),
+    );
+    assert_eq!(codes(&outcome), ["EMPTY_SPAN_ID"]);
+    assert_eq!(read(&dir, "a.txt"), "one\ntwo\n");
 }
 
 #[test]

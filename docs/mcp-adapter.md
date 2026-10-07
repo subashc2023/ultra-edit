@@ -111,7 +111,7 @@ The names below are server-side names; the host may add a namespace.
 | Tool | Arguments | Engine operation |
 | --- | --- | --- |
 | `ultra_edit_snapshot` | `{path, selection: {kind: "range", first, last, snapshot?}}`, `{path, selection: {kind: "search", query, offset?, snapshot?}}`, or `{path, selection: {kind: "full", expected_bytes?}}` | Focused range, paged literal search, or bounded full read; `snapshot` continues a prior snapshot |
-| `ultra_edit` | `EditRequest`: `{request_id?, files: [{base, changes: [{id?, target, text}]}]}` | Prepare and commit through `edit` |
+| `ultra_edit` | `EditRequest`: `{request_id?, files: [{path or base, changes: [{old, new, count?, in?} or {lines, expect, new} or {after, expect, new} or {span, expect?, new}]}]}` | Prepare and commit through `edit` |
 | `ultra_edit_status` | `{query: {kind: "receipt", request_id, full?: boolean}}` or `{query: {kind: "evidence", reference}}` | Retrieve a compact outcome (default), full receipt (`full: true`), or explicit evidence |
 | `ultra_edit_prepare` | The same direct `EditRequest` as `ultra_edit` | Persist a preview or rejected draft |
 | `ultra_edit_commit` | `{plan}` | Commit the stored candidate |
@@ -153,8 +153,8 @@ derived ID when the call omitted one. A result returned for an already recorded
 request without a new commit attempt adds `replayed: true` (omitted otherwise),
 and its report begins with a replay notice; a replay never writes target files.
 Each of the first six compact diagnostics can carry up to three `candidates`,
-`{kind, line, end_line, text?, similarity?}`, for a missing `exact`/`all` target
-or a failed span `expect`; full drafts carry them for every diagnostic. Receipt
+`{kind, line, end_line, text?, similarity?}`, for a missing `old` target or a
+failed span or line `expect`; full drafts carry them for every diagnostic. Receipt
 requests with `full: true` return `{kind: "receipt", receipt}`; a recorded
 request without a receipt returns
 `{kind: "receipt_unavailable", request_id, receipt: null}`.
@@ -246,11 +246,12 @@ contract, so recheck them on major Claude Code upgrades.
   server. A server-level `"alwaysLoad": true` key in the MCP server
   configuration, including a plugin's `.mcp.json`, loads every tool of that
   server. Tools with neither are deferred behind `ToolSearch`, though the model
-  sometimes calls a deferred tool directly. Ultra Edit marks `ultra_edit_snapshot`
-  and `ultra_edit`, the two tools every edit uses, so an editing session skips
-  the round trip (about 0.9 extra API calls per run in the benchmark); the other
-  tools, used only for recovery, stay deferred. The two schemas add about 5.5 KB
-  to every request, which the prompt cache serves after the first.
+  sometimes calls a deferred tool directly. Ultra Edit marks only `ultra_edit`,
+  the tool every edit uses, so an editing session skips the round trip (about
+  0.9 extra API calls per run in the benchmark). Ordinary edits name files by
+  `path` and need no snapshot, so `ultra_edit_snapshot` stays deferred with the
+  recovery tools. The schema adds about 2 KB to every request, which the prompt
+  cache serves after the first.
 - Results. When a tool result has only text `content`, the model sees that text.
   When it has both text `content` and `structuredContent`, the model sees only
   the serialized `structuredContent` JSON and never the text. A results mode

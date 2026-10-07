@@ -243,8 +243,8 @@ fn startup_requires_explicit_root_and_keeps_protocol_stdout_clean() {
             );
         }
         assert!(!tool["description"].as_str().unwrap().is_empty());
-        // Only the tools of every edit skip Claude Code's ToolSearch round trip.
-        let always = matches!(name, "ultra_edit_snapshot" | "ultra_edit");
+        // Only the edit tool skips Claude Code's ToolSearch round trip.
+        let always = name == "ultra_edit";
         assert_eq!(
             tool["_meta"]["anthropic/alwaysLoad"],
             if always { json!(true) } else { json!(null) },
@@ -801,12 +801,13 @@ fn declared_schema_minimums_agree_with_the_runtime_line_and_count_rules() {
     let range = variant(&snapshot, "Selection", "range");
     assert_eq!(range["properties"]["first"]["minimum"], 1);
     assert_eq!(range["properties"]["last"]["minimum"], 1);
-    // Shorthand fields carry the runtime minimums; the verbose target stays opaque.
+    // Shorthand fields carry the runtime minimums; the verbose form, still accepted,
+    // is not advertised.
     let change = schema("ultra_edit")["$defs"]["Change"].clone();
     assert_eq!(change["properties"]["count"]["minimum"], 1);
     assert_eq!(change["properties"]["lines"]["items"]["minimum"], 1);
     assert_eq!(change["properties"]["after"]["minimum"], 0);
-    assert_eq!(change["properties"]["target"]["type"], "object");
+    assert!(change["properties"].get("target").is_none(), "{change}");
 
     let rejected = client.call(
         "ultra_edit_snapshot",
@@ -2124,8 +2125,12 @@ fn the_routing_cards_example_commits_through_the_server_by_path() {
     let end = card[start..].find("]}]}").unwrap() + start + 4;
     let root = TempDir::new().unwrap();
     fs::create_dir(root.path().join("src")).unwrap();
-    let file = root.path().join("src").join("a.py");
-    fs::write(&file, "retries = 2\ncfg = load(cfg)\n").unwrap();
+    let file = root.path().join("src").join("app.py");
+    fs::write(
+        &file,
+        "import os\n\nretries = 2\ncfg = load(cfg)\n\n\ndef main():\n    run()\n",
+    )
+    .unwrap();
     let mut example: Value = serde_json::from_str(&card[start..end]).unwrap();
     example["files"][0]["path"] = json!(file.to_str().unwrap());
     let mut client = Client::start(root.path());
@@ -2133,7 +2138,7 @@ fn the_routing_cards_example_commits_through_the_server_by_path() {
     assert_eq!(done["commit"], "committed", "{done}");
     assert_eq!(
         fs::read_to_string(&file).unwrap(),
-        "retries = 3\nconfig = load(config)\n"
+        "import os\nimport re\n\nretries = 3\nconfig = load(config)\n\n\ndef main(argv):\n    run(argv)\n"
     );
     // Resending the identical call replays the recorded result and writes nothing.
     let again = client.call("ultra_edit", example, false);
@@ -2180,7 +2185,7 @@ fn shorthand_changes_commit_and_their_verbose_spelling_replays() {
     let text = refused.to_string();
     assert!(
         text.contains(
-            "lines takes numbers like [146,150]; span IDs such as r146..r150 go in `span`"
+            "file 1, change 1: lines takes numbers like [146,150]; span IDs such as r146..r150 go in `span`"
         ),
         "{refused}"
     );
