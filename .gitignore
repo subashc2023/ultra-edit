@@ -3,3 +3,6 @@
 /plugin/claude-code/runtime/
 __pycache__/
 *.py[cod]
+# Third-party MCP servers installed for the evaluation (see eval/third_party/README.md).
+/eval/third_party/install/
+/eval/third_party/node_modules/
