@@ -388,6 +388,11 @@ class ShellHeuristicTests(unittest.TestCase):
             ("sed -i.bak -e 's/a/b/' file", "Bash", ["in_place"]),
             ("sed -n '1,5p' file && sed --version", "Bash", []),
             ("perl -pi -e 's/a/b/' file", "Bash", ["in_place"]),
+            ("perl -0pi -e 's/a\\nb/c/' file", "Bash", ["in_place"]),
+            ("perl -0777 -ne 'print' file", "Bash", []),
+            ("gawk -i inplace '{sub(/a/, \"b\")} 1' file", "Bash", ["in_place"]),
+            ("awk '{print $1}' file", "Bash", []),
+            ("git apply fix.patch", "Bash", []),
             ("echo 2.4.0 > VERSION", "Bash", ["echo_redirect"]),
             ("printf '%s\\n' 'SIGN_BUILD=1' >> build/release.sh", "Bash", ["echo_redirect"]),
             ('echo "a > b"', "Bash", []),
@@ -420,6 +425,48 @@ class ShellHeuristicTests(unittest.TestCase):
         for command, tool, expected in cases:
             with self.subTest(command=command):
                 self.assertEqual(evaluation.shell_write_kinds(command, tool), expected)
+
+    def test_shell_edit_kinds(self):
+        cases = [
+            ("git apply fix.patch", ["patch_apply"]),
+            ("git -C repo apply -p1 /tmp/x.diff", ["patch_apply"]),
+            ("cat fix.diff | git apply", ["patch_apply"]),
+            ("patch -p1 < fix.diff", ["patch_apply"]),
+            ("git apply <<'PATCH'\n--- a/x\n+++ b/x\nPATCH", ["patch_apply"]),
+            ("git apply --check fix.patch", []),
+            ("git apply --stat x.diff && git apply x.diff", ["patch_apply"]),
+            ("patch --dry-run -p1 < fix.diff", []),
+            ("sed 's/a/b/' f > f.tmp && mv f.tmp f", ["filter_redirect"]),
+            ("LC_ALL=C awk '{print}' f > f.new", ["filter_redirect"]),
+            ("grep x f 2>/dev/null", []),
+            ("cat f > /dev/null", []),
+            ("cat > f <<'EOF'\nx > y\nEOF", []),
+            ("echo 'git apply x' && git status", []),
+            ("sed -n '1,5p' f", []),
+            (None, []),
+        ]
+        for command, expected in cases:
+            with self.subTest(command=command):
+                self.assertEqual(evaluation.shell_edit_kinds(command), expected)
+
+    def test_failed_patch_file_apply_is_a_failed_edit_but_not_a_bash_write(self):
+        transcript = transcript_from(
+            init_message(),
+            assistant("m1", tool_use("t1", "Bash", {"command": "git apply fix.patch"})),
+            tool_result("t1", "error: patch failed: a.txt:1", is_error=True),
+            assistant(
+                "m2", tool_use("t2", "Bash", {"command": "sed 's/a/b/' a.txt > a.tmp && mv a.tmp a.txt"})
+            ),
+            tool_result("t2", ""),
+            assistant("m3", tool_use("t3", "Bash", {"command": "git apply --check fix.patch"})),
+            tool_result("t3", ""),
+            result_message(),
+        )
+        metrics = evaluation.compute_metrics(transcript)
+        self.assertEqual((metrics["edit_calls"], metrics["edit_failures"]), (2, 1))
+        self.assertEqual((metrics["bash_write_attempts"], metrics["bash_writes"]), (0, 0))
+        self.assertEqual(metrics["shell_edit_kinds"], {"filter_redirect": 1, "patch_apply": 1})
+        self.assertFalse(evaluation.first_attempt(metrics, correct=True))
 
 
 class ComparisonTests(unittest.TestCase):
@@ -574,6 +621,45 @@ class SummaryTests(unittest.TestCase):
             self.assertEqual(written, evaluation.summarize(self.records()))
             self.assertIn("## By task and arm", output.getvalue())
 
+    def test_rescore_recomputes_metrics_from_saved_streams(self):
+        with tempfile.TemporaryDirectory() as directory:
+            results = Path(directory)
+            run_dir = results / "runs" / "t__native__r1"
+            run_dir.mkdir(parents=True)
+            stream = [
+                init_message(),
+                assistant("msg_1", tool_use("t1", "Edit", {"file_path": "a", "old_string": "x"})),
+                tool_result("t1", "not found", is_error=True),
+                assistant("msg_2", tool_use("t2", "Edit", {"file_path": "a", "old_string": "y"})),
+                tool_result("t2", "updated"),
+                result_message(),
+            ]
+            (run_dir / "stream.jsonl").write_text(
+                "".join(json.dumps(message) + "\n" for message in stream), encoding="utf-8"
+            )
+            stale = {
+                "run_id": "t__native__r1",
+                "task": "t",
+                "arm": "native",
+                "rep": 1,
+                "outcome": "pass",
+                "correct": True,
+                "first_attempt": True,
+                "comparison": {"mismatched": [], "missing": [], "unexpected": []},
+                "integrity": {"errors": [], "warnings": []},
+                "metrics": {"tool_calls": 0, "edit_failures": 0},
+            }
+            (results / "runs.jsonl").write_text(json.dumps(stale) + "\n", encoding="utf-8")
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(evaluation.main(["--rescore", str(results)]), 0)
+            [record] = evaluation.load_records(results)
+            self.assertEqual(record["outcome"], "pass")
+            self.assertEqual(record["metrics"]["tool_calls"], 2)
+            self.assertEqual(record["metrics"]["edit_failures"], 1)
+            self.assertFalse(record["first_attempt"])
+            self.assertTrue((results / "runs.jsonl.bak").exists())
+            self.assertTrue((results / "summary.md").exists())
+
 
 SAMPLE_HELP = """Usage: claude [options] [command] [prompt]
   -p, --print                           Print response and exit
@@ -725,6 +811,24 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(env["CLAUDE_CONFIG_DIR"], r"C:\t\claude-config")
         self.assertNotIn("CLAUDECODE", env)
         self.assertEqual(base["CLAUDECODE"], "1")
+
+    def test_child_environment_drops_host_behavior_knobs(self):
+        base = {
+            "PATH": "/usr/bin",
+            "ANTHROPIC_BASE_URL": "https://proxy.invalid",
+            "CLAUDE_EFFORT": "xhigh",
+            "MCP_CONNECTION_NONBLOCKING": "1",
+            "CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH": "4096",
+            "CLAUDE_CODE_ARTIFACT_DB": "1",
+            "CLAUDE_CODE_REMOTE_SESSION_ID": "cse_x",
+            "CLAUDE_CODE_SYNC_PLUGINS": "1",
+        }
+        env, removed = evaluation.build_env(base)
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "https://proxy.invalid")
+        for name in base:
+            if name not in ("PATH", "ANTHROPIC_BASE_URL"):
+                self.assertNotIn(name, env)
+                self.assertIn(name, removed)
 
     def test_plan_interleaves_and_shuffles_arm_order_deterministically(self):
         tasks = [evaluation.Task(name, Path(name), "p", {"a": b"1"}, {"a": b"2"}) for name in ("t1", "t2")]
@@ -1413,6 +1517,31 @@ class ArmRegistryTests(unittest.TestCase):
             evaluation.third_party_arm("x", entry).disallowed_tools, evaluation.NATIVE_EDIT_TOOL_NAMES
         )
 
+    def test_third_party_arm_names_and_edit_tools_are_validated(self):
+        path = write_arms_file(
+            self.root,
+            {
+                "ok.v1": third_party_entry(),
+                "../escape": third_party_entry(server_name="a"),
+                "x__y": third_party_entry(server_name="b"),
+                "no-edit-tools": third_party_entry(server_name="c", edit_tools=[]),
+                "missing-edit-tools": {
+                    key: value
+                    for key, value in third_party_entry(server_name="d").items()
+                    if key != "edit_tools"
+                },
+            },
+        )
+        registry = evaluation.load_arm_registry(path)
+        self.assertIn("ok.v1", registry.arms)
+        self.assertEqual(
+            sorted(registry.unavailable), ["../escape", "missing-edit-tools", "no-edit-tools", "x__y"]
+        )
+        self.assertIn("arm names must be", registry.unavailable["../escape"])
+        self.assertIn("edit_tools", registry.unavailable["no-edit-tools"])
+        # Unavailable entries still name servers that must not leak into other arms.
+        self.assertEqual(registry.third_party_servers, frozenset({"fs", "a", "b", "c", "d"}))
+
     def test_resolve_default_all_unknown_and_unavailable(self):
         path = write_arms_file(
             self.root,
@@ -1551,6 +1680,15 @@ class ThirdPartyIntegrityTests(unittest.TestCase):
             ["third-party MCP server(s) present in the fs-test arm: other-fs"],
         )
 
+    def test_third_party_arm_without_required_tools_needs_one_server_tool(self):
+        arm = evaluation.third_party_arm("fs-test", third_party_entry(required_tools=[]))
+        connected = [{"name": "fs", "status": "connected"}]
+        empty = init_message(tools=("Read", "Bash", "mcp__other-fs__edit_file"), mcp_servers=connected)
+        errors, _ = self.check(arm, empty, result_message())
+        self.assertIn("no fs tools listed at init", errors)
+        listed = init_message(tools=("Read", "Bash", "mcp__fs__read_file"), mcp_servers=connected)
+        self.assertEqual(self.check(arm, listed, result_message())[0], [])
+
     def test_other_arms_reject_third_party_leaks_and_disallowed_tools(self):
         leaked_server = init_message(mcp_servers=[{"name": "fs", "status": "connected"}])
         errors, warnings = self.check("native", leaked_server, result_message())
@@ -1653,6 +1791,37 @@ class RichMetricsTests(unittest.TestCase):
         self.assertIsNone(empty["context_tokens_total"])
         self.assertIsNone(empty["final_text_bytes"])
         self.assertEqual(empty["context_series"], [])
+
+    def test_parallel_tool_calls_interleave_lines_of_one_response(self):
+        # As in Claude Code 2.1.292: one response with three parallel tool calls is
+        # three stream lines with the same id and usage, with results in between.
+        used = usage(2, 0, 22293, 24)
+        transcript = transcript_from(
+            init_message(),
+            assistant_with_usage("msg_a", tool_use("t1", "Read", {"file_path": "a"}), used),
+            tool_result("t1", "a"),
+            assistant_with_usage("msg_a", tool_use("t2", "Read", {"file_path": "b"}), used),
+            assistant_with_usage("msg_a", tool_use("t3", "Read", {"file_path": "c"}), used),
+            tool_result("t2", "b"),
+            tool_result("t3", "c"),
+            assistant_with_usage("msg_b", {"type": "text", "text": "Done."}, usage(2, 22293, 1124, 388)),
+            result_message(
+                modelUsage={
+                    "claude-test": {
+                        "inputTokens": 4,
+                        "outputTokens": 900,
+                        "cacheReadInputTokens": 22293,
+                        "cacheCreationInputTokens": 23417,
+                    }
+                }
+            ),
+        )
+        metrics = evaluation.compute_metrics(transcript)
+        self.assertEqual((metrics["api_calls"], metrics["tool_calls"]), (2, 3))
+        self.assertEqual(metrics["context_tokens_total"], metrics["total_input_tokens"])
+        self.assertEqual(metrics["context_series"], [[22295, 24], [23419, 388]])
+        # Stream output counts are snapshots; modelUsage holds the real output.
+        self.assertLess(metrics["output_tokens_calls"], metrics["output_tokens"])
 
     def test_bytes_shell_reads_and_tool_counters(self):
         snapshot = ULTRA + "ultra_edit_snapshot"
@@ -1913,6 +2082,25 @@ class ParallelAndThirdPartyRunTests(unittest.TestCase):
         argv = sed_log["argv"]
         self.assertEqual(argv[argv.index("--disallowedTools") + 1], "Edit,Write,MultiEdit,NotebookEdit")
         self.assertIn("sed", argv[argv.index("--append-system-prompt") + 1])
+
+    def test_a_harness_error_in_one_run_does_not_stop_the_others(self):
+        self.write_plan()
+        out = self.root / "results"
+        out.mkdir()
+        real_run_one = evaluation.run_one
+
+        def flaky(config, spec):
+            if spec.arm == "shell-sed":
+                raise KeyError("boom")
+            return real_run_one(config, spec)
+
+        plan = evaluation.plan_runs([self.task], ["native", "shell-sed", "shell-python"], 1, seed=None)
+        log = evaluation.RunLog(out / "runs.jsonl")
+        with mock.patch.object(evaluation, "run_one", flaky), redirect_stdout(io.StringIO()) as output:
+            with mock.patch("sys.stderr", io.StringIO()):
+                evaluation.run_plan(self.config(out), plan, log, jobs=2)
+        self.assertEqual(sorted(r["arm"] for r in evaluation.load_records(out)), ["native", "shell-python"])
+        self.assertIn("HARNESS ERROR (not recorded): KeyError", output.getvalue())
 
     def test_budget_stops_launching_new_runs(self):
         # Each fake run costs $0.0125, so a $0.02 limit is reached after two recorded runs.

@@ -44,8 +44,8 @@ task and repetition (`--seed`) to spread prompt-cache effects across arms.
 Third-party arms are defined in `third_party/arms.json`; installation and the
 list of servers are in [`third_party/README.md`](third_party/README.md). Each
 entry has a `description`, a `server_name`, an `mcp_server` (`command`, `args`,
-`env`), the `edit_tools` that count as edit calls, the `required_tools` that
-must be listed at init, an optional `append_system_prompt`, and
+`env`), the `edit_tools` that count as edit calls (required), the
+`required_tools` that must be listed at init, an optional `append_system_prompt`, and
 `disallowed_tools` (default: the four native edit tools). In `command`, `args`,
 and `env`, `{repo}` becomes the run's temporary repository and
 `{third_party_dir}` the install directory (`third_party/install`, or
@@ -57,7 +57,10 @@ Each run writes the substituted server to `<run>/mcp.json` and passes
 `--dry-run` prints each arm's `mcp.json`; `--preflight` checks that the server's
 command (and any `{third_party_dir}` path in its arguments) exists without
 starting it. An unknown arm, a malformed entry, or a missing server is an
-error before any paid run. `--third-party-arms FILE` reads another arms file.
+error before any paid run. Arm names may use letters, digits, `.`, `_`, and `-`
+(no `__`), since they become run directory names. A run of a third-party arm is
+invalid unless its server is `connected` at init and its `required_tools` (or,
+without any, at least one of its tools) are listed. `--third-party-arms FILE` reads another arms file.
 
 ## Tasks
 
@@ -123,7 +126,12 @@ leak into any arm. By default each run uses:
   `DISABLE_AUTOUPDATER=1`, `ENABLE_CLAUDEAI_MCP_SERVERS=false`,
   `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, `CLAUDE_CODE_SKIP_PROMPT_HISTORY=1`.
   The harness removes `CLAUDE_CODE_PLUGIN_DIRS` and the markers a parent
-  Claude Code session exports (`CLAUDECODE`, ...).
+  Claude Code session exports (`CLAUDECODE`, ...). It also removes behavior
+  settings a host may set for itself, such as `CLAUDE_EFFORT`,
+  `MCP_CONNECTION_NONBLOCKING`, `ENABLE_TOOL_SEARCH`, and
+  `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH`, plus variables starting with
+  `CLAUDE_CODE_ARTIFACT_`, `CLAUDE_CODE_REMOTE`, or `CLAUDE_CODE_SYNC_`, so
+  every arm runs with Claude Code's defaults. Pass `--effort` to set effort.
 
 Every run is then checked against its `system/init` message and hook events:
 
@@ -254,8 +262,13 @@ Metrics:
   reconcile, inspect). A second native Edit that silently fixes an earlier
   successful one is not detected.
 - **Tool calls, Edit calls, Tool errors**: edit calls are Edit, Write,
-  MultiEdit, NotebookEdit, content-writing shell commands, the Ultra Edit
-  commit tools, and a third-party arm's `edit_tools`. Tool errors are results
+  MultiEdit, NotebookEdit, content-writing shell commands (Bash writes, below),
+  other shell edits (`shell_edit_kinds`: `patch_apply` for `git apply` or
+  `patch` from a file or pipe, `filter_redirect` for `sed`, `awk`, `perl`,
+  `grep`, ... redirected into a file), the Ultra Edit commit tools, and a
+  third-party arm's `edit_tools`. So a failed `git apply fix.patch` is a failed
+  edit, while running a script file the model wrote (`python3 fix.py`) is only
+  a shell call. Tool errors are results
   flagged `is_error`, plus Ultra Edit results showing `ready: false`,
   `kind: rejected`/`error`, or a commit that is not `committed`.
 - **Shell calls, shell errors**: Bash and PowerShell calls, and those whose
@@ -266,10 +279,10 @@ Metrics:
   earlier in the run. `toolsearch_calls` counts ToolSearch calls (MCP tools are
   deferred behind it in recent Claude Code), `skill_calls` Skill calls.
 - **Bash writes**: shell commands that match a heuristic (heredoc into a
-  redirect, `tee`, `git apply`, or `patch`; `sed`/`perl -i`; `echo`/`printf`
-  redirect; inline Python/Node scripts calling write APIs; PowerShell
-  writers), shown as succeeded/attempted. In `native-guard`, attempts blocked
-  by the hook also appear in `hook_denials`.
+  redirect, `tee`, `git apply`, or `patch`; `sed -i`, `perl -pi`, or
+  `awk -i inplace`; `echo`/`printf` redirect; inline Python/Node scripts
+  calling write APIs; PowerShell writers), shown as succeeded/attempted. In
+  `native-guard`, attempts blocked by the hook also appear in `hook_denials`.
 - **Turns, tokens, cost**: `num_turns`, `modelUsage` summed over all models
   (subagents included), and `total_cost_usd` from the final `result` message.
   **Input tok** is uncached input plus cache reads plus cache writes. Cost
@@ -280,9 +293,14 @@ Metrics:
   `api_calls` (`subagent_api_calls` of them in subagents),
   `first_call_context_tokens`, `peak_context_tokens` (largest single request),
   `context_tokens_total` (**Context tok**: the sum over calls, the input the
-  model processed regardless of cache state), `output_tokens_calls` (a
-  cross-check of `modelUsage` output), and `context_series` (`[context,
-  output]` per main-thread call, for plotting growth).
+  model processed regardless of cache state), `output_tokens_calls`, and
+  `context_series` (`[context, output]` per main-thread call, for plotting
+  growth). The output count in stream lines is a snapshot taken before each
+  response finished, so `output_tokens_calls` and the output in
+  `context_series` undercount (often by more than half); use `output_tokens`
+  (`modelUsage`) for output. `context_tokens_total` matches `total_input_tokens`
+  unless Claude Code made calls that do not appear in the stream (subagents
+  do appear).
 - **Bytes**: `tool_input_bytes` (UTF-8 length of each tool input as compact
   JSON) and `tool_result_bytes` (UTF-8 length of each result's text), with
   per-tool breakdowns in `tool_input_bytes_by_tool` and
@@ -315,6 +333,10 @@ count against an arm). Read a failure's `diff.txt` before drawing conclusions.
 `python eval/run_eval.py --summarize eval/results/<dir>` rebuilds `summary.md`
 and `runs.csv` from `runs.jsonl`; records from older harness versions lack the
 new metrics and show `-` there.
+`--rescore eval/results/<dir>` recomputes every run's metrics from its saved
+`stream.jsonl` with the current harness, keeps the original as
+`runs.jsonl.bak`, and rebuilds the summary. Outcomes and byte comparisons are
+kept, because the temporary repositories no longer exist.
 
 ## Adding a task
 

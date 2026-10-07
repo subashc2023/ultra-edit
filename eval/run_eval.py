@@ -32,6 +32,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from collections import Counter
 from collections.abc import Collection, Container, Iterable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -102,6 +103,37 @@ STRIPPED_ENV = (
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
+    # Behavior knobs that a host (such as a cloud Claude Code session) can set for
+    # itself and that would otherwise change every arm's effort, tools, or MCP
+    # startup: the evaluation measures Claude Code's defaults.
+    "CLAUDE_EFFORT",
+    "CLAUDE_CODE_DEBUG",
+    "CLAUDE_CODE_DIAGNOSTICS_FILE",
+    "CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
+    "MCP_CONNECTION_NONBLOCKING",
+    "MCP_TOOL_TIMEOUT",
+    "ENABLE_TOOL_SEARCH",
+    "CLAUDE_AUTO_BACKGROUND_TASKS",
+    "CLAUDE_CODE_BG_TASKS_REPORT_RUNNING",
+    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_HOLD_UNANSWERED_PARKED_PERMISSION",
+    "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH",
+    "CLAUDE_CODE_TEE_SDK_STDOUT",
+    "CLAUDE_CODE_DISABLE_BUILTIN_ANTMCP",
+    "CLAUDE_CODE_USE_CCR_V2",
+    "CLAUDE_CODE_WORKER_EPOCH",
+    "CLAUDE_CODE_MODEL_CAPABILITIES",
+    "DOCUMENTS_MCP_SCRATCH_ROOT",
+    "AI_AGENT",
+)
+# Prefixes of host-specific variables that add tools or sync state into a session.
+STRIPPED_ENV_PREFIXES = (
+    "CLAUDE_CODE_ARTIFACT_",
+    "CLAUDE_CODE_REMOTE",
+    "CLAUDE_CODE_SYNC_",
+    "CLAUDE_CODE_MESSAGING_",
 )
 CHILD_ENV = {
     "DISABLE_AUTOUPDATER": "1",
@@ -171,6 +203,7 @@ _SHELL_ONLY = (
     "Make every file change by "
 )
 _SERVER_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
+_ARM_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 @dataclass(frozen=True)
@@ -326,6 +359,9 @@ def third_party_arm(name: str, entry: Any) -> ArmSpec:
     if prompt is not None and not isinstance(prompt, str):
         raise ValueError("append_system_prompt must be a string or null")
     edit_tools = _string_list(entry.get("edit_tools"), "edit_tools")
+    if not edit_tools:
+        # Without them the server's edits and failures would not count as edit calls.
+        raise ValueError("edit_tools must name the server's file-changing tools")
     required = _string_list(entry.get("required_tools"), "required_tools")
     if "disallowed_tools" in entry:
         disallowed = _string_list(entry.get("disallowed_tools"), "disallowed_tools")
@@ -361,6 +397,10 @@ def load_arm_registry(arms_file: Path | None = DEFAULT_THIRD_PARTY_ARMS) -> ArmR
             servers.add(entry["server_name"])
         if name in BUILTIN_ARMS or name == "all":
             registry.unavailable[name] = f"{arms_file} redefines a built-in arm name"
+            continue
+        if not _ARM_NAME.match(name) or "__" in name:
+            # Arm names become run directory names (<task>__<arm>__r<rep>).
+            registry.unavailable[name] = f"{arms_file}: arm names must be letters, digits, '.', '_' or '-'"
             continue
         try:
             registry.arms[name] = third_party_arm(name, entry)
@@ -854,8 +894,10 @@ _AWK_IN_PLACE = re.compile(r"\b(?:g?awk|mawk|nawk)\b.*\s(?:-i\s*|--include[=\s]\
 # filter's output redirected into a file (sed ... > f.tmp && mv f.tmp f).
 _ENV_PREFIX = r"^(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"
 _PATCH_APPLY = re.compile(
-    _ENV_PREFIX + r"(?:git(?:\s+-[Cc]\s+\S+|\s+--[A-Za-z-]+=\S+)*\s+apply\b(?!.*\s--(?:check|stat|numstat|summary)\b)"
-    r"|patch\b(?!.*\s--(?:dry-run|check)\b))"
+    _ENV_PREFIX
+    + r"(?:git(?:\s+-[Cc]\s+\S+|\s+--[A-Za-z-]+=\S+)*\s+apply\b"
+    + r"(?!.*\s--(?:check|stat|numstat|summary)\b)"
+    + r"|patch\b(?!.*\s--(?:dry-run|check)\b))"
 )
 _FILTER = re.compile(
     _ENV_PREFIX + r"(?:g?sed|g?awk|mawk|nawk|perl|tr|grep|egrep|fgrep|cut|sort|uniq|head|tail|cat|iconv|jq|yq"
@@ -1222,6 +1264,9 @@ def _third_party_errors(
     missing = [tool for tool in spec.required_tools if tool not in tools]
     if missing:
         errors.append(f"required {spec.server_name} tools missing at init: {', '.join(missing)}")
+    elif not any(_tool_server(tool, {str(spec.server_name)}) for tool in tools):
+        # A connected server with no tools leaves only native tools: not this arm.
+        errors.append(f"no {spec.server_name} tools listed at init")
     return errors
 
 
@@ -1548,6 +1593,10 @@ def build_env(base: Mapping[str, str], config_dir: Any = None) -> tuple[dict[str
         if actual is not None:
             env.pop(actual)
             removed.append(name)
+    for upper_name, actual in sorted(upper.items()):
+        if upper_name.startswith(STRIPPED_ENV_PREFIXES) and actual in env:
+            env.pop(actual)
+            removed.append(upper_name)
     env.update(CHILD_ENV)
     if config_dir is not None:
         env["CLAUDE_CONFIG_DIR"] = str(config_dir)
@@ -2476,6 +2525,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     mode.add_argument(
         "--summarize", type=Path, metavar="RESULTS_DIR", help="rebuild summary.md from runs.jsonl"
     )
+    mode.add_argument(
+        "--rescore",
+        type=Path,
+        metavar="RESULTS_DIR",
+        help="recompute metrics from saved transcripts (keeps runs.jsonl.bak), then rebuild summary.md",
+    )
     parser.add_argument(
         "--task", action="append", dest="tasks", metavar="NAME", help="repeatable; default all"
     )
@@ -2784,6 +2839,43 @@ def _harness_commit() -> str | None:
     return (completed.stdout.strip() or None) if completed.returncode == 0 else None
 
 
+def rescore_records(results_dir: Path, registry: ArmRegistry) -> list[dict[str, Any]]:
+    """Recompute each run's metrics from its saved stream.jsonl with the current code.
+
+    Outcomes, byte comparisons, and integrity results are kept: the temporary
+    repositories are gone, so only transcript-derived values can be recomputed.
+    """
+    results_dir = Path(results_dir)
+    records = load_records(results_dir)
+    manifest_path = results_dir / "manifest.json"
+    recorded_specs: dict[str, Any] = {}
+    if manifest_path.exists():
+        recorded_specs = json.loads(manifest_path.read_text(encoding="utf-8")).get("arm_specs") or {}
+    rescored = []
+    for record in records:
+        arm = record.get("arm")
+        if isinstance(recorded_specs.get(arm), dict) and "edit_tools" in recorded_specs[arm]:
+            edit_tools = tuple(recorded_specs[arm]["edit_tools"])
+        elif arm in registry.arms:
+            edit_tools = registry.arms[arm].edit_tools
+        else:
+            edit_tools = NATIVE_EDIT_TOOL_NAMES
+        stream = results_dir / "runs" / str(record.get("run_id")) / "stream.jsonl"
+        updated = dict(record)
+        if stream.exists():
+            metrics = compute_metrics(parse_stream_file(stream), edit_tools)
+            updated["metrics"] = metrics
+            updated["first_attempt"] = first_attempt(metrics, bool(record.get("correct")))
+        rescored.append(updated)
+    backup = results_dir / "runs.jsonl.bak"
+    if not backup.exists():
+        shutil.copyfile(results_dir / "runs.jsonl", backup)
+    with open(results_dir / "runs.jsonl", "w", encoding="utf-8") as handle:
+        for record in rescored:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return rescored
+
+
 def write_results(records: Sequence[Mapping[str, Any]], results_dir: Path) -> str:
     """summary.md and runs.csv from the records; returns the summary text."""
     summary = summarize(records) if records else "# Ultra Edit evaluation\n\nNo runs completed.\n"
@@ -2801,6 +2893,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.summarize:
             summary = write_results(load_records(args.summarize), args.summarize)
             _print(summary)
+            return 0
+        if args.rescore:
+            records = rescore_records(args.rescore, load_arm_registry(args.third_party_arms))
+            _print(write_results(records, args.rescore))
             return 0
         registry = load_arm_registry(args.third_party_arms)
         specs = registry.resolve(args.arms)
@@ -2896,7 +2992,12 @@ def run_plan(
         return f"[{index:3d}/{len(plan)}] {text.ljust(width)}"
 
     def finish(future: Future, text: str) -> None:
-        record = future.result()
+        try:
+            record = future.result()
+        except Exception as error:  # a harness bug in one run must not kill the in-flight ones
+            _print(f"{text} HARNESS ERROR (not recorded): {type(error).__name__}: {error}")
+            traceback.print_exception(type(error), error, error.__traceback__, file=sys.stderr)
+            return
         log.add(record)
         if jobs == 1:
             _print(_progress_line(record))
