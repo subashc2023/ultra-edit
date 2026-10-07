@@ -23,6 +23,7 @@ def load_module(name: str):
 
 stats = load_module("stats")
 digest = load_module("digest")
+facts = load_module("facts")
 
 
 def record(task, arm, rep, cost, correct=True, outcome="pass", context=1000.0):
@@ -139,6 +140,104 @@ class DigestTests(unittest.TestCase):
         self.assertIn('CALL Edit (18B): {"old_string":"a"}', text)
         self.assertIn("-> ERROR (9B): not found", text)
         self.assertIn('-"x\\r\\n"', text)
+
+
+def call(message_id, tool_id, name, tool_input, context=1000):
+    return {
+        "type": "assistant",
+        "message": {
+            "id": message_id,
+            "usage": {"input_tokens": 0, "cache_read_input_tokens": context, "output_tokens": 10},
+            "content": [{"type": "tool_use", "id": tool_id, "name": name, "input": tool_input}],
+        },
+    }
+
+
+def answer(tool_id, text, is_error=False):
+    return {
+        "type": "user",
+        "message": {"content": [{"type": "tool_result", "tool_use_id": tool_id, "content": text, "is_error": is_error}]},
+    }
+
+
+def run_facts_for(events, arm="native", edit_tools=None):
+    """Facts for one run whose transcript is `events`; context per API call comes from usage."""
+    contexts = []
+    for event in events:
+        if event["type"] == "assistant" and event["message"]["id"] not in [c[0] for c in contexts]:
+            contexts.append((event["message"]["id"], event["message"]["usage"]["cache_read_input_tokens"]))
+    with tempfile.TemporaryDirectory() as directory:
+        results = Path(directory)
+        run_dir = results / "runs" / f"t__{arm}__r1"
+        run_dir.mkdir(parents=True)
+        (run_dir / "stream.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events), encoding="utf-8")
+        rec = record("t", arm, 1, 0.1)
+        rec["metrics"]["context_series"] = [[context, 10] for _, context in contexts]
+        tools = edit_tools if edit_tools is not None else facts.harness.NATIVE_EDIT_TOOL_NAMES
+        return facts.run_facts(rec, results, tools)
+
+
+class FactsTests(unittest.TestCase):
+    def test_a_failed_edit_and_its_recovery_are_costed_in_context_tokens(self):
+        result = run_facts_for(
+            [
+                call("m1", "t1", "Read", {"file_path": "/r/a.py"}, 1000),
+                answer("t1", "1\tx = 1"),
+                call("m2", "t2", "Edit", {"file_path": "/r/a.py", "old_string": "y", "new_string": "z"}, 1100),
+                answer("t2", "<tool_use_error>String to replace not found in file.</tool_use_error>", True),
+                call("m3", "t3", "Edit", {"file_path": "/r/a.py", "old_string": "x", "new_string": "z"}, 1200),
+                answer("t3", "The file /r/a.py has been updated."),
+                call("m4", "t4", "Bash", {"command": "git diff a.py | cat -A"}, 1300),
+                answer("t4", "-x = 1$\n+z = 1$"),
+            ]
+        )
+        self.assertEqual([s["kind"] for s in result["steps"]], ["read", "edit", "edit", "verify"])
+        self.assertEqual(result["edit_failures"], 1)
+        self.assertEqual(result["errors"], {"not_found": 1})
+        self.assertEqual(
+            result["recoveries"],
+            [{"step": 1, "error": "not_found", "masked": False, "fixed_at": 2, "steps_between": 0, "context_tokens": 1200}],
+        )
+        self.assertTrue(result["post_edit"]["diff_content"])
+        self.assertIn("byte_view", result["post_edit"]["features"])
+
+    def test_a_script_failure_hidden_by_a_later_command_is_a_masked_failed_edit(self):
+        script = "python3 - <<'EOF'\nimport pathlib\np = pathlib.Path('a.py')\ns = p.read_text()\nassert s.count('y') == 1\np.write_text(s)\nEOF\ngit diff --stat"
+        result = run_facts_for(
+            [
+                call("m1", "t1", "Bash", {"command": script}),
+                answer("t1", "Traceback (most recent call last):\n  File \"<stdin>\", line 4\nAssertionError"),
+            ],
+            arm="shell-python",
+        )
+        step = result["steps"][0]
+        self.assertEqual((step["channel"], step["error"], step["masked"], step["failed"]), ("bash:python", "python:AssertionError", True, True))
+        self.assertEqual(result["masked_failures"], 1)
+
+    def test_a_patch_built_with_sed_is_attributed_to_git_apply_and_a_missing_viewer_does_not_fail_it(self):
+        command = "sed -i 's/a/b/' $T/b/x.py\ngit apply <<'PATCH'\n--- a/x.py\n+++ b/x.py\nPATCH\nxxd x.py | head"
+        result = run_facts_for(
+            [
+                call("m1", "t1", "Bash", {"command": command}),
+                answer("t1", "Exit code 127\n x.py | 2 +-\n/bin/bash: line 7: xxd: command not found", True),
+            ],
+            arm="shell-patch",
+        )
+        step = result["steps"][0]
+        self.assertEqual((step["channel"], step["error"], step["failed"]), ("bash:git_apply", "command_not_found", False))
+        self.assertEqual(result["edit_failures"], 0)
+
+    def test_an_error_inside_a_successful_mcp_result_is_masked(self):
+        tool = "mcp__text-editor__patch_text_file_contents"
+        payload = json.dumps({"result": "error", "reason": "Content range hash mismatch", "file_hash": None})
+        result = run_facts_for(
+            [call("m1", "t1", tool, {"file_path": "/r/a.py", "patches": []}), answer("t1", payload)],
+            arm="mcp-text-editor",
+            edit_tools=(tool,),
+        )
+        step = result["steps"][0]
+        self.assertEqual(step["error"], "text_editor:content_range_hash_mismatch")
+        self.assertTrue(step["masked"] and step["failed"])
 
 
 if __name__ == "__main__":

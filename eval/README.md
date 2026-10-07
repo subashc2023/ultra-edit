@@ -367,6 +367,20 @@ input size and abbreviated input, each result's size and error flag, the final
 message, and the byte diff of a failed run. The digests are small enough to read
 dozens of runs side by side.
 
+`python3 eval/facts.py eval/results/<dir>` writes `facts.jsonl` and `facts.md`:
+behaviour counted from the transcripts, so analysis does not recount by
+reading. Every tool call becomes a step with the API call that issued it, a
+kind (read, search, inspect, edit, verify), shell features (`git diff`, a
+diffstat, byte views such as `cat -A`, tests, asserts), and an error class. Per
+run it gives the edit channels (`Edit`, `mcp:edit_file`, `bash:python`,
+`bash:git_apply`, ...), the checks made before the first and after the last
+edit, masked failures, and each recovery from a failed edit to the next
+successful one with the context tokens it cost. A masked failure is one the
+tool reported as success: a script's traceback hidden by a later command's exit
+status, a `git apply` error printed by a command that still exited 0, or an
+error inside an MCP result. A shell edit whose only failure is a missing viewer
+(`... && xxd file` without `xxd`) is not a failed edit.
+
 ## Adding a task
 
 Create `tasks/<name>/prompt.md`, `fixture/`, and `expected/`. State the exact
