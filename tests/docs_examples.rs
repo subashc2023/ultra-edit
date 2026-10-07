@@ -52,7 +52,8 @@ fn json_blocks(text: &str) -> Vec<String> {
 fn every_documented_request_parses() {
     let mut requests = 0;
     for (name, text) in DOCS {
-        for block in json_blocks(text) {
+        // A Windows checkout may give the Markdown CRLF line endings.
+        for block in json_blocks(&text.replace("\r\n", "\n")) {
             let value: Value = serde_json::from_str(&block)
                 .unwrap_or_else(|error| panic!("{name}: {error}\n{block}"));
             if value.get("files").is_some() {
