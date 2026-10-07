@@ -56,32 +56,33 @@ pub(crate) fn read_range(
             "Line numbers must be positive and the first must not exceed the last",
         ));
     }
-    let too_many_lines = last - first >= MAX_RANGE_LINES;
-    let mut total_lines = 0;
-    let mut disclosed = Vec::new();
-    for (index, range) in line_ranges(&text).enumerate() {
-        total_lines = index + 1;
-        if !too_many_lines && (first..=last).contains(&total_lines) {
-            disclosed.push(Span {
-                id: format!("r{total_lines}"),
-                start: range.start,
-                end: range.end,
-                line: total_lines,
-            });
-        }
-    }
-    if last > total_lines {
+    let total_lines = line_ranges(&text).count();
+    if first > total_lines {
         return Err(Error::new(
             "INVALID_LINE_RANGE",
-            format!("File has {total_lines} line(s); requested through line {last}"),
+            format!("File has {total_lines} line(s); the range starts at line {first}"),
         ));
     }
-    if too_many_lines {
+    // A range past the end reads through the last line, as native Read does; the
+    // response's `end` and `total_lines` say where the file stopped.
+    let last = last.min(total_lines);
+    if last - first >= MAX_RANGE_LINES {
         return Err(Error::new(
             "READ_TOO_LARGE",
             "A focused read supports at most 200 lines; choose a smaller range",
         ));
     }
+    let disclosed: Vec<Span> = line_ranges(&text)
+        .enumerate()
+        .map(|(index, range)| (index + 1, range))
+        .filter(|(line, _)| (first..=last).contains(line))
+        .map(|(line, range)| Span {
+            id: format!("r{line}"),
+            start: range.start,
+            end: range.end,
+            line,
+        })
+        .collect();
     let start = disclosed[0].start;
     let end = disclosed[disclosed.len() - 1].end;
     let selected = &text[start..end];

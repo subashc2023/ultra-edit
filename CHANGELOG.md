@@ -32,6 +32,10 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ### Changed
 
+- A snapshot range that runs past the file's last line now reads through it,
+  as native Read does, instead of failing with `INVALID_LINE_RANGE`; a range
+  that starts past the last line still fails. The benchmark saw five such
+  failures, each costing a round trip.
 - The plugin's session routing card is rewritten path-first and cut from 4,191
   to under 2,048 bytes, and the server instructions from 1,431 to 613
   characters. The edit skill now covers recovery and span targets; ordinary

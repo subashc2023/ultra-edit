@@ -82,7 +82,9 @@ from that listing or from `text`; `text` remains the exact selected bytes for
 and the last selected line's terminator; original newlines **inside** the range
 are included unchanged.
 Empty and BOM-only files have an empty line 1. Invalid ranges fail explicitly.
-Focused reads allow at most 200 lines and 6,000 source Unicode characters. They
+A range that runs past the last line reads through it, as native Read does, and
+the response's `end` and `total_lines` say where the file stopped; a range that
+starts past the last line is `INVALID_LINE_RANGE`. Focused reads allow at most 200 lines and 6,000 source Unicode characters. They
 reject oversized selections instead of issuing references to clipped text,
 directing an oversized selection to a smaller range, a search, or an explicit
 `EXPECTED_BYTES` full read rather than a plain full read that may also be over
