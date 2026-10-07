@@ -350,6 +350,23 @@ new metrics and show `-` there.
 `runs.jsonl.bak`, and rebuilds the summary. Outcomes and byte comparisons are
 kept, because the temporary repositories no longer exist.
 
+### Comparing arms and reading transcripts
+
+`summary.md` averages raw costs, so one expensive task can dominate an arm's
+mean. `python3 eval/stats.py eval/results/<dir> > stats.md` pairs arms task by
+task instead: it reports correctness and first-try rates with Wilson 95%
+intervals, then each arm's cost, context, output tokens, turns, and calls as
+the geometric mean of per-task ratios against `native` and against
+`ultra-edit`, with a bootstrap 95% interval from resampling repetitions within
+each task. Several directories are pooled; `DIR:SUFFIX` renames that
+directory's arms (`ultra-edit-SUFFIX`) so two builds of one arm can be compared.
+
+`python3 eval/digest.py eval/results/<dir> OUT_DIR` writes one short text file
+per run: every API call's context size, the assistant's text, each tool call's
+input size and abbreviated input, each result's size and error flag, the final
+message, and the byte diff of a failed run. The digests are small enough to read
+dozens of runs side by side.
+
 ## Adding a task
 
 Create `tasks/<name>/prompt.md`, `fixture/`, and `expected/`. State the exact
