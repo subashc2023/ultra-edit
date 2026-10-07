@@ -16,8 +16,8 @@ same absolute `path` you Read: the server root never follows `cd` or a worktree.
   `"count":N` replaces exactly N occurrences.
 - `lines:[a,b]` replaces those whole lines (Read's numbers); `"new":""` deletes
   them. `after:n` inserts lines after line n (0 = top). Both need `expect`: the
-  current text of line n or a, or `[line a, line b]` for a range; 8+ visible
-  characters in all.
+  current text of line n or a, or `[line a, line b]` for a range, matching
+  nowhere else in the file.
 - Every change applies to the file as it was when the call started, never to
   another change's output. Text is literal: no whitespace or quote changes. In a
   file whose lines all end in CRLF, LF in your text is written as CRLF.

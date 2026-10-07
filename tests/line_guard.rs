@@ -80,18 +80,24 @@ fn an_array_expect_keeps_an_empty_last_line() {
     assert_eq!(rejected(&full, change).code, "EXPECTED_TEXT_MISMATCH");
 }
 
-/// A line that both the head and the tail name counts once toward the minimum.
+/// A guard is strong when it matches one place, however short it is, and weak when
+/// it matches more, however it is given.
 #[test]
-fn a_line_given_as_both_head_and_tail_counts_once_toward_the_minimum() {
-    let base = spanless("abcd\nefgh ijkl\n");
-    assert_eq!(
-        rejected(&base, ends([1, 1], Some("abcd"), None, "x")).code,
-        "LINE_GUARD_WEAK"
-    );
-    assert_eq!(
-        rejected(&base, ends([1, 1], Some("abcd"), Some("abcd"), "x")).code,
-        "LINE_GUARD_WEAK"
-    );
+fn a_guard_must_match_one_place() {
+    let unique = spanless("abcd\nefgh ijkl\n");
+    for change in [
+        ends([1, 1], Some("abcd"), None, "x"),
+        ends([1, 1], Some("abcd"), Some("abcd"), "x"),
+    ] {
+        assert_eq!(outcome(&unique, change).unwrap(), "x\nefgh ijkl\n");
+    }
+    let repeated = spanless("abcd\nabcd\nefgh ijkl\n");
+    for change in [
+        ends([1, 1], Some("abcd"), None, "x"),
+        ends([1, 1], Some("abcd"), Some("abcd"), "x"),
+    ] {
+        assert_eq!(rejected(&repeated, change).code, "LINE_GUARD_WEAK");
+    }
 }
 
 /// Past five places, a line's count is given as more than five.
@@ -151,11 +157,13 @@ fn suggested_ranges_are_ranges_that_can_be_followed() {
 /// A weak expect is quoted as given: a missing tail adds no trailing space.
 #[test]
 fn a_weak_expect_is_quoted_without_a_trailing_space() {
-    let base = spanless("abcd\nefgh ijkl\n");
+    let base = spanless("abcd\nabcd\n");
     let error = rejected(&base, ends([1, 1], Some("abcd"), None, "x"));
     assert_eq!(error.code, "LINE_GUARD_WEAK");
     assert!(
-        error.message.starts_with("expect \"abcd\" has under"),
+        error
+            .message
+            .starts_with("expect \"abcd\" matches 2 ranges"),
         "{}",
         error.message
     );
@@ -164,7 +172,7 @@ fn a_weak_expect_is_quoted_without_a_trailing_space() {
 /// An insertion has no range to widen, nor a range to repeat in `new`.
 #[test]
 fn weak_insert_advice_does_not_talk_about_a_range() {
-    let base = spanless("ab\ncdef ghij\n");
+    let base = spanless("ab\ncdef ghij\nab\n");
     let error = rejected(&base, insert(1, Some("ab"), "x"));
     assert_eq!(error.code, "LINE_GUARD_WEAK");
     assert!(
@@ -233,7 +241,7 @@ fn line_guard_boundaries_behave_as_intended() {
     assert!(
         error
             .message
-            .contains("it is at line 3 now, so the range is [2,3]")
+            .contains("it is at line 3, so the range is [2,3]")
     );
     assert_eq!(
         outcome(&base, ends([2, 3], Some("fn remove_me() {"), Some("}"), "")).unwrap(),

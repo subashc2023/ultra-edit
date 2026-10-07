@@ -291,7 +291,6 @@ fn line_targets_in_a_path_file_need_a_strong_expect() {
     // A path file was read through another view, so its line numbers may be stale.
     for (change, code) in [
         (lines([2, 2], None), "LINE_GUARD_REQUIRED"),
-        (lines([2, 2], Some("    run();")), "LINE_GUARD_WEAK"),
         (lines([2, 3], Some("    run();")), "LINE_GUARD_REQUIRED"),
         (
             lines([2, 3], Some("    serve_forever();\n}")),
@@ -348,7 +347,7 @@ fn a_line_added_inside_a_range_since_the_read_is_caught_at_its_end() {
     assert!(
         outcome.diagnostics[0]
             .message
-            .contains("it is at line 7 now, so the range is [3,7]"),
+            .contains("it is at line 7, so the range is [3,7]"),
         "{}",
         outcome.diagnostics[0].message
     );
@@ -454,6 +453,31 @@ fn one_file_named_twice_or_an_empty_span_is_reported_once() {
     );
     assert_eq!(codes(&outcome), ["EMPTY_SPAN_ID"]);
     assert_eq!(read(&dir, "a.txt"), "one\ntwo\n");
+}
+
+#[test]
+fn a_missing_path_that_ends_like_a_workspace_file_names_it() {
+    let (dir, workspace) = setup(&[("docs/a.md", "one\n")]);
+    // A directory left out of an absolute path: the root's parent instead of the root.
+    let parent = dir.path().parent().unwrap().join("docs").join("a.md");
+    let outcome = rejected(
+        workspace
+            .edit(request(vec![at(
+                parent.to_str().unwrap(),
+                vec![exact("one", "1")],
+            )]))
+            .unwrap(),
+    );
+    assert_eq!(codes(&outcome), ["TARGET_MISSING"]);
+    let message = &outcome.diagnostics[0].message;
+    let near = std::fs::canonicalize(dir.path().join("docs").join("a.md")).unwrap();
+    assert!(
+        message.ends_with(&format!(
+            "; did you mean {}?",
+            ultra_edit::report::path_for_display(&near.to_string_lossy())
+        )),
+        "{message}"
+    );
 }
 
 #[test]

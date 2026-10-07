@@ -82,7 +82,7 @@ class ReleasePackagingTests(unittest.TestCase):
                 "ultra-edit": {
                     "type": "stdio",
                     "command": "${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp",
-                    "args": ["--root", "${CLAUDE_PROJECT_DIR}"],
+                    "args": ["--root", "${CLAUDE_PROJECT_DIR}", "--no-instructions"],
                 }
             }
         }

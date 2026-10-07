@@ -142,6 +142,7 @@ pub struct DiffRequest {
 pub struct McpServer {
     workspace: Arc<Workspace>,
     tool_router: ToolRouter<Self>,
+    instructions: bool,
 }
 
 impl McpServer {
@@ -149,7 +150,15 @@ impl McpServer {
         Self {
             workspace: Arc::new(workspace),
             tool_router: Self::tool_router(),
+            instructions: true,
         }
+    }
+
+    /// Sends no server instructions, for a host that already gives the model the
+    /// same routing, as the Claude Code plugin's session card does.
+    pub fn without_instructions(mut self) -> Self {
+        self.instructions = false;
+        self
     }
 
     async fn operate(
@@ -468,9 +477,13 @@ impl McpServer {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("ultra-edit", env!("CARGO_PKG_VERSION")))
-            .with_instructions(INSTRUCTIONS)
+        let info = ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("ultra-edit", env!("CARGO_PKG_VERSION")));
+        if self.instructions {
+            info.with_instructions(INSTRUCTIONS)
+        } else {
+            info
+        }
     }
 }
 

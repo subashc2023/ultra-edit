@@ -256,7 +256,7 @@ pub(crate) fn line_places(
 ) -> String {
     match starts {
         [] => String::new(),
-        [only] => format!("it is at line {only} now, so {} {REPAIR}.", retarget(*only)),
+        [only] => format!("it is at line {only}, so {} {REPAIR}.", retarget(*only)),
         [first, ..] => {
             let count = if starts.len() > cap {
                 format!("more than {cap}")

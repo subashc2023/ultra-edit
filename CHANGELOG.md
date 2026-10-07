@@ -34,10 +34,12 @@ All notable changes to Ultra Edit are documented here. Releases follow
   last line. `expect` on a line target is compared line by line, ignoring line
   endings. Unless the base disclosed the lines (a `path` file discloses none),
   it is required, must reach the range's last line, as every line or as
-  `[first line, last line]`, and needs at least 8 visible characters
-  (`LINE_GUARD_REQUIRED`, `LINE_GUARD_WEAK`), so a stale line number, including
-  a line added inside the range, is rejected rather than applied, and the
-  message gives the current range.
+  `[first line, last line]`, and, like `old`, must match nowhere else in the
+  file (`LINE_GUARD_REQUIRED`, `LINE_GUARD_WEAK`), so a stale line number,
+  including a line added inside the range, is rejected rather than applied,
+  and the message gives the current range. A path that names no file but ends
+  like a workspace file, as when a directory was left out, is answered with
+  that file's path.
   New diagnostics: `LINE_OUT_OF_RANGE`, `EMPTY_INSERTION`, and an
   `OVERLAPPING_CHANGES` message naming the single `lines` change to send.
 - Line-ending adaptation: in a file whose every line ends in CRLF, `old`, `new`,
@@ -72,6 +74,11 @@ All notable changes to Ultra Edit are documented here. Releases follow
   to under 2,048 bytes, and the server instructions from 1,431 to about 650
   characters. The edit skill now covers recovery and span targets; ordinary
   edits need only the card.
+- The plugin starts the server with the new `--no-instructions` flag: its session
+  card already gives the routing, and the duplicate server instructions cost
+  about 280 tokens on every model call. The edit tool's schema also drops
+  property descriptions that its description already gives, from 2,927 to 2,287
+  bytes. Other hosts still receive the instructions.
 - `ultra_edit` carries `_meta: {"anthropic/alwaysLoad": true}`, so Claude Code
   loads its schema up front instead of behind a `ToolSearch` round trip, which
   the benchmark measured at about 0.9 extra API calls per editing session.
