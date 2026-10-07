@@ -1,0 +1,6 @@
+{"checksum":"daf38bfb70a04a63ef65488e38f8ede80311c601ab1bfb947414f6b60a1fd012","payload":{"event":"begin","file_count":2,"plan_digest":"57783b2f746dbbb05070e292d38128eb1fcc6f2efecdee3ed45cc28576e8bdaf","plan_id":"p27ae989b7286489d895ed6cb28f85c9e","preflight_failed":false}}
+{"checksum":"dccd24a25e1d19c151cf21f20397aa5c9b04ee9bc148dfea7d758ceb0a3bd1b6","payload":{"event":"intent","index":0}}
+{"checksum":"6ab09be87cb833703076cce5c21819eb0d7cf323c2b691a30061cfd3d32df465","payload":{"after":"sbdab7348b51846429bba880730556486","error":null,"event":"outcome","index":0,"status":"committed"}}
+{"checksum":"f6032bbeccfdc531229c0536f89835646984ab0c3bb3b56a53a2b9bb3922f034","payload":{"event":"intent","index":1}}
+{"checksum":"3b97e811d1a1747bf6284b2ef9561d6e7daecad69f92ea584a147978154c0c7c","payload":{"after":"s8152c4fc2db54f918d4a7b8a248d5bde","error":null,"event":"outcome","index":1,"status":"committed"}}
+{"checksum":"161ae3b3155ec646a1221d474c1579e2ae075e5dd766aa9fdf46fadccbf968f5","payload":{"event":"finished"}}

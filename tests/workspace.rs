@@ -1220,3 +1220,76 @@ fn a_replay_notice_counts_against_the_report_bounds() {
     assert_eq!(replayed.lines().next(), Some(REPLAY_NOTICE));
     assert_eq!(replayed.lines().nth(1), fresh.lines().next());
 }
+
+/// Derived request IDs are persisted as binding keys, so the IDs 0.3.0 derived for
+/// these requests must never change: a different ID would re-attempt an edit whose
+/// output was lost instead of replaying its receipt.
+#[test]
+fn derived_request_ids_match_0_3_0() {
+    let file = |base: &str, target: Target, text: &str| EditRequest {
+        request_id: String::new(),
+        files: vec![FileRequest {
+            base: base.into(),
+            changes: vec![Change {
+                id: String::new(),
+                target,
+                text: text.into(),
+            }],
+        }],
+    };
+    let golden = [
+        (
+            file(
+                "s00000000000000000000000000000001",
+                Target::Exact {
+                    old: "alpha = 1".into(),
+                    scope: None,
+                },
+                "alpha = 2",
+            ),
+            "auto-5449ca50c1835a6f1d12d9ffa2b1e0b7",
+        ),
+        (
+            file(
+                "s00000000000000000000000000000002",
+                Target::All {
+                    old: "old_name".into(),
+                    scope: "r0".into(),
+                    expected: 3,
+                },
+                "new_name",
+            ),
+            "auto-f0a764ec9036620a82f665c4348a55dc",
+        ),
+        (
+            file(
+                "s00000000000000000000000000000003",
+                Target::Span {
+                    span: "r12".into(),
+                    expect: Some("    return x;".into()),
+                },
+                "    return y;",
+            ),
+            "auto-63beb797ae5975a3c95f9cd7f30c8a08",
+        ),
+    ];
+    for (request, id) in golden {
+        assert_eq!(resolve_ids(request).unwrap().request_id, id);
+    }
+    let corrections = [Change {
+        id: "1.1".into(),
+        target: Target::Exact {
+            old: "two".into(),
+            scope: Some("r2".into()),
+        },
+        text: "2".into(),
+    }];
+    assert_eq!(
+        repair_request_id("", "d00000000000000000000000000000004", &corrections).unwrap(),
+        "auto-de1755d7e9acadbd0ee7c77d576a350d"
+    );
+    assert_eq!(
+        undo_request_id("", "p00000000000000000000000000000005").unwrap(),
+        "auto-6bef3b0b08e8021d34d1eb63f244f1ac"
+    );
+}

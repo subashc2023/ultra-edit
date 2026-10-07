@@ -1,0 +1,1 @@
+{"checksum":"8b72a12f14a7b7e0742ea2915f891b93379d12360ae652808702be8a6913e51e","payload":{"input":{"kind":"edit","request":{"files":[{"base":"sf2af7b2a49da4183be3d599cf2dfcdea","changes":[{"id":"1.1","target":{"kind":"exact","old":"before","scope":null},"text":"after"}]}],"request_id":"stale-0.3.0"}},"reference":"pafb650c1b36a424b9d1bd68bd6423e26"}}

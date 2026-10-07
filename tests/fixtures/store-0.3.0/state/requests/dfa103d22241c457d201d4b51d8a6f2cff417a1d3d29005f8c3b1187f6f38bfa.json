@@ -1,0 +1,1 @@
+{"checksum":"b7cdd945c2a60bd25af4ca05cda3eb7f5640c0f2fe105ca2498e7bedf842a94f","payload":{"input":{"kind":"edit","request":{"files":[{"base":"s708d88473a364a5098183c1f8c1e03c4","changes":[{"id":"1.1","target":{"kind":"exact","old":"before","scope":null},"text":"after"}]}],"request_id":"interrupted-0.3.0"}},"reference":"p69fc919f9f0c48a6ac541f5f0c14d0b2"}}
