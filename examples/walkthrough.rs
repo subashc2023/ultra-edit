@@ -50,6 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     target: Target::Exact {
                         old: "RETRIES: u32 = 2".into(),
                         scope: None,
+                        lines: None,
                     },
                     text: "RETRIES: u32 = 3".into(),
                 },

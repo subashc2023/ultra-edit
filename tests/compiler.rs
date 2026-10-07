@@ -14,6 +14,7 @@ fn exact(id: &str, old: &str, text: &str) -> Change {
         target: Target::Exact {
             old: old.into(),
             scope: None,
+            lines: None,
         },
         text: text.into(),
     }
@@ -60,6 +61,7 @@ fn scoped(id: &str, old: &str, scope: &str) -> Change {
         target: Target::Exact {
             old: old.into(),
             scope: Some(scope.into()),
+            lines: None,
         },
         text: "replacement".into(),
     }
@@ -180,6 +182,7 @@ fn exact_ambiguity_reports_replace_all_cardinality() {
         target: Target::Exact {
             old: "aa".into(),
             scope: Some("r4".into()),
+            lines: None,
         },
         text: "x".into(),
     };
@@ -189,15 +192,16 @@ fn exact_ambiguity_reports_replace_all_cardinality() {
     assert_eq!(errors[0].actual, Some(6));
     assert_eq!(
         errors[0].message,
-        "Expected 1 occurrence(s), found 6 overlapping starts (4 non-overlapping) at line 4 and later; add surrounding text to `old`, or scope it to a disclosed span holding one"
+        "Expected 1 occurrence(s), found 6 overlapping starts (4 non-overlapping) at line 4 and later; add surrounding text to `old`, or restrict it with \"in\":[4,4]"
     );
 
     let all = Change {
         id: "all".into(),
         target: Target::All {
             old: "aa".into(),
-            scope: "r4".into(),
+            scope: Some("r4".into()),
             expected: 4,
+            lines: None,
         },
         text: "x".into(),
     };
@@ -212,8 +216,9 @@ fn replace_all_requires_non_overlapping_cardinality() {
         id: "a".into(),
         target: Target::All {
             old: "aa".into(),
-            scope: "r0".into(),
+            scope: Some("r0".into()),
             expected: 2,
+            lines: None,
         },
         text: "x".into(),
     };
@@ -223,16 +228,18 @@ fn replace_all_requires_non_overlapping_cardinality() {
     assert_eq!(errors[0].actual, Some(1));
     change.target = Target::All {
         old: "aa".into(),
-        scope: "r0".into(),
+        scope: Some("r0".into()),
         expected: 1,
+        lines: None,
     };
     let plan = compile(&request(&base, vec![change.clone()]), &bases(&base)).unwrap();
     assert_eq!(plan.files[0].output, "xa");
     assert_eq!(plan.files[0].replacements.len(), 1);
     change.target = Target::All {
         old: "a".into(),
-        scope: "r0".into(),
+        scope: Some("r0".into()),
         expected: 2,
+        lines: None,
     };
     let errors = compile(&request(&base, vec![change]), &bases(&base)).unwrap_err();
     assert_eq!(errors[0].code, "EXPECTED_COUNT_MISMATCH");
@@ -255,8 +262,9 @@ fn replace_all_self_overlapping_patterns_apply_left_to_right_within_scope() {
             id: "all".into(),
             target: Target::All {
                 old: old.into(),
-                scope: "r2".into(),
+                scope: Some("r2".into()),
                 expected,
+                lines: None,
             },
             text: "x".into(),
         };
@@ -269,8 +277,9 @@ fn replace_all_self_overlapping_patterns_apply_left_to_right_within_scope() {
         id: "all".into(),
         target: Target::All {
             old: "\n\n".into(),
-            scope: "r0".into(),
+            scope: Some("r0".into()),
             expected: 2,
+            lines: None,
         },
         text: "\n".into(),
     };
@@ -330,11 +339,19 @@ fn output_warnings_are_nonblocking_and_inspect_literal_resulting_bytes() {
         ("a", "a", "b\0b", "b\0b", vec!["NUL_BYTE"]),
         ("a\0", "a", "b", "b\0", vec!["NUL_BYTE"]),
         ("a\0", "\0", "", "a", vec![]),
+        // LF-only text is adapted to an all-CRLF file; a text holding CR is literal.
         (
             "a\r\nb\r\n",
             "a",
             "a\nextra\0",
-            "a\nextra\0\r\nb\r\n",
+            "a\r\nextra\0\r\nb\r\n",
+            vec!["NUL_BYTE", "EOL_ADAPTED"],
+        ),
+        (
+            "a\r\nb\r\n",
+            "a",
+            "a\nextra\0\r",
+            "a\nextra\0\r\r\nb\r\n",
             vec!["NUL_BYTE", "MIXED_LINE_ENDINGS"],
         ),
         ("a\nb\n", "a", "a\r", "a\r\nb\n", vec!["MIXED_LINE_ENDINGS"]),
@@ -391,8 +408,9 @@ fn scopes_bound_candidates_and_replacement_text_is_literal() {
         id: "all".into(),
         target: Target::All {
             old: "a".into(),
-            scope: "r2".into(),
+            scope: Some("r2".into()),
             expected: 2,
+            lines: None,
         },
         text: "é\r\n".into(),
     };
@@ -404,6 +422,7 @@ fn scopes_bound_candidates_and_replacement_text_is_literal() {
         target: Target::Exact {
             old: "a\r\n".into(),
             scope: Some("r1".into()),
+            lines: None,
         },
         text: "x".into(),
     };
@@ -509,7 +528,7 @@ fn empty_exact_target_gives_reachable_insertion_advice() {
     assert_eq!(errors[0].code, "EMPTY_TARGET");
     assert_eq!(
         errors[0].message,
-        "Exact search text must not be empty; for insertion, replace adjacent text with itself plus the insertion, or use a returned zero-width span"
+        "Exact search text must not be empty; to insert, use {\"after\":n,\"new\":...}, or replace adjacent text with itself plus the insertion"
     );
 
     let repaired = Change {
@@ -517,6 +536,7 @@ fn empty_exact_target_gives_reachable_insertion_advice() {
         target: Target::Exact {
             old: "first".into(),
             scope: Some("r1".into()),
+            lines: None,
         },
         text: "first\r\ninserted".into(),
     };
@@ -584,8 +604,9 @@ fn all_safely_discoverable_request_errors_are_collected_across_files() {
                         id: "all".into(),
                         target: Target::All {
                             old: "".into(),
-                            scope: "".into(),
+                            scope: Some("".into()),
                             expected: 0,
+                            lines: None,
                         },
                         text: "x".into(),
                     },
@@ -770,8 +791,9 @@ fn request_and_replacement_limits_apply_across_file_entries() {
             id: format!("all{index}"),
             target: Target::All {
                 old: "a".into(),
-                scope: "r0".into(),
+                scope: Some("r0".into()),
                 expected: MAX_REPLACEMENTS / 2 + usize::from(index == 0),
+                lines: None,
             },
             text: "".into(),
         }];
@@ -785,8 +807,9 @@ fn request_and_replacement_limits_apply_across_file_entries() {
         id: "all".into(),
         target: Target::All {
             old: "a".into(),
-            scope: "r0".into(),
+            scope: Some("r0".into()),
             expected: MAX_REPLACEMENTS,
+            lines: None,
         },
         text: "".into(),
     };
@@ -823,8 +846,9 @@ fn overlap_diagnostics_and_output_expansion_are_bounded() {
         id: "all".into(),
         target: Target::All {
             old: "a".into(),
-            scope: "r0".into(),
+            scope: Some("r0".into()),
             expected: 3,
+            lines: None,
         },
         text: "b".repeat(MAX_TEXT_BYTES / 2),
     };
@@ -869,8 +893,9 @@ fn replace_all_counts_beyond_the_retained_position_budget() {
             id: "all".into(),
             target: Target::All {
                 old: "aa".into(),
-                scope: "r0".into(),
+                scope: Some("r0".into()),
                 expected,
+                lines: None,
             },
             text: "".into(),
         };
@@ -943,10 +968,8 @@ fn whitespace_candidates_carry_exact_source_text_and_lines() {
     assert_eq!(plan.files[0].output, "fn main() {\n\tlet x = 2;\n}\n");
 
     // A multi-line LF needle finds CRLF source, including its final line ending.
-    let base = snapshot(
-        "crlf.txt".into(),
-        "a\r\n  b = 1;\r\n  c = 2;\r\nd\r\n".into(),
-    );
+    // The file's last line ends in LF, so the needle is not adapted to CRLF.
+    let base = snapshot("crlf.txt".into(), "a\r\n  b = 1;\r\n  c = 2;\r\nd\n".into());
     let error = rejected(&base, exact("crlf", "  b = 1;\n  c = 2;\n", "x"));
     let crlf = candidate(
         CandidateKind::Whitespace,
@@ -1005,8 +1028,9 @@ fn candidates_stay_within_the_target_scope() {
         id: "all".into(),
         target: Target::All {
             old: "  x = 1".into(),
-            scope: "r3".into(),
+            scope: Some("r3".into()),
             expected: 1,
+            lines: None,
         },
         text: "x".into(),
     };
@@ -1201,8 +1225,9 @@ fn counted_matches_explain_themselves_without_candidates() {
         id: "all".into(),
         target: Target::All {
             old: "x = 1".into(),
-            scope: "r0".into(),
+            scope: Some("r0".into()),
             expected: 3,
+            lines: None,
         },
         text: "y".into(),
     };
@@ -1356,9 +1381,26 @@ fn span_ranges_replace_from_the_first_body_to_the_last_like_selection() {
         .unwrap();
         assert_eq!(plan.files[0].output, output, "{span}");
     }
-    // A range keeps byte-exact `expect`.
-    let guarded_range = guarded("r1..r2", "a\nb");
-    let error = compile(&request(&base, vec![guarded_range]), &bases(&base)).unwrap_err();
+    // A range keeps byte-exact `expect`, after LF-only text is adapted to an
+    // all-CRLF file.
+    let error = compile(
+        &request(&base, vec![guarded("r1..r2", "a \nb")]),
+        &bases(&base),
+    )
+    .unwrap_err();
+    assert_eq!(error[0].code, "EXPECTED_TEXT_MISMATCH");
+    let plan = compile(
+        &request(&base, vec![guarded("r1..r2", "a\nb")]),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(plan.warnings[0].code, "EOL_ADAPTED");
+    let mixed = snapshot("mixed.txt".into(), "a\r\nb\r\nc\n".into());
+    let error = compile(
+        &request(&mixed, vec![guarded("r1..r2", "a\nb")]),
+        &bases(&mixed),
+    )
+    .unwrap_err();
     assert_eq!(error[0].code, "EXPECTED_TEXT_MISMATCH");
     let plan = compile(
         &request(&base, vec![guarded("r1..r2", "a\r\nb")]),
@@ -1390,7 +1432,7 @@ fn span_ranges_need_every_line_disclosed() {
         assert_eq!(
             error.message,
             format!(
-                "Span {span} needs every line disclosed; this base discloses lines 146-150, 1875-1879; selection = lines 1875-1879. Read the rest by continuing this snapshot"
+                "Span {span} needs every line disclosed; this base discloses lines 146-150, 1875-1879; selection = lines 1875-1879. Continue this snapshot to read the rest, or use \"lines\" with expect"
             )
         );
     }
@@ -1411,8 +1453,9 @@ fn span_ranges_scope_exact_and_all_targets() {
         id: "all".into(),
         target: Target::All {
             old: "x".into(),
-            scope: "r2..r3".into(),
+            scope: Some("r2..r3".into()),
             expected: 2,
+            lines: None,
         },
         text: "y".into(),
     };
@@ -1467,7 +1510,7 @@ fn unknown_spans_teach_what_the_base_discloses() {
         assert_eq!(
             error.message,
             format!(
-                "{span:?} is not a span ID; spans look like r146, r146..r150, selection, or m1. This base discloses {disclosed}"
+                "{span:?} is not a span ID; use r146, r146..r150, selection, m1, or \"lines\":[146,150]. This base discloses {disclosed}"
             )
         );
     }
@@ -1511,7 +1554,7 @@ fn ambiguous_exact_targets_name_the_first_five_match_lines() {
     assert_eq!(error.actual, Some(7));
     assert_eq!(
         error.message,
-        "Expected 1 occurrence(s), found 7 overlapping starts (7 non-overlapping) at lines 1, 3, 4, 6 and later; add surrounding text to `old`, or scope it to a disclosed span holding one"
+        "Expected 1 occurrence(s), found 7 overlapping starts (7 non-overlapping) at lines 1, 3, 4, 6 and later; add surrounding text to `old`, or restrict it with \"in\":[1,1]"
     );
     let base = snapshot("two.txt".into(), "a\nkey\nb\nkey\n".into());
     assert!(
@@ -1522,10 +1565,11 @@ fn ambiguous_exact_targets_name_the_first_five_match_lines() {
 }
 
 #[test]
-fn an_lf_target_on_a_crlf_file_gets_a_line_ending_hint() {
+fn an_lf_target_on_a_mixed_eol_file_gets_a_line_ending_hint() {
+    // One LF line keeps the file from being all CRLF, so `old` stays literal.
     let base = snapshot(
         "crlf.ps1".into(),
-        "param()\r\nif ($x) {\r\n    Write-Host 1\r\n}\r\n".into(),
+        "param()\r\nif ($x) {\r\n    Write-Host 1\r\n}\r\n# lf\n".into(),
     );
     let error = rejected(&base, exact("b", "if ($x) {\n    Write-Host 1\n}", "y"));
     assert_eq!(error.code, "TARGET_NOT_FOUND");
@@ -1641,8 +1685,9 @@ fn edge_warnings_are_once_per_change_and_bounded() {
         id: "all".into(),
         target: Target::All {
             old: "x ".into(),
-            scope: "r0".into(),
+            scope: Some("r0".into()),
             expected: 3,
+            lines: None,
         },
         text: "x".into(),
     };
@@ -1686,7 +1731,7 @@ fn byte_warnings_precede_edge_warnings_so_compact_summaries_keep_them() {
     let text: String = (0..8).map(|index| format!("k{index}= v\n")).collect();
     let mut first = snapshot("first.txt".into(), format!("{text}\0"));
     first.id = "s1".into();
-    let mut second = snapshot("second.txt".into(), "a\r\nb\r\n".into());
+    let mut second = snapshot("second.txt".into(), "a\r\nb\n".into());
     second.id = "s2".into();
     let changes = (0..8)
         .map(|index| {
@@ -1708,7 +1753,7 @@ fn byte_warnings_precede_edge_warnings_so_compact_summaries_keep_them() {
             FileRequest {
                 path: None,
                 base: second.id.clone(),
-                changes: vec![exact("eol", "a\r\n", "a\n")],
+                changes: vec![exact("eol", "a", "A")],
             },
         ],
     };
@@ -1789,4 +1834,715 @@ fn a_span_range_over_inconsistent_line_offsets_is_rejected_not_sliced() {
     base.spans[2].end = 2;
     let error = rejected(&base, span_change("b", "r1..r2", "X"));
     assert_eq!(error.code, "UNKNOWN_SPAN");
+}
+
+fn lines_change(id: &str, lines: [usize; 2], expect: Option<&str>, text: &str) -> Change {
+    Change {
+        id: id.into(),
+        target: Target::Lines {
+            lines,
+            expect: expect.map(str::to_owned),
+            expect_last: None,
+        },
+        text: text.into(),
+    }
+}
+
+fn insert(id: &str, after: usize, expect: Option<&str>, text: &str) -> Change {
+    Change {
+        id: id.into(),
+        target: Target::Insert {
+            after,
+            expect: expect.map(str::to_owned),
+        },
+        text: text.into(),
+    }
+}
+
+/// Plans `changes` against a full snapshot of `text`, which discloses every line.
+fn output(text: &str, changes: Vec<Change>) -> String {
+    let base = snapshot("lines.txt".into(), text.into());
+    let plan = compile(&request(&base, changes), &bases(&base))
+        .unwrap_or_else(|errors| panic!("{text:?}: {errors:?}"));
+    plan.files[0].output.clone()
+}
+
+/// A base that discloses no line, like a receipt's after-snapshot.
+fn spanless(text: &str) -> Snapshot {
+    let mut base = snapshot("spanless.txt".into(), text.into());
+    base.spans.clear();
+    base
+}
+
+fn settings(lines: usize, eol: &str) -> String {
+    (1..=lines)
+        .map(|line| format!("    setting_{line} = {line}{eol}"))
+        .collect()
+}
+
+#[test]
+fn lines_replace_whole_lines_and_inherit_the_last_terminator() {
+    for (text, lines, new, expected) in [
+        ("a\nb\nc\n", [2, 2], "B", "a\nB\nc\n"),
+        ("a\nb\nc\n", [2, 2], "B1\nB2", "a\nB1\nB2\nc\n"),
+        ("a\r\nb\r\nc\r\n", [2, 2], "B", "a\r\nB\r\nc\r\n"),
+        ("a\r\nb\r\nc\r\n", [2, 3], "B\r\nC", "a\r\nB\r\nC\r\n"),
+        // No final newline stays absent, and mixed endings keep each line's own.
+        ("a\nb", [2, 2], "B", "a\nB"),
+        ("a\r\nb\nc", [1, 2], "X", "X\nc"),
+        // A trailing line feed in `new` is written literally.
+        ("a\nb", [2, 2], "B\n", "a\nB\n"),
+        ("a\nb\nc\n", [1, 1], "X\n\n", "X\n\nb\nc\n"),
+        ("\u{feff}a\nb\n", [1, 1], "A", "\u{feff}A\nb\n"),
+        ("", [1, 1], "new", "new"),
+    ] {
+        assert_eq!(
+            output(text, vec![lines_change("c", lines, None, new)]),
+            expected,
+            "{text:?} {lines:?} {new:?}"
+        );
+    }
+}
+
+#[test]
+fn empty_lines_text_deletes_and_keeps_the_final_newline_state() {
+    for (text, lines, expected) in [
+        ("a\nb\nc\n", [2, 2], "a\nc\n"),
+        ("a\nb\nc\n", [3, 3], "a\nb\n"),
+        ("a\nb\nc\n", [1, 3], ""),
+        // Deleting a last line without a terminator takes the one before it.
+        ("a\nb\nc", [3, 3], "a\nb"),
+        ("a\nb\nc", [2, 3], "a"),
+        ("a\nb\nc", [1, 3], ""),
+        ("a\r\nb\r\nc", [3, 3], "a\r\nb"),
+        ("\u{feff}a\nb\n", [1, 1], "\u{feff}b\n"),
+        ("\u{feff}a\nb", [1, 2], "\u{feff}"),
+    ] {
+        assert_eq!(
+            output(text, vec![lines_change("c", lines, None, "")]),
+            expected,
+            "{text:?} {lines:?}"
+        );
+    }
+}
+
+#[test]
+fn after_inserts_whole_lines_with_the_files_line_endings() {
+    for (text, after, new, expected) in [
+        ("a\nb\n", 0, "x", "x\na\nb\n"),
+        ("a\nb\n", 1, "x", "a\nx\nb\n"),
+        ("a\nb\n", 1, "x\n", "a\nx\nb\n"),
+        ("a\nb\n", 2, "x\ny", "a\nb\nx\ny\n"),
+        // Native Read's empty line after a final line ending stands for the last line.
+        ("a\nb\n", 3, "x", "a\nb\nx\n"),
+        ("a\r\nb\r\n", 1, "x", "a\r\nx\r\nb\r\n"),
+        // At an end without a newline, the file's first terminator separates the
+        // insertion, and the file still lacks a final newline.
+        ("a\nb", 2, "x", "a\nb\nx"),
+        ("a\r\nb", 2, "x", "a\r\nb\r\nx"),
+        ("a", 1, "x", "a\nx"),
+        ("a", 0, "x", "x\na"),
+        ("\u{feff}a\n", 0, "x", "\u{feff}x\na\n"),
+        // An empty file receives the text as given.
+        ("", 0, "x", "x"),
+        ("", 1, "x\n", "x\n"),
+        ("\u{feff}", 0, "x", "\u{feff}x"),
+    ] {
+        assert_eq!(
+            output(text, vec![insert("c", after, None, new)]),
+            expected,
+            "{text:?} after {after} {new:?}"
+        );
+    }
+    let base = snapshot("empty.txt".into(), "a\n".into());
+    let error = rejected(&base, insert("c", 1, None, ""));
+    assert_eq!(error.code, "EMPTY_INSERTION");
+}
+
+#[test]
+fn lines_past_the_end_explain_the_phantom_line() {
+    // [2,3] on a two-line file with a final newline clamps to [2,2].
+    assert_eq!(
+        output("a\nb\n", vec![lines_change("c", [2, 3], None, "B")]),
+        "a\nB\n"
+    );
+    let base = snapshot("end.txt".into(), "a\nb\n".into());
+    for change in [
+        lines_change("c", [3, 3], None, "x"),
+        lines_change("c", [2, 4], None, "x"),
+        insert("c", 4, None, "x"),
+    ] {
+        let error = rejected(&base, change);
+        assert_eq!(error.code, "LINE_OUT_OF_RANGE");
+        assert_eq!(error.expected, Some(2));
+        assert!(
+            error.message.ends_with(
+                "the file has 2 lines; native Read also shows an empty line 3 after the final line ending, which holds no text; use after:2 to append"
+            ),
+            "{}",
+            error.message
+        );
+    }
+    let base = snapshot("open.txt".into(), "a\nb".into());
+    let error = rejected(&base, lines_change("c", [2, 3], None, "x"));
+    assert_eq!(
+        (error.code.as_str(), error.actual),
+        ("LINE_OUT_OF_RANGE", Some(3))
+    );
+    assert_eq!(
+        error.message,
+        "Line 3 is past the end: the file has 2 lines and no final line ending; use after:2 to append"
+    );
+    // Malformed verbose ranges are reported once, without a range check.
+    let error = rejected(&base, lines_change("c", [0, 1], None, "x"));
+    assert_eq!(error.code, "INVALID_LINE_RANGE");
+    assert_eq!(error.message, "Lines [0,1] must satisfy 1 <= first <= last");
+}
+
+fn ends_change(id: &str, lines: [usize; 2], ends: [&str; 2], text: &str) -> Change {
+    Change {
+        id: id.into(),
+        target: Target::Lines {
+            lines,
+            expect: Some(ends[0].into()),
+            expect_last: Some(ends[1].into()),
+        },
+        text: text.into(),
+    }
+}
+
+#[test]
+fn line_expect_compares_whole_lines_ignoring_line_endings() {
+    for eol in ["\n", "\r\n"] {
+        let text = settings(12, eol);
+        let base = spanless(&text);
+        for change in [
+            lines_change(
+                "c",
+                [5, 6],
+                Some("    setting_5 = 5\n    setting_6 = 6"),
+                "    done",
+            ),
+            lines_change(
+                "c",
+                [5, 6],
+                Some("    setting_5 = 5\r\n    setting_6 = 6\r\n"),
+                "    done",
+            ),
+            ends_change(
+                "c",
+                [5, 6],
+                ["    setting_5 = 5", "    setting_6 = 6\n"],
+                "    done",
+            ),
+        ] {
+            let id = format!("{:?}", change.target);
+            let plan = compile(&request(&base, vec![change]), &bases(&base))
+                .unwrap_or_else(|errors| panic!("{id}: {errors:?}"));
+            assert_eq!(
+                plan.files[0].output,
+                text.replace(
+                    &format!("    setting_5 = 5{eol}    setting_6 = 6{eol}"),
+                    &format!("    done{eol}")
+                )
+            );
+        }
+        // A base that disclosed the lines takes `expect` as a prefix of the range.
+        let full = snapshot("full.txt".into(), text.clone());
+        let change = lines_change("c", [5, 6], Some("    setting_5 = 5"), "    done");
+        assert!(compile(&request(&full, vec![change]), &bases(&full)).is_ok());
+        let plan = compile(
+            &request(
+                &base,
+                vec![insert("c", 7, Some("    setting_7 = 7"), "    added")],
+            ),
+            &bases(&base),
+        )
+        .unwrap();
+        assert!(
+            plan.files[0]
+                .output
+                .contains(&format!("setting_7 = 7{eol}    added{eol}    setting_8"))
+        );
+    }
+    // A shifted line number points to where the expected lines are.
+    let base = spanless(&settings(12, "\n"));
+    let error = rejected(
+        &base,
+        lines_change("c", [5, 5], Some("    setting_6 = 6"), "x"),
+    );
+    assert_eq!(error.code, "EXPECTED_TEXT_MISMATCH");
+    assert_eq!(
+        error.candidates,
+        [candidate(CandidateKind::Exact, (6, 6), "    setting_6 = 6")]
+    );
+    assert_eq!(
+        error.message,
+        "Line 5 holds \"    setting_5 = 5\", not expect; it is at line 6 now, so use lines [6,6] if the whole range moved (ultra_edit_repair can replace just this change)."
+    );
+    // The new range for a moved head keeps the range's length.
+    let error = rejected(
+        &base,
+        ends_change("c", [4, 6], ["    setting_5 = 5", "    setting_7 = 7"], "x"),
+    );
+    assert!(
+        error
+            .message
+            .contains("it is at line 5 now, so use lines [5,7] if the whole range moved"),
+        "{}",
+        error.message
+    );
+    // A line added inside the range moves its end, which the last lines catch.
+    let mut grown: Vec<String> = settings(12, "\n").lines().map(str::to_owned).collect();
+    grown.insert(6, "    extra = 0".into());
+    let grown = spanless(&(grown.join("\n") + "\n"));
+    let error = rejected(
+        &grown,
+        ends_change("c", [5, 8], ["    setting_5 = 5", "    setting_8 = 8"], ""),
+    );
+    assert_eq!(error.code, "EXPECTED_TEXT_MISMATCH");
+    assert_eq!(
+        error.message,
+        "Line 8 holds \"    setting_7 = 7\", not the expected last lines; it is at line 9 now, so the range is [5,9] (ultra_edit_repair can replace just this change)."
+    );
+    assert_eq!(
+        error.candidates,
+        [candidate(CandidateKind::Exact, (9, 9), "    setting_8 = 8")]
+    );
+    // Whitespace is compared exactly; a near miss asks for a corrected expect.
+    let error = rejected(
+        &base,
+        lines_change(
+            "c",
+            [5, 6],
+            Some("    setting_5 = 5 \n    setting_6 = 6"),
+            "x",
+        ),
+    );
+    assert_eq!(error.code, "EXPECTED_TEXT_MISMATCH");
+    assert!(
+        error.message.starts_with("Lines 5-6 holds"),
+        "{}",
+        error.message
+    );
+    assert!(error.message.contains("into expect"), "{}", error.message);
+    // Part of a line is not a line, and is not answered with its own line number.
+    let error = rejected(&base, lines_change("c", [5, 5], Some("    setting_5"), "x"));
+    assert_eq!(
+        error.message,
+        "Line 5 holds \"    setting_5 = 5\", not expect; expect compares whole lines, and its text is only part of line 5; give whole lines (ultra_edit_repair can replace just this change)."
+    );
+    // The lines above an insertion guard it; more lines than exist is explained.
+    let error = rejected(
+        &base,
+        insert(
+            "c",
+            2,
+            Some("    setting_1 = 1\n    setting_2 = 2\n    setting_3 = 3"),
+            "x",
+        ),
+    );
+    assert_eq!(
+        error.message,
+        "expect has 3 lines but only 2 precede the insertion; it gives the lines ending at after"
+    );
+    let error = rejected(
+        &base,
+        lines_change(
+            "c",
+            [5, 5],
+            Some("    setting_5 = 5\n    setting_6 = 6"),
+            "x",
+        ),
+    );
+    assert_eq!(error.message, "expect has 2 lines but lines [5,5] have 1");
+}
+
+#[test]
+fn undisclosed_lines_need_an_expect_that_reaches_the_last_line() {
+    let text = "fn a() {\n    one();\n}\n}\nfn b() {}\n";
+    let base = spanless(text);
+    for (change, code, message) in [
+        (
+            lines_change("c", [3, 4], None, ""),
+            "LINE_GUARD_REQUIRED",
+            "Lines 3-4 were not disclosed by this base, so the numbers may be stale; give expect as [first line, last line] with their current text, or every line, at least 8 visible characters",
+        ),
+        (
+            lines_change("c", [3, 4], Some("fn a() {"), ""),
+            "LINE_GUARD_REQUIRED",
+            "Lines 3-4 were not disclosed by this base, so the numbers may be stale; expect checks only the first 1, missing a shift inside the range: give it as [first line, last line], or every line, at least 8 visible characters",
+        ),
+        (
+            insert("c", 2, None, "x"),
+            "LINE_GUARD_REQUIRED",
+            "Line 2 was not disclosed by this base, so the numbers may be stale; add expect with line 2's current text, at least 8 visible characters",
+        ),
+        (
+            ends_change("c", [3, 4], ["}", "}"], ""),
+            "LINE_GUARD_WEAK",
+            "expect \"} }\" has under 8 visible characters, so it could still match after a line shift; widen the range to take in a neighbouring line, repeating it in `new` and `expect`, or target the text with `old`",
+        ),
+        (
+            insert("c", 0, Some("fn a() {"), "x"),
+            "EXPECTED_TEXT_MISMATCH",
+            "after:0 inserts at the top of the file, so no line precedes it for expect to guard; omit expect",
+        ),
+    ] {
+        let error = rejected(&base, change);
+        assert_eq!(
+            (error.code.as_str(), error.message.as_str()),
+            (code, message)
+        );
+    }
+    let error = rejected(&base, insert("c", 3, Some("}\n"), "x"));
+    assert_eq!(error.code, "LINE_GUARD_WEAK");
+    assert!(error.message.contains("extend it with the lines above"));
+    let error = rejected(&base, lines_change("c", [2, 2], Some("    one();"), "x"));
+    assert_eq!(error.code, "LINE_GUARD_WEAK");
+    assert!(
+        error.message.contains("widen the range"),
+        "{}",
+        error.message
+    );
+    // Lines together reach the minimum, and the top of the file needs no guard.
+    for changes in [
+        vec![
+            insert("top", 0, None, "// top"),
+            insert("c", 3, Some("fn a() {\n    one();\n}"), "x"),
+        ],
+        vec![insert("top", 0, Some(""), "// top")],
+        vec![ends_change("c", [1, 2], ["fn a() {", "    one();"], "")],
+    ] {
+        compile(&request(&base, changes), &bases(&base)).unwrap();
+    }
+    // A base that disclosed the lines needs no expect, and a weak one is fine.
+    let full = snapshot("full.txt".into(), text.into());
+    for change in [
+        lines_change("c", [3, 4], None, ""),
+        lines_change("c", [3, 4], Some("}"), ""),
+    ] {
+        let plan = compile(&request(&full, vec![change]), &bases(&full)).unwrap();
+        assert_eq!(plan.files[0].output, "fn a() {\n    one();\nfn b() {}\n");
+    }
+    // An empty file has no line to guard, and the advice says how to insert.
+    let empty = spanless("");
+    for change in [
+        lines_change("c", [1, 1], None, "x"),
+        insert("c", 1, Some(""), "x"),
+    ] {
+        let error = rejected(&empty, change);
+        assert!(
+            error
+                .message
+                .contains("the file is empty, so insert with after:0"),
+            "{}",
+            error.message
+        );
+    }
+}
+
+#[test]
+fn a_ranged_base_guards_only_the_lines_it_disclosed() {
+    let base = ranged(&numbered(300), &[(146, 150)]);
+    for change in [
+        lines_change("c", [146, 150], None, "x"),
+        lines_change("c", [150, 150], None, ""),
+        insert("c", 150, None, "x"),
+        insert("c", 0, None, "x"),
+    ] {
+        let id = format!("{:?}", change.target);
+        compile(&request(&base, vec![change]), &bases(&base))
+            .unwrap_or_else(|errors| panic!("{id}: {errors:?}"));
+    }
+    for change in [
+        lines_change("c", [145, 146], None, "x"),
+        lines_change("c", [150, 151], None, "x"),
+        insert("c", 151, None, "x"),
+    ] {
+        assert_eq!(rejected(&base, change).code, "LINE_GUARD_REQUIRED");
+    }
+}
+
+#[test]
+fn line_targets_touching_one_another_conflict_with_a_combining_hint() {
+    let text = "1\n2\n3\n4\n5\n6\n";
+    assert_eq!(
+        output(
+            text,
+            vec![
+                lines_change("a", [1, 3], None, "A"),
+                lines_change("b", [4, 6], None, "B"),
+            ]
+        ),
+        "A\nB\n"
+    );
+    let base = snapshot("conflict.txt".into(), text.into());
+    let conflict = |changes: Vec<Change>| {
+        let errors = compile(&request(&base, changes), &bases(&base)).unwrap_err();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].code, "OVERLAPPING_CHANGES");
+        errors[0].message.clone()
+    };
+    assert!(
+        conflict(vec![
+            insert("a", 3, None, "x"),
+            lines_change("b", [4, 6], None, "B"),
+        ])
+        .ends_with(
+            "overlap; combine them into one lines change [4,6] whose new text includes the insertion"
+        )
+    );
+    assert!(
+        conflict(vec![
+            lines_change("a", [2, 3], None, "x"),
+            lines_change("b", [3, 4], None, "B"),
+        ])
+        .ends_with("overlap; combine them into one lines change [2,4]")
+    );
+    assert!(
+        conflict(vec![insert("a", 2, None, "x"), insert("b", 2, None, "y")])
+            .ends_with("overlap; combine them into one after:2 change")
+    );
+    // Replacing the line before a last line deleted without a terminator overlaps.
+    let base = snapshot("open.txt".into(), "a\nb\nc".into());
+    let errors = compile(
+        &request(
+            &base,
+            vec![
+                lines_change("a", [2, 2], None, "B"),
+                lines_change("b", [3, 3], None, ""),
+            ],
+        ),
+        &bases(&base),
+    )
+    .unwrap_err();
+    assert_eq!(
+        errors[0].message,
+        "Changes a (2..4) and b (3..5) overlap; combine them into one lines change [2,3] (deleting a last line that has no line ending also takes the one before it)"
+    );
+}
+
+#[test]
+fn in_restricts_old_to_whole_lines() {
+    let text = "x = 1\ny = 2\nx = 1\n";
+    let base = snapshot("in.txt".into(), text.into());
+    let error = rejected(&base, exact("c", "x = 1", "x = 9"));
+    assert!(error.message.ends_with("or restrict it with \"in\":[1,1]"));
+    let scoped = |lines: [usize; 2]| Change {
+        id: "c".into(),
+        target: Target::Exact {
+            old: "x = 1".into(),
+            scope: None,
+            lines: Some(lines),
+        },
+        text: "x = 9".into(),
+    };
+    assert_eq!(output(text, vec![scoped([3, 3])]), "x = 1\ny = 2\nx = 9\n");
+    // The last line's terminator is in scope, and the phantom line clamps.
+    assert_eq!(output(text, vec![scoped([2, 4])]), "x = 1\ny = 2\nx = 9\n");
+    let error = rejected(&base, scoped([2, 2]));
+    assert_eq!(error.code, "TARGET_NOT_FOUND");
+    assert_eq!(error.candidates[0].kind, CandidateKind::Exact);
+    let error = rejected(&base, scoped([5, 6]));
+    assert_eq!(error.code, "LINE_OUT_OF_RANGE");
+    // A search scope past the end is not advice to append.
+    assert!(
+        error
+            .message
+            .ends_with("end `in` at line 3 or earlier, or drop it to search the whole file"),
+        "{}",
+        error.message
+    );
+    // A final line feed in `old` ends its line, so the hint holds that line alone.
+    let error = rejected(
+        &snapshot("in.txt".into(), "x = 1\nx = 1\ny = 2\n".into()),
+        exact("c", "x = 1\n", "x = 9\n"),
+    );
+    assert!(
+        error.message.ends_with("or restrict it with \"in\":[1,1]"),
+        "{}",
+        error.message
+    );
+    let all = Change {
+        id: "c".into(),
+        target: Target::All {
+            old: "1".into(),
+            scope: None,
+            expected: 2,
+            lines: Some([1, 3]),
+        },
+        text: "7".into(),
+    };
+    assert_eq!(output(text, vec![all]), "x = 7\ny = 2\nx = 7\n");
+    // A scope-less replace-all counts the whole file.
+    let all = Change {
+        id: "c".into(),
+        target: Target::All {
+            old: "x".into(),
+            scope: None,
+            expected: 2,
+            lines: None,
+        },
+        text: "z".into(),
+    };
+    assert_eq!(output(text, vec![all]), "z = 1\ny = 2\nz = 1\n");
+    let both = Change {
+        id: "c".into(),
+        target: Target::Exact {
+            old: "x = 1".into(),
+            scope: Some("r1".into()),
+            lines: Some([1, 1]),
+        },
+        text: "x".into(),
+    };
+    assert_eq!(rejected(&base, both).code, "CONFLICTING_SCOPE");
+}
+
+#[test]
+fn lf_text_is_adapted_to_an_all_crlf_file_and_says_so() {
+    let text = "a\r\nb\r\nc\r\n";
+    let base = snapshot("crlf.txt".into(), text.into());
+    let plan = compile(
+        &request(&base, vec![exact("c", "a\nb", "A\nB")]),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(plan.files[0].output, "A\r\nB\r\nc\r\n");
+    assert_eq!(plan.files[0].replacements[0].text, "A\r\nB");
+    // The request keeps the text as written, so its derived ID is unchanged.
+    assert_eq!(plan.request.files[0].changes[0].text, "A\nB");
+    assert_eq!(plan.warnings.len(), 1);
+    assert_eq!(plan.warnings[0].code, "EOL_ADAPTED");
+    assert_eq!(plan.warnings[0].change_id.as_deref(), Some("c"));
+    assert_eq!(
+        plan.warnings[0].message,
+        "Change c: this file ends every line with CRLF, so LF in its text was matched and written as CRLF; text holding a \\r stays literal"
+    );
+    for (changes, expected) in [
+        // Only `old` holds LF.
+        (vec![exact("c", "a\nb", "AB")], "AB\r\nc\r\n"),
+        // Lines text is adapted before its terminator is inherited.
+        (
+            vec![lines_change("c", [1, 1], None, "x\ny")],
+            "x\r\ny\r\nb\r\nc\r\n",
+        ),
+        (vec![insert("c", 3, None, "d\n")], "a\r\nb\r\nc\r\nd\r\n"),
+        (vec![guarded("r1..r2", "a\nb")], "replacement\r\nc\r\n"),
+    ] {
+        let plan = compile(&request(&base, changes), &bases(&base)).unwrap();
+        assert_eq!(plan.files[0].output, expected);
+        assert_eq!(plan.warnings[0].code, "EOL_ADAPTED");
+    }
+    // Text holding a CR, and text without LF, stay literal.
+    let plan = compile(
+        &request(&base, vec![exact("c", "a\r\nb", "A\nB\r")]),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(plan.files[0].output, "A\nB\r\r\nc\r\n");
+    assert_eq!(plan.warnings[0].code, "MIXED_LINE_ENDINGS");
+    assert_eq!(plan.warnings.len(), 1);
+    let plan = compile(&request(&base, vec![exact("c", "b", "B")]), &bases(&base)).unwrap();
+    assert!(plan.warnings.is_empty());
+    // Mixed files, a lone CR, or no line ending at all keep every text literal.
+    for text in ["a\r\nb\nc\r\n", "a\r\nb\rc\r\n", "a b c"] {
+        let base = snapshot("literal.txt".into(), text.into());
+        let plan = compile(
+            &request(&base, vec![exact("c", "b", "x\ny")]),
+            &bases(&base),
+        )
+        .unwrap();
+        assert!(plan.files[0].output.contains("x\ny"), "{text:?}");
+        assert!(
+            plan.warnings
+                .iter()
+                .all(|warning| warning.code != "EOL_ADAPTED"),
+            "{text:?}"
+        );
+        if text.contains('\n') {
+            assert_eq!(
+                rejected(&base, exact("c", "a\nb", "x")).code,
+                "TARGET_NOT_FOUND"
+            );
+        }
+    }
+    // A literal compile, as undo uses, writes LF as given.
+    let plan = ultra_edit::compiler::compile_with(
+        &request(&base, vec![span_change("undo", "r0", "a\nb\n")]),
+        &bases(&base),
+        ultra_edit::compiler::Eol::Literal,
+    )
+    .unwrap();
+    assert_eq!(plan.files[0].output, "a\nb\n");
+    assert!(plan.warnings.is_empty());
+}
+
+#[test]
+fn an_eol_warning_names_a_bounded_number_of_changes() {
+    let base = snapshot("crlf.txt".into(), "a\r\nb\r\nc\r\nd\r\ne\r\n".into());
+    let long = "x".repeat(60);
+    let changes: Vec<_> = ["a", "b", "c", "d", "e"]
+        .iter()
+        .map(|old| exact(&format!("{long}{old}"), old, &format!("{old}\n{old}")))
+        .collect();
+    let plan = compile(&request(&base, changes), &bases(&base)).unwrap();
+    assert_eq!(
+        plan.files[0].output,
+        "a\r\na\r\nb\r\nb\r\nc\r\nc\r\nd\r\nd\r\ne\r\ne\r\n"
+    );
+    let warning = &plan.warnings[0];
+    assert_eq!(warning.code, "EOL_ADAPTED");
+    assert!(
+        warning.message.starts_with("Changes xxxxxxxx"),
+        "{}",
+        warning.message
+    );
+    assert!(
+        warning.message.contains(", 2 more: "),
+        "{}",
+        warning.message
+    );
+    assert!(
+        warning.message.chars().count() <= 240,
+        "{}",
+        warning.message
+    );
+}
+
+#[test]
+fn a_change_whose_old_holds_a_cr_stays_literal_so_crlf_converts_to_lf() {
+    let base = snapshot("crlf.txt".into(), "a\r\nb\r\n".into());
+    let count = |old: &str, text: &str, expected| Change {
+        id: "c".into(),
+        target: Target::All {
+            old: old.into(),
+            scope: None,
+            expected,
+            lines: None,
+        },
+        text: text.into(),
+    };
+    for (change, output) in [
+        (count("\r\n", "\n", 2), "a\nb\n"),
+        (exact("c", "a\r\nb", "a\nb"), "a\nb\r\n"),
+    ] {
+        let plan = compile(&request(&base, vec![change]), &bases(&base)).unwrap();
+        assert_eq!(plan.files[0].output, output);
+        assert!(
+            plan.warnings
+                .iter()
+                .all(|warning| warning.code != "EOL_ADAPTED"),
+            "{:?}",
+            plan.warnings
+        );
+    }
+    // Text copied from a view that hides the CR is still adapted.
+    let plan = compile(
+        &request(&base, vec![exact("c", "a\nb", "A\nB")]),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(plan.files[0].output, "A\r\nB\r\n");
+    assert_eq!(plan.warnings[0].code, "EOL_ADAPTED");
 }

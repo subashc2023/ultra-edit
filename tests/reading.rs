@@ -214,6 +214,7 @@ fn unscoped_exact_targets_still_search_the_complete_original_file() {
     edit.files[0].changes[0].target = Target::Exact {
         old: "same".into(),
         scope: None,
+        lines: None,
     };
     let rejected = workspace.prepare(edit.clone()).unwrap();
     assert!(!rejected.ready);
@@ -223,6 +224,7 @@ fn unscoped_exact_targets_still_search_the_complete_original_file() {
     edit.files[0].changes[0].target = Target::Exact {
         old: "same".into(),
         scope: Some("selection".into()),
+        lines: None,
     };
     assert!(workspace.prepare(edit).unwrap().ready);
 }

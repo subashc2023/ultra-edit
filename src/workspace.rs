@@ -511,6 +511,19 @@ impl Workspace {
                 ));
             }
         };
+        // An undo restores recorded bytes exactly; a repair would plan new text.
+        let origin = digest(request.request_id.as_bytes());
+        if self.storage.exists("requests", &origin)?
+            && matches!(
+                self.storage.get::<Binding>("requests", &origin)?.input,
+                Input::Undo { .. }
+            )
+        {
+            return Err(Error::new(
+                "INVALID_REFERENCE",
+                "An undo restores recorded bytes and cannot be repaired; once the file holds the undone plan's output again, undo that plan with a new request_id",
+            ));
+        }
         if request_id == request.request_id {
             return Err(Error::new(
                 "REQUEST_ID_REUSED",
@@ -767,16 +780,31 @@ impl Workspace {
             }
             snapshots.insert(file.base.clone(), snapshot);
         }
-        let compiled = compiler::compile(&request, &snapshots);
+        // An undo restores recorded bytes, which line-ending adaptation must not touch.
+        let eol = if undo {
+            compiler::Eol::Literal
+        } else {
+            compiler::Eol::Adapt
+        };
+        let compiled = compiler::compile_with(&request, &snapshots, eol);
         let plan = match compiled {
             Ok(plan) => Some(plan),
             Err(errors) => {
-                // The workspace already reported every base absent from the map.
-                diagnostics.extend(
-                    errors
-                        .into_iter()
-                        .filter(|error| error.code != "UNKNOWN_SNAPSHOT"),
-                );
+                // The workspace already reported every base absent from the map, and
+                // every span named in a path file, which discloses only r0.
+                let needs_base: BTreeSet<String> = diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.code == "SPAN_NEEDS_BASE")
+                    .filter_map(|diagnostic| diagnostic.change_id.clone())
+                    .collect();
+                diagnostics.extend(errors.into_iter().filter(|error| {
+                    error.code != "UNKNOWN_SNAPSHOT"
+                        && !(error.code == "UNKNOWN_SPAN"
+                            && error
+                                .change_id
+                                .as_ref()
+                                .is_some_and(|id| needs_base.contains(id)))
+                }));
                 None
             }
         };
@@ -824,6 +852,7 @@ impl Workspace {
     ) -> Result<(EditRequest, BTreeMap<String, Snapshot>), Error> {
         let mut fresh = BTreeMap::new();
         let mut total_bytes = 0usize;
+        let mut read = BTreeSet::new();
         for file in &mut request.files {
             let Some(given) = file.path.clone() else {
                 continue;
@@ -846,7 +875,17 @@ impl Workspace {
                 })
             };
             match resolved {
+                Ok(Some((path, _))) if read.contains(&path) => {
+                    // Reported once here; the entry keeps its path, so nothing else plans it.
+                    let mut diagnostic = Diagnostic::new(
+                        "DUPLICATE_TARGET_PATH",
+                        "This file is named by an earlier entry; list each file once, with all its changes in that entry",
+                    );
+                    diagnostic.file = Some(path);
+                    diagnostics.push(diagnostic);
+                }
                 Ok(Some((path, text))) => {
+                    read.insert(path.clone());
                     // Checked as each file is read, so a batch never holds more than the limit.
                     total_bytes = total_bytes.saturating_add(text.len());
                     if total_bytes > 64 * 1024 * 1024 {
@@ -860,7 +899,7 @@ impl Workspace {
                             let mut diagnostic = Diagnostic::new(
                                 "SPAN_NEEDS_BASE",
                                 format!(
-                                    "Span {span} needs a base from ultra_edit_snapshot. With `path`, target literal text with `old`, or use r0 for the whole file."
+                                    "Span {span} needs a base from ultra_edit_snapshot; with `path`, target text with `old`, or whole lines with `lines` and `expect`."
                                 ),
                             );
                             diagnostic.file = Some(path.clone());
@@ -868,7 +907,7 @@ impl Workspace {
                             diagnostics.push(diagnostic);
                         }
                     }
-                    let snapshot = compiler::snapshot(path, text);
+                    let snapshot = compiler::file_snapshot(path, text);
                     self.storage.put("snapshots", &snapshot.id, &snapshot)?;
                     file.base = snapshot.id.clone();
                     file.path = None;
@@ -1017,10 +1056,12 @@ pub fn normalize_paths(mut request: EditRequest, roots: &[&Path]) -> EditRequest
 fn needs_base(target: &Target) -> Option<&str> {
     let span = match target {
         Target::Exact { scope, .. } => scope.as_deref()?,
-        Target::All { scope, .. } => scope.as_str(),
+        Target::All { scope, .. } => scope.as_deref()?,
         Target::Span { span, .. } => span.as_str(),
+        Target::Lines { .. } | Target::Insert { .. } => return None,
     };
-    (span != "r0").then_some(span)
+    // An empty ID is reported once, as EMPTY_SPAN_ID.
+    (!span.trim().is_empty() && span != "r0").then_some(span)
 }
 
 /// Fills each empty change ID with its 1-based `"{file}.{change}"` position, then an

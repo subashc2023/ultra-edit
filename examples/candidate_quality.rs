@@ -258,6 +258,7 @@ fn search(file: &File, needle: &str) -> Option<Vec<Candidate>> {
         target: Target::Exact {
             old: needle.into(),
             scope: None,
+            lines: None,
         },
         text: String::new(),
     };

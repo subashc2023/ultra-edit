@@ -28,8 +28,14 @@ normally.
 
 Every change is resolved against its original base. Planning errors reject the
 entire batch. Undeclared bytes remain identical. Replacement strings are literal
-UTF-8, with no regex expansion, Unicode normalization, newline conversion, shell,
-formatter, or model execution. Preserve `\r\n` explicitly when inserting CRLF.
+UTF-8, with no regex expansion, Unicode normalization, shell, formatter, or model
+execution. Three deterministic exceptions derive bytes from the base alone:
+`lines` and `after` text without a final line feed takes the replaced line's
+ending; line-target `expect` ignores line endings; and in a base whose every
+line ends in CRLF, `old`, `new`, and `expect` text holding LF but no CR is
+matched and written as CRLF, with an `EOL_ADAPTED` warning, because views such
+as native Read hide the CR. Text holding a CR, every text of a change whose
+`old` or span `expect` holds one, and every other base stay literal.
 Candidate outputs containing NUL or both CRLF and bare LF receive nonblocking
 `NUL_BYTE` or `MIXED_LINE_ENDINGS` warnings. This includes existing conditions
 retained in the candidate; warnings do not change bytes or reject the request.
@@ -44,14 +50,16 @@ doubles it; check that line, and send a follow-up edit if it was not intended.
 ```json
 {
   "files": [{
-    "base": "REPLACE_WITH_RETURNED_SNAPSHOT",
-    "changes": [{
-      "target": { "kind": "exact", "old": "old text", "scope": "selection" },
-      "text": "new text"
-    }]
+    "path": "/abs/src/app.py",
+    "changes": [{ "old": "old text", "new": "new text" }]
   }]
 }
 ```
+
+Name each file by `path`, which reads its current bytes under the workspace
+lock, or by a snapshot `base`, which spans need. Both spellings of a change, the
+shorthand and the verbose `{"target":{…},"text":…}` form that requests are
+stored in, derive the same request ID.
 
 There is no enclosing `request` field. `request_id` and each change `id` are
 optional. A missing or empty change ID becomes its 1-based `"{file}.{change}"`

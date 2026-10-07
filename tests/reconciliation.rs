@@ -22,6 +22,7 @@ fn prepare(workspace: &Workspace, paths: &[&str], request_id: &str) -> PreparedP
                 target: Target::Exact {
                     old: "before".into(),
                     scope: None,
+                    lines: None,
                 },
                 text: "after".into(),
             }],

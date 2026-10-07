@@ -115,7 +115,7 @@ with A's snapshot, then use B's snapshot as the single base and target A's and
 B's `r{n}` IDs (or `selection` for B) in one file entry. Two independently read
 snapshots of the same file cannot share a request: `TARGET_ALIAS` and
 `DUPLICATE_TARGET_PATH` require one entry and one base per file. Without
-continuation, keep one base and target text with an unscoped exact `old`.
+continuation, keep one base and target text with an unrestricted `old`.
 
 `search src/retry.rs RETRIES` performs case-sensitive literal search in one file.
 The response contains `snapshot`, `path`, `digest`, the exact `query`, `offset`,
@@ -148,51 +148,44 @@ previous query's match references, whose absolute ordinals no longer apply, and
 keeps line references. Edits still reject stale source bytes.
 
 Use either response's `snapshot` as an edit request's `base`, then target a
-returned span, or scope an exact search to `selection` or a returned line.
+returned span, or restrict `old` to `selection` or a returned line with `in`.
 Focused snapshots retain the whole original file internally for byte
 preservation and stale detection, but persist **only the disclosed references**:
 there is no hidden `r0`, unshown line reference, or omitted match reference.
-Unscoped exact replacements still search the complete original file; use an
-explicit scope to restrict matching. `get SNAPSHOT` explicitly retrieves the full
+An unrestricted `old` still searches the complete original file; use `in` to
+restrict matching. `get SNAPSHOT` explicitly retrieves the full
 stored source as evidence. Every read, including a continuation, captures a new
 snapshot; references remain valid across process restarts, and a change anywhere
 in the file makes their original base stale. Combine changes to one file using
 one base snapshot.
 
-An edit request uses snapshot IDs returned by `read`:
-
-```json
-{
-  "files": [{
-    "base": "s_REPLACE_WITH_RETURNED_ID",
-    "changes": [
-      {
-        "target": { "kind": "exact", "old": "const retries = 2;" },
-        "text": "const retries = 3;"
-      },
-      {
-        "target": { "kind": "span", "span": "r5", "expect": "const delayMs = 100;" },
-        "text": "const delayMs = 250;"
-      }
-    ]
-  }]
-}
-```
-
-A file can instead be named by `path`, as native Edit names it. The server
-resolves the path inside the workspace and reads the file's current bytes under
-the workspace lock, stores them as a snapshot, and uses that snapshot as the
-file's base, so plans and drafts record bases exactly as snapshot requests do:
+An edit request names each file by `path`, or by a snapshot `base` returned by
+`read`, and lists its changes:
 
 ```json
 {
   "files": [{
     "path": "src/retry.ts",
     "changes": [
-      {
-        "target": { "kind": "exact", "old": "const retries = 2;" },
-        "text": "const retries = 3;"
-      }
+      { "old": "const retries = 2;", "new": "const retries = 3;" },
+      { "lines": [12, 14], "expect": ["function backoff(attempt) {", "}"], "new": "" },
+      { "after": 3, "expect": "import { sleep } from './sleep';", "new": "import { log } from './log';" }
+    ]
+  }]
+}
+```
+
+A `path` is resolved inside the workspace, and the server reads the file's
+current bytes under the workspace lock, stores them as a snapshot, and uses that
+snapshot as the file's base, so plans and drafts record bases exactly as
+snapshot requests do. A snapshot `base` is needed for span targets:
+
+```json
+{
+  "files": [{
+    "base": "s_REPLACE_WITH_RETURNED_ID",
+    "changes": [
+      { "span": "r5", "expect": "const delayMs = 100;", "new": "const delayMs = 250;" }
     ]
   }]
 }
@@ -202,10 +195,10 @@ Each file needs `path` or `base` (`EMPTY_SNAPSHOT_ID` otherwise). With both, the
 base is used and must be that file's snapshot (`SNAPSHOT_PATH_MISMATCH`). A path
 that cannot be read gets its own diagnostic, such as `TARGET_MISSING` or
 `PATH_OUTSIDE_WORKSPACE`, and nothing is written. A path file was never read
-through a snapshot, so no span of it was disclosed: a `span` or `scope` other
+through a snapshot, so no span of it was disclosed: a `span` or `in` span other
 than `r0`, the whole file, is `SPAN_NEEDS_BASE`. Path mode detects no change
-made between your read and the call; the exact `old` text is the guard, as with
-native Edit. Paths are normalized lexically before IDs are derived: a leading
+made between your read and the call; the `old` text is the guard, as with
+native Edit, and line targets need `expect`. Paths are normalized lexically before IDs are derived: a leading
 workspace root, spelled as given at launch or in canonical form, is stripped and
 `.` components and repeated separators are dropped, while `..` is kept, so
 `a.txt`, `./a.txt`, and `<root>/a.txt` derive one request ID even when the root
@@ -230,85 +223,121 @@ reference. The same arguments give the same ID across processes, restarts, CLI,
 and MCP. The ID is echoed as the response `request_id`, stored in plans, drafts,
 and receipts, and accepted by `receipt`. Pass an explicit `request_id` to name a
 request yourself: 1–256 UTF-8 bytes with no control characters, and not
-whitespace-only (`INVALID_REQUEST_ID`). `retry` always requires one. Available
-targets:
+whitespace-only (`INVALID_REQUEST_ID`). `retry` always requires one. Change
+forms:
 
-| Target | Contract |
+| Change | Contract |
 | --- | --- |
-| `{"kind":"exact","old":"text"}` | Exactly one occurrence in the original file. |
-| `{"kind":"exact","old":"text","scope":"r5"}` | Exactly one occurrence contained in a disclosed span. |
-| `{"kind":"all","old":"text","scope":"r0","expected":3}` | Explicit scope and exact positive count of non-overlapping, left-to-right replacements. |
-| `{"kind":"span","span":"r5"}` | Replace that span with literal `text`. |
-| `{"kind":"span","span":"r5","expect":"old line"}` | Replace only if the selected original bytes equal `expect` exactly. |
-| `{"kind":"span","span":"r12..r18"}` | Replace a run of disclosed lines, from the start of line 12's body to the end of line 18's. |
+| `{"old":"text","new":"…"}` | Exactly one occurrence in the original file. |
+| `{"old":"text","in":"r5","new":"…"}` | Exactly one occurrence contained in a disclosed span. |
+| `{"old":"text","in":[72,87],"new":"…"}` | Exactly one occurrence contained in lines 72-87, from line 72's start through line 87's terminator. |
+| `{"old":"text","count":3,"new":"…"}` | Exactly 3 non-overlapping, left-to-right occurrences in the whole file, or within `in`. |
+| `{"span":"r5","new":"…"}` | Replace that span with literal `new`. |
+| `{"span":"r5","expect":"old line","new":"…"}` | Replace only if the selected original bytes equal `expect` exactly. |
+| `{"span":"r12..r18","new":"…"}` | Replace a run of disclosed lines, from the start of line 12's body to the end of line 18's. |
+| `{"lines":[12,18],"expect":["…","…"],"new":"…"}` | Replace whole lines 12-18, terminators included; `""` deletes them. |
+| `{"after":12,"expect":"…","new":"…"}` | Insert whole lines after line 12; `after:0` inserts at the top, after a BOM. |
 
-`scope` is a disclosed span ID such as `r5`, `selection`, or `m2`, or a line
-range `rA..rB`, never literal source text. A line range is accepted wherever a
-span ID is, as `span` or `scope`, when its base disclosed every line from A to B
-(as the `spans` summary `r12..r18` reports). It means what `selection` means
-for a range read of those lines: it excludes line B's terminator, so `""` blanks
-the lines rather than deleting them, and `expect` stays byte-exact (`\r\n` in
-CRLF source). A range with an undisclosed line, or with A after B, is
-`UNKNOWN_SPAN`. Arbitrary undisclosed line regions need a range snapshot first;
-inline `{first,last}` scopes are not supported. Prefer `exact` or add
-`span.expect` when a mistaken positional ID should fail instead of replacing the
-wrong text. An expectation mismatch returns `EXPECTED_TEXT_MISMATCH`.
+`new` may be spelled `text`, but not both. A change gives exactly one of `old`,
+`span`, `lines`, or `after`; `count` and `in` apply only to `old`, and `expect`
+only to `span`, `lines`, and `after`. `lines` takes `[first,last]`, and `12`,
+`"12"`, and `"12-14"` are read as `[12,12]` and `[12,14]`; `in` takes the same
+line forms or a span ID. A malformed change is refused while the arguments are
+parsed, with a message naming the accepted form, such as `lines takes numbers
+like [146,150]; span IDs such as r146..r150 go in `span``.
+
+The verbose form `{"id":"…","target":{…},"text":"…"}` is still accepted, and it
+is the canonical form that plans, drafts, and receipts store: `old` is
+`{"kind":"exact","old":…,"scope":…}`, `count` is
+`{"kind":"all","old":…,"scope":…,"expected":N}` with `scope` optional, `in`
+lines are a `"lines":[a,b]` field of either, `span` is
+`{"kind":"span","span":…,"expect":…}`, `lines` is
+`{"kind":"lines","lines":[a,b],"expect":…,"expect_last":…}`, and `after` is
+`{"kind":"insert","after":n,"expect":…}`. Every spelling of one change derives
+the same request ID, and requests stored by 0.3.0 load and replay unchanged.
+
+Line targets address whole lines by the numbers native Read shows, each line
+running from its body through its terminator. Text that does not end in a line
+feed takes the last replaced line's terminator, so CRLF lines stay CRLF and a
+last line without a terminator stays without one; text that ends in a line feed
+is written as given. `""` deletes the lines, and deleting through a last line
+that lacks a terminator also removes the line ending before the range, so the
+file still lacks a final one. An insertion after a line writes `new` followed by
+that line's terminator, unless `new` ends in a line feed; after a last line that
+lacks a terminator, it writes the file's first line ending and then `new`, so
+the file still lacks a final one. `after:0` inserts before line 1, after a BOM.
+Read shows an empty line T+1 after a final line ending; it holds no bytes, so a
+range ending at T+1, or `after` T+1, means line T. A line past the end is
+`LINE_OUT_OF_RANGE`, whose message gives the line count and suggests `after` to
+append.
+
+`expect` on a line target is compared line by line with the line bodies,
+ignoring line endings and a trailing line feed. For `after`, it gives the lines
+ending at `after`. For `lines`, a string gives the first lines of the range, and
+a pair `[first, last]` gives its first lines and its last lines (stored as
+`expect` and `expect_last`); an array of any other length gives the range's
+lines in order. It is required unless the base disclosed every addressed line
+through a snapshot read (`LINE_GUARD_REQUIRED`). A `path` file discloses none,
+since its line numbers come from another view and may be stale. A required
+`expect` must reach the range's last line, by giving every line or the pair, so
+a line added or removed inside the range is caught, and needs at least 8
+non-whitespace characters in all (`LINE_GUARD_WEAK`), because a `}` or blank
+line can still match after the file shifts; `after:0` takes none. A mismatch is
+`EXPECTED_TEXT_MISMATCH`: the message quotes the addressed lines and, when the
+expected lines occur elsewhere, gives the current range, and the diagnostic
+carries them as `exact` candidates, or near misses as below. `after` with empty
+text is `EMPTY_INSERTION`.
+
+A span ID is a disclosed ID such as `r5`, `selection`, or `m2`, or a line range
+`rA..rB`, never literal source text. A line range is accepted wherever a span ID
+is, as `span` or `in`, when its base disclosed every line from A to B (as the
+`spans` summary `r12..r18` reports). It means what `selection` means for a range
+read of those lines: it excludes line B's terminator, so `""` blanks the lines
+rather than deleting them, and `expect` stays byte-exact. A range with an
+undisclosed line, or with A after B, is `UNKNOWN_SPAN`. Prefer `old`, or add
+`expect`, when a mistaken positional ID should fail instead of replacing the
+wrong text; an expectation mismatch returns `EXPECTED_TEXT_MISMATCH`. Line
+spans exclude terminators, so to delete whole lines use `lines`.
 
 `UNKNOWN_SPAN` lists what the base discloses, in line numbers rather than IDs,
 for example `This base discloses lines 146-150, 1875-1879; selection = lines
 1875-1879`, bounded to about 100 characters. An ID of another shape, such as
-`146-150`, `L146`, or `r146-r150`, is answered with the shapes span IDs take,
-and a range past the file's last line names that line instead of suggesting
-another read.
+`146-150`, `L146`, or `r146-r150`, is answered with the shapes span IDs take
+and the `lines` form, and a range past the file's last line names that line
+instead of suggesting another read.
 
-Empty exact search strings are rejected. Use a returned zero-width span with
-`expect: ""` for insertion where one exists. Line snapshots do not synthesize a
-zero-width target at every boundary. Because line spans exclude terminators, to
-insert a new `inserted` line between `first\r\nsecond`, either replace `first`
-with `first\r\ninserted` or replace `second` with `inserted\r\nsecond`,
-preferably guarded by `span.expect`. The untouched line ending supplies the other
-separator.
+Empty `old` is rejected with `EMPTY_TARGET`; insert with `after` instead.
 
-For the same reason, replacing a line span with `""` only blanks that line; its
-terminator remains. To **delete** a line, read a range that also covers the
-following line, then either match the line and its actual line ending as exact
-text inside `selection` — `{"kind":"exact","old":"gamma\n","scope":"selection"}`,
-using `"gamma\r\n"` in CRLF source — or replace the `selection` of that line and
-its neighbour with the surviving neighbour's body alone. `selection` excludes only
-the **last** selected line's terminator, so the deleted line must not be the last
-line of the selection.
-
-`exact` ambiguity checks and search count overlapping starts: `aa` occurs at two
+`old` ambiguity checks and search count overlapping starts: `aa` occurs at two
 starts in `aaa`. For `TARGET_AMBIGUOUS`, `actual` remains that overlapping-start
-count; the message also gives the non-overlapping count required by a corresponding
-same-scope `{"kind":"all"}` target, for example
-`found 6 overlapping starts (4 non-overlapping)`, and the lines of the first five
-starts, as in `at lines 41, 89, 137`, so a longer `old` or a scope can single one
-out. `all` counts and replaces those
-non-overlapping matches from left to right: `aa` in `aaaa` requires `expected: 2`,
-and eight spaces contain four replacements of `"  "`.
-Use the parenthesized value only with the same `old` and disclosed scope. Because
-`all` requires a scope, an unscoped `exact` from a focused snapshot may require a
-new snapshot and request that disclose the intended region. Overlapping
-replacements from different changes and
-coincident insertions reject the entire batch. This initial compiler also rejects
-insertions that touch either boundary of another replacement; combine them into
-one change. Adjacent nonempty replacements are allowed.
+count; the message also gives the non-overlapping count a `count` change in the
+same scope would need, for example `found 6 overlapping starts (4
+non-overlapping)`, and the lines of the first five starts, as in `at lines 41,
+89, 137`, with an `"in":[first,last]` that holds the first one alone. `count`
+counts and replaces non-overlapping matches from left to right: `aa` in `aaaa`
+requires `count: 2`, and eight spaces contain four replacements of `"  "`.
+Overlapping replacements from different changes and coincident insertions
+reject the entire batch. This compiler also rejects insertions, including
+`after` targets, that touch either boundary of another replacement, and a
+deletion of a last line that lacks a terminator overlaps a change on the line
+before it; the `OVERLAPPING_CHANGES` message names the single `lines` change
+to send instead. Adjacent nonempty replacements, such as `lines` `[1,3]` and
+`[4,6]`, are allowed.
 
 A diagnostic can carry up to three near-miss `candidates`,
 `{kind, line, end_line, text?, similarity?}`, for `TARGET_NOT_FOUND` on an
-`exact` or `all` target, searching the change's scope or the whole stored file
-if unscoped, and for `EXPECTED_TEXT_MISMATCH` on a span target, searching the
-whole snapshot. That mismatch message quotes the span's actual text, as in
-`Span holds "…", not expect; …`. `TARGET_AMBIGUOUS` and count mismatches where
+`old` target, searching the change's scope or the whole stored file if
+unrestricted, and for `EXPECTED_TEXT_MISMATCH` on a span or line target,
+searching the whole snapshot. That mismatch message quotes what the span or
+lines hold, as in `Span holds "…", not expect; …`. `TARGET_AMBIGUOUS` and count mismatches where
 something matched get none, and the key is absent when there are none. `line`
 and `end_line` are 1-based and inclusive, numbered like `r{n}`. `text` is the
 exact current bytes, omitted rather than clipped above 2,000 characters.
 `similarity` is a percentage, present only for `similar`. The first tier with
 results supplies the candidates:
 
-- `exact`: an unmet expectation's text occurs literally elsewhere, or a scoped
-  `exact`/`all` target's text occurs outside its scope. A wrong scope, such as an
+- `exact`: an unmet expectation's text occurs literally elsewhere, or a
+  restricted `old` occurs outside its `in`. A wrong scope, such as an
   off-by-one line, is checked first, so it is never answered with a similar line
   inside the scope.
 - `whitespace`: equal after CRLF becomes LF, spaces and tabs before line ends
@@ -334,20 +363,30 @@ has LF, as text copied from a view that hides `\r` does, the message says so. Co
 `similar` candidate is the intended region first: it can be a structurally
 similar but different line, most often for single-line targets. Then repair only
 the failed change ID, or submit a new request. If `text` is absent, read
-`line..end_line` first. Copied text may not be unique; add a scope if the retry
-reports `TARGET_AMBIGUOUS`.
+`line..end_line` first. Copied text may not be unique; restrict it with `in` if
+the retry reports `TARGET_AMBIGUOUS`.
 
 Replacement strings are literal UTF-8, including `$`, backslashes, tabs, Unicode
-forms, trailing spaces, and supplied newlines. There is **no newline conversion**:
-write `\r\n` if newly inserted text should use CRLF. All undeclared bytes remain
-identical. Invalid UTF-8 is rejected explicitly; UTF-16 and other encodings are
+forms, trailing spaces, and supplied newlines, with three deterministic
+exceptions that depend only on the base: line-target terminators and line-wise
+`expect`, above, and line-ending adaptation. In a base whose every line ending
+is CRLF (at least one CRLF, no bare LF, no lone CR), `old`, `new`, and `expect`
+text that holds LF but no CR is matched and written with CRLF, and the plan
+carries an `EOL_ADAPTED` warning naming those changes. Views such as native Read
+hide the CR, so text copied from them could never match such a file. Text that
+holds a CR stays literal, and so does every text of a change whose `old` or span
+`expect` holds one, so `{"old":"\r\n","new":"\n","count":N}` converts lines to
+LF. Text for any other base stays literal, so write `\r\n` explicitly in a
+mixed file. An undo restores recorded bytes without adaptation, and an undo's
+draft cannot be repaired (`INVALID_REFERENCE`); undo the plan again instead.
+All undeclared bytes remain identical. Invalid UTF-8 is rejected explicitly; UTF-16 and other encodings are
 not decoded. No formatter, shell command, or model runs inside the engine.
 Ready plans and receipts carry nonblocking `NUL_BYTE` and `MIXED_LINE_ENDINGS`
 warnings when candidate output contains NUL or both CRLF and bare LF. Warnings
 also report pre-existing conditions retained in the candidate; they do not alter
 bytes or reject the request. Inspect them before committing a preview.
 
-A nonblocking `WHITESPACE_EDGE` warning flags an `exact` or `all` change whose
+A nonblocking `WHITESPACE_EDGE` warning flags an `old` change whose
 `old` and `new` agree on their first (or last) visible character but differ in
 the whitespace beyond it, where that matters in the file: whitespace `old` has
 and `new` drops beside visible text joins them (`unit_price * Decimal` written as
@@ -382,8 +421,8 @@ still requires the `id` of the change it replaces (`INVALID_REPAIR` otherwise):
   "reference": "d_REPLACE_WITH_RETURNED_ID",
   "changes": [{
     "id": "1.1",
-    "target": { "kind": "exact", "old": "const retries = 1;" },
-    "text": "const retries = 3;"
+    "old": "const retries = 1;",
+    "new": "const retries = 3;"
   }]
 }
 ```
@@ -456,7 +495,8 @@ are separate regions of one change. `intended_digest` identifies the **intended*
 candidate and is evidence of actual output only for confirmed committed files.
 Each committed file also carries `after`: a snapshot reference holding the bytes
 that were written, with no disclosed spans, usable as the base of a follow-up
-unscoped `exact` edit or search page without reading the file again.
+`old` edit, line target with `expect`, or search page without reading the file
+again.
 The CLI's `validation: "not_requested"` means no external validation command was
 run. MCP receipt responses omit this unconfigurable field. Run project checks
 separately; a confirmed write is not evidence that tests passed.
@@ -504,7 +544,10 @@ naming the blob, and restoring its exact bytes repairs every object that
 references it. State written by 0.2.0 loads without migration, and both formats
 coexist. A 0.2.0 binary reading a new object fails closed with `STORE_CORRUPT`,
 and its pruning refuses, so do not mix an older plugin server or CLI with a newer
-one on the same workspace.
+one on the same workspace. State written by 0.3.0 also loads, re-serializes byte-identically, and replays.
+Records of requests that use `path`, `lines`, `after`, `in` with lines, or
+`count` without `in` have shapes 0.3.x cannot read; a 0.3.x binary reports
+`STORE_CORRUPT` for them and its pruning refuses before deleting anything.
 
 To review reclaimable storage, run `prune-snapshots 604800` for snapshots older
 than seven days. The JSON result lists `eligible` snapshot IDs and their
