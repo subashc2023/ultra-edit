@@ -15,7 +15,9 @@ All notable changes to Ultra Edit are documented here. Releases follow
 - A nonblocking `WHITESPACE_EDGE` warning quotes the resulting line when an
   `exact` or `all` change's `old` and `new` differ only in whitespace at an edge
   and that joins text (`unit_price * Decimal` written as `unit_price *Decimal`)
-  or lands beside more whitespace. Bytes are still written as given.
+  or lands beside more whitespace. Bytes are still written as given. These
+  warnings follow the plan's `NUL_BYTE` and `MIXED_LINE_ENDINGS` warnings, so
+  compact responses keep showing those.
 
 ### Changed
 

@@ -280,6 +280,9 @@ pub fn compile(
         return Err(diagnostics);
     }
     let mut warnings = Vec::new();
+    // Edge warnings follow every byte warning, so the few a compact response
+    // shows never trade a NUL or mixed line ending for a whitespace lint.
+    let mut edge_warnings = Vec::new();
     let files = resolved
         .into_iter()
         .map(|(base, replacements, changes)| {
@@ -287,7 +290,7 @@ pub fn compile(
                 .iter()
                 .map(|change| (change.id.as_str(), change))
                 .collect();
-            let mut edges = Vec::new();
+            let mut placed = Vec::new();
             let mut output = String::new();
             let mut cursor = 0;
             for replacement in &replacements {
@@ -295,19 +298,25 @@ pub fn compile(
                 let start = output.len();
                 output.push_str(&replacement.text);
                 cursor = replacement.end;
-                if let Some(change) = targets.get(replacement.change_id.as_str()) {
-                    for edge in whitespace_edges(&base.text, replacement, change) {
+                placed.push((replacement.change_id.as_str(), start..output.len()));
+            }
+            output.push_str(&base.text[cursor..]);
+            warn_output(&base.path, &output, &mut warnings);
+            // Neighbours are judged in the output, where an adjacent change's text
+            // may stand beside this one instead of the original bytes.
+            let mut edges = Vec::new();
+            for (id, range) in placed {
+                if let Some(change) = targets.get(id) {
+                    for edge in whitespace_edges(&output, &range, change) {
                         let junction = match edge {
-                            Edge::DropsTrailing | Edge::AddsTrailing => output.len(),
-                            Edge::DropsLeading | Edge::AddsLeading => start,
+                            Edge::DropsTrailing | Edge::AddsTrailing => range.end,
+                            Edge::DropsLeading | Edge::AddsLeading => range.start,
                         };
                         edges.push((*change, edge, junction));
                     }
                 }
             }
-            output.push_str(&base.text[cursor..]);
-            warn_edges(&base.path, &output, edges, &mut warnings);
-            warn_output(&base.path, &output, &mut warnings);
+            warn_edges(&base.path, &output, edges, &mut edge_warnings);
             PreparedFile {
                 base: base.clone(),
                 output,
@@ -316,6 +325,7 @@ pub fn compile(
             }
         })
         .collect();
+    warnings.append(&mut edge_warnings);
     Ok(PreparedPlan {
         id: new_id("p"),
         request: request.clone(),
@@ -343,11 +353,12 @@ const EDGE_CONTEXT_CHARS: usize = 40;
 const MAX_EDGE_WARNINGS: usize = 8;
 
 /// Finds the edges where `old` and `new` agree on their outermost visible character
-/// but only one of them carries whitespace there, and the original text beside the
-/// match makes the difference visible. Dropped whitespace joins the neighbouring
-/// text, or joins two lines; added spaces or tabs land beside more whitespace, or
-/// at the end of a line. Span changes have no `old` to compare and are never checked.
-fn whitespace_edges(text: &str, replacement: &Replacement, change: &Change) -> Vec<Edge> {
+/// but only one of them carries whitespace there, and the output beside the
+/// replacement at `placed` makes the difference visible. Dropped whitespace joins the
+/// neighbouring text, or joins two lines; added spaces or tabs land beside more
+/// whitespace, or at the end of a line. Span changes have no `old` to compare and are
+/// never checked.
+fn whitespace_edges(output: &str, placed: &Range<usize>, change: &Change) -> Vec<Edge> {
     let old = match &change.target {
         Target::Exact { old, .. } | Target::All { old, .. } => old.as_str(),
         Target::Span { .. } => return Vec::new(),
@@ -361,7 +372,7 @@ fn whitespace_edges(text: &str, replacement: &Replacement, change: &Change) -> V
         return Vec::new();
     }
     let mut edges = Vec::new();
-    let after = text[replacement.end..].chars().next();
+    let after = output[placed.end..].chars().next();
     if old_core.chars().next_back() == new_core.chars().next_back() {
         let old_end = &old[old.trim_end_matches(EDGE_WHITESPACE).len()..];
         let new_end = &new[new.trim_end_matches(EDGE_WHITESPACE).len()..];
@@ -372,10 +383,10 @@ fn whitespace_edges(text: &str, replacement: &Replacement, change: &Change) -> V
         }
     }
     // A byte-order mark starts the file rather than text a target could join.
-    let before = text[..replacement.start]
+    let before = output[..placed.start]
         .chars()
         .next_back()
-        .filter(|ch| *ch != '\u{feff}' || replacement.start != 3);
+        .filter(|ch| *ch != '\u{feff}' || placed.start != 3);
     if old_core.chars().next() == new_core.chars().next() {
         let old_start = &old[..old.len() - old.trim_start_matches(EDGE_WHITESPACE).len()];
         let new_start = &new[..new.len() - new.trim_start_matches(EDGE_WHITESPACE).len()];
@@ -673,10 +684,21 @@ fn span_range(base: &Snapshot, id: &str) -> Result<(usize, usize), String> {
     let covered =
         last - first < lines.len() && (first..=last).all(|line| lines.contains_key(&line));
     match (lines.get(&first), lines.get(&last)) {
-        (Some(start), Some(end)) if covered => Ok((start.start, end.end)),
-        _ => Err(format!(
-            "Span {shown} needs every line disclosed; this base discloses {disclosed}. Read the rest by continuing this snapshot"
+        (Some(start), Some(end)) if covered && start.start <= end.end => Ok((start.start, end.end)),
+        // Genuine line spans ascend; a store edited by hand may not.
+        (Some(_), Some(_)) if covered => Err(format!(
+            "Span {shown} spans lines whose recorded offsets are out of order; read the file again"
         )),
+        // No further read discloses a line the file lacks; counting the lines
+        // costs one scan, paid only on this failure.
+        _ => match line_ranges(&base.text).count() {
+            total if last > total => Err(format!(
+                "Span {shown} runs past the file's last line, {total}; this base discloses {disclosed}"
+            )),
+            _ => Err(format!(
+                "Span {shown} needs every line disclosed; this base discloses {disclosed}. Read the rest by continuing this snapshot"
+            )),
+        },
     }
 }
 

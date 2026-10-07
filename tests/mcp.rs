@@ -825,11 +825,14 @@ fn diff_and_byte_warnings_are_available_before_and_after_commit() {
     ]}]});
     let prepared = client.call("ultra_edit_prepare", request.clone(), false);
     assert_eq!(prepared["warning_count"], 3);
+    // Byte warnings come first; the edge lint follows them.
+    assert_eq!(prepared["warnings"][0]["code"], "NUL_BYTE");
+    assert_eq!(prepared["warnings"][1]["code"], "MIXED_LINE_ENDINGS");
     assert_eq!(
-        prepared["warnings"][0],
+        prepared["warnings"][2],
         json!({
             "code": "WHITESPACE_EDGE",
-            "file": prepared["warnings"][1]["file"],
+            "file": prepared["warnings"][0]["file"],
             "message": "Change three: `old` ends in whitespace `new` drops, joining what follows; line 20 now reads \"line 20line 21\"",
         })
     );

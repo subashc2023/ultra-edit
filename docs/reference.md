@@ -217,7 +217,9 @@ wrong text. An expectation mismatch returns `EXPECTED_TEXT_MISMATCH`.
 `UNKNOWN_SPAN` lists what the base discloses, in line numbers rather than IDs,
 for example `This base discloses lines 146-150, 1875-1879; selection = lines
 1875-1879`, bounded to about 100 characters. An ID of another shape, such as
-`146-150`, `L146`, or `r146-r150`, is answered with the shapes span IDs take.
+`146-150`, `L146`, or `r146-r150`, is answered with the shapes span IDs take,
+and a range past the file's last line names that line instead of suggesting
+another read.
 
 Empty exact search strings are rejected. Use a returned zero-width span with
 `expect: ""` for insertion where one exists. Line snapshots do not synthesize a
@@ -314,7 +316,9 @@ spaces or tabs `new` adds and `old` lacks land beside more whitespace or, at the
 end, before a line end. Added leading indentation at a line start is not
 flagged. The message quotes the resulting line, as in `line 2 now reads
 "…_quantize(line.unit_price *Decimal(line.qty))"`, once per change and edge and
-at most eight per file. The bytes are still written exactly as given.
+at most eight per file. The bytes are still written exactly as given. These
+warnings follow every `NUL_BYTE` and `MIXED_LINE_ENDINGS` warning of the plan, so
+the six warnings a compact response shows never trade one of those for this lint.
 
 ## Preview, repair, retry, and undo
 

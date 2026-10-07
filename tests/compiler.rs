@@ -1669,3 +1669,114 @@ fn edge_warnings_are_once_per_change_and_bounded() {
         warnings[7].message
     );
 }
+
+#[test]
+fn byte_warnings_precede_edge_warnings_so_compact_summaries_keep_them() {
+    // Eight edge warnings in the first file must not push the second file's
+    // MIXED_LINE_ENDINGS, or the first file's NUL_BYTE, out of the six warnings
+    // a compact response shows.
+    let text: String = (0..8).map(|index| format!("k{index}= v\n")).collect();
+    let mut first = snapshot("first.txt".into(), format!("{text}\0"));
+    first.id = "s1".into();
+    let mut second = snapshot("second.txt".into(), "a\r\nb\r\n".into());
+    second.id = "s2".into();
+    let changes = (0..8)
+        .map(|index| {
+            exact(
+                &format!("c{index}"),
+                &format!("k{index}= "),
+                &format!("k{index}="),
+            )
+        })
+        .collect();
+    let request = EditRequest {
+        request_id: "order".into(),
+        files: vec![
+            FileRequest {
+                base: first.id.clone(),
+                changes,
+            },
+            FileRequest {
+                base: second.id.clone(),
+                changes: vec![exact("eol", "a\r\n", "a\n")],
+            },
+        ],
+    };
+    let snapshots = BTreeMap::from([
+        (first.id.clone(), first.clone()),
+        (second.id.clone(), second.clone()),
+    ]);
+    let plan = compile(&request, &snapshots).unwrap();
+    let codes: Vec<_> = plan
+        .warnings
+        .iter()
+        .map(|warning| warning.code.as_str())
+        .collect();
+    let mut expected = vec!["NUL_BYTE", "MIXED_LINE_ENDINGS"];
+    expected.extend(["WHITESPACE_EDGE"; 8]);
+    assert_eq!(codes, expected);
+    let shown = ultra_edit::report::warning_summaries(&plan.warnings);
+    assert_eq!(shown[1]["code"], "MIXED_LINE_ENDINGS");
+    assert_eq!(shown[1]["file"], "second.txt");
+}
+
+#[test]
+fn span_ranges_past_the_last_line_say_so_instead_of_asking_for_more_reads() {
+    let base = snapshot("short.txt".into(), "a\nb\nc\n".into());
+    let error = rejected(&base, span_change("b", "r2..r9", "X"));
+    assert_eq!(error.code, "UNKNOWN_SPAN");
+    assert_eq!(
+        error.message,
+        "Span r2..r9 runs past the file's last line, 3; this base discloses r0 (whole file); lines 1-3"
+    );
+    // A range base points past the end the same way, not at another read.
+    let text = numbered(10);
+    let ranged_base = ranged(&text, &[(8, 10)]);
+    assert_eq!(
+        rejected(&ranged_base, span_change("b", "r9..r11", "X")).message,
+        "Span r9..r11 runs past the file's last line, 10; this base discloses lines 8-10; selection = lines 8-10"
+    );
+    // The bound holds for the longest IDs and disclosure lists.
+    let scattered: Vec<_> = (1..=10).map(|line| (line, line)).collect();
+    let error = rejected(
+        &ranged(&numbered(10), &scattered),
+        span_change("b", &format!("r1..r{}", usize::MAX), "X"),
+    );
+    assert!(error.message.chars().count() <= 240, "{}", error.message);
+}
+
+#[test]
+fn edge_warnings_judge_neighbours_in_the_output_not_the_original() {
+    // Each change alone would join text, but together the space survives.
+    let (output, warnings) = edge_warnings(
+        "a b\n",
+        vec![exact("left", "a ", "a"), exact("right", "b", " b")],
+    );
+    assert_eq!(output, "a b\n");
+    assert!(warnings.is_empty(), "{warnings:?}");
+    // The neighbour a dropped space now joins is another change's text.
+    let (output, warnings) = edge_warnings(
+        "x = a  b\n",
+        vec![exact("left", "a ", "a"), exact("right", " b", "c")],
+    );
+    assert_eq!(output, "x = ac\n");
+    assert_eq!(warnings.len(), 1);
+    assert!(
+        warnings[0].message.ends_with("line 1 now reads \"x = ac\""),
+        "{}",
+        warnings[0].message
+    );
+}
+
+#[test]
+fn a_span_range_over_inconsistent_line_offsets_is_rejected_not_sliced() {
+    // A tampered snapshot whose line 2 lies before line 1 must not reach a
+    // reversed byte slice.
+    let mut base = snapshot("tampered.txt".into(), "aaaa\nbb\n".into());
+    base.spans[1].start = 5;
+    base.spans[1].end = 7;
+    base.spans[2].start = 0;
+    base.spans[2].end = 2;
+    let error = rejected(&base, span_change("b", "r1..r2", "X"));
+    assert_eq!(error.code, "UNKNOWN_SPAN");
+}
