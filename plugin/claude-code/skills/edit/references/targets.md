@@ -116,9 +116,10 @@ For `after`, it gives the lines ending at `after`. For `lines`, a string gives
 the first lines of the range, and `[first, last]` gives its first and last
 lines (each may hold several lines). It is required unless the base disclosed
 every addressed line (a `path` file discloses none), and then must reach the
-range's last line, by giving every line or the `[first, last]` pair, with at
-least 8 visible characters in all (`LINE_GUARD_REQUIRED`, `LINE_GUARD_WEAK`), so
-a line added or removed inside the range since your Read is caught. `after:0`
+range's last line, by giving every line or the `[first, last]` pair, and must
+match nowhere else in the file, as `old` must (`LINE_GUARD_REQUIRED`,
+`LINE_GUARD_WEAK`), so a line added or removed inside the range since your Read
+is caught. `after:0`
 takes none. A mismatch is `EXPECTED_TEXT_MISMATCH`, and when the expected lines
 occur elsewhere the message gives the current range. A line past the end is
 `LINE_OUT_OF_RANGE`. On `span`, `expect` is byte-exact.

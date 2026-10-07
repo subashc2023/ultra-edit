@@ -280,9 +280,11 @@ lines in order. It is required unless the base disclosed every addressed line
 through a snapshot read (`LINE_GUARD_REQUIRED`). A `path` file discloses none,
 since its line numbers come from another view and may be stale. A required
 `expect` must reach the range's last line, by giving every line or the pair, so
-a line added or removed inside the range is caught, and needs at least 8
-non-whitespace characters in all (`LINE_GUARD_WEAK`), because a `}` or blank
-line can still match after the file shifts; `after:0` takes none. A mismatch is
+a line added or removed inside the range is caught, and, as `old` must, it must
+match this place alone (`LINE_GUARD_WEAK` names the others): a guard such as a
+`}` or blank line that also matches elsewhere could still match after the file
+shifts, while one that matches once cannot without also matching the moved
+lines. `after:0` takes none. A mismatch is
 `EXPECTED_TEXT_MISMATCH`: the message quotes the addressed lines and, when the
 expected lines occur elsewhere, gives the current range, and the diagnostic
 carries them as `exact` candidates, or near misses as below. `after` with empty

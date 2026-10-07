@@ -2,7 +2,7 @@ use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use same_file::Handle;
@@ -216,7 +216,16 @@ impl Storage {
 
     pub fn resolve(&self, path: &Path) -> Result<PathBuf, Error> {
         let requested = self.root.join(path);
-        let path = fs::canonicalize(&requested).map_err(|error| target_error(&requested, error))?;
+        let path = fs::canonicalize(&requested).map_err(|error| {
+            let mut error = target_error(&requested, error);
+            if error.code == "TARGET_MISSING"
+                && let Some(near) = self.ending_like(path)
+            {
+                let near = crate::report::path_for_display(&near.to_string_lossy()).into_owned();
+                error.message = format!("{}; did you mean {near}?", error.message);
+            }
+            error
+        })?;
         if !path.starts_with(&self.root) || path.starts_with(&self.state) {
             return Err(Error::new(
                 "PATH_OUTSIDE_WORKSPACE",
@@ -230,6 +239,27 @@ impl Storage {
             ));
         }
         Ok(path)
+    }
+
+    /// A workspace file whose path ends like `path`, which names none, as when a
+    /// directory was left out of an absolute path. Only paths under the root are
+    /// probed, and only after a miss.
+    fn ending_like(&self, path: &Path) -> Option<PathBuf> {
+        let parts: Vec<&std::ffi::OsStr> = path
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(part) => Some(part),
+                _ => None,
+            })
+            .collect();
+        (1..parts.len()).find_map(|skip| {
+            let candidate =
+                fs::canonicalize(self.root.join(parts[skip..].iter().collect::<PathBuf>())).ok()?;
+            (candidate.starts_with(&self.root)
+                && !candidate.starts_with(&self.state)
+                && candidate.is_file())
+            .then_some(candidate)
+        })
     }
 
     pub fn read(&self, path: &Path) -> Result<String, Error> {

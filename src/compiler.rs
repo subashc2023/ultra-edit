@@ -26,7 +26,6 @@ pub const MAX_CANDIDATE_SEARCHES: usize = 6;
 const AMBIGUOUS_LINES: usize = 5;
 /// Visible characters a line target's `expect` needs before it guards lines the
 /// base did not disclose: fewer, like a lone `}`, could match after a line shift.
-pub const MIN_GUARD_CHARS: usize = 8;
 /// Change IDs an `EOL_ADAPTED` warning names before counting the rest.
 const ADAPTED_IDS: usize = 3;
 
@@ -1446,7 +1445,8 @@ struct Expect<'a> {
 /// Checks a line target's `expect`. Unless the base disclosed every addressed line,
 /// line numbers from elsewhere may be stale, so one is required: for `lines`, it
 /// must reach the range's last line, either by giving every line or by giving the
-/// last lines too, and it needs `MIN_GUARD_CHARS` visible characters in all.
+/// last lines too, and, as `old` must, it must match this place alone, so a
+/// shifted number cannot find the same text elsewhere.
 /// Comparing line by line, ignoring line endings, lets text copied from a view
 /// that hides `\r` guard CRLF lines.
 fn line_guard(
@@ -1515,7 +1515,7 @@ fn line_guard(
             diagnostics,
             "LINE_GUARD_REQUIRED",
             format!(
-                "{lines_named} not disclosed by this base, so the numbers may be stale; {advice}, at least {MIN_GUARD_CHARS} visible characters"
+                "{lines_named} not disclosed by this base, so the numbers may be stale; {advice}"
             ),
         );
     }
@@ -1625,50 +1625,65 @@ fn line_guard(
             diagnostics,
         );
     }
-    // A line that both the head and the tail check is evidence once.
-    let overlap = match guard {
-        Guard::Prefix { first, last } => (first + head.len()).saturating_sub(last + 1 - tail.len()),
-        Guard::Above { .. } => 0,
+    if !required {
+        return true;
+    }
+    // Every place the whole guard matches: a guard that matches elsewhere too could
+    // still match after the file shifted, as an ambiguous `old` could.
+    let places: Vec<usize> = match guard {
+        Guard::Prefix { .. } => (1..=(lines.count() + 1).saturating_sub(extent))
+            .filter(|&start| {
+                matches_at(start, &head) && matches_at(start + extent - tail.len(), &tail)
+            })
+            .take(AMBIGUOUS_LINES + 1)
+            .collect(),
+        Guard::Above { .. } => (1..=(lines.count() + 1).saturating_sub(head.len()))
+            .filter(|&start| matches_at(start, &head))
+            .map(|start| start + head.len() - 1)
+            .take(AMBIGUOUS_LINES + 1)
+            .collect(),
     };
-    let visible: usize = head
-        .iter()
-        .chain(&tail[overlap.min(tail.len())..])
-        .map(|piece| piece.chars().filter(|ch| !ch.is_whitespace()).count())
-        .sum();
-    if required && visible < MIN_GUARD_CHARS {
-        let advice = if empty {
-            "the file is empty, so insert with after:0, which needs no expect".to_owned()
-        } else {
-            let more = match guard {
-                Guard::Prefix { .. } if head.len() + tail.len() < extent => {
-                    "add lines to it (each part of [first, last] may hold several)".to_owned()
-                }
-                Guard::Above { .. } if head.len() < extent => {
-                    "extend it with the lines above".to_owned()
-                }
-                // Every line above is given; only the line below can strengthen it.
-                Guard::Above { line } if line < lines.count() => format!(
-                    "replace lines [{line},{}] instead, repeating both in `new` and `expect`",
-                    line + 1
-                ),
-                Guard::Above { .. } => String::new(),
-                Guard::Prefix { .. } => {
-                    "widen the range to take in a neighbouring line, repeating it in `new` and `expect`".to_owned()
-                }
-            };
-            if more.is_empty() {
-                "target the text with `old`".to_owned()
-            } else {
-                format!("{more}, or target the text with `old`")
+    if places.len() > 1 {
+        let more = match guard {
+            Guard::Prefix { .. } if head.len() + tail.len() < extent => {
+                "add lines to it (each part of [first, last] may hold several)".to_owned()
+            }
+            Guard::Above { line } if head.len() < line => {
+                "extend it with the lines above".to_owned()
+            }
+            // Every line above is given; only the line below can single it out.
+            Guard::Above { line } if line < lines.count() => format!(
+                "replace lines [{line},{}] instead, repeating both in `new` and `expect`",
+                line + 1
+            ),
+            Guard::Above { .. } => String::new(),
+            Guard::Prefix { .. } => {
+                "widen the range by a neighbouring line, repeating it in `new` and `expect`"
+                    .to_owned()
             }
         };
+        let advice = if more.is_empty() {
+            "target the text with `old`".to_owned()
+        } else {
+            format!("{more}, or use `old`")
+        };
+        let count = if places.len() > AMBIGUOUS_LINES {
+            format!("more than {AMBIGUOUS_LINES}")
+        } else {
+            places.len().to_string()
+        };
+        let noun = match guard {
+            Guard::Prefix { .. } => "ranges",
+            Guard::Above { .. } => "places",
+        };
         let given: Vec<&str> = [expect.head, expect.tail].into_iter().flatten().collect();
-        let quoted = candidates::quoted(&given.join(" "), 40);
+        let quoted = candidates::quoted(&given.join(" "), 30);
         return reject(
             diagnostics,
             "LINE_GUARD_WEAK",
             format!(
-                "expect {quoted} has under {MIN_GUARD_CHARS} visible characters, so it could still match after a line shift; {advice}"
+                "expect {quoted} matches {count} {noun} in this file, from line {}, so a stale number could pick another; {advice}",
+                places[0]
             ),
         );
     }

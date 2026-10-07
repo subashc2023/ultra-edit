@@ -2078,7 +2078,7 @@ fn line_expect_compares_whole_lines_ignoring_line_endings() {
     );
     assert_eq!(
         error.message,
-        "Line 5 holds \"    setting_5 = 5\", not expect; it is at line 6 now, so use lines [6,6] if the whole range moved (ultra_edit_repair can replace just this change)."
+        "Line 5 holds \"    setting_5 = 5\", not expect; it is at line 6, so use lines [6,6] if the whole range moved (ultra_edit_repair can replace just this change)."
     );
     // The new range for a moved head keeps the range's length.
     let error = rejected(
@@ -2088,7 +2088,7 @@ fn line_expect_compares_whole_lines_ignoring_line_endings() {
     assert!(
         error
             .message
-            .contains("it is at line 5 now, so use lines [5,7] if the whole range moved"),
+            .contains("it is at line 5, so use lines [5,7] if the whole range moved"),
         "{}",
         error.message
     );
@@ -2103,7 +2103,7 @@ fn line_expect_compares_whole_lines_ignoring_line_endings() {
     assert_eq!(error.code, "EXPECTED_TEXT_MISMATCH");
     assert_eq!(
         error.message,
-        "Line 8 holds \"    setting_7 = 7\", not the expected last lines; it is at line 9 now, so the range is [5,9] (ultra_edit_repair can replace just this change)."
+        "Line 8 holds \"    setting_7 = 7\", not the expected last lines; it is at line 9, so the range is [5,9] (ultra_edit_repair can replace just this change)."
     );
     assert_eq!(
         error.candidates,
@@ -2160,28 +2160,28 @@ fn line_expect_compares_whole_lines_ignoring_line_endings() {
 
 #[test]
 fn undisclosed_lines_need_an_expect_that_reaches_the_last_line() {
-    let text = "fn a() {\n    one();\n}\n}\nfn b() {}\n";
+    let text = "fn a() {\n    one();\n}\n}\nfn b() {}\n}\n}\n";
     let base = spanless(text);
     for (change, code, message) in [
         (
             lines_change("c", [3, 4], None, ""),
             "LINE_GUARD_REQUIRED",
-            "Lines 3-4 were not disclosed by this base, so the numbers may be stale; give expect as [first line, last line] with their current text, or every line, at least 8 visible characters",
+            "Lines 3-4 were not disclosed by this base, so the numbers may be stale; give expect as [first line, last line] with their current text, or every line",
         ),
         (
-            lines_change("c", [3, 4], Some("fn a() {"), ""),
+            lines_change("c", [3, 4], Some("}"), ""),
             "LINE_GUARD_REQUIRED",
-            "Lines 3-4 were not disclosed by this base, so the numbers may be stale; expect checks only the first 1, missing a shift inside the range: give it as [first line, last line], or every line, at least 8 visible characters",
+            "Lines 3-4 were not disclosed by this base, so the numbers may be stale; expect checks only the first 1, missing a shift inside the range: give it as [first line, last line], or every line",
         ),
         (
             insert("c", 2, None, "x"),
             "LINE_GUARD_REQUIRED",
-            "Line 2 was not disclosed by this base, so the numbers may be stale; add expect with line 2's current text, at least 8 visible characters",
+            "Line 2 was not disclosed by this base, so the numbers may be stale; add expect with line 2's current text",
         ),
         (
             ends_change("c", [3, 4], ["}", "}"], ""),
             "LINE_GUARD_WEAK",
-            "expect \"} }\" has under 8 visible characters, so it could still match after a line shift; widen the range to take in a neighbouring line, repeating it in `new` and `expect`, or target the text with `old`",
+            "expect \"} }\" matches 2 ranges in this file, from line 3, so a stale number could pick another; widen the range by a neighbouring line, repeating it in `new` and `expect`, or use `old`",
         ),
         (
             insert("c", 0, Some("fn a() {"), "x"),
@@ -2198,15 +2198,9 @@ fn undisclosed_lines_need_an_expect_that_reaches_the_last_line() {
     let error = rejected(&base, insert("c", 3, Some("}\n"), "x"));
     assert_eq!(error.code, "LINE_GUARD_WEAK");
     assert!(error.message.contains("extend it with the lines above"));
-    let error = rejected(&base, lines_change("c", [2, 2], Some("    one();"), "x"));
-    assert_eq!(error.code, "LINE_GUARD_WEAK");
-    assert!(
-        error.message.contains("widen the range"),
-        "{}",
-        error.message
-    );
-    // Lines together reach the minimum, and the top of the file needs no guard.
+    // A short line that occurs once guards as well as a long one, as with `old`.
     for changes in [
+        vec![lines_change("c", [2, 2], Some("    one();"), "    two();")],
         vec![
             insert("top", 0, None, "// top"),
             insert("c", 3, Some("fn a() {\n    one();\n}"), "x"),
@@ -2216,30 +2210,34 @@ fn undisclosed_lines_need_an_expect_that_reaches_the_last_line() {
     ] {
         compile(&request(&base, changes), &bases(&base)).unwrap();
     }
-    // A base that disclosed the lines needs no expect, and a weak one is fine.
+    // A base that disclosed the lines needs no expect, and an ambiguous one is fine.
     let full = snapshot("full.txt".into(), text.into());
     for change in [
         lines_change("c", [3, 4], None, ""),
         lines_change("c", [3, 4], Some("}"), ""),
     ] {
         let plan = compile(&request(&full, vec![change]), &bases(&full)).unwrap();
-        assert_eq!(plan.files[0].output, "fn a() {\n    one();\nfn b() {}\n");
-    }
-    // An empty file has no line to guard, and the advice says how to insert.
-    let empty = spanless("");
-    for change in [
-        lines_change("c", [1, 1], None, "x"),
-        insert("c", 1, Some(""), "x"),
-    ] {
-        let error = rejected(&empty, change);
-        assert!(
-            error
-                .message
-                .contains("the file is empty, so insert with after:0"),
-            "{}",
-            error.message
+        assert_eq!(
+            plan.files[0].output,
+            "fn a() {\n    one();\nfn b() {}\n}\n}\n"
         );
     }
+    // An empty file has no line to guard: the advice says how to insert, and its
+    // one empty line is a guard that matches once.
+    let empty = spanless("");
+    let error = rejected(&empty, lines_change("c", [1, 1], None, "x"));
+    assert!(
+        error
+            .message
+            .contains("the file is empty, so insert with after:0"),
+        "{}",
+        error.message
+    );
+    compile(
+        &request(&empty, vec![insert("c", 1, Some(""), "x")]),
+        &bases(&empty),
+    )
+    .unwrap();
 }
 
 #[test]

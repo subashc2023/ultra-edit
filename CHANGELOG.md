@@ -34,10 +34,12 @@ All notable changes to Ultra Edit are documented here. Releases follow
   last line. `expect` on a line target is compared line by line, ignoring line
   endings. Unless the base disclosed the lines (a `path` file discloses none),
   it is required, must reach the range's last line, as every line or as
-  `[first line, last line]`, and needs at least 8 visible characters
-  (`LINE_GUARD_REQUIRED`, `LINE_GUARD_WEAK`), so a stale line number, including
-  a line added inside the range, is rejected rather than applied, and the
-  message gives the current range.
+  `[first line, last line]`, and, like `old`, must match nowhere else in the
+  file (`LINE_GUARD_REQUIRED`, `LINE_GUARD_WEAK`), so a stale line number,
+  including a line added inside the range, is rejected rather than applied,
+  and the message gives the current range. A path that names no file but ends
+  like a workspace file, as when a directory was left out, is answered with
+  that file's path.
   New diagnostics: `LINE_OUT_OF_RANGE`, `EMPTY_INSERTION`, and an
   `OVERLAPPING_CHANGES` message naming the single `lines` change to send.
 - Line-ending adaptation: in a file whose every line ends in CRLF, `old`, `new`,
