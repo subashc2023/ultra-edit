@@ -206,9 +206,12 @@ through a snapshot, so no span of it was disclosed: a `span` or `scope` other
 than `r0`, the whole file, is `SPAN_NEEDS_BASE`. Path mode detects no change
 made between your read and the call; the exact `old` text is the guard, as with
 native Edit. Paths are normalized lexically before IDs are derived: a leading
-workspace root is stripped and `.` components and repeated separators are
-dropped, while `..` is kept, so `a.txt`, `./a.txt`, and `<root>/a.txt` derive
-one request ID. A rejected request with a derived ID and a path file is not
+workspace root, spelled as given at launch or in canonical form, is stripped and
+`.` components and repeated separators are dropped, while `..` is kept, so
+`a.txt`, `./a.txt`, and `<root>/a.txt` derive one request ID even when the root
+is reached through a symlink. Other spellings of one file, such as through a
+symlinked subdirectory, derive different IDs, so resend a lost call with the
+same paths. A rejected request with a derived ID and a path file is not
 bound, so resending it after fixing the cause evaluates it again; with an
 explicit `request_id`, it replays like any other request. Replaying a committed
 path request whose files changed since adds a `REPLAYED_FILE_CHANGED` warning:
