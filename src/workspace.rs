@@ -511,18 +511,30 @@ impl Workspace {
                 ));
             }
         };
-        // An undo restores recorded bytes exactly; a repair would plan new text.
-        let origin = digest(request.request_id.as_bytes());
-        if self.storage.exists("requests", &origin)?
-            && matches!(
-                self.storage.get::<Binding>("requests", &origin)?.input,
-                Input::Undo { .. }
-            )
-        {
-            return Err(Error::new(
-                "INVALID_REFERENCE",
-                "An undo restores recorded bytes and cannot be repaired; once the file holds the undone plan's output again, undo that plan with a new request_id",
-            ));
+        // An undo restores recorded bytes exactly; a repair would plan new text. A
+        // store written by 0.3.0 may hold repairs of an undo's draft, so follow them.
+        let mut origin = request.request_id.clone();
+        let mut seen = BTreeSet::new();
+        loop {
+            let key = digest(origin.as_bytes());
+            if !seen.insert(key.clone()) || !self.storage.exists("requests", &key)? {
+                break;
+            }
+            let reference = match self.storage.get::<Binding>("requests", &key)?.input {
+                Input::Undo { .. } => {
+                    return Err(Error::new(
+                        "INVALID_REFERENCE",
+                        "An undo restores recorded bytes and cannot be repaired; once the file holds the undone plan's output again, undo that plan with a new request_id",
+                    ));
+                }
+                Input::Repair { reference, .. } | Input::Retry { reference, .. } => reference,
+                Input::Edit { .. } => break,
+            };
+            origin = match self.evidence_unlocked(&reference)? {
+                Evidence::Plan(plan) => plan.request.request_id,
+                Evidence::Draft(draft) => draft.request.request_id,
+                Evidence::Snapshot(_) | Evidence::Inspection(_) => break,
+            };
         }
         if request_id == request.request_id {
             return Err(Error::new(

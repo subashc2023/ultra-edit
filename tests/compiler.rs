@@ -2350,7 +2350,7 @@ fn in_restricts_old_to_whole_lines() {
     assert!(
         error
             .message
-            .ends_with("end `in` at line 3 or earlier, or drop it to search the whole file"),
+            .ends_with("end `in` by line 3 or drop it to search the whole file"),
         "{}",
         error.message
     );

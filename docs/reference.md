@@ -378,7 +378,9 @@ holds a CR stays literal, and so does every text of a change whose `old` or span
 `expect` holds one, so `{"old":"\r\n","new":"\n","count":N}` converts lines to
 LF. Text for any other base stays literal, so write `\r\n` explicitly in a
 mixed file. An undo restores recorded bytes without adaptation, and an undo's
-draft cannot be repaired (`INVALID_REFERENCE`); undo the plan again instead.
+draft cannot be repaired (`INVALID_REFERENCE`): once the file holds the plan's
+output again, undo the plan under a new `request_id`, since an identical undo
+replays its recorded rejection.
 All undeclared bytes remain identical. Invalid UTF-8 is rejected explicitly; UTF-16 and other encodings are
 not decoded. No formatter, shell command, or model runs inside the engine.
 Ready plans and receipts carry nonblocking `NUL_BYTE` and `MIXED_LINE_ENDINGS`

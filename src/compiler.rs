@@ -296,7 +296,8 @@ pub(crate) fn derives(
     change: &Change,
     replacement: &Replacement,
 ) -> bool {
-    let crlf = *crlf.get_or_init(|| crlf_only(text));
+    // A change kept literal by its `old` was never adapted.
+    let crlf = *crlf.get_or_init(|| crlf_only(text)) && !literal(change);
     let adapted = adapt_eol(crlf, &change.text);
     match change.target {
         Target::Lines { .. } | Target::Insert { .. } => {
@@ -1093,7 +1094,7 @@ impl<'a> FileContext<'a> {
         let total = lines.count();
         let advice = match change.target {
             Target::Exact { .. } | Target::All { .. } => {
-                format!("end `in` at line {total} or earlier, or drop it to search the whole file")
+                format!("end `in` by line {total} or drop it to search the whole file")
             }
             _ if lines.body(1).start == self.base.text.len() => {
                 "the file is empty; insert with after:0".to_owned()
@@ -1552,20 +1553,32 @@ fn line_guard(
     };
     if !head.is_empty() && !matches_at(head_start, &head) {
         let found = find_lines(&base.text, lines, &head, 1);
-        let rest = candidates::line_places(&found, |start| match guard {
-            Guard::Prefix { first, last } => {
-                format!(
-                    "use lines [{start},{}] if the whole range moved",
-                    last - first + start
-                )
-            }
-            Guard::Above { .. } => format!("use after:{}", start + head.len() - 1),
-        });
-        let rest = if rest.is_empty() {
-            fuzzy_advice(context, expect.head.unwrap_or_default(), budget)
-        } else {
-            (rest, line_candidates(context, &found, head.len()))
-        };
+        // Only a place where the whole range fits can be offered as its new place.
+        let usable: Vec<usize> = found
+            .iter()
+            .copied()
+            .filter(|&start| match guard {
+                Guard::Prefix { first, last } => start + (last - first) <= lines.count(),
+                Guard::Above { .. } => true,
+            })
+            .collect();
+        let rest = relocated(
+            context,
+            &found,
+            &usable,
+            head.len(),
+            budget,
+            expect.head,
+            |start| match guard {
+                Guard::Prefix { first, last } => {
+                    format!(
+                        "use lines [{start},{}] if the whole range moved",
+                        last - first + start
+                    )
+                }
+                Guard::Above { .. } => format!("use after:{}", start + head.len() - 1),
+            },
+        );
         return mismatch_at(
             context,
             change,
@@ -1580,16 +1593,27 @@ fn line_guard(
         && !tail.is_empty()
         && !matches_at(last + 1 - tail.len(), &tail)
     {
-        // The range keeps its start; its end is where the last lines are now.
-        let found = find_lines(&base.text, lines, &tail, first);
-        let rest = candidates::line_places(&found, |start| {
-            format!("the range is [{first},{}]", start + tail.len() - 1)
-        });
-        let rest = if rest.is_empty() {
-            fuzzy_advice(context, expect.tail.unwrap_or_default(), budget)
-        } else {
-            (rest, line_candidates(context, &found, tail.len()))
-        };
+        // The range keeps its start; its end is where the last lines are now,
+        // which must leave room for the head.
+        let mut found = find_lines(&base.text, lines, &tail, first);
+        let usable: Vec<usize> = found
+            .iter()
+            .copied()
+            .filter(|&start| start + tail.len() >= first + head.len())
+            .collect();
+        if found.is_empty() {
+            // Whole lines above the range are still whole lines, not part of one.
+            found = find_lines(&base.text, lines, &tail, 1);
+        }
+        let rest = relocated(
+            context,
+            &found,
+            &usable,
+            tail.len(),
+            budget,
+            expect.tail,
+            |start| format!("the range is [{first},{}]", start + tail.len() - 1),
+        );
         let tail_start = last + 1 - tail.len();
         return mismatch_at(
             context,
@@ -1601,9 +1625,14 @@ fn line_guard(
             diagnostics,
         );
     }
+    // A line that both the head and the tail check is evidence once.
+    let overlap = match guard {
+        Guard::Prefix { first, last } => (first + head.len()).saturating_sub(last + 1 - tail.len()),
+        Guard::Above { .. } => 0,
+    };
     let visible: usize = head
         .iter()
-        .chain(&tail)
+        .chain(&tail[overlap.min(tail.len())..])
         .map(|piece| piece.chars().filter(|ch| !ch.is_whitespace()).count())
         .sum();
     if required && visible < MIN_GUARD_CHARS {
@@ -1612,23 +1641,29 @@ fn line_guard(
         } else {
             let more = match guard {
                 Guard::Prefix { .. } if head.len() + tail.len() < extent => {
-                    "add more of the range's lines to it"
+                    "add lines to it (each part of [first, last] may hold several)".to_owned()
                 }
-                Guard::Above { .. } if head.len() < extent => "extend it with the lines above",
-                _ => {
-                    "widen the range to take in a neighbouring line, repeating it in `new` and `expect`"
+                Guard::Above { .. } if head.len() < extent => {
+                    "extend it with the lines above".to_owned()
+                }
+                // Every line above is given; only the line below can strengthen it.
+                Guard::Above { line } if line < lines.count() => format!(
+                    "replace lines [{line},{}] instead, repeating both in `new` and `expect`",
+                    line + 1
+                ),
+                Guard::Above { .. } => String::new(),
+                Guard::Prefix { .. } => {
+                    "widen the range to take in a neighbouring line, repeating it in `new` and `expect`".to_owned()
                 }
             };
-            format!("{more}, or target the text with `old`")
+            if more.is_empty() {
+                "target the text with `old`".to_owned()
+            } else {
+                format!("{more}, or target the text with `old`")
+            }
         };
-        let quoted = candidates::quoted(
-            &[
-                expect.head.unwrap_or_default(),
-                expect.tail.unwrap_or_default(),
-            ]
-            .join(" "),
-            40,
-        );
+        let given: Vec<&str> = [expect.head, expect.tail].into_iter().flatten().collect();
+        let quoted = candidates::quoted(&given.join(" "), 40);
         return reject(
             diagnostics,
             "LINE_GUARD_WEAK",
@@ -1638,6 +1673,33 @@ fn line_guard(
         );
     }
     true
+}
+
+/// Advice and candidates for guarded lines that are not where the target says:
+/// a new place where the target fits, whole lines elsewhere, or near misses.
+fn relocated(
+    context: &FileContext,
+    found: &[usize],
+    usable: &[usize],
+    count: usize,
+    budget: &mut Budget,
+    text: Option<&str>,
+    retarget: impl Fn(usize) -> String,
+) -> (String, Vec<Candidate>) {
+    if !usable.is_empty() {
+        (
+            candidates::line_places(usable, AMBIGUOUS_LINES, retarget),
+            line_candidates(context, usable, count),
+        )
+    } else if !found.is_empty() {
+        // Whole lines, but the target cannot have moved there whole.
+        (
+            candidates::line_advice(&[]),
+            line_candidates(context, found, count),
+        )
+    } else {
+        fuzzy_advice(context, text.unwrap_or_default(), budget)
+    }
 }
 
 /// Pushes `EXPECTED_TEXT_MISMATCH` quoting the `count` lines from `start`.
@@ -1704,7 +1766,7 @@ fn line_candidates(context: &FileContext, starts: &[usize], count: usize) -> Vec
 }
 
 /// Lines from `from` on where `pieces` occur as consecutive whole line bodies, at
-/// most [`AMBIGUOUS_LINES`] of them.
+/// most one more than [`AMBIGUOUS_LINES`], so a caller can tell the cap was reached.
 fn find_lines(text: &str, lines: &LineIndex, pieces: &[&str], from: usize) -> Vec<usize> {
     let count = lines.count();
     if pieces.is_empty() || pieces.len() > count {
@@ -1717,7 +1779,7 @@ fn find_lines(text: &str, lines: &LineIndex, pieces: &[&str], from: usize) -> Ve
                 .enumerate()
                 .all(|(offset, piece)| text[lines.body(start + offset)] == **piece)
         })
-        .take(AMBIGUOUS_LINES)
+        .take(AMBIGUOUS_LINES + 1)
         .collect()
 }
 
