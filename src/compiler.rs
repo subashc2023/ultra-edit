@@ -131,12 +131,13 @@ pub fn compile(
     let mut change_ids = BTreeSet::new();
     for file in &request.files {
         let path = snapshots.get(&file.base).map(|base| base.path.as_str());
-        if file.base.trim().is_empty() {
+        // A path file that could not be read keeps an empty base and already has its diagnostic.
+        if file.base.trim().is_empty() && file.path.is_none() {
             diagnostics.push(at(
                 path,
                 None,
                 "EMPTY_SNAPSHOT_ID",
-                "Snapshot ID must not be empty",
+                "Each file needs a path or a snapshot base",
             ));
         }
         if file.changes.is_empty() {

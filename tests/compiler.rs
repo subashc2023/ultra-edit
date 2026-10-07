@@ -34,6 +34,7 @@ fn request(base: &Snapshot, changes: Vec<Change>) -> EditRequest {
     EditRequest {
         request_id: "test".into(),
         files: vec![FileRequest {
+            path: None,
             base: base.id.clone(),
             changes,
         }],
@@ -567,10 +568,12 @@ fn all_safely_discoverable_request_errors_are_collected_across_files() {
         request_id: "".into(),
         files: vec![
             FileRequest {
+                path: None,
                 base: "missing".into(),
                 changes: vec![exact("duplicate", "", "x")],
             },
             FileRequest {
+                path: None,
                 base: base.id.clone(),
                 changes: vec![
                     exact("duplicate", "a", "x"),
@@ -589,6 +592,7 @@ fn all_safely_discoverable_request_errors_are_collected_across_files() {
                 ],
             },
             FileRequest {
+                path: None,
                 base: "".into(),
                 changes: vec![],
             },
@@ -634,10 +638,12 @@ fn distinct_snapshots_of_one_path_cannot_produce_competing_plans() {
         request_id: "duplicate-path".into(),
         files: vec![
             FileRequest {
+                path: None,
                 base: first.id.clone(),
                 changes: vec![exact("a", "a", "x")],
             },
             FileRequest {
+                path: None,
                 base: second.id.clone(),
                 changes: vec![exact("b", "b", "y")],
             },
@@ -741,12 +747,14 @@ fn request_and_replacement_limits_apply_across_file_entries() {
         request_id: "limited".into(),
         files: vec![
             FileRequest {
+                path: None,
                 base: first.id.clone(),
                 changes: (0..MAX_CHANGES / 2 + 1)
                     .map(|index| exact(&format!("a{index}"), "a", ""))
                     .collect(),
             },
             FileRequest {
+                path: None,
                 base: second.id.clone(),
                 changes: (0..MAX_CHANGES / 2)
                     .map(|index| exact(&format!("b{index}"), "a", ""))
@@ -1693,10 +1701,12 @@ fn byte_warnings_precede_edge_warnings_so_compact_summaries_keep_them() {
         request_id: "order".into(),
         files: vec![
             FileRequest {
+                path: None,
                 base: first.id.clone(),
                 changes,
             },
             FileRequest {
+                path: None,
                 base: second.id.clone(),
                 changes: vec![exact("eol", "a\r\n", "a\n")],
             },

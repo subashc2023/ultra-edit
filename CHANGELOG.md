@@ -7,6 +7,17 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ### Added
 
+- Path mode: a file entry can name its file by `path` instead of a snapshot
+  `base`, as native Edit does. The server reads the file's current bytes under
+  the workspace lock as the base, so an ordinary edit needs no
+  `ultra_edit_snapshot` call. Batches stay all-or-nothing across files, with
+  receipts, replay, and undo. Spans other than `r0` still need a snapshot base
+  (`SPAN_NEEDS_BASE`). Paths are normalized lexically before request IDs are
+  derived, a rejected derived-ID path request is not bound so an identical
+  resend is evaluated again, and replaying a committed path request whose files
+  changed since warns `REPLAYED_FILE_CHANGED`. Stored plans and drafts keep the
+  0.3.0 shape, a base per file.
+
 - Span ranges `rA..rB` work as a `span` or `scope` when the base disclosed
   every line from A to B, such as the `r146..r150` a range read lists in
   `spans`. A range runs from the start of line A's body to the end of line B's,
@@ -21,6 +32,10 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ### Changed
 
+- The plugin's session routing card is rewritten path-first and cut from 4,191
+  to under 2,048 bytes, and the server instructions from 1,431 to 613
+  characters. The edit skill now covers recovery and span targets; ordinary
+  edits need only the card.
 - `ultra_edit_snapshot` and `ultra_edit` carry `_meta: {"anthropic/alwaysLoad":
   true}`, so Claude Code loads their schemas up front instead of behind a
   `ToolSearch` round trip, which the benchmark measured at about 0.9 extra API

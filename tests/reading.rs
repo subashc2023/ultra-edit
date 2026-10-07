@@ -15,6 +15,7 @@ fn request(id: &str, base: &str, span: &str, text: &str) -> EditRequest {
     EditRequest {
         request_id: id.into(),
         files: vec![FileRequest {
+            path: None,
             base: base.into(),
             changes: vec![Change {
                 id: "replace".into(),
@@ -33,6 +34,7 @@ fn span_edits(id: &str, base: &str, changes: &[(&str, &str)]) -> EditRequest {
     EditRequest {
         request_id: id.into(),
         files: vec![FileRequest {
+            path: None,
             base: base.into(),
             changes: changes
                 .iter()

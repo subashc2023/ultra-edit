@@ -77,7 +77,10 @@ impl Client {
         assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
         assert!(initialized["result"]["capabilities"]["tools"].is_object());
         let instructions = initialized["result"]["instructions"].as_str().unwrap();
-        assert!(instructions.starts_with("ALWAYS use these direct MCP tools"));
+        assert!(
+            instructions
+                .starts_with("Edit existing UTF-8 files in the launch workspace with ultra_edit")
+        );
         assert!(
             instructions.len() <= 2_000,
             "Claude truncates server instructions"
@@ -2103,5 +2106,31 @@ fn rejections_repairs_and_undos_replay_under_derived_ids() {
         replay_of(&undone)
     );
     assert_eq!(fs::read_to_string(&path).unwrap(), "y y\n");
+    client.close();
+}
+
+#[test]
+fn the_routing_cards_example_commits_through_the_server_by_path() {
+    let card = include_str!("../plugin/claude-code/instructions.md");
+    assert!(card.len() <= 2_048, "the card is {} bytes", card.len());
+    let start = card.find("{\"files\"").unwrap();
+    let end = card[start..].find("]}]}").unwrap() + start + 4;
+    let root = TempDir::new().unwrap();
+    fs::create_dir(root.path().join("src")).unwrap();
+    let file = root.path().join("src").join("a.py");
+    fs::write(&file, "retries = 2\ncfg = load(cfg)\n").unwrap();
+    let mut example: Value = serde_json::from_str(&card[start..end]).unwrap();
+    example["files"][0]["path"] = json!(file.to_str().unwrap());
+    let mut client = Client::start(root.path());
+    let done = client.call("ultra_edit", example.clone(), false);
+    assert_eq!(done["commit"], "committed", "{done}");
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "retries = 3\nconfig = load(config)\n"
+    );
+    // Resending the identical call replays the recorded result and writes nothing.
+    let again = client.call("ultra_edit", example, false);
+    assert_eq!(again["commit"], "committed");
+    assert_eq!(again["replayed"], true, "{again}");
     client.close();
 }

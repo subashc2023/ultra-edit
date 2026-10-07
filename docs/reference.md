@@ -177,6 +177,41 @@ An edit request uses snapshot IDs returned by `read`:
 }
 ```
 
+A file can instead be named by `path`, as native Edit names it. The server
+resolves the path inside the workspace and reads the file's current bytes under
+the workspace lock, stores them as a snapshot, and uses that snapshot as the
+file's base, so plans and drafts record bases exactly as snapshot requests do:
+
+```json
+{
+  "files": [{
+    "path": "src/retry.ts",
+    "changes": [
+      {
+        "target": { "kind": "exact", "old": "const retries = 2;" },
+        "text": "const retries = 3;"
+      }
+    ]
+  }]
+}
+```
+
+Each file needs `path` or `base` (`EMPTY_SNAPSHOT_ID` otherwise). With both, the
+base is used and must be that file's snapshot (`SNAPSHOT_PATH_MISMATCH`). A path
+that cannot be read gets its own diagnostic, such as `TARGET_MISSING` or
+`PATH_OUTSIDE_WORKSPACE`, and nothing is written. A path file was never read
+through a snapshot, so no span of it was disclosed: a `span` or `scope` other
+than `r0`, the whole file, is `SPAN_NEEDS_BASE`. Path mode detects no change
+made between your read and the call; the exact `old` text is the guard, as with
+native Edit. Paths are normalized lexically before IDs are derived: a leading
+workspace root is stripped and `.` components and repeated separators are
+dropped, while `..` is kept, so `a.txt`, `./a.txt`, and `<root>/a.txt` derive
+one request ID. A rejected request with a derived ID and a path file is not
+bound, so resending it after fixing the cause evaluates it again; with an
+explicit `request_id`, it replays like any other request. Replaying a committed
+path request whose files changed since adds a `REPLAYED_FILE_CHANGED` warning:
+nothing was written now, and applying the edit again needs a new `request_id`.
+
 `request_id` and each change `id` are optional; these changes receive IDs `1.1`
 and `1.2`. A missing or empty change ID becomes its 1-based `"{file}.{change}"`
 position in the request. Explicit change IDs are kept and must be unique across
