@@ -246,7 +246,11 @@ contract, so recheck them on major Claude Code upgrades.
   server. A server-level `"alwaysLoad": true` key in the MCP server
   configuration, including a plugin's `.mcp.json`, loads every tool of that
   server. Tools with neither are deferred behind `ToolSearch`, though the model
-  sometimes calls a deferred tool directly.
+  sometimes calls a deferred tool directly. Ultra Edit marks `ultra_edit_snapshot`
+  and `ultra_edit`, the two tools every edit uses, so an editing session skips
+  the round trip (about 0.9 extra API calls per run in the benchmark); the other
+  tools, used only for recovery, stay deferred. The two schemas add about 5.5 KB
+  to every request, which the prompt cache serves after the first.
 - Results. When a tool result has only text `content`, the model sees that text.
   When it has both text `content` and `structuredContent`, the model sees only
   the serialized `structuredContent` JSON and never the text. A results mode

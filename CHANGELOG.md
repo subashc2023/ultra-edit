@@ -21,6 +21,10 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ### Changed
 
+- `ultra_edit_snapshot` and `ultra_edit` carry `_meta: {"anthropic/alwaysLoad":
+  true}`, so Claude Code loads their schemas up front instead of behind a
+  `ToolSearch` round trip, which the benchmark measured at about 0.9 extra API
+  calls per editing session. Recovery tools stay deferred.
 - Diagnostic messages, which are free text, now say more. `UNKNOWN_SPAN` lists
   what the base discloses (`lines 146-150, 1875-1879; selection = lines
   1875-1879`) and answers IDs of other shapes, such as `146-150`, with the shapes

@@ -240,6 +240,13 @@ fn startup_requires_explicit_root_and_keeps_protocol_stdout_clean() {
             );
         }
         assert!(!tool["description"].as_str().unwrap().is_empty());
+        // Only the tools of every edit skip Claude Code's ToolSearch round trip.
+        let always = matches!(name, "ultra_edit_snapshot" | "ultra_edit");
+        assert_eq!(
+            tool["_meta"]["anthropic/alwaysLoad"],
+            if always { json!(true) } else { json!(null) },
+            "{name}"
+        );
     }
     assert_eq!(client.rpc("ping", json!({}))["result"], json!({}));
     assert!(client.rpc("unsupported/method", json!({}))["error"].is_object());
