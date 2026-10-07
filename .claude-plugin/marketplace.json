@@ -10,8 +10,8 @@
       "name": "ultra-edit",
       "source": {
         "source": "archive",
-        "url": "https://github.com/subashc2023/ultra-edit/releases/download/v0.2.0/ultra-edit-plugin-v0.2.0-all.zip",
-        "sha256": "fead4629e79a3442cae39968efbeac023389087ea03cc6c0f2255426b9f8e7c5"
+        "url": "https://github.com/subashc2023/ultra-edit/releases/download/v0.3.0/ultra-edit-plugin-v0.3.0-all.zip",
+        "sha256": "a6da190e5126f49e32b030362ff75cc0f30cede04b1d6ed32fe9d6de2f160171"
       },
       "description": "Edit existing UTF-8 files through immutable snapshots, checked batches, and durable receipts.",
       "author": {
