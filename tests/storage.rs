@@ -33,6 +33,7 @@ fn plan(storage: &Storage, paths: &[&str]) -> PreparedPlan {
                 target: Target::Exact {
                     old: "before".into(),
                     scope: None,
+                    lines: None,
                 },
                 text: "after".into(),
             }],
@@ -887,4 +888,83 @@ fn rereading_an_unchanged_file_stores_only_a_small_snapshot() {
         blob_names(root),
         BTreeSet::from([digest(text.as_bytes()), digest(changed.as_bytes())])
     );
+}
+
+#[test]
+fn derived_line_replacements_are_recomputed_before_commit() {
+    let directory = tempfile::tempdir().expect("directory");
+    let target = directory.path().join("file.txt");
+    fs::write(&target, "a\r\nb\r\nc\r\n").expect("fixture");
+    let storage = Storage::open(directory.path()).expect("storage");
+    let _lock = storage.lock().expect("lock");
+    let snapshot = compiler::snapshot(
+        storage
+            .resolve(Path::new("file.txt"))
+            .expect("resolve")
+            .to_string_lossy()
+            .into_owned(),
+        storage.read(Path::new("file.txt")).expect("read"),
+    );
+    let change = |id: &str, target: Target, text: &str| Change {
+        id: id.into(),
+        target,
+        text: text.into(),
+    };
+    let request = EditRequest {
+        request_id: "derived".into(),
+        files: vec![FileRequest {
+            path: None,
+            base: snapshot.id.clone(),
+            changes: vec![
+                // The terminator is inherited, and `old`/`new` are adapted to CRLF.
+                change(
+                    "lines",
+                    Target::Lines {
+                        lines: [2, 2],
+                        expect: None,
+                    },
+                    "B",
+                ),
+                change(
+                    "exact",
+                    Target::Exact {
+                        old: "c\n".into(),
+                        scope: None,
+                        lines: None,
+                    },
+                    "C\n",
+                ),
+            ],
+        }],
+    };
+    let snapshots = BTreeMap::from([(snapshot.id.clone(), snapshot)]);
+    let plan = compiler::compile(&request, &snapshots).expect("compile");
+    assert_eq!(plan.files[0].replacements[0].text, "B\r\n");
+    assert_eq!(plan.files[0].replacements[1].text, "C\r\n");
+    // One byte altered in a derived replacement, with the output kept consistent.
+    let mut altered = plan.clone();
+    altered.files[0].replacements[0].text = "B\n".into();
+    altered.files[0].output = "a\r\nB\nC\r\n".into();
+    assert_eq!(
+        storage.commit(&altered).expect_err("altered").code,
+        "INVALID_PLAN"
+    );
+    let mut moved = plan.clone();
+    moved.files[0].replacements[0].end -= 1;
+    moved.files[0].output = "a\r\nB\r\n\nC\r\n".into();
+    assert_eq!(
+        storage.commit(&moved).expect_err("moved").code,
+        "INVALID_PLAN"
+    );
+    let mut adapted = plan.clone();
+    adapted.files[0].replacements[1].text = "C\r\r\n".into();
+    adapted.files[0].output = "a\r\nB\r\nC\r\r\n".into();
+    assert_eq!(
+        storage.commit(&adapted).expect_err("adapted").code,
+        "INVALID_PLAN"
+    );
+    assert_eq!(fs::read(&target).expect("read"), b"a\r\nb\r\nc\r\n");
+    let receipt = storage.commit(&plan).expect("commit");
+    assert_eq!(receipt.commit, CommitStatus::Committed);
+    assert_eq!(fs::read(&target).expect("read"), b"a\r\nB\r\nC\r\n");
 }

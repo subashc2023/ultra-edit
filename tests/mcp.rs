@@ -737,7 +737,7 @@ fn span_ranges_from_the_spans_summary_edit_two_regions_in_one_call_over_mcp() {
     assert_eq!(diagnostic["code"], "UNKNOWN_SPAN");
     assert_eq!(
         diagnostic["message"],
-        "\"146-150\" is not a span ID; spans look like r146, r146..r150, selection, or m1. This base discloses lines 146-150, 1875-1879; selection = lines 1875-1879"
+        "\"146-150\" is not a span ID; use r146, r146..r150, selection, m1, or \"lines\":[146,150]. This base discloses lines 146-150, 1875-1879; selection = lines 1875-1879"
     );
     let committed = client.call(
         "ultra_edit",
@@ -801,8 +801,12 @@ fn declared_schema_minimums_agree_with_the_runtime_line_and_count_rules() {
     let range = variant(&snapshot, "Selection", "range");
     assert_eq!(range["properties"]["first"]["minimum"], 1);
     assert_eq!(range["properties"]["last"]["minimum"], 1);
-    let all = variant(&schema("ultra_edit"), "Target", "all");
-    assert_eq!(all["properties"]["expected"]["minimum"], 1);
+    // Shorthand fields carry the runtime minimums; the verbose target stays opaque.
+    let change = schema("ultra_edit")["$defs"]["Change"].clone();
+    assert_eq!(change["properties"]["count"]["minimum"], 1);
+    assert_eq!(change["properties"]["lines"]["items"]["minimum"], 1);
+    assert_eq!(change["properties"]["after"]["minimum"], 0);
+    assert_eq!(change["properties"]["target"]["type"], "object");
 
     let rejected = client.call(
         "ultra_edit_snapshot",
@@ -824,7 +828,9 @@ fn declared_schema_minimums_agree_with_the_runtime_line_and_count_rules() {
 #[test]
 fn diff_and_byte_warnings_are_available_before_and_after_commit() {
     let root = TempDir::new().unwrap();
-    let before: String = (1..=44).map(|line| format!("line {line}\r\n")).collect();
+    // A final LF line makes the file mixed, so LF-only text stays literal.
+    let mut before: String = (1..=44).map(|line| format!("line {line}\r\n")).collect();
+    before.push_str("tail\n");
     fs::write(root.path().join("file.txt"), &before).unwrap();
     let mut client = Client::start(root.path());
     let snapshot = client.full("file.txt");
@@ -1957,8 +1963,9 @@ fn request_and_change_ids_are_optional_except_for_retry() {
         let schema = schema(name);
         assert_eq!(required(&schema), ["files"], "{name}");
         assert_eq!(schema["properties"]["request_id"]["type"], "string");
+        // Every change field is optional in the schema; parsing enforces the forms.
         let change = &schema["$defs"]["Change"];
-        assert_eq!(required(change), ["target", "text"], "{name}");
+        assert!(change.get("required").is_none(), "{name}: {change}");
         assert_eq!(change["properties"]["id"]["type"], "string");
     }
     assert_eq!(
@@ -2132,5 +2139,79 @@ fn the_routing_cards_example_commits_through_the_server_by_path() {
     let again = client.call("ultra_edit", example, false);
     assert_eq!(again["commit"], "committed");
     assert_eq!(again["replayed"], true, "{again}");
+    client.close();
+}
+
+#[test]
+fn shorthand_changes_commit_and_their_verbose_spelling_replays() {
+    let root = TempDir::new().unwrap();
+    fs::write(
+        root.path().join("app.py"),
+        "timeout_ms = 1500\nretries = 3\n",
+    )
+    .unwrap();
+    let mut client = Client::start(root.path());
+    let base = client.full("app.py");
+    let shorthand = json!({"files":[{"base":base["snapshot"],"changes":[
+        {"old":"timeout_ms = 1500","new":"timeout_ms = 2500"},
+        {"lines":[2,2],"new":"retries = 5"}
+    ]}]});
+    let committed = client.call("ultra_edit", shorthand, false);
+    assert_eq!(committed["commit"], "committed");
+    assert_eq!(
+        fs::read_to_string(root.path().join("app.py")).unwrap(),
+        "timeout_ms = 2500\nretries = 5\n"
+    );
+    let verbose = json!({"files":[{"base":base["snapshot"],"changes":[
+        {"target":{"kind":"exact","old":"timeout_ms = 1500","scope":null},"text":"timeout_ms = 2500"},
+        {"id":"1.2","target":{"kind":"lines","lines":[2,2]},"text":"retries = 5"}
+    ]}]});
+    assert_eq!(
+        client.call("ultra_edit", verbose, false),
+        replay_of(&committed)
+    );
+    // A malformed change is refused while parsing, with the accepted form.
+    let refused = client.rpc(
+        "tools/call",
+        json!({"name":"ultra_edit","arguments":{"files":[{"base":base["snapshot"],"changes":[
+            {"lines":"r1..r2","new":"x"}
+        ]}]}}),
+    );
+    let text = refused.to_string();
+    assert!(
+        text.contains(
+            "lines takes numbers like [146,150]; span IDs such as r146..r150 go in `span`"
+        ),
+        "{refused}"
+    );
+    client.close();
+}
+
+#[test]
+fn lines_delete_and_lf_text_keep_a_crlf_file_crlf_on_disk() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("Rotate-Logs.ps1");
+    fs::write(
+        &path,
+        "param()\r\n# Deprecated: remove in 3.0\r\nWrite-Host 1\r\nif ($x) {\r\n    Write-Host 2\r\n}\r\n",
+    )
+    .unwrap();
+    let mut client = Client::start(root.path());
+    let base = client.full("Rotate-Logs.ps1");
+    let committed = client.call(
+        "ultra_edit",
+        json!({"files":[{"base":base["snapshot"],"changes":[
+            {"lines":[2,2],"new":""},
+            // Copied from a view that hides \r: LF is matched and written as CRLF.
+            {"old":"if ($x) {\n    Write-Host 2\n}","new":"if ($y) {\n    Write-Host 3\n}"}
+        ]}]}),
+        false,
+    );
+    assert_eq!(committed["commit"], "committed");
+    assert_eq!(committed["warnings"][0]["code"], "EOL_ADAPTED");
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"param()\r\nWrite-Host 1\r\nif ($y) {\r\n    Write-Host 3\r\n}\r\n"
+    );
     client.close();
 }

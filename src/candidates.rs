@@ -209,8 +209,9 @@ fn differs_only_in_line_endings(candidate: &Candidate, needle: &str) -> bool {
         })
 }
 
-/// Describes an unmet span expectation, quoting the text the span selected.
-pub(crate) fn mismatch(actual: &str, candidates: &[Candidate]) -> String {
+/// Describes an unmet expectation, quoting the text that `subject` (such as "Span"
+/// or "Lines 4-5") holds.
+pub(crate) fn mismatch(subject: &str, actual: &str, candidates: &[Candidate]) -> String {
     let rest = if candidates.is_empty() {
         "inspect the original snapshot and choose the intended span".to_owned()
     } else {
@@ -218,14 +219,42 @@ pub(crate) fn mismatch(actual: &str, candidates: &[Candidate]) -> String {
     };
     // The quote yields room to the advice; the three extra characters are its
     // quotes and a clipping ellipsis.
-    let fixed = "Span holds , not expect; ".len() + rest.chars().count() + 3;
+    let fixed = subject.len() + " holds , not expect; ".len() + rest.chars().count() + 3;
     let room = MESSAGE_CHARS.saturating_sub(fixed);
     let actual = quoted(actual, room.min(QUOTED_CHARS));
-    format!("Span holds {actual}, not expect; {rest}")
+    format!("{subject} holds {actual}, not expect; {rest}")
+}
+
+/// Describes a line target's unmet `expect`, quoting the lines `subject` names.
+/// Where `expect` occurs elsewhere the line numbers are stale, so the advice is to
+/// use that place's numbers; otherwise it is to correct `expect`.
+pub(crate) fn line_mismatch(subject: &str, actual: &str, candidates: &[Candidate]) -> String {
+    let rest = match candidates.first() {
+        None => "read the lines again and correct the line numbers or expect".to_owned(),
+        Some(first) if first.kind == CandidateKind::Exact && candidates.len() == 1 => format!(
+            "it is at {}, so use those line numbers {REPAIR}.",
+            place(first)
+        ),
+        Some(first) if first.kind == CandidateKind::Exact => format!(
+            "it occurs {} times, first at line {}; use the intended place's line numbers {REPAIR}.",
+            candidates.len(),
+            first.line
+        ),
+        Some(_) => advice_into(candidates, "expect"),
+    };
+    let fixed = subject.len() + " holds , not expect; ".len() + rest.chars().count() + 3;
+    let room = MESSAGE_CHARS.saturating_sub(fixed);
+    let actual = quoted(actual, room.min(QUOTED_CHARS));
+    format!("{subject} holds {actual}, not expect; {rest}")
 }
 
 /// Explains candidates briefly; the candidates themselves carry every line.
 fn advice(candidates: &[Candidate]) -> String {
+    advice_into(candidates, "`old`")
+}
+
+/// [`advice`] for text to be copied into `field`.
+fn advice_into(candidates: &[Candidate], field: &str) -> String {
     let Some(first) = candidates.first() else {
         return String::new();
     };
@@ -251,14 +280,14 @@ fn advice(candidates: &[Candidate]) -> String {
     };
     let complete = candidates.iter().all(|candidate| candidate.text.is_some());
     let action = match (first.kind, many, complete) {
-        (_, false, false) => "Read it and copy its exact text into `old`",
-        (_, true, false) => "Read one and copy its exact text into `old`",
-        (CandidateKind::Similar, false, true) => "Verify it, then copy its exact text into `old`",
-        (CandidateKind::Similar, true, true) => "Verify one, then copy its exact text into `old`",
-        (_, false, true) => "Copy its exact text into `old`",
-        (_, true, true) => "Copy the intended one's exact text into `old`",
+        (_, false, false) => "Read it and copy its exact text into",
+        (_, true, false) => "Read one and copy its exact text into",
+        (CandidateKind::Similar, false, true) => "Verify it, then copy its exact text into",
+        (CandidateKind::Similar, true, true) => "Verify one, then copy its exact text into",
+        (_, false, true) => "Copy its exact text into",
+        (_, true, true) => "Copy the intended one's exact text into",
     };
-    format!("{finding}. {action} {REPAIR}.")
+    format!("{finding}. {action} {field} {REPAIR}.")
 }
 
 fn place(candidate: &Candidate) -> String {
@@ -1055,6 +1084,7 @@ mod tests {
     fn every_message_fits_what_clients_display() {
         let line = 16_777_216;
         let actual = "\u{0}".repeat(100);
+        let lines = format!("Lines {line}-{line}");
         for kind in [
             CandidateKind::Exact,
             CandidateKind::Whitespace,
@@ -1065,16 +1095,20 @@ mod tests {
                     let candidates = vec![candidate(kind, line - 1, line, text); count];
                     for message in [
                         not_found(usize::MAX, "a\nb", &candidates),
-                        mismatch(&actual, &candidates),
+                        mismatch("Span", &actual, &candidates),
+                        mismatch(&lines, &actual, &candidates),
+                        line_mismatch(&lines, &actual, &candidates),
                     ] {
                         assert!(message.chars().count() <= MESSAGE_CHARS, "{message}");
                     }
                 }
             }
         }
-        assert!(mismatch(&actual, &[]).chars().count() <= MESSAGE_CHARS);
+        assert!(mismatch(&lines, &actual, &[]).chars().count() <= MESSAGE_CHARS);
+        assert!(line_mismatch(&lines, &actual, &[]).chars().count() <= MESSAGE_CHARS);
         // Ordinary advice leaves the quote its full width.
         let message = mismatch(
+            "Span",
             &"x".repeat(100),
             &[candidate(CandidateKind::Exact, 3, 3, true)],
         );

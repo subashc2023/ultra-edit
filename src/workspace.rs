@@ -767,16 +767,31 @@ impl Workspace {
             }
             snapshots.insert(file.base.clone(), snapshot);
         }
-        let compiled = compiler::compile(&request, &snapshots);
+        // An undo restores recorded bytes, which line-ending adaptation must not touch.
+        let eol = if undo {
+            compiler::Eol::Literal
+        } else {
+            compiler::Eol::Adapt
+        };
+        let compiled = compiler::compile_with(&request, &snapshots, eol);
         let plan = match compiled {
             Ok(plan) => Some(plan),
             Err(errors) => {
-                // The workspace already reported every base absent from the map.
-                diagnostics.extend(
-                    errors
-                        .into_iter()
-                        .filter(|error| error.code != "UNKNOWN_SNAPSHOT"),
-                );
+                // The workspace already reported every base absent from the map, and
+                // every span named in a path file, which discloses only r0.
+                let needs_base: BTreeSet<String> = diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.code == "SPAN_NEEDS_BASE")
+                    .filter_map(|diagnostic| diagnostic.change_id.clone())
+                    .collect();
+                diagnostics.extend(errors.into_iter().filter(|error| {
+                    error.code != "UNKNOWN_SNAPSHOT"
+                        && !(error.code == "UNKNOWN_SPAN"
+                            && error
+                                .change_id
+                                .as_ref()
+                                .is_some_and(|id| needs_base.contains(id)))
+                }));
                 None
             }
         };
@@ -860,7 +875,7 @@ impl Workspace {
                             let mut diagnostic = Diagnostic::new(
                                 "SPAN_NEEDS_BASE",
                                 format!(
-                                    "Span {span} needs a base from ultra_edit_snapshot. With `path`, target literal text with `old`, or use r0 for the whole file."
+                                    "Span {span} needs a base from ultra_edit_snapshot; with `path`, target text with `old`, or whole lines with `lines` and `expect`."
                                 ),
                             );
                             diagnostic.file = Some(path.clone());
@@ -868,7 +883,7 @@ impl Workspace {
                             diagnostics.push(diagnostic);
                         }
                     }
-                    let snapshot = compiler::snapshot(path, text);
+                    let snapshot = compiler::file_snapshot(path, text);
                     self.storage.put("snapshots", &snapshot.id, &snapshot)?;
                     file.base = snapshot.id.clone();
                     file.path = None;
@@ -1017,8 +1032,9 @@ pub fn normalize_paths(mut request: EditRequest, roots: &[&Path]) -> EditRequest
 fn needs_base(target: &Target) -> Option<&str> {
     let span = match target {
         Target::Exact { scope, .. } => scope.as_deref()?,
-        Target::All { scope, .. } => scope.as_str(),
+        Target::All { scope, .. } => scope.as_deref()?,
         Target::Span { span, .. } => span.as_str(),
+        Target::Lines { .. } | Target::Insert { .. } => return None,
     };
     (span != "r0").then_some(span)
 }

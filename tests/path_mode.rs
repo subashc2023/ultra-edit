@@ -24,6 +24,7 @@ fn exact(old: &str, new: &str) -> Change {
         target: Target::Exact {
             old: old.into(),
             scope: None,
+            lines: None,
         },
         text: new.into(),
     }
@@ -261,8 +262,9 @@ fn spans_in_a_path_file_need_a_base_except_r0() {
         id: String::new(),
         target: Target::All {
             old: "a".into(),
-            scope: "r0".into(),
+            scope: Some("r0".into()),
             expected: 2,
+            lines: None,
         },
         text: "b".into(),
     };
@@ -272,6 +274,42 @@ fn spans_in_a_path_file_need_a_base_except_r0() {
             .unwrap(),
     );
     assert_eq!(read(&dir, "a.txt"), "b b\n");
+}
+
+#[test]
+fn line_targets_in_a_path_file_need_a_strong_expect() {
+    let (dir, workspace) = setup(&[("a.rs", "fn main() {\n    run();\n    serve_forever();\n}\n")]);
+    let lines = |range: [usize; 2], expect: Option<&str>| Change {
+        id: String::new(),
+        target: Target::Lines {
+            lines: range,
+            expect: expect.map(str::to_owned),
+        },
+        text: "    start();".into(),
+    };
+    // A path file was read through another view, so its line numbers may be stale.
+    for (change, code) in [
+        (lines([2, 2], None), "LINE_GUARD_REQUIRED"),
+        (lines([2, 2], Some("    run();")), "LINE_GUARD_WEAK"),
+        (
+            lines([2, 3], Some("    serve_forever();")),
+            "EXPECTED_TEXT_MISMATCH",
+        ),
+    ] {
+        let outcome = rejected(
+            workspace
+                .edit(request(vec![at("a.rs", vec![change])]))
+                .unwrap(),
+        );
+        assert_eq!(codes(&outcome), [code]);
+    }
+    let change = lines([2, 3], Some("    run();\n    serve_forever();"));
+    receipt(
+        workspace
+            .edit(request(vec![at("a.rs", vec![change])]))
+            .unwrap(),
+    );
+    assert_eq!(read(&dir, "a.rs"), "fn main() {\n    start();\n}\n");
 }
 
 #[test]

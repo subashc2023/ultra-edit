@@ -1,5 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ops::Range;
+use std::borrow::Cow;
+use std::cell::OnceCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::ops::{Range, RangeInclusive};
 
 use crate::candidates;
 use crate::model::{
@@ -22,6 +24,11 @@ pub const MAX_CANDIDATE_SEARCH_BYTES: usize = 2 * MAX_TEXT_BYTES;
 pub const MAX_CANDIDATE_SEARCHES: usize = 6;
 /// Match starts an ambiguous exact target locates by line.
 const AMBIGUOUS_LINES: usize = 5;
+/// Visible characters a line target's `expect` needs before it guards lines the
+/// base did not disclose: fewer, like a lone `}`, could match after a line shift.
+pub const MIN_GUARD_CHARS: usize = 8;
+/// Change IDs an `EOL_ADAPTED` warning names before counting the rest.
+const ADAPTED_IDS: usize = 3;
 
 struct Budget {
     spans_left: usize,
@@ -54,6 +61,24 @@ impl Budget {
         };
         self.searches_left = left;
         search(&mut self.search_bytes_left)
+    }
+}
+
+/// A snapshot the engine takes of a `path` file, disclosing only `r0`: the caller
+/// saw the file through another view, so its line numbers may be stale, and line
+/// targets need `expect`.
+pub fn file_snapshot(path: String, text: String) -> Snapshot {
+    Snapshot {
+        id: new_id("s"),
+        path,
+        digest: digest(text.as_bytes()),
+        spans: vec![Span {
+            id: "r0".into(),
+            start: 0,
+            end: text.len(),
+            line: 0,
+        }],
+        text,
     }
 }
 
@@ -98,9 +123,200 @@ pub(crate) fn line_ranges(text: &str) -> impl Iterator<Item = Range<usize>> + '_
         .chain(empty)
 }
 
+/// Whole lines of a text, numbered like [`line_ranges`]. Each line runs from its
+/// body through its terminator, if any; only the last line can lack one.
+pub(crate) struct LineIndex {
+    bodies: Vec<Range<usize>>,
+    len: usize,
+}
+
+impl LineIndex {
+    pub(crate) fn new(text: &str) -> Self {
+        Self {
+            bodies: line_ranges(text).collect(),
+            len: text.len(),
+        }
+    }
+
+    /// Lines in the text; an empty text has one empty line.
+    fn count(&self) -> usize {
+        self.bodies.len()
+    }
+
+    fn body(&self, line: usize) -> Range<usize> {
+        self.bodies[line - 1].clone()
+    }
+
+    /// Where the line's terminator ends: the next body's start, or the text's end.
+    fn end(&self, line: usize) -> usize {
+        self.bodies.get(line).map_or(self.len, |next| next.start)
+    }
+
+    fn terminator<'t>(&self, text: &'t str, line: usize) -> &'t str {
+        &text[self.bodies[line - 1].end..self.end(line)]
+    }
+
+    /// Native Read shows an empty line after a final line ending; it holds no bytes,
+    /// so naming it stands for the last line.
+    fn clamp(&self, text: &str, line: usize) -> usize {
+        let count = self.count();
+        if line == count + 1 && !self.terminator(text, count).is_empty() {
+            count
+        } else {
+            line
+        }
+    }
+
+    /// One-based `[first, last]` with the phantom line clamped, when every line exists.
+    fn bounds(&self, text: &str, first: usize, last: usize) -> Option<(usize, usize)> {
+        let last = self.clamp(text, last);
+        (1 <= first && first <= last && last <= self.count()).then_some((first, last))
+    }
+}
+
+/// Whether every line ending in `text` is CRLF: at least one, no bare LF, no lone CR.
+pub(crate) fn crlf_only(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut crlf = false;
+    for (index, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'\r' if bytes.get(index + 1) == Some(&b'\n') => crlf = true,
+            b'\r' => return false,
+            b'\n' if index == 0 || bytes[index - 1] != b'\r' => return false,
+            _ => {}
+        }
+    }
+    crlf
+}
+
+/// Text as written to a base whose line endings are all CRLF: a text holding LF but
+/// no CR has each LF become CRLF, since views such as native Read hide the CR.
+/// Any other text, or any text for another base, stays literal.
+pub(crate) fn adapt_eol(crlf: bool, text: &str) -> Cow<'_, str> {
+    if crlf && adapts(text) {
+        Cow::Owned(text.replace('\n', "\r\n"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+fn adapts(text: &str) -> bool {
+    text.contains('\n') && !text.contains('\r')
+}
+
+/// The range a line target replaces and the text it writes there, derived from the
+/// base bytes alone, or `None` when a line is out of range or the target is not a
+/// line target. `new` is the change's text, already adapted to the base's line
+/// endings. Stored plans are checked by recomputing this.
+///
+/// Replaced lines include their terminators. Text that does not end in a line feed
+/// inherits the last line's terminator, so CRLF and a missing final newline persist.
+/// Empty text deletes the lines; deleting through a last line that lacks a
+/// terminator also takes the line ending before the range, so the file still lacks
+/// one. An insertion after line n writes whole lines after its terminator; at an
+/// end without a final newline it writes the file's first terminator, then `new`.
+pub(crate) fn derived_replacement(
+    text: &str,
+    lines: &LineIndex,
+    target: &Target,
+    new: &str,
+) -> Option<(Range<usize>, String)> {
+    let with_terminator = |terminator: &str| {
+        if new.ends_with('\n') {
+            new.to_owned()
+        } else {
+            format!("{new}{terminator}")
+        }
+    };
+    match target {
+        Target::Lines {
+            lines: [first, last],
+            ..
+        } => {
+            let (first, last) = lines.bounds(text, *first, *last)?;
+            let mut start = lines.body(first).start;
+            let terminator = lines.terminator(text, last);
+            let written = if !new.is_empty() {
+                with_terminator(terminator)
+            } else {
+                if terminator.is_empty() && first > 1 {
+                    start = lines.body(first - 1).end;
+                }
+                String::new()
+            };
+            Some((start..lines.end(last), written))
+        }
+        Target::Insert { after, .. } => {
+            let after = lines.clamp(text, *after);
+            if after > lines.count() {
+                return None;
+            }
+            let top = lines.body(1).start;
+            if top == text.len() {
+                // Nothing to separate from: an empty file receives `new` as given.
+                return Some((top..top, new.to_owned()));
+            }
+            let first = match lines.terminator(text, 1) {
+                "" => "\n",
+                terminator => terminator,
+            };
+            if after == 0 {
+                return Some((top..top, with_terminator(first)));
+            }
+            let at = lines.end(after);
+            Some(match lines.terminator(text, after) {
+                "" => (at..at, format!("{first}{new}")),
+                terminator => (at..at, with_terminator(terminator)),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Whether `replacement` is what the compiler derives for `change` from `text`,
+/// with the change's text literal or adapted to an all-CRLF base. Line targets
+/// are recomputed in full; other targets write their text unchanged.
+pub(crate) fn derives(
+    text: &str,
+    lines: &OnceCell<LineIndex>,
+    crlf: &OnceCell<bool>,
+    change: &Change,
+    replacement: &Replacement,
+) -> bool {
+    let crlf = *crlf.get_or_init(|| crlf_only(text));
+    let adapted = adapt_eol(crlf, &change.text);
+    match change.target {
+        Target::Lines { .. } | Target::Insert { .. } => {
+            let lines = lines.get_or_init(|| LineIndex::new(text));
+            let found = Some((replacement.start..replacement.end, replacement.text.clone()));
+            derived_replacement(text, lines, &change.target, &change.text) == found
+                || derived_replacement(text, lines, &change.target, &adapted) == found
+        }
+        _ => replacement.text == change.text || replacement.text == adapted,
+    }
+}
+
+/// How a compile treats LF-only text for an all-CRLF base.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Eol {
+    /// Writes CRLF, and says so with an `EOL_ADAPTED` warning.
+    Adapt,
+    /// Writes every byte as given, as an undo restoring recorded bytes must.
+    Literal,
+}
+
+/// Plans `request` against its base snapshots, adapting line endings ([`Eol::Adapt`]).
 pub fn compile(
     request: &EditRequest,
     snapshots: &BTreeMap<String, Snapshot>,
+) -> Result<PreparedPlan, Vec<Diagnostic>> {
+    compile_with(request, snapshots, Eol::Adapt)
+}
+
+pub fn compile_with(
+    request: &EditRequest,
+    snapshots: &BTreeMap<String, Snapshot>,
+    eol: Eol,
 ) -> Result<PreparedPlan, Vec<Diagnostic>> {
     let change_count = request.files.iter().try_fold(0usize, |count, file| {
         count
@@ -200,10 +416,11 @@ pub fn compile(
         if !validate_snapshot(base, &file.base, &mut diagnostics) {
             continue;
         }
+        let mut context = FileContext::new(base, eol);
         let mut replacements = Vec::new();
         for change in &file.changes {
             resolve_change(
-                base,
+                &mut context,
                 change,
                 &mut replacements,
                 &mut diagnostics,
@@ -239,13 +456,17 @@ pub fn compile(
                         None,
                         "OVERLAPPING_CHANGES",
                         format!(
-                            "Changes {} ({}..{}) and {} ({}..{}) overlap; combine them into one replacement",
+                            "Changes {} ({}..{}) and {} ({}..{}) overlap; {}",
                             left.change_id,
                             left.start,
                             left.end,
                             right.change_id,
                             right.start,
-                            right.end
+                            right.end,
+                            combine_advice(
+                                context.extents.get(left.change_id.as_str()),
+                                context.extents.get(right.change_id.as_str()),
+                            )
                         ),
                     );
                     diagnostic.change_id = Some(left.change_id.clone());
@@ -255,13 +476,14 @@ pub fn compile(
             }
         }
         if !duplicate_path {
-            resolved.push((base, replacements, &file.changes));
+            resolved.push((context, replacements, &file.changes));
         }
     }
     if !diagnostics.is_empty() {
         return Err(diagnostics);
     }
-    for (base, replacements, _) in &resolved {
+    for (context, replacements, _) in &resolved {
+        let base = context.base;
         let output_size = replacements
             .iter()
             .try_fold(base.text.len(), |size, replacement| {
@@ -286,7 +508,8 @@ pub fn compile(
     let mut edge_warnings = Vec::new();
     let files = resolved
         .into_iter()
-        .map(|(base, replacements, changes)| {
+        .map(|(context, replacements, changes)| {
+            let base = context.base;
             let targets: HashMap<&str, &Change> = changes
                 .iter()
                 .map(|change| (change.id.as_str(), change))
@@ -303,12 +526,19 @@ pub fn compile(
             }
             output.push_str(&base.text[cursor..]);
             warn_output(&base.path, &output, &mut warnings);
+            warn_adapted(&base.path, &context.adapted, &mut warnings);
             // Neighbours are judged in the output, where an adjacent change's text
             // may stand beside this one instead of the original bytes.
+            let crlf = context.crlf();
             let mut edges = Vec::new();
             for (id, range) in placed {
                 if let Some(change) = targets.get(id) {
-                    for edge in whitespace_edges(&output, &range, change) {
+                    let old = match &change.target {
+                        Target::Exact { old, .. } | Target::All { old, .. } => old,
+                        _ => continue,
+                    };
+                    let (old, new) = (adapt_eol(crlf, old), adapt_eol(crlf, &change.text));
+                    for edge in whitespace_edges(&output, &range, &old, &new) {
                         let junction = match edge {
                             Edge::DropsTrailing | Edge::AddsTrailing => range.end,
                             Edge::DropsLeading | Edge::AddsLeading => range.start,
@@ -353,18 +583,13 @@ const EDGE_CONTEXT_CHARS: usize = 40;
 /// `WHITESPACE_EDGE` warnings per file; each one scans its output line.
 const MAX_EDGE_WARNINGS: usize = 8;
 
-/// Finds the edges where `old` and `new` agree on their outermost visible character
-/// but only one of them carries whitespace there, and the output beside the
-/// replacement at `placed` makes the difference visible. Dropped whitespace joins the
-/// neighbouring text, or joins two lines; added spaces or tabs land beside more
-/// whitespace, or at the end of a line. Span changes have no `old` to compare and are
-/// never checked.
-fn whitespace_edges(output: &str, placed: &Range<usize>, change: &Change) -> Vec<Edge> {
-    let old = match &change.target {
-        Target::Exact { old, .. } | Target::All { old, .. } => old.as_str(),
-        Target::Span { .. } => return Vec::new(),
-    };
-    let new = change.text.as_str();
+/// Finds the edges where an exact target's `old` and `new` agree on their outermost
+/// visible character but only one of them carries whitespace there, and the output
+/// beside the replacement at `placed` makes the difference visible. Dropped
+/// whitespace joins the neighbouring text, or joins two lines; added spaces or tabs
+/// land beside more whitespace, or at the end of a line. Span and line targets have
+/// no `old` to compare and are never checked.
+fn whitespace_edges(output: &str, placed: &Range<usize>, old: &str, new: &str) -> Vec<Edge> {
     let (old_core, new_core) = (
         old.trim_matches(EDGE_WHITESPACE),
         new.trim_matches(EDGE_WHITESPACE),
@@ -481,6 +706,38 @@ fn warn_edges(
     }
 }
 
+/// Says which changes had LF written as CRLF to match an all-CRLF file.
+fn warn_adapted(path: &str, adapted: &[&str], warnings: &mut Vec<Diagnostic>) {
+    let Some(first) = adapted.first() else {
+        return;
+    };
+    let mut ids: Vec<String> = adapted
+        .iter()
+        .take(ADAPTED_IDS)
+        .map(|id| id.chars().take(24).collect())
+        .collect();
+    if adapted.len() > ADAPTED_IDS {
+        ids.push(format!("{} more", adapted.len() - ADAPTED_IDS));
+    }
+    let mut warning = at(
+        Some(path),
+        None,
+        "EOL_ADAPTED",
+        format!(
+            "{} {}: this file ends every line with CRLF, so LF in {} text was matched and written as CRLF; text holding a \\r stays literal",
+            if adapted.len() == 1 {
+                "Change"
+            } else {
+                "Changes"
+            },
+            ids.join(", "),
+            if adapted.len() == 1 { "its" } else { "their" },
+        ),
+    );
+    warning.change_id = Some((*first).to_owned());
+    warnings.push(warning);
+}
+
 fn warn_output(path: &str, output: &str, warnings: &mut Vec<Diagnostic>) {
     if output.contains('\0') {
         warnings.push(at(
@@ -525,12 +782,13 @@ fn at(
 }
 
 fn validate_target(change: &Change, path: Option<&str>, diagnostics: &mut Vec<Diagnostic>) {
-    let (old, scope) = match &change.target {
-        Target::Exact { old, scope } => (Some(old), scope.as_ref()),
+    let (old, scope, lines) = match &change.target {
+        Target::Exact { old, scope, lines } => (Some(old), scope.as_ref(), lines.as_ref()),
         Target::All {
             old,
             scope,
             expected,
+            lines,
         } => {
             if *expected == 0 {
                 diagnostics.push(at(
@@ -540,16 +798,28 @@ fn validate_target(change: &Change, path: Option<&str>, diagnostics: &mut Vec<Di
                     "Replace-all requires a positive expected count",
                 ));
             }
-            (Some(old), Some(scope))
+            (Some(old), scope.as_ref(), lines.as_ref())
         }
-        Target::Span { span, .. } => (None, Some(span)),
+        Target::Span { span, .. } => (None, Some(span), None),
+        Target::Lines { lines, .. } => (None, None, Some(lines)),
+        Target::Insert { .. } => {
+            if change.text.is_empty() {
+                diagnostics.push(at(
+                    path,
+                    Some(change),
+                    "EMPTY_INSERTION",
+                    "Inserted text must not be empty; to delete lines, use lines with new \"\"",
+                ));
+            }
+            (None, None, None)
+        }
     };
     if old.is_some_and(String::is_empty) {
         diagnostics.push(at(
             path,
             Some(change),
             "EMPTY_TARGET",
-            "Exact search text must not be empty; for insertion, replace adjacent text with itself plus the insertion, or use a returned zero-width span",
+            "Exact search text must not be empty; to insert, use {\"after\":n,\"new\":...}, or replace adjacent text with itself plus the insertion",
         ));
     }
     if scope.is_some_and(|id| id.trim().is_empty()) {
@@ -558,6 +828,24 @@ fn validate_target(change: &Change, path: Option<&str>, diagnostics: &mut Vec<Di
             Some(change),
             "EMPTY_SPAN_ID",
             "Span ID must not be empty",
+        ));
+    }
+    if old.is_some() && scope.is_some() && lines.is_some() {
+        diagnostics.push(at(
+            path,
+            Some(change),
+            "CONFLICTING_SCOPE",
+            "Restrict `old` to a span ID or to lines, not both",
+        ));
+    }
+    if let Some([first, last]) = lines
+        && !(1 <= *first && first <= last)
+    {
+        diagnostics.push(at(
+            path,
+            Some(change),
+            "INVALID_LINE_RANGE",
+            format!("Lines [{first},{last}] must satisfy 1 <= first <= last"),
         ));
     }
 }
@@ -665,7 +953,7 @@ fn span_range(base: &Snapshot, id: &str) -> Result<(usize, usize), String> {
                 format!("Span {shown} is not disclosed by this base, which discloses {disclosed}")
             } else {
                 format!(
-                    "{shown:?} is not a span ID; spans look like r146, r146..r150, selection, or m1. This base discloses {disclosed}"
+                    "{shown:?} is not a span ID; use r146, r146..r150, selection, m1, or \"lines\":[146,150]. This base discloses {disclosed}"
                 )
             },
         );
@@ -697,7 +985,7 @@ fn span_range(base: &Snapshot, id: &str) -> Result<(usize, usize), String> {
                 "Span {shown} runs past the file's last line, {total}; this base discloses {disclosed}"
             )),
             _ => Err(format!(
-                "Span {shown} needs every line disclosed; this base discloses {disclosed}. Read the rest by continuing this snapshot"
+                "Span {shown} needs every line disclosed; this base discloses {disclosed}. Continue this snapshot to read the rest, or use \"lines\" with expect"
             )),
         },
     }
@@ -718,60 +1006,300 @@ fn is_number(digits: &str) -> bool {
     !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn resolve_change(
-    base: &Snapshot,
-    change: &Change,
+/// One file's base and what resolving its changes computes at most once.
+struct FileContext<'a> {
+    base: &'a Snapshot,
+    eol: Eol,
+    lines: OnceCell<LineIndex>,
+    crlf: OnceCell<bool>,
+    disclosed: OnceCell<HashSet<usize>>,
+    /// Changes whose text was adapted to CRLF, in request order.
+    adapted: Vec<&'a str>,
+    /// The lines each line target addresses, which overlap advice names.
+    extents: HashMap<&'a str, Extent>,
+}
+
+impl<'a> FileContext<'a> {
+    fn new(base: &'a Snapshot, eol: Eol) -> Self {
+        Self {
+            base,
+            eol,
+            lines: OnceCell::new(),
+            crlf: OnceCell::new(),
+            disclosed: OnceCell::new(),
+            adapted: Vec::new(),
+            extents: HashMap::new(),
+        }
+    }
+
+    /// Whether LF-only text is adapted for this base.
+    fn crlf(&self) -> bool {
+        self.eol == Eol::Adapt && *self.crlf.get_or_init(|| crlf_only(&self.base.text))
+    }
+
+    fn lines(&self) -> &LineIndex {
+        self.lines.get_or_init(|| LineIndex::new(&self.base.text))
+    }
+
+    /// Whether the base disclosed every line in `lines` as a line span.
+    fn disclosed(&self, lines: RangeInclusive<usize>) -> bool {
+        let disclosed = self.disclosed.get_or_init(|| {
+            self.base
+                .spans
+                .iter()
+                .filter_map(|span| reading::line_id(&span.id))
+                .collect()
+        });
+        // A range longer than the disclosed lines cannot be covered; this also bounds
+        // the membership check by the snapshot's size.
+        lines.end() - lines.start() < disclosed.len()
+            && lines.into_iter().all(|line| disclosed.contains(&line))
+    }
+
+    /// `[first, last]` with the phantom line clamped, or `LINE_OUT_OF_RANGE`. A
+    /// malformed pair was already reported by `validate_target`.
+    fn line_bounds(
+        &self,
+        change: &Change,
+        [first, last]: [usize; 2],
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Option<(usize, usize)> {
+        if !(1 <= first && first <= last) {
+            return None;
+        }
+        let lines = self.lines();
+        let bounds = lines.bounds(&self.base.text, first, last);
+        if bounds.is_none() {
+            diagnostics.push(self.out_of_range(change, last));
+        }
+        bounds
+    }
+
+    fn out_of_range(&self, change: &Change, line: usize) -> Diagnostic {
+        let lines = self.lines();
+        let total = lines.count();
+        let message = if lines.terminator(&self.base.text, total).is_empty() {
+            format!(
+                "Line {line} is past the end: the file has {total} lines and no final line ending; use after:{total} to append"
+            )
+        } else {
+            format!(
+                "Line {line} is past the end: the file has {total} lines; native Read also shows an empty line {} after the final line ending, which holds no text; use after:{total} to append",
+                total + 1
+            )
+        };
+        let mut diagnostic = at(
+            Some(&self.base.path),
+            Some(change),
+            "LINE_OUT_OF_RANGE",
+            message,
+        );
+        diagnostic.expected = Some(total);
+        diagnostic.actual = Some(line);
+        diagnostic
+    }
+}
+
+/// The lines a line target addresses, for advice when it overlaps another change.
+#[derive(Clone, Copy)]
+enum Extent {
+    Lines {
+        first: usize,
+        last: usize,
+        /// The deletion also takes the line ending before `first`.
+        takes_previous: bool,
+    },
+    After(usize),
+}
+
+/// How to merge two overlapping changes; line targets name the merged change.
+fn combine_advice(left: Option<&Extent>, right: Option<&Extent>) -> String {
+    let takes = |extent: Option<&Extent>| {
+        matches!(
+            extent,
+            Some(Extent::Lines {
+                takes_previous: true,
+                ..
+            })
+        )
+    };
+    let note = if takes(left) || takes(right) {
+        " (deleting a last line that has no line ending also takes the one before it)"
+    } else {
+        ""
+    };
+    match (left, right) {
+        (
+            Some(Extent::Lines { first, last, .. }),
+            Some(Extent::Lines {
+                first: other_first,
+                last: other_last,
+                ..
+            }),
+        ) => format!(
+            "combine them into one lines change [{},{}]{note}",
+            first.min(other_first),
+            last.max(other_last)
+        ),
+        (Some(Extent::Lines { first, last, .. }), Some(Extent::After(_)))
+        | (Some(Extent::After(_)), Some(Extent::Lines { first, last, .. })) => format!(
+            "combine them into one lines change [{first},{last}] whose new text includes the insertion{note}"
+        ),
+        (Some(Extent::After(line)), Some(Extent::After(_))) => {
+            format!("combine them into one after:{line} change")
+        }
+        _ => "combine them into one replacement".into(),
+    }
+}
+
+/// Resolves one change against its file's base into replacements, or diagnostics
+/// that explain why it cannot be planned.
+fn resolve_change<'a>(
+    context: &mut FileContext<'a>,
+    change: &'a Change,
     replacements: &mut Vec<Replacement>,
     diagnostics: &mut Vec<Diagnostic>,
     budget: &mut Budget,
 ) {
-    let (old, scope, expected) = match &change.target {
-        Target::Exact { old, scope } => (old.as_str(), scope.as_deref(), 1),
-        Target::All {
-            old,
-            scope,
-            expected,
-        } => (old.as_str(), Some(scope.as_str()), *expected),
+    let base = context.base;
+    let crlf = context.crlf();
+    let text = adapt_eol(crlf, &change.text);
+    let adapted = matches!(text, Cow::Owned(_))
+        || match &change.target {
+            Target::Exact { old, .. } | Target::All { old, .. } => crlf && adapts(old),
+            Target::Span { expect, .. } => crlf && expect.as_deref().is_some_and(adapts),
+            Target::Lines { .. } | Target::Insert { .. } => false,
+        };
+    if adapted {
+        context.adapted.push(&change.id);
+    }
+    let (guard, expect) = match &change.target {
         Target::Span { span, expect } => {
             if let Some((start, end)) = scope_range(base, change, Some(span), diagnostics) {
                 let actual = &base.text[start..end];
-                if let Some(expect) = expect.as_ref().filter(|text| *text != actual) {
+                let expect = expect.as_deref().map(|expect| adapt_eol(crlf, expect));
+                if let Some(expect) = expect.filter(|text| *text != actual) {
                     // The span may be the wrong one, so search the whole snapshot.
                     let whole = 0..base.text.len();
                     let found = budget.candidates(|search| {
-                        candidates::find(search, &base.text, whole, expect, true)
+                        candidates::find(search, &base.text, whole, &expect, true)
                     });
                     let mut diagnostic = at(
                         Some(&base.path),
                         Some(change),
                         "EXPECTED_TEXT_MISMATCH",
-                        candidates::mismatch(actual, &found),
+                        candidates::mismatch("Span", actual, &found),
                     );
                     diagnostic.candidates = found;
                     diagnostics.push(diagnostic);
                     return;
                 }
-                if !budget.reserve(1, &change.text) {
-                    diagnostics.push(resource_limit(base, change));
-                    return;
-                }
-                replacements.push(Replacement {
-                    start,
-                    end,
-                    text: change.text.clone(),
-                    change_id: change.id.clone(),
-                });
+                push_replacement(
+                    base,
+                    change,
+                    start..end,
+                    &text,
+                    replacements,
+                    diagnostics,
+                    budget,
+                );
             }
             return;
         }
+        Target::Lines { lines, expect } => match context.line_bounds(change, *lines, diagnostics) {
+            Some((first, last)) => (Guard::Prefix { first, last }, expect),
+            None => return,
+        },
+        Target::Insert { after, expect } => {
+            let lines = context.lines();
+            let line = lines.clamp(&base.text, *after);
+            if line > lines.count() {
+                diagnostics.push(context.out_of_range(change, *after));
+                return;
+            }
+            // An empty insertion was reported by `validate_target`.
+            if change.text.is_empty() {
+                return;
+            }
+            (Guard::Above { line }, expect)
+        }
+        Target::Exact { .. } | Target::All { .. } => {
+            resolve_exact(context, change, &text, replacements, diagnostics, budget);
+            return;
+        }
     };
-    let range = scope_range(base, change, scope, diagnostics);
-    if old.is_empty() || expected == 0 {
+    if !line_guard(
+        context,
+        change,
+        guard,
+        expect.as_deref(),
+        diagnostics,
+        budget,
+    ) {
+        return;
+    }
+    let found = derived_replacement(&base.text, context.lines(), &change.target, &text);
+    let Some((range, written)) = found else {
+        return;
+    };
+    let extent = match guard {
+        Guard::Prefix { first, last } => Extent::Lines {
+            first,
+            last,
+            takes_previous: range.start < context.lines().body(first).start,
+        },
+        Guard::Above { line } => Extent::After(line),
+    };
+    context.extents.insert(&change.id, extent);
+    push_replacement(
+        base,
+        change,
+        range,
+        &written,
+        replacements,
+        diagnostics,
+        budget,
+    );
+}
+
+/// Resolves an `exact` or `all` target by searching its scope for `old`, adapted
+/// like `text` to the base's line endings.
+fn resolve_exact(
+    context: &FileContext,
+    change: &Change,
+    text: &str,
+    replacements: &mut Vec<Replacement>,
+    diagnostics: &mut Vec<Diagnostic>,
+    budget: &mut Budget,
+) {
+    let base = context.base;
+    let (old, scope, lines, expected) = match &change.target {
+        Target::Exact { old, scope, lines } => (old, scope.as_deref(), lines, 1),
+        Target::All {
+            old,
+            scope,
+            expected,
+            lines,
+        } => (old, scope.as_deref(), lines, *expected),
+        Target::Span { .. } | Target::Lines { .. } | Target::Insert { .. } => return,
+    };
+    let old = adapt_eol(context.crlf(), old);
+    let range = match lines {
+        Some(lines) => context
+            .line_bounds(change, *lines, diagnostics)
+            .map(|(first, last)| {
+                let lines = context.lines();
+                (lines.body(first).start, lines.end(last))
+            }),
+        None => scope_range(base, change, scope, diagnostics),
+    };
+    if old.is_empty() || expected == 0 || (scope.is_some() && lines.is_some()) {
         return;
     }
     let Some((start, end)) = range else {
         return;
     };
+    let old = old.as_ref();
     let retained = expected.min(budget.spans_left);
     let exact = matches!(change.target, Target::Exact { .. });
     let (actual, non_overlapping, positions) = if matches!(change.target, Target::All { .. }) {
@@ -812,6 +1340,9 @@ fn resolve_change(
             let mut lines = line_numbers(&base.text, &starts);
             lines.dedup();
             let noun = if lines.len() == 1 { "line" } else { "lines" };
+            // The first match's whole lines: a line scope that holds it alone.
+            let first = lines[0];
+            let last = first + old.matches('\n').count();
             let lines: Vec<_> = lines.iter().map(usize::to_string).collect();
             let more = if actual > starts.len() {
                 " and later"
@@ -819,7 +1350,7 @@ fn resolve_change(
                 ""
             };
             format!(
-                "Expected {expected} occurrence(s), found {actual} overlapping starts ({non_overlapping} non-overlapping) at {noun} {}{more}; add surrounding text to `old`, or scope it to a disclosed span holding one",
+                "Expected {expected} occurrence(s), found {actual} overlapping starts ({non_overlapping} non-overlapping) at {noun} {}{more}; add surrounding text to `old`, or restrict it with \"in\":[{first},{last}]",
                 lines.join(", ")
             )
         } else if !found.is_empty() {
@@ -836,16 +1367,173 @@ fn resolve_change(
         diagnostics.push(diagnostic);
         return;
     }
-    if !budget.reserve(actual, &change.text) {
+    if !budget.reserve(actual, text) {
         diagnostics.push(resource_limit(base, change));
         return;
     }
     replacements.extend(positions.into_iter().map(|position| Replacement {
         start: start + position,
         end: start + position + old.len(),
-        text: change.text.clone(),
+        text: text.to_owned(),
         change_id: change.id.clone(),
     }));
+}
+
+fn push_replacement(
+    base: &Snapshot,
+    change: &Change,
+    range: Range<usize>,
+    text: &str,
+    replacements: &mut Vec<Replacement>,
+    diagnostics: &mut Vec<Diagnostic>,
+    budget: &mut Budget,
+) {
+    if !budget.reserve(1, text) {
+        diagnostics.push(resource_limit(base, change));
+        return;
+    }
+    replacements.push(Replacement {
+        start: range.start,
+        end: range.end,
+        text: text.to_owned(),
+        change_id: change.id.clone(),
+    });
+}
+
+/// The lines a line target's `expect` is compared with.
+#[derive(Clone, Copy)]
+enum Guard {
+    /// The first lines of `first..=last`, which the target replaces.
+    Prefix { first: usize, last: usize },
+    /// The lines ending at `line`, after which the target inserts.
+    Above { line: usize },
+}
+
+/// Checks a line target's `expect`, and requires one, at least `MIN_GUARD_CHARS`
+/// visible characters long, unless the base disclosed every addressed line: line
+/// numbers from elsewhere may be stale. `expect` is compared line by line, ignoring
+/// line endings, so text copied from a view that hides `\r` still guards CRLF lines.
+fn line_guard(
+    context: &FileContext,
+    change: &Change,
+    guard: Guard,
+    expect: Option<&str>,
+    diagnostics: &mut Vec<Diagnostic>,
+    budget: &mut Budget,
+) -> bool {
+    let base = context.base;
+    let addressed = match guard {
+        Guard::Prefix { first, last } => Some(first..=last),
+        Guard::Above { line: 0 } => None,
+        Guard::Above { line } => Some(line..=line),
+    };
+    let required = addressed.is_some_and(|lines| !context.disclosed(lines));
+    let Some(expect) = expect else {
+        if required {
+            let finding = match guard {
+                Guard::Prefix { first, last } if first != last => format!(
+                    "Lines {first}-{last} were not disclosed by this base, so their numbers may be stale; add expect with the first line you expect there"
+                ),
+                Guard::Prefix { first: line, .. } | Guard::Above { line } => format!(
+                    "Line {line} was not disclosed by this base, so its number may be stale; add expect with the line you expect there"
+                ),
+            };
+            diagnostics.push(at(
+                Some(&base.path),
+                Some(change),
+                "LINE_GUARD_REQUIRED",
+                format!("{finding}, at least {MIN_GUARD_CHARS} visible characters"),
+            ));
+        }
+        return !required;
+    };
+    let pieces = expected_lines(expect);
+    let lines = context.lines();
+    let count = pieces.len();
+    let checked = match guard {
+        Guard::Prefix { first, last } => {
+            (count <= last - first + 1).then(|| first..=first + count - 1)
+        }
+        Guard::Above { line } => (count <= line).then(|| line + 1 - count..=line),
+    };
+    let Some(checked) = checked else {
+        let finding = match guard {
+            Guard::Prefix { first, last } => format!(
+                "expect has {count} lines but lines [{first},{last}] have {}; it gives the first lines of the range",
+                last - first + 1
+            ),
+            Guard::Above { line } => format!(
+                "expect has {count} lines but only {line} precede the insertion; it gives the lines ending at after"
+            ),
+        };
+        diagnostics.push(at(
+            Some(&base.path),
+            Some(change),
+            "EXPECTED_TEXT_MISMATCH",
+            finding,
+        ));
+        return false;
+    };
+    let matched = checked
+        .clone()
+        .zip(&pieces)
+        .all(|(line, piece)| base.text[lines.body(line)] == **piece);
+    if !matched {
+        let actual = &base.text[lines.body(*checked.start()).start..lines.body(*checked.end()).end];
+        // The lines may have moved, so search the whole snapshot for where they are.
+        let needle = adapt_eol(context.crlf(), expect.strip_suffix('\n').unwrap_or(expect));
+        let whole = 0..base.text.len();
+        let found =
+            budget.candidates(|search| candidates::find(search, &base.text, whole, &needle, true));
+        let subject = if checked.start() == checked.end() {
+            format!("Line {}", checked.start())
+        } else {
+            format!("Lines {}-{}", checked.start(), checked.end())
+        };
+        let mut diagnostic = at(
+            Some(&base.path),
+            Some(change),
+            "EXPECTED_TEXT_MISMATCH",
+            candidates::line_mismatch(&subject, actual, &found),
+        );
+        diagnostic.candidates = found;
+        diagnostics.push(diagnostic);
+        return false;
+    }
+    let visible: usize = pieces
+        .iter()
+        .map(|piece| piece.chars().filter(|ch| !ch.is_whitespace()).count())
+        .sum();
+    if required && visible < MIN_GUARD_CHARS {
+        let extend = match guard {
+            Guard::Prefix { .. } => "the following lines of the range",
+            Guard::Above { .. } => "the lines above",
+        };
+        diagnostics.push(at(
+            Some(&base.path),
+            Some(change),
+            "LINE_GUARD_WEAK",
+            format!(
+                "expect {} has under {MIN_GUARD_CHARS} visible characters, so it could still match after a line shift; extend it with {extend}, or target the text with `old`",
+                candidates::quoted(expect, 40)
+            ),
+        ));
+        return false;
+    }
+    true
+}
+
+/// A line-wise `expect` as line bodies: split on LF, each without one trailing CR,
+/// and without the empty piece a final line feed leaves.
+fn expected_lines(expect: &str) -> Vec<&str> {
+    let mut pieces: Vec<&str> = expect
+        .split('\n')
+        .map(|piece| piece.strip_suffix('\r').unwrap_or(piece))
+        .collect();
+    if pieces.len() > 1 && pieces.last() == Some(&"") {
+        pieces.pop();
+    }
+    pieces
 }
 
 /// One-based line numbers of ascending byte `offsets`, counting line feeds once.

@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -9,10 +10,10 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 use tempfile::NamedTempFile;
 
-use crate::compiler::MAX_TEXT_BYTES;
+use crate::compiler::{self, MAX_TEXT_BYTES};
 use crate::model::{
-    CommitStatus, Error, FileOutcome, FileStatus, PreparedFile, PreparedPlan, Receipt, Snapshot,
-    digest, new_id,
+    Change, CommitStatus, Error, FileOutcome, FileStatus, PreparedFile, PreparedPlan, Receipt,
+    Snapshot, Target, digest, new_id,
 };
 
 mod reconciliation;
@@ -1237,6 +1238,13 @@ fn validate_plan(plan: &PreparedPlan) -> Result<(), Error> {
         let mut output = String::new();
         let mut previous_start = None;
         let mut seen = std::collections::HashSet::new();
+        let changes: HashMap<&str, &Change> = request
+            .changes
+            .iter()
+            .map(|change| (change.id.as_str(), change))
+            .collect();
+        // Computed only when a replacement needs them.
+        let (lines, crlf) = (OnceCell::new(), OnceCell::new());
         for replacement in &file.replacements {
             if replacement.start < end
                 || replacement.end < replacement.start
@@ -1252,11 +1260,16 @@ fn validate_plan(plan: &PreparedPlan) -> Result<(), Error> {
                     "Replacement ranges are invalid or overlap",
                 ));
             }
-            if !request
-                .changes
-                .iter()
-                .any(|change| change.id == replacement.change_id && change.text == replacement.text)
-            {
+            // A line target derives one replacement; recomputing it from the base
+            // catches a plan altered after the compiler wrote it.
+            let derived = changes
+                .get(replacement.change_id.as_str())
+                .is_some_and(|change| {
+                    compiler::derives(&file.base.text, &lines, &crlf, change, replacement)
+                        && (!matches!(change.target, Target::Lines { .. } | Target::Insert { .. })
+                            || !seen.contains(&replacement.change_id))
+                });
+            if !derived {
                 return Err(Error::new(
                     "INVALID_PLAN",
                     "Replacement does not match a requested change",
@@ -1581,6 +1594,7 @@ mod tests {
                     target: Target::Exact {
                         old: "before".into(),
                         scope: None,
+                        lines: None,
                     },
                     text: "after".into(),
                 }],
@@ -1620,6 +1634,7 @@ mod tests {
                     target: Target::Exact {
                         old: old.into(),
                         scope: None,
+                        lines: None,
                     },
                     text: text.into(),
                 }],
