@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Range;
 
 use crate::candidates;
@@ -6,6 +6,7 @@ use crate::model::{
     Candidate, Change, Diagnostic, EditRequest, PreparedFile, PreparedPlan, Replacement, Snapshot,
     Span, Target, digest, new_id,
 };
+use crate::reading;
 
 pub const MAX_CHANGES: usize = 1_000;
 pub const MAX_REPLACEMENTS: usize = 10_000;
@@ -19,6 +20,8 @@ pub const MAX_CANDIDATE_SEARCH_BYTES: usize = 2 * MAX_TEXT_BYTES;
 /// response shows. Each search aligns a bounded number of windows, so this caps
 /// the time a failing request holds the workspace lock.
 pub const MAX_CANDIDATE_SEARCHES: usize = 6;
+/// Match starts an ambiguous exact target locates by line.
+const AMBIGUOUS_LINES: usize = 5;
 
 struct Budget {
     spans_left: usize,
@@ -280,14 +283,30 @@ pub fn compile(
     let files = resolved
         .into_iter()
         .map(|(base, replacements, changes)| {
+            let targets: HashMap<&str, &Change> = changes
+                .iter()
+                .map(|change| (change.id.as_str(), change))
+                .collect();
+            let mut edges = Vec::new();
             let mut output = String::new();
             let mut cursor = 0;
             for replacement in &replacements {
                 output.push_str(&base.text[cursor..replacement.start]);
+                let start = output.len();
                 output.push_str(&replacement.text);
                 cursor = replacement.end;
+                if let Some(change) = targets.get(replacement.change_id.as_str()) {
+                    for edge in whitespace_edges(&base.text, replacement, change) {
+                        let junction = match edge {
+                            Edge::DropsTrailing | Edge::AddsTrailing => output.len(),
+                            Edge::DropsLeading | Edge::AddsLeading => start,
+                        };
+                        edges.push((*change, edge, junction));
+                    }
+                }
             }
             output.push_str(&base.text[cursor..]);
+            warn_edges(&base.path, &output, edges, &mut warnings);
             warn_output(&base.path, &output, &mut warnings);
             PreparedFile {
                 base: base.clone(),
@@ -303,6 +322,151 @@ pub fn compile(
         files,
         warnings,
     })
+}
+
+/// Whitespace at one edge of an exact target that the replacement drops beside
+/// other text, joining them, or adds beside more whitespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Edge {
+    DropsTrailing,
+    AddsTrailing,
+    DropsLeading,
+    AddsLeading,
+}
+
+/// Edge whitespace in this sense; other Unicode spaces are left to the author.
+const EDGE_WHITESPACE: [char; 4] = [' ', '\t', '\r', '\n'];
+/// Characters a `WHITESPACE_EDGE` warning quotes on each side of the junction,
+/// short enough that the message fits the 240 characters clients display.
+const EDGE_CONTEXT_CHARS: usize = 40;
+/// `WHITESPACE_EDGE` warnings per file; each one scans its output line.
+const MAX_EDGE_WARNINGS: usize = 8;
+
+/// Finds the edges where `old` and `new` agree on their outermost visible character
+/// but only one of them carries whitespace there, and the original text beside the
+/// match makes the difference visible. Dropped whitespace joins the neighbouring
+/// text, or joins two lines; added spaces or tabs land beside more whitespace, or
+/// at the end of a line. Span changes have no `old` to compare and are never checked.
+fn whitespace_edges(text: &str, replacement: &Replacement, change: &Change) -> Vec<Edge> {
+    let old = match &change.target {
+        Target::Exact { old, .. } | Target::All { old, .. } => old.as_str(),
+        Target::Span { .. } => return Vec::new(),
+    };
+    let new = change.text.as_str();
+    let (old_core, new_core) = (
+        old.trim_matches(EDGE_WHITESPACE),
+        new.trim_matches(EDGE_WHITESPACE),
+    );
+    if old_core.is_empty() || new_core.is_empty() {
+        return Vec::new();
+    }
+    let mut edges = Vec::new();
+    let after = text[replacement.end..].chars().next();
+    if old_core.chars().next_back() == new_core.chars().next_back() {
+        let old_end = &old[old.trim_end_matches(EDGE_WHITESPACE).len()..];
+        let new_end = &new[new.trim_end_matches(EDGE_WHITESPACE).len()..];
+        if drops(old_end, new_end, after) {
+            edges.push(Edge::DropsTrailing);
+        } else if adds(old_end, new_end) && matches!(after, None | Some(' ' | '\t' | '\r' | '\n')) {
+            edges.push(Edge::AddsTrailing);
+        }
+    }
+    // A byte-order mark starts the file rather than text a target could join.
+    let before = text[..replacement.start]
+        .chars()
+        .next_back()
+        .filter(|ch| *ch != '\u{feff}' || replacement.start != 3);
+    if old_core.chars().next() == new_core.chars().next() {
+        let old_start = &old[..old.len() - old.trim_start_matches(EDGE_WHITESPACE).len()];
+        let new_start = &new[..new.len() - new.trim_start_matches(EDGE_WHITESPACE).len()];
+        if drops(old_start, new_start, before) {
+            edges.push(Edge::DropsLeading);
+        } else if adds(old_start, new_start) && matches!(before, Some(' ' | '\t')) {
+            // Added indentation at the start of a line is usually deliberate.
+            edges.push(Edge::AddsLeading);
+        }
+    }
+    edges
+}
+
+/// Whether `new` drops all of `old`'s edge whitespace beside `neighbour`, so text
+/// joins: any visible neighbour, or a space or tab once a line ending is gone.
+fn drops(old: &str, new: &str, neighbour: Option<char>) -> bool {
+    !old.is_empty()
+        && new.is_empty()
+        && neighbour.is_some_and(|ch| {
+            !ch.is_whitespace() || (old.contains('\n') && matches!(ch, ' ' | '\t'))
+        })
+}
+
+/// Whether `new` adds spaces or tabs, and nothing else, at an edge where `old` has none.
+fn adds(old: &str, new: &str) -> bool {
+    old.is_empty() && !new.is_empty() && new.chars().all(|ch| matches!(ch, ' ' | '\t'))
+}
+
+/// Warns once per change and edge, in output order, quoting the resulting line
+/// around the first junction. The bytes are written as given; the warning only
+/// asks for a look, since native editors write the same text silently.
+fn warn_edges(
+    path: &str,
+    output: &str,
+    mut edges: Vec<(&Change, Edge, usize)>,
+    warnings: &mut Vec<Diagnostic>,
+) {
+    edges.sort_by_key(|(_, edge, junction)| (*junction, *edge));
+    let mut warned = BTreeSet::new();
+    let (mut line, mut cursor) = (1, 0);
+    for (change, edge, junction) in edges {
+        if warned.len() == MAX_EDGE_WARNINGS {
+            break;
+        }
+        if !warned.insert((change.id.as_str(), edge)) {
+            continue;
+        }
+        line += output.as_bytes()[cursor..junction]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count();
+        cursor = junction;
+        let line_start = output[..junction].rfind('\n').map_or(0, |index| index + 1);
+        let line_end = output[junction..]
+            .find('\n')
+            .map_or(output.len(), |index| junction + index);
+        let before = &output[line_start..junction];
+        let after = output[junction..line_end]
+            .strip_suffix('\r')
+            .unwrap_or(&output[junction..line_end]);
+        let skipped = before.chars().count().saturating_sub(EDGE_CONTEXT_CHARS);
+        let mut excerpt = String::new();
+        if skipped > 0 {
+            excerpt.push('…');
+        }
+        excerpt.extend(before.chars().skip(skipped));
+        excerpt.extend(after.chars().take(EDGE_CONTEXT_CHARS));
+        if after.chars().nth(EDGE_CONTEXT_CHARS).is_some() {
+            excerpt.push('…');
+        }
+        let finding = match edge {
+            Edge::DropsTrailing => "`old` ends in whitespace `new` drops, joining what follows",
+            Edge::AddsTrailing => {
+                "`new` ends in spaces or tabs `old` lacks, before whitespace or a line end"
+            }
+            Edge::DropsLeading => "`old` starts with whitespace `new` drops, joining what precedes",
+            Edge::AddsLeading => {
+                "`new` starts with spaces or tabs `old` lacks, after more whitespace"
+            }
+        };
+        let id: String = change.id.chars().take(24).collect();
+        warnings.push(at(
+            Some(path),
+            Some(change),
+            "WHITESPACE_EDGE",
+            format!(
+                "Change {id}: {finding}; line {line} now reads {}",
+                candidates::quoted(&excerpt, 2 * EDGE_CONTEXT_CHARS + 10)
+            ),
+        ));
+    }
 }
 
 fn warn_output(path: &str, output: &str, warnings: &mut Vec<Diagnostic>) {
@@ -453,18 +617,82 @@ fn scope_range(
     if id.trim().is_empty() {
         return None;
     }
-    match base.spans.iter().find(|span| span.id == id) {
-        Some(span) => Some((span.start, span.end)),
-        None => {
-            diagnostics.push(at(
-                Some(&base.path),
-                Some(change),
-                "UNKNOWN_SPAN",
-                format!("Span {id} is unavailable in snapshot {}", base.id),
-            ));
+    match span_range(base, id) {
+        Ok(range) => Some(range),
+        Err(message) => {
+            diagnostics.push(at(Some(&base.path), Some(change), "UNKNOWN_SPAN", message));
             None
         }
     }
+}
+
+/// Characters of a span ID quoted back in a diagnostic.
+const QUOTED_ID_CHARS: usize = 24;
+
+/// Resolves a span ID the base disclosed, or a line range `rA..rB` whose every line
+/// it disclosed, to byte offsets. A range runs from the start of line A's body to
+/// the end of line B's, like `selection`, so B's terminator is kept. Otherwise the
+/// error teaches what this base discloses.
+fn span_range(base: &Snapshot, id: &str) -> Result<(usize, usize), String> {
+    if let Some(span) = base.spans.iter().find(|span| span.id == id) {
+        return Ok((span.start, span.end));
+    }
+    let shown: String = if id.chars().count() > QUOTED_ID_CHARS {
+        id.chars().take(QUOTED_ID_CHARS).chain(['…']).collect()
+    } else {
+        id.into()
+    };
+    let disclosed = reading::disclosed_lines(&base.spans);
+    let Some((first, last)) = line_range(id) else {
+        let known_shape = id == "selection"
+            || ["r", "m"]
+                .iter()
+                .any(|prefix| id.strip_prefix(prefix).is_some_and(is_number));
+        return Err(
+            if known_shape || !id.bytes().any(|byte| byte.is_ascii_digit()) {
+                format!("Span {shown} is not disclosed by this base, which discloses {disclosed}")
+            } else {
+                format!(
+                    "{shown:?} is not a span ID; spans look like r146, r146..r150, selection, or m1. This base discloses {disclosed}"
+                )
+            },
+        );
+    };
+    if first > last {
+        return Err(format!(
+            "Span {shown} is reversed; write r{last}..r{first}. This base discloses {disclosed}"
+        ));
+    }
+    let lines: HashMap<usize, &Span> = base
+        .spans
+        .iter()
+        .filter_map(|span| Some((reading::line_id(&span.id)?, span)))
+        .collect();
+    // A range longer than the disclosed lines cannot be covered; this also bounds
+    // the membership check by the snapshot's size.
+    let covered =
+        last - first < lines.len() && (first..=last).all(|line| lines.contains_key(&line));
+    match (lines.get(&first), lines.get(&last)) {
+        (Some(start), Some(end)) if covered => Ok((start.start, end.end)),
+        _ => Err(format!(
+            "Span {shown} needs every line disclosed; this base discloses {disclosed}. Read the rest by continuing this snapshot"
+        )),
+    }
+}
+
+/// Parses a line range `rA..rB` of one-based line numbers, in either order.
+fn line_range(id: &str) -> Option<(usize, usize)> {
+    let (first, last) = id.strip_prefix('r')?.split_once("..r")?;
+    let number = |digits: &str| {
+        (is_number(digits) && !digits.starts_with('0'))
+            .then(|| digits.parse().ok())
+            .flatten()
+    };
+    Some((number(first)?, number(last)?))
+}
+
+fn is_number(digits: &str) -> bool {
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn resolve_change(
@@ -555,11 +783,24 @@ fn resolve_change(
             Vec::new()
         };
         let message = if exact && actual != 0 {
+            // Locations make the repair one step; only a failure pays for the rescan.
+            let starts = scan_occurrences(&base.text[start..end], old, 0, AMBIGUOUS_LINES);
+            let starts: Vec<_> = starts.positions.iter().map(|at| start + at).collect();
+            let mut lines = line_numbers(&base.text, &starts);
+            lines.dedup();
+            let noun = if lines.len() == 1 { "line" } else { "lines" };
+            let lines: Vec<_> = lines.iter().map(usize::to_string).collect();
+            let more = if actual > starts.len() {
+                " and later"
+            } else {
+                ""
+            };
             format!(
-                "Expected {expected} occurrence(s), found {actual} overlapping starts ({non_overlapping} non-overlapping); inspect the snapshot and choose an explicit span or narrower scope"
+                "Expected {expected} occurrence(s), found {actual} overlapping starts ({non_overlapping} non-overlapping) at {noun} {}{more}; add surrounding text to `old`, or scope it to a disclosed span holding one",
+                lines.join(", ")
             )
         } else if !found.is_empty() {
-            candidates::not_found(expected, &found)
+            candidates::not_found(expected, old, &found)
         } else {
             format!(
                 "Expected {expected} occurrence(s), found {actual}; inspect the snapshot and choose an explicit span or narrower scope"
@@ -582,6 +823,22 @@ fn resolve_change(
         text: change.text.clone(),
         change_id: change.id.clone(),
     }));
+}
+
+/// One-based line numbers of ascending byte `offsets`, counting line feeds once.
+fn line_numbers(text: &str, offsets: &[usize]) -> Vec<usize> {
+    let (mut line, mut cursor) = (1, 0);
+    offsets
+        .iter()
+        .map(|&offset| {
+            line += text.as_bytes()[cursor..offset]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count();
+            cursor = offset;
+            line
+        })
+        .collect()
 }
 
 struct OccurrenceScan {

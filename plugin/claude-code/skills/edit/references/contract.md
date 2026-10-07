@@ -33,6 +33,9 @@ formatter, or model execution. Preserve `\r\n` explicitly when inserting CRLF.
 Candidate outputs containing NUL or both CRLF and bare LF receive nonblocking
 `NUL_BYTE` or `MIXED_LINE_ENDINGS` warnings. This includes existing conditions
 retained in the candidate; warnings do not change bytes or reject the request.
+A `WHITESPACE_EDGE` warning quotes the resulting line when `old` and `new` differ
+only in edge whitespace that joins text (`* Decimal` becoming `*Decimal`) or
+doubles it; check that line, and send a follow-up edit if it was not intended.
 
 ## Request identity
 

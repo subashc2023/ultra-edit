@@ -5,6 +5,27 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ## [Unreleased]
 
+### Added
+
+- Span ranges `rA..rB` work as a `span` or `scope` when the base disclosed
+  every line from A to B, such as the `r146..r150` a range read lists in
+  `spans`. A range runs from the start of line A's body to the end of line B's,
+  like `selection`, so `""` blanks the lines and `expect` is byte-exact. A
+  reversed or partly undisclosed range is `UNKNOWN_SPAN`.
+- A nonblocking `WHITESPACE_EDGE` warning quotes the resulting line when an
+  `exact` or `all` change's `old` and `new` differ only in whitespace at an edge
+  and that joins text (`unit_price * Decimal` written as `unit_price *Decimal`)
+  or lands beside more whitespace. Bytes are still written as given.
+
+### Changed
+
+- Diagnostic messages, which are free text, now say more. `UNKNOWN_SPAN` lists
+  what the base discloses (`lines 146-150, 1875-1879; selection = lines
+  1875-1879`) and answers IDs of other shapes, such as `146-150`, with the shapes
+  span IDs take. `TARGET_AMBIGUOUS` names the lines of the first five matches.
+  `TARGET_NOT_FOUND` says when the best whitespace candidate differs from `old`
+  only in CRLF line endings. Codes, fields, and the `spans` summary are unchanged.
+
 ## [0.3.0] - 2026-09-25
 
 ### Added

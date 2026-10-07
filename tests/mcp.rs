@@ -689,6 +689,72 @@ fn continued_ranges_and_searches_edit_distant_lines_under_one_base_over_mcp() {
     client.close();
 }
 
+/// The benchmark's large-file-two-regions run guessed span ranges from the
+/// `spans` summary; they now resolve, and other guesses learn what is disclosed.
+#[test]
+fn span_ranges_from_the_spans_summary_edit_two_regions_in_one_call_over_mcp() {
+    let root = TempDir::new().unwrap();
+    let line = |number: usize| format!("    value_{number} = compute({number})\n");
+    let original: String = (1..=2_000).map(line).collect();
+    fs::write(root.path().join("routes.py"), &original).unwrap();
+    let mut client = Client::start(root.path());
+    let first = client.range("routes.py", 146, 150);
+    let both = client.call(
+        "ultra_edit_snapshot",
+        json!({"path":"routes.py","selection":{
+            "kind":"range","first":1875,"last":1879,"snapshot":first["snapshot"]
+        }}),
+        false,
+    );
+    assert_eq!(
+        both["spans"],
+        json!(["r146..r150", "r1875..r1879", "selection"])
+    );
+    let body = |first: usize, last: usize| {
+        (first..=last)
+            .map(|number| line(number).trim_end().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let guessed = client.call(
+        "ultra_edit",
+        json!({"files":[{"base":both["snapshot"],"changes":[
+            {"target":{"kind":"span","span":"146-150"},"text":"x"}
+        ]}]}),
+        true,
+    );
+    let diagnostic = &guessed["diagnostics"][0];
+    assert_eq!(diagnostic["code"], "UNKNOWN_SPAN");
+    assert_eq!(
+        diagnostic["message"],
+        "\"146-150\" is not a span ID; spans look like r146, r146..r150, selection, or m1. This base discloses lines 146-150, 1875-1879; selection = lines 1875-1879"
+    );
+    let committed = client.call(
+        "ultra_edit",
+        json!({"files":[{"base":both["snapshot"],"changes":[
+            {"target":{"kind":"span","span":"r146..r150","expect":body(146, 150)},
+             "text":"    first_region = True"},
+            {"target":{"kind":"exact","old":"compute(1877)","scope":"r1875..r1879"},
+             "text":"compute(1877, cached=True)"}
+        ]}]}),
+        false,
+    );
+    assert_eq!(committed["commit"], "committed");
+    let expected: String = (1..=2_000)
+        .map(|number| match number {
+            146 => "    first_region = True\n".into(),
+            147..=150 => String::new(),
+            1877 => "    value_1877 = compute(1877, cached=True)\n".into(),
+            _ => line(number),
+        })
+        .collect();
+    assert_eq!(
+        fs::read(root.path().join("routes.py")).unwrap(),
+        expected.as_bytes()
+    );
+    client.close();
+}
+
 #[test]
 fn declared_schema_minimums_agree_with_the_runtime_line_and_count_rules() {
     let root = TempDir::new().unwrap();
@@ -754,10 +820,19 @@ fn diff_and_byte_warnings_are_available_before_and_after_commit() {
     let snapshot = client.full("file.txt");
     let request = json!({"request_id":"review","files":[{"base":snapshot["snapshot"],"changes":[
         {"id":"one","target":{"kind":"exact","old":"line 10\r\n"},"text":"changed 10\n"},
-        {"id":"two","target":{"kind":"exact","old":"line 35"},"text":"changed\u{0000}35"}
+        {"id":"two","target":{"kind":"exact","old":"line 35"},"text":"changed\u{0000}35"},
+        {"id":"three","target":{"kind":"exact","old":"line 20\r\n"},"text":"line 20"}
     ]}]});
     let prepared = client.call("ultra_edit_prepare", request.clone(), false);
-    assert_eq!(prepared["warning_count"], 2);
+    assert_eq!(prepared["warning_count"], 3);
+    assert_eq!(
+        prepared["warnings"][0],
+        json!({
+            "code": "WHITESPACE_EDGE",
+            "file": prepared["warnings"][1]["file"],
+            "message": "Change three: `old` ends in whitespace `new` drops, joining what follows; line 20 now reads \"line 20line 21\"",
+        })
+    );
     let diff = client.call(
         "ultra_edit_diff",
         json!({"plan":prepared["reference"]}),
@@ -765,10 +840,10 @@ fn diff_and_byte_warnings_are_available_before_and_after_commit() {
     );
     let text = diff["diff"].as_str().unwrap();
     assert!(text.contains("-line 10\r\n+changed 10\n"), "{text}");
-    assert!(!text.contains("line 22"), "{text}");
+    assert!(!text.contains("line 27"), "{text}");
     assert!(diff["next_offset"].is_null());
     let committed = client.call("ultra_edit", request, false);
-    assert_eq!(committed["warning_count"], 2);
+    assert_eq!(committed["warning_count"], 3);
     assert_eq!(committed["warnings"], prepared["warnings"]);
     client.close();
     let mut client = Client::start(root.path());
@@ -783,6 +858,7 @@ fn diff_and_byte_warnings_are_available_before_and_after_commit() {
         before
             .replace("line 10\r\n", "changed 10\n")
             .replace("line 35", "changed\u{0}35")
+            .replace("line 20\r\n", "line 20")
     );
     client.close();
 }
