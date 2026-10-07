@@ -217,7 +217,7 @@ def _validate_mcp_config(config: Mapping[str, object], source: str) -> None:
     expected = {
         "type": "stdio",
         "command": "${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp",
-        "args": ["--root", "${CLAUDE_PROJECT_DIR}"],
+        "args": ["--root", "${CLAUDE_PROJECT_DIR}", "--no-instructions"],
     }
     for key, value in expected.items():
         if server.get(key) != value:

@@ -104,10 +104,10 @@ pub struct EditRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FileRequest {
-    /// The absolute path you Read; the server reads the file's current bytes. Give `path` or `base`.
+    /// The absolute path you Read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// A snapshot ID from ultra_edit_snapshot, needed for span targets.
+    /// A snapshot ID, for span targets.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub base: String,
     #[serde(deserialize_with = "numbered_changes")]
@@ -486,26 +486,24 @@ impl schemars::JsonSchema for Change {
         let line = serde_json::json!({"type": "integer", "minimum": 1});
         let pair =
             serde_json::json!({"type": "array", "items": line, "minItems": 2, "maxItems": 2});
-        let mut lines = pair.clone();
-        lines["description"] = "Whole lines [first,last] to replace, as Read numbers them.".into();
+        let lines = pair.clone();
         // `text` (an alias of `new`) and the verbose `target` are accepted but not
         // advertised, so the schema every call pays for teaches one spelling.
         schemars::json_schema!({
             "type": "object",
-            "description": "One of {old,new}, {lines,expect,new}, {after,expect,new}, or {span,new}.",
             "properties": {
-                "id": {"type": "string", "description": "Omit; repair names the change to replace, e.g. \"1.2\"."},
-                "old": {"type": "string", "description": "Exact current text; must occur once unless count is given."},
-                "new": {"type": "string", "description": "Replacement text; \"\" deletes."},
-                "count": {"type": "integer", "minimum": 1, "description": "Replace exactly this many occurrences of old."},
-                "in": {"anyOf": [pair, {"type": "string"}], "description": "Restrict old to lines [first,last] or a span ID."},
+                "id": {"type": "string", "description": "Omit; repair names the change to replace."},
+                "old": {"type": "string"},
+                "new": {"type": "string"},
+                "count": {"type": "integer", "minimum": 1},
+                "in": {"anyOf": [pair, {"type": "string"}]},
                 "lines": lines,
-                "after": {"type": "integer", "minimum": 0, "description": "Insert whole lines after this line; 0 is the top."},
+                "after": {"type": "integer", "minimum": 0},
                 "expect": {
                     "anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2}],
-                    "description": "Current text of the line (lines/after), or [first line, last line] of a range; exact bytes for span."
+                    "description": "The line's current text, or [first line, last line]; exact bytes for span."
                 },
-                "span": {"type": "string", "description": "A span ID the base disclosed, e.g. r12 or r12..r18."}
+                "span": {"type": "string", "description": "A span ID the base disclosed."}
             }
         })
     }

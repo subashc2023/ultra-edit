@@ -62,7 +62,11 @@ a custom configuration directory; Claude Code identifies that copy as
 For a session-only source test, use
 `claude --plugin-dir ABSOLUTE_PLUGIN_DIRECTORY`.
 The packaged `.mcp.json` runs `${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp` with
-the argument array `["--root", "${CLAUDE_PROJECT_DIR}"]`. The native launcher
+the argument array `["--root", "${CLAUDE_PROJECT_DIR}", "--no-instructions"]`.
+`--no-instructions` leaves server instructions out of `initialize`, because the
+plugin's session card already gives the model the same routing; measured with
+Claude Code 2.1.293, the duplicate cost about 280 tokens on every model call.
+Other hosts start the server without it and receive the instructions. The native launcher
 resolves `.exe` on Windows. Hook entries point to the same executable with an
 explicit argument array, so they launch directly without a shell. `runtime/`
 keeps the binaries private; a plugin `bin/` directory would be added to Claude's
@@ -215,8 +219,8 @@ guidance. Report conflicting workflow instructions; generic advice to use sed
 or heredocs is not a reason to silently abandon the user's explicit Ultra Edit
 route.
 
-The runtime contract is also carried in server instructions, tool descriptions,
-and schemas. The [thin skill](../plugin/claude-code/skills/edit/SKILL.md) keeps the
+The runtime contract is also carried in tool descriptions and schemas, and, for
+hosts other than the plugin, in server instructions. The [thin skill](../plugin/claude-code/skills/edit/SKILL.md) keeps the
 ordinary flow and non-optional base, literal-text, retry, and outcome rules up
 front. Its task/symptom table links to four focused references: contract, targets,
 recovery, and Claude Code. Those references are inside the plugin, so installation

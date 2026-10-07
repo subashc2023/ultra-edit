@@ -33,6 +33,8 @@ impl Client {
     }
 
     fn connect_after_prefix(command: &mut Command, malformed_prefix: bool) -> Self {
+        // The plugin's server leaves routing to its session card.
+        let instructed = !command.get_args().any(|arg| arg == "--no-instructions");
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -76,15 +78,20 @@ impl Client {
         );
         assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
         assert!(initialized["result"]["capabilities"]["tools"].is_object());
-        let instructions = initialized["result"]["instructions"].as_str().unwrap();
-        assert!(
-            instructions
-                .starts_with("Edit existing UTF-8 files in the launch workspace with ultra_edit")
-        );
-        assert!(
-            instructions.len() <= 2_000,
-            "Claude truncates server instructions"
-        );
+        if instructed {
+            let instructions = initialized["result"]["instructions"].as_str().unwrap();
+            assert!(
+                instructions.starts_with(
+                    "Edit existing UTF-8 files in the launch workspace with ultra_edit"
+                )
+            );
+            assert!(
+                instructions.len() <= 2_000,
+                "Claude truncates server instructions"
+            );
+        } else {
+            assert!(initialized["result"].get("instructions").is_none());
+        }
         client.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
         client
     }
@@ -193,6 +200,8 @@ fn startup_requires_explicit_root_and_keeps_protocol_stdout_clean() {
         vec![],
         vec!["--root"],
         vec!["--root", "missing-workspace"],
+        vec!["--root", ".", "--no-instruction"],
+        vec!["--root", ".", "--no-instructions", "extra"],
         vec!["--help", "extra"],
         vec!["--claude-context"],
         vec!["--claude-context", "Bash"],

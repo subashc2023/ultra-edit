@@ -74,6 +74,11 @@ All notable changes to Ultra Edit are documented here. Releases follow
   to under 2,048 bytes, and the server instructions from 1,431 to about 650
   characters. The edit skill now covers recovery and span targets; ordinary
   edits need only the card.
+- The plugin starts the server with the new `--no-instructions` flag: its session
+  card already gives the routing, and the duplicate server instructions cost
+  about 280 tokens on every model call. The edit tool's schema also drops
+  property descriptions that its description already gives, from 2,927 to 2,287
+  bytes. Other hosts still receive the instructions.
 - `ultra_edit` carries `_meta: {"anthropic/alwaysLoad": true}`, so Claude Code
   loads its schema up front instead of behind a `ToolSearch` round trip, which
   the benchmark measured at about 0.9 extra API calls per editing session.

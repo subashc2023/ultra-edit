@@ -31,10 +31,12 @@ fn main() -> ExitCode {
     let arguments = env::args_os().skip(1).collect::<Vec<_>>();
     if arguments.len() == 1 && (arguments[0] == "--help" || arguments[0] == "-h") {
         println!(
-            "ultra-edit-mcp {}\nUsage: ultra-edit-mcp --root WORKSPACE\n\
+            "ultra-edit-mcp {}\nUsage: ultra-edit-mcp --root WORKSPACE [--no-instructions]\n\
              Or: ultra-edit-mcp --claude-context SessionStart|SubagentStart\n\
              Or: ultra-edit-mcp --claude-hook PreToolUse\n\n\
              Serve MCP over stdio inside one fixed existing workspace.\n\
+             --no-instructions sends no server instructions, for a host that already gives the\n\
+             model the same routing, such as the Claude Code plugin's session card.\n\
              JSON-RPC lines are limited to 16 MiB. Protocol output uses stdout; errors use stderr.\n\
              Cancellation or disconnection does not imply rollback; query receipts before retrying.\n\
              --claude-context prints plugin hook JSON and exits without opening a workspace.\n\
@@ -85,12 +87,16 @@ fn main() -> ExitCode {
         guard_shell_writes();
         return ExitCode::SUCCESS;
     }
-    if arguments.len() != 2 || arguments[0] != "--root" {
-        eprintln!(
-            "Usage: ultra-edit-mcp --root WORKSPACE (or --claude-context EVENT / --claude-hook EVENT / --help / --version)"
-        );
-        return ExitCode::from(2);
-    }
+    let instructions = match &arguments[..] {
+        [root, _] if root == "--root" => true,
+        [root, _, flag] if root == "--root" && flag == "--no-instructions" => false,
+        _ => {
+            eprintln!(
+                "Usage: ultra-edit-mcp --root WORKSPACE [--no-instructions] (or --claude-context EVENT / --claude-hook EVENT / --help / --version)"
+            );
+            return ExitCode::from(2);
+        }
+    };
     let workspace = match Workspace::open(PathBuf::from(&arguments[1])) {
         Ok(workspace) => workspace,
         Err(error) => {
@@ -108,7 +114,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match runtime.block_on(serve(workspace)) {
+    let server = McpServer::new(workspace);
+    let server = if instructions {
+        server
+    } else {
+        server.without_instructions()
+    };
+    match runtime.block_on(serve(server)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("MCP server error: {error}");
@@ -180,7 +192,7 @@ fn guard_scope(cwd: Option<&str>) -> shell_guard::Scope {
         })
 }
 
-async fn serve(workspace: Workspace) -> Result<(), Box<dyn std::error::Error>> {
+async fn serve(server: McpServer) -> Result<(), Box<dyn std::error::Error>> {
     let failed = CancellationToken::new();
     let transport = StdioTransport {
         input: stdin_messages()?,
@@ -194,11 +206,7 @@ async fn serve(workspace: Workspace) -> Result<(), Box<dyn std::error::Error>> {
             answered: Notify::new(),
         }),
     };
-    McpServer::new(workspace)
-        .serve(transport)
-        .await?
-        .waiting()
-        .await?;
+    server.serve(transport).await?.waiting().await?;
     if failed.is_cancelled() {
         return Err(io::Error::other("MCP transport failed; see stderr").into());
     }
