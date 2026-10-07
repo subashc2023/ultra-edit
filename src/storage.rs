@@ -1574,6 +1574,7 @@ mod tests {
             let snapshot =
                 compiler::snapshot(canonical.to_string_lossy().into_owned(), "before".into());
             files.push(FileRequest {
+                path: None,
                 base: snapshot.id.clone(),
                 changes: vec![Change {
                     id: format!("change-{index}"),
@@ -1612,6 +1613,7 @@ mod tests {
         let request = EditRequest {
             request_id: request_id.into(),
             files: vec![FileRequest {
+                path: None,
                 base: snapshot.id.clone(),
                 changes: vec![Change {
                     id: format!("{request_id}-change"),

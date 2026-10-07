@@ -34,6 +34,7 @@ fn request(base: &Snapshot, changes: Vec<Change>) -> EditRequest {
     EditRequest {
         request_id: "test".into(),
         files: vec![FileRequest {
+            path: None,
             base: base.id.clone(),
             changes,
         }],
@@ -188,7 +189,7 @@ fn exact_ambiguity_reports_replace_all_cardinality() {
     assert_eq!(errors[0].actual, Some(6));
     assert_eq!(
         errors[0].message,
-        "Expected 1 occurrence(s), found 6 overlapping starts (4 non-overlapping); inspect the snapshot and choose an explicit span or narrower scope"
+        "Expected 1 occurrence(s), found 6 overlapping starts (4 non-overlapping) at line 4 and later; add surrounding text to `old`, or scope it to a disclosed span holding one"
     );
 
     let all = Change {
@@ -567,10 +568,12 @@ fn all_safely_discoverable_request_errors_are_collected_across_files() {
         request_id: "".into(),
         files: vec![
             FileRequest {
+                path: None,
                 base: "missing".into(),
                 changes: vec![exact("duplicate", "", "x")],
             },
             FileRequest {
+                path: None,
                 base: base.id.clone(),
                 changes: vec![
                     exact("duplicate", "a", "x"),
@@ -589,6 +592,7 @@ fn all_safely_discoverable_request_errors_are_collected_across_files() {
                 ],
             },
             FileRequest {
+                path: None,
                 base: "".into(),
                 changes: vec![],
             },
@@ -634,10 +638,12 @@ fn distinct_snapshots_of_one_path_cannot_produce_competing_plans() {
         request_id: "duplicate-path".into(),
         files: vec![
             FileRequest {
+                path: None,
                 base: first.id.clone(),
                 changes: vec![exact("a", "a", "x")],
             },
             FileRequest {
+                path: None,
                 base: second.id.clone(),
                 changes: vec![exact("b", "b", "y")],
             },
@@ -741,12 +747,14 @@ fn request_and_replacement_limits_apply_across_file_entries() {
         request_id: "limited".into(),
         files: vec![
             FileRequest {
+                path: None,
                 base: first.id.clone(),
                 changes: (0..MAX_CHANGES / 2 + 1)
                     .map(|index| exact(&format!("a{index}"), "a", ""))
                     .collect(),
             },
             FileRequest {
+                path: None,
                 base: second.id.clone(),
                 changes: (0..MAX_CHANGES / 2)
                     .map(|index| exact(&format!("b{index}"), "a", ""))
@@ -1295,4 +1303,490 @@ fn candidate_searches_per_request_are_capped() {
     let cap = ultra_edit::compiler::MAX_CANDIDATE_SEARCHES;
     assert!(searched[..cap].iter().all(|found| *found), "{searched:?}");
     assert!(searched[cap..].iter().all(|found| !found), "{searched:?}");
+}
+
+/// A base like a range read continued with more ranges: only the listed lines are
+/// disclosed, and `selection` covers the last range.
+fn ranged(text: &str, ranges: &[(usize, usize)]) -> Snapshot {
+    let mut base = snapshot("ranged.txt".into(), text.into());
+    let lines = base.spans.clone();
+    base.spans.clear();
+    for &(first, last) in ranges {
+        base.spans.extend(lines[first..=last].iter().cloned());
+    }
+    let &(first, last) = ranges.last().unwrap();
+    base.spans.push(Span {
+        id: "selection".into(),
+        start: lines[first].start,
+        end: lines[last].end,
+        line: first,
+    });
+    base
+}
+
+fn numbered(lines: usize) -> String {
+    (1..=lines).map(|line| format!("line {line}\n")).collect()
+}
+
+#[test]
+fn span_ranges_replace_from_the_first_body_to_the_last_like_selection() {
+    let base = snapshot("full.txt".into(), "a\r\nb\r\nc\r\nd\r\n".into());
+    let plan = compile(
+        &request(&base, vec![span_change("range", "r2..r3", "B\r\nC")]),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(plan.files[0].output, "a\r\nB\r\nC\r\nd\r\n");
+    assert_eq!(
+        (
+            plan.files[0].replacements[0].start,
+            plan.files[0].replacements[0].end
+        ),
+        (3, 7)
+    );
+    // `""` blanks the lines rather than deleting them, and a one-line range is that line.
+    for (span, output) in [
+        ("r2..r3", "a\r\n\r\nd\r\n"),
+        ("r4..r4", "a\r\nb\r\nc\r\n\r\n"),
+    ] {
+        let plan = compile(
+            &request(&base, vec![span_change("blank", span, "")]),
+            &bases(&base),
+        )
+        .unwrap();
+        assert_eq!(plan.files[0].output, output, "{span}");
+    }
+    // A range keeps byte-exact `expect`.
+    let guarded_range = guarded("r1..r2", "a\nb");
+    let error = compile(&request(&base, vec![guarded_range]), &bases(&base)).unwrap_err();
+    assert_eq!(error[0].code, "EXPECTED_TEXT_MISMATCH");
+    let plan = compile(
+        &request(&base, vec![guarded("r1..r2", "a\r\nb")]),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(plan.files[0].output, "replacement\r\nc\r\nd\r\n");
+}
+
+#[test]
+fn span_ranges_need_every_line_disclosed() {
+    let text = numbered(2_000);
+    let base = ranged(&text, &[(146, 150), (1875, 1879)]);
+    for (span, output) in [
+        ("r146..r150", "line 145\nX\nline 151\n"),
+        ("r1875..r1879", "line 1874\nX\nline 1880\n"),
+        ("r147..r147", "line 146\nX\nline 148\n"),
+    ] {
+        let plan = compile(
+            &request(&base, vec![span_change("range", span, "X")]),
+            &bases(&base),
+        )
+        .unwrap();
+        assert!(plan.files[0].output.contains(output), "{span}");
+    }
+    for span in ["r145..r150", "r146..r151", "r146..r1879", "r1..r2000"] {
+        let error = rejected(&base, span_change("b", span, "X"));
+        assert_eq!(error.code, "UNKNOWN_SPAN");
+        assert_eq!(
+            error.message,
+            format!(
+                "Span {span} needs every line disclosed; this base discloses lines 146-150, 1875-1879; selection = lines 1875-1879. Read the rest by continuing this snapshot"
+            )
+        );
+    }
+    let error = rejected(&base, span_change("b", "r150..r146", "X"));
+    assert_eq!(
+        error.message,
+        "Span r150..r146 is reversed; write r146..r150. This base discloses lines 146-150, 1875-1879; selection = lines 1875-1879"
+    );
+}
+
+#[test]
+fn span_ranges_scope_exact_and_all_targets() {
+    let base = snapshot("scope.txt".into(), "x\nx\nx\nx\n".into());
+    let scoped_range = scoped("one", "x", "r2..r2");
+    let plan = compile(&request(&base, vec![scoped_range]), &bases(&base)).unwrap();
+    assert_eq!(plan.files[0].output, "x\nreplacement\nx\nx\n");
+    let all = Change {
+        id: "all".into(),
+        target: Target::All {
+            old: "x".into(),
+            scope: "r2..r3".into(),
+            expected: 2,
+        },
+        text: "y".into(),
+    };
+    let plan = compile(&request(&base, vec![all]), &bases(&base)).unwrap();
+    assert_eq!(plan.files[0].output, "x\ny\ny\nx\n");
+    let error = rejected(&base, scoped("b", "x", "r2..r3"));
+    assert_eq!(error.code, "TARGET_AMBIGUOUS");
+    assert!(
+        error.message.contains("at lines 2, 3;"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn unknown_spans_teach_what_the_base_discloses() {
+    let text = numbered(2_000);
+    let base = ranged(&text, &[(146, 150), (1875, 1879)]);
+    let disclosed = "lines 146-150, 1875-1879; selection = lines 1875-1879";
+    for (span, message) in [
+        (
+            "r12",
+            format!("Span r12 is not disclosed by this base, which discloses {disclosed}"),
+        ),
+        (
+            "r0",
+            format!("Span r0 is not disclosed by this base, which discloses {disclosed}"),
+        ),
+        (
+            "m1",
+            format!("Span m1 is not disclosed by this base, which discloses {disclosed}"),
+        ),
+        (
+            "whole",
+            format!("Span whole is not disclosed by this base, which discloses {disclosed}"),
+        ),
+    ] {
+        assert_eq!(
+            rejected(&base, span_change("b", span, "X")).message,
+            message
+        );
+    }
+    for span in [
+        "146-150",
+        "L146",
+        "r146-r150",
+        "lines 146..150",
+        "r0146..r150",
+    ] {
+        let error = rejected(&base, span_change("b", span, "X"));
+        assert_eq!(error.code, "UNKNOWN_SPAN");
+        assert_eq!(
+            error.message,
+            format!(
+                "{span:?} is not a span ID; spans look like r146, r146..r150, selection, or m1. This base discloses {disclosed}"
+            )
+        );
+    }
+    // A long guessed ID is clipped, and a long disclosure list ends in an ellipsis.
+    let scattered: Vec<_> = (1..=60).map(|line| (line * 30, line * 30)).collect();
+    let base = ranged(&text, &scattered);
+    let error = rejected(&base, span_change("b", &"r9".repeat(40), "X"));
+    assert!(
+        error
+            .message
+            .starts_with("\"r9r9r9r9r9r9r9r9r9r9r9r9…\" is not a span ID")
+    );
+    assert!(error.message.ends_with(", …"), "{}", error.message);
+    // Every UNKNOWN_SPAN message fits what clients display.
+    for span in [
+        "r9".repeat(40),
+        format!("r{}..r1", usize::MAX),
+        format!("r1..r{}", usize::MAX),
+        format!("m{}", usize::MAX),
+    ] {
+        let error = rejected(&base, span_change("b", &span, "X"));
+        assert!(error.message.contains(", …"), "{}", error.message);
+        assert!(error.message.chars().count() <= 240, "{}", error.message);
+    }
+    // A whole-file snapshot says so.
+    let full = snapshot("full.txt".into(), "a\nb\n".into());
+    assert_eq!(
+        rejected(&full, span_change("b", "selection", "X")).message,
+        "Span selection is not disclosed by this base, which discloses r0 (whole file); lines 1-2"
+    );
+}
+
+#[test]
+fn ambiguous_exact_targets_name_the_first_five_match_lines() {
+    let base = snapshot(
+        "ambiguous.txt".into(),
+        "x = 1\nskip\nx = 1; x = 1\nx = 1\n\nx = 1\nx = 1\nx = 1\n".into(),
+    );
+    let error = rejected(&base, exact("b", "x = 1", "y"));
+    assert_eq!(error.code, "TARGET_AMBIGUOUS");
+    assert_eq!(error.actual, Some(7));
+    assert_eq!(
+        error.message,
+        "Expected 1 occurrence(s), found 7 overlapping starts (7 non-overlapping) at lines 1, 3, 4, 6 and later; add surrounding text to `old`, or scope it to a disclosed span holding one"
+    );
+    let base = snapshot("two.txt".into(), "a\nkey\nb\nkey\n".into());
+    assert!(
+        rejected(&base, exact("b", "key", "y"))
+            .message
+            .contains("(2 non-overlapping) at lines 2, 4;")
+    );
+}
+
+#[test]
+fn an_lf_target_on_a_crlf_file_gets_a_line_ending_hint() {
+    let base = snapshot(
+        "crlf.ps1".into(),
+        "param()\r\nif ($x) {\r\n    Write-Host 1\r\n}\r\n".into(),
+    );
+    let error = rejected(&base, exact("b", "if ($x) {\n    Write-Host 1\n}", "y"));
+    assert_eq!(error.code, "TARGET_NOT_FOUND");
+    assert_eq!(
+        error.message,
+        "Expected 1 occurrence(s), found 0; a candidate at lines 2-4 differs only in its CRLF line endings. Copy its exact text, \\r\\n included, into `old` (ultra_edit_repair can replace just this change)."
+    );
+    assert_eq!(
+        error.candidates[0].text.as_deref(),
+        Some("if ($x) {\r\n    Write-Host 1\r\n}")
+    );
+}
+
+fn edge_warnings(text: &str, changes: Vec<Change>) -> (String, Vec<Diagnostic>) {
+    let base = snapshot("edge.py".into(), text.into());
+    let plan = compile(&request(&base, changes), &bases(&base)).unwrap();
+    let warnings = plan
+        .warnings
+        .into_iter()
+        .filter(|warning| warning.code == "WHITESPACE_EDGE")
+        .collect();
+    (plan.files[0].output.clone(), warnings)
+}
+
+#[test]
+fn dropped_edge_whitespace_that_joins_text_warns_without_blocking() {
+    // The benchmark case: the trailing space of `old` was left out of `new`.
+    let text = "def f(line):\n    prorated = _round_cents(line.unit_price * Decimal(line.qty))\n";
+    let (output, warnings) = edge_warnings(
+        text,
+        vec![exact(
+            "1.1",
+            "    prorated = _round_cents(line.unit_price * ",
+            "    prorated = _quantize(line.unit_price *",
+        )],
+    );
+    assert!(output.contains("_quantize(line.unit_price *Decimal(line.qty))"));
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].change_id.as_deref(), Some("1.1"));
+    assert_eq!(warnings[0].file.as_deref(), Some("edge.py"));
+    assert_eq!(
+        warnings[0].message,
+        "Change 1.1: `old` ends in whitespace `new` drops, joining what follows; line 2 now reads \"…  prorated = _quantize(line.unit_price *Decimal(line.qty))\""
+    );
+
+    let (_, warnings) = edge_warnings("a = b\nc = d\n", vec![exact("join", "b\n", "b")]);
+    assert_eq!(
+        warnings[0].message,
+        "Change join: `old` ends in whitespace `new` drops, joining what follows; line 1 now reads \"a = bc = d\""
+    );
+    let (_, warnings) = edge_warnings("x+ y\n", vec![exact("lead", " y", "z")]);
+    assert_eq!(warnings.len(), 0, "the first visible characters differ");
+    let (_, warnings) = edge_warnings("x+ y\n", vec![exact("lead", " y", "y")]);
+    assert_eq!(
+        warnings[0].message,
+        "Change lead: `old` starts with whitespace `new` drops, joining what precedes; line 1 now reads \"x+y\""
+    );
+    // A dropped line ending joins indented text too.
+    let (_, warnings) = edge_warnings("if a:\n    b\n", vec![exact("nl", "a:\n", "a:")]);
+    assert_eq!(warnings.len(), 1);
+}
+
+#[test]
+fn added_edge_whitespace_beside_whitespace_warns() {
+    let (output, warnings) = edge_warnings("f(a, b)\n", vec![exact("double", "a,", "a, ")]);
+    assert_eq!(output, "f(a,  b)\n");
+    assert_eq!(
+        warnings[0].message,
+        "Change double: `new` ends in spaces or tabs `old` lacks, before whitespace or a line end; line 1 now reads \"f(a,  b)\""
+    );
+    let (_, warnings) = edge_warnings("x = 1\r\ny = 2\r\n", vec![exact("eol", "x = 1", "x = 1 ")]);
+    assert!(
+        warnings[0].message.ends_with("line 1 now reads \"x = 1 \""),
+        "{}",
+        warnings[0].message
+    );
+    let (_, warnings) = edge_warnings("f(a, b)\n", vec![exact("lead", "b)", " b)")]);
+    assert!(
+        warnings[0]
+            .message
+            .contains("after more whitespace; line 1 now reads \"f(a,  b)\"")
+    );
+}
+
+#[test]
+fn ordinary_edits_carry_no_edge_warning() {
+    for (text, old, new) in [
+        ("a = 1\n", "a = 1", "a = 2"),
+        ("a = 1\n", "a = 1\n", "a = 2\n"),
+        // Deleting a line, adding lines, and re-indenting are deliberate.
+        ("a\nb\nc\n", "b\n", ""),
+        ("a\nb\n", "a\n", "a\nx\n"),
+        ("a\nb\n", "b", "    b"),
+        ("a\n\nb\n", "a\n", "a"),
+        // Whitespace-only targets have no visible edge.
+        ("a  b\n", "  ", " "),
+        // The dropped whitespace sits beside more whitespace.
+        ("a b  c\n", "b ", "B"),
+        // Nothing follows the target.
+        ("f(x) ", "x) ", "y)"),
+        ("\u{feff} a\n", " a", "a"),
+    ] {
+        let (_, warnings) = edge_warnings(text, vec![exact("ok", old, new)]);
+        assert!(warnings.is_empty(), "{old:?} -> {new:?}: {warnings:?}");
+    }
+    let (_, warnings) = edge_warnings("a b\n", vec![span_change("span", "r1", "ab")]);
+    assert!(warnings.is_empty());
+}
+
+#[test]
+fn edge_warnings_are_once_per_change_and_bounded() {
+    let all = Change {
+        id: "all".into(),
+        target: Target::All {
+            old: "x ".into(),
+            scope: "r0".into(),
+            expected: 3,
+        },
+        text: "x".into(),
+    };
+    let (output, warnings) = edge_warnings("x a\nx b\nx c\n", vec![all]);
+    assert_eq!(output, "xa\nxb\nxc\n");
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].message.ends_with("line 1 now reads \"xa\""));
+
+    let text: String = (0..20).map(|index| format!("k{index}= v\n")).collect();
+    let changes = (0..20)
+        .map(|index| {
+            exact(
+                &format!("c{index}"),
+                &format!("k{index}= "),
+                &format!("k{index}="),
+            )
+        })
+        .collect();
+    let (_, warnings) = edge_warnings(&text, changes);
+    assert_eq!(warnings.len(), 8);
+    // Long lines, escapes and IDs still fit what clients display.
+    let long = format!("{} = \t\u{1}{}\n", "é".repeat(500), "\"".repeat(500));
+    let id = "i".repeat(300);
+    let (_, long_warnings) = edge_warnings(&long, vec![exact(&id, "= \t", "=")]);
+    assert_eq!(long_warnings.len(), 1);
+    let message = &long_warnings[0].message;
+    assert!(message.chars().count() <= 240, "{message}");
+    assert!(message.ends_with("\"…"), "{message}");
+    assert!(
+        warnings[7].message.contains("line 8 now reads \"k7=v\""),
+        "{}",
+        warnings[7].message
+    );
+}
+
+#[test]
+fn byte_warnings_precede_edge_warnings_so_compact_summaries_keep_them() {
+    // Eight edge warnings in the first file must not push the second file's
+    // MIXED_LINE_ENDINGS, or the first file's NUL_BYTE, out of the six warnings
+    // a compact response shows.
+    let text: String = (0..8).map(|index| format!("k{index}= v\n")).collect();
+    let mut first = snapshot("first.txt".into(), format!("{text}\0"));
+    first.id = "s1".into();
+    let mut second = snapshot("second.txt".into(), "a\r\nb\r\n".into());
+    second.id = "s2".into();
+    let changes = (0..8)
+        .map(|index| {
+            exact(
+                &format!("c{index}"),
+                &format!("k{index}= "),
+                &format!("k{index}="),
+            )
+        })
+        .collect();
+    let request = EditRequest {
+        request_id: "order".into(),
+        files: vec![
+            FileRequest {
+                path: None,
+                base: first.id.clone(),
+                changes,
+            },
+            FileRequest {
+                path: None,
+                base: second.id.clone(),
+                changes: vec![exact("eol", "a\r\n", "a\n")],
+            },
+        ],
+    };
+    let snapshots = BTreeMap::from([
+        (first.id.clone(), first.clone()),
+        (second.id.clone(), second.clone()),
+    ]);
+    let plan = compile(&request, &snapshots).unwrap();
+    let codes: Vec<_> = plan
+        .warnings
+        .iter()
+        .map(|warning| warning.code.as_str())
+        .collect();
+    let mut expected = vec!["NUL_BYTE", "MIXED_LINE_ENDINGS"];
+    expected.extend(["WHITESPACE_EDGE"; 8]);
+    assert_eq!(codes, expected);
+    let shown = ultra_edit::report::warning_summaries(&plan.warnings);
+    assert_eq!(shown[1]["code"], "MIXED_LINE_ENDINGS");
+    assert_eq!(shown[1]["file"], "second.txt");
+}
+
+#[test]
+fn span_ranges_past_the_last_line_say_so_instead_of_asking_for_more_reads() {
+    let base = snapshot("short.txt".into(), "a\nb\nc\n".into());
+    let error = rejected(&base, span_change("b", "r2..r9", "X"));
+    assert_eq!(error.code, "UNKNOWN_SPAN");
+    assert_eq!(
+        error.message,
+        "Span r2..r9 runs past the file's last line, 3; this base discloses r0 (whole file); lines 1-3"
+    );
+    // A range base points past the end the same way, not at another read.
+    let text = numbered(10);
+    let ranged_base = ranged(&text, &[(8, 10)]);
+    assert_eq!(
+        rejected(&ranged_base, span_change("b", "r9..r11", "X")).message,
+        "Span r9..r11 runs past the file's last line, 10; this base discloses lines 8-10; selection = lines 8-10"
+    );
+    // The bound holds for the longest IDs and disclosure lists.
+    let scattered: Vec<_> = (1..=10).map(|line| (line, line)).collect();
+    let error = rejected(
+        &ranged(&numbered(10), &scattered),
+        span_change("b", &format!("r1..r{}", usize::MAX), "X"),
+    );
+    assert!(error.message.chars().count() <= 240, "{}", error.message);
+}
+
+#[test]
+fn edge_warnings_judge_neighbours_in_the_output_not_the_original() {
+    // Each change alone would join text, but together the space survives.
+    let (output, warnings) = edge_warnings(
+        "a b\n",
+        vec![exact("left", "a ", "a"), exact("right", "b", " b")],
+    );
+    assert_eq!(output, "a b\n");
+    assert!(warnings.is_empty(), "{warnings:?}");
+    // The neighbour a dropped space now joins is another change's text.
+    let (output, warnings) = edge_warnings(
+        "x = a  b\n",
+        vec![exact("left", "a ", "a"), exact("right", " b", "c")],
+    );
+    assert_eq!(output, "x = ac\n");
+    assert_eq!(warnings.len(), 1);
+    assert!(
+        warnings[0].message.ends_with("line 1 now reads \"x = ac\""),
+        "{}",
+        warnings[0].message
+    );
+}
+
+#[test]
+fn a_span_range_over_inconsistent_line_offsets_is_rejected_not_sliced() {
+    // A tampered snapshot whose line 2 lies before line 1 must not reach a
+    // reversed byte slice.
+    let mut base = snapshot("tampered.txt".into(), "aaaa\nbb\n".into());
+    base.spans[1].start = 5;
+    base.spans[1].end = 7;
+    base.spans[2].start = 0;
+    base.spans[2].end = 2;
+    let error = rejected(&base, span_change("b", "r1..r2", "X"));
+    assert_eq!(error.code, "UNKNOWN_SPAN");
 }

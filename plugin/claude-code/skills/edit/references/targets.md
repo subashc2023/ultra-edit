@@ -12,7 +12,7 @@ Call `ultra_edit_snapshot` with one existing `path` and one `selection`:
 | Complete file | `{"kind":"full"}` | `spans: ["r0", "r1..r400"]`, where `r0` is all bytes and `r1`… are line bodies, plus `lines`; within the default full-read limits |
 
 Range and full responses summarize their disclosed IDs in `spans`, collapsing
-consecutive line IDs into `r12..r18`, and list every disclosed line body in
+consecutive line IDs into `r12..r18` (itself a usable span; see below), and list every disclosed line body in
 `lines` as `"r12 | const retries = 2;"`. A blank line is `"r14 | "`, and whole-file
 `r0` has no listing entry. Choose `r{n}` from that listing instead of counting
 newlines; `text` still holds the exact selected bytes, which is what `expect`
@@ -91,6 +91,7 @@ separate literal `text` field.
 | Intent | Target | Requirement |
 | --- | --- | --- |
 | Replace a disclosed line, selection, or match | `{"kind":"span","span":"m1"}` | The span belongs to this base. |
+| Replace a run of disclosed lines | `{"kind":"span","span":"r146..r150","expect":"…"}` | This base disclosed every line from 146 to 150. |
 | Guard a positional target with known content | `{"kind":"span","span":"m1","expect":"old text"}` | The selected original bytes equal `expect`, or `EXPECTED_TEXT_MISMATCH` rejects the batch. |
 | Replace unique exact text inside an inspected range | `{"kind":"exact","old":"old text","scope":"selection"}` | Exactly one occurrence wholly inside that scope. |
 | Replace unique exact text anywhere in the original file | `{"kind":"exact","old":"old text"}` | Exactly one occurrence in the entire file. |
@@ -107,6 +108,15 @@ an `inserted` line between `first\r\nsecond`, replace `first` with
 clipped context fragment.
 `scope` is a span ID, never literal text. To select a multi-line region, first
 read its range and use `selection`; inline `{first,last}` scopes are unsupported.
+
+A line range `rA..rB` works as a `span` or `scope` when the base disclosed every
+line from A to B, for instance across a range continued with another range. It
+behaves like `selection` for those lines: from the start of line A's body to the
+end of line B's, so B's terminator stays, `""` blanks the lines instead of
+deleting them, and `expect` must equal the bodies joined by the file's own line
+endings. `r150..r146`, a range with an undisclosed line, and shapes such as
+`146-150` or `L146` are `UNKNOWN_SPAN`; its message lists what the base
+discloses, as in `lines 146-150, 1875-1879; selection = lines 1875-1879`.
 
 Because line spans exclude terminators, replacing a line span with `""` only
 blanks that line; its terminator survives. To delete a line, read a range that
@@ -126,9 +136,9 @@ CRLF source.
 Search and `exact` ambiguity counts include overlapping starts: `aa` occurs twice in `aaa`.
 Ambiguous exact matches are errors. In `TARGET_AMBIGUOUS`, `actual` remains the
 overlapping-start count; the message adds, in parentheses, the non-overlapping
-count for a corresponding same-scope `{"kind":"all"}` target:
-`found 6 overlapping starts
-(4 non-overlapping)`. Select a disclosed match, narrow the scope, or deliberately
+count for a corresponding same-scope `{"kind":"all"}` target, and the lines of
+the first five starts: `found 6 overlapping starts
+(4 non-overlapping) at lines 41, 89, 137`. Select a disclosed match, narrow the scope, or deliberately
 switch to `all` using that parenthesized value as `expected`, with the same `old`
 and disclosed scope. An unscoped `exact` from a focused snapshot has no equivalent
 `all` repair unless that snapshot discloses a span covering the intended region;
@@ -154,7 +164,7 @@ clipped, so read `line..end_line` instead. The first tier with results wins:
 | `kind` | Found | Use |
 | --- | --- | --- |
 | `exact` | The unmet `expect` text elsewhere, or a scoped target's text outside its scope | For `expect`, copy `text` into `old`; for a scope, pick a scope that contains the line or drop it. |
-| `whitespace` | Text equal after CRLF→LF, dropping trailing spaces/tabs, and collapsing space/tab runs | Copy `text` verbatim; it keeps the file's indentation, such as `"\tlet x = 1;"`. Write the replacement with the file's tabs and line endings. |
+| `whitespace` | Text equal after CRLF→LF, dropping trailing spaces/tabs, and collapsing space/tab runs | Copy `text` verbatim; it keeps the file's indentation, such as `"\tlet x = 1;"`. Write the replacement with the file's tabs and line endings. The message says when only CRLF line endings differ. |
 | `similar` | Text at least 70% similar (`similarity` gives the percentage) | Confirm it is the intended region first; it can be a different line of similar shape. |
 
 A scoped target first checks whether its exact text occurs elsewhere in the file,

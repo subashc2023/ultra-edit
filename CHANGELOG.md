@@ -5,6 +5,52 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ## [Unreleased]
 
+### Added
+
+- Path mode: a file entry can name its file by `path` instead of a snapshot
+  `base`, as native Edit does. The server reads the file's current bytes under
+  the workspace lock as the base, so an ordinary edit needs no
+  `ultra_edit_snapshot` call. Batches stay all-or-nothing across files, with
+  receipts, replay, and undo. Spans other than `r0` still need a snapshot base
+  (`SPAN_NEEDS_BASE`). Paths are normalized lexically before request IDs are
+  derived, a rejected derived-ID path request is not bound so an identical
+  resend is evaluated again, and replaying a committed path request whose files
+  changed since warns `REPLAYED_FILE_CHANGED`. Stored plans and drafts keep the
+  0.3.0 shape, a base per file.
+
+- Span ranges `rA..rB` work as a `span` or `scope` when the base disclosed
+  every line from A to B, such as the `r146..r150` a range read lists in
+  `spans`. A range runs from the start of line A's body to the end of line B's,
+  like `selection`, so `""` blanks the lines and `expect` is byte-exact. A
+  reversed or partly undisclosed range is `UNKNOWN_SPAN`.
+- A nonblocking `WHITESPACE_EDGE` warning quotes the resulting line when an
+  `exact` or `all` change's `old` and `new` differ only in whitespace at an edge
+  and that joins text (`unit_price * Decimal` written as `unit_price *Decimal`)
+  or lands beside more whitespace. Bytes are still written as given. These
+  warnings follow the plan's `NUL_BYTE` and `MIXED_LINE_ENDINGS` warnings, so
+  compact responses keep showing those.
+
+### Changed
+
+- A snapshot range that runs past the file's last line now reads through it,
+  as native Read does, instead of failing with `INVALID_LINE_RANGE`; a range
+  that starts past the last line still fails. The benchmark saw five such
+  failures, each costing a round trip.
+- The plugin's session routing card is rewritten path-first and cut from 4,191
+  to under 2,048 bytes, and the server instructions from 1,431 to 613
+  characters. The edit skill now covers recovery and span targets; ordinary
+  edits need only the card.
+- `ultra_edit_snapshot` and `ultra_edit` carry `_meta: {"anthropic/alwaysLoad":
+  true}`, so Claude Code loads their schemas up front instead of behind a
+  `ToolSearch` round trip, which the benchmark measured at about 0.9 extra API
+  calls per editing session. Recovery tools stay deferred.
+- Diagnostic messages, which are free text, now say more. `UNKNOWN_SPAN` lists
+  what the base discloses (`lines 146-150, 1875-1879; selection = lines
+  1875-1879`) and answers IDs of other shapes, such as `146-150`, with the shapes
+  span IDs take. `TARGET_AMBIGUOUS` names the lines of the first five matches.
+  `TARGET_NOT_FOUND` says when the best whitespace candidate differs from `old`
+  only in CRLF line endings. Codes, fields, and the `spans` summary are unchanged.
+
 ## [0.3.0] - 2026-09-25
 
 ### Added

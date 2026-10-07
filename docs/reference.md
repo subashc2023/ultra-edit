@@ -73,14 +73,18 @@ To read a small region, use `read-range src/retry.rs 12 18`. Line numbers are
 one-based and inclusive. It returns `snapshot`, `path`, `digest`, file totals,
 the exact selected `text`, absolute byte `start`/`end` of the selection, the
 summarized editable `spans` — `["r12..r18", "selection"]`, where `r12`…`r18` are
-individual line bodies and `selection` is the entire selected range — and a
+individual line bodies, the range `r12..r18` or any part of it such as
+`r13..r15` addresses a run of them, and `selection` is the entire selected
+range — and a
 `lines` listing such as `"r12 | const retries = 2;"`. Copy replacement bodies
 from that listing or from `text`; `text` remains the exact selected bytes for
 `expect` guards and multi-line `exact` targets. The text excludes the leading BOM
 and the last selected line's terminator; original newlines **inside** the range
 are included unchanged.
 Empty and BOM-only files have an empty line 1. Invalid ranges fail explicitly.
-Focused reads allow at most 200 lines and 6,000 source Unicode characters. They
+A range that runs past the last line reads through it, as native Read does, and
+the response's `end` and `total_lines` say where the file stopped; a range that
+starts past the last line is `INVALID_LINE_RANGE`. Focused reads allow at most 200 lines and 6,000 source Unicode characters. They
 reject oversized selections instead of issuing references to clipped text,
 directing an oversized selection to a smaller range, a search, or an explicit
 `EXPECTED_BYTES` full read rather than a plain full read that may also be over
@@ -175,6 +179,41 @@ An edit request uses snapshot IDs returned by `read`:
 }
 ```
 
+A file can instead be named by `path`, as native Edit names it. The server
+resolves the path inside the workspace and reads the file's current bytes under
+the workspace lock, stores them as a snapshot, and uses that snapshot as the
+file's base, so plans and drafts record bases exactly as snapshot requests do:
+
+```json
+{
+  "files": [{
+    "path": "src/retry.ts",
+    "changes": [
+      {
+        "target": { "kind": "exact", "old": "const retries = 2;" },
+        "text": "const retries = 3;"
+      }
+    ]
+  }]
+}
+```
+
+Each file needs `path` or `base` (`EMPTY_SNAPSHOT_ID` otherwise). With both, the
+base is used and must be that file's snapshot (`SNAPSHOT_PATH_MISMATCH`). A path
+that cannot be read gets its own diagnostic, such as `TARGET_MISSING` or
+`PATH_OUTSIDE_WORKSPACE`, and nothing is written. A path file was never read
+through a snapshot, so no span of it was disclosed: a `span` or `scope` other
+than `r0`, the whole file, is `SPAN_NEEDS_BASE`. Path mode detects no change
+made between your read and the call; the exact `old` text is the guard, as with
+native Edit. Paths are normalized lexically before IDs are derived: a leading
+workspace root is stripped and `.` components and repeated separators are
+dropped, while `..` is kept, so `a.txt`, `./a.txt`, and `<root>/a.txt` derive
+one request ID. A rejected request with a derived ID and a path file is not
+bound, so resending it after fixing the cause evaluates it again; with an
+explicit `request_id`, it replays like any other request. Replaying a committed
+path request whose files changed since adds a `REPLAYED_FILE_CHANGED` warning:
+nothing was written now, and applying the edit again needs a new `request_id`.
+
 `request_id` and each change `id` are optional; these changes receive IDs `1.1`
 and `1.2`. A missing or empty change ID becomes its 1-based `"{file}.{change}"`
 position in the request. Explicit change IDs are kept and must be unique across
@@ -198,12 +237,26 @@ targets:
 | `{"kind":"all","old":"text","scope":"r0","expected":3}` | Explicit scope and exact positive count of non-overlapping, left-to-right replacements. |
 | `{"kind":"span","span":"r5"}` | Replace that span with literal `text`. |
 | `{"kind":"span","span":"r5","expect":"old line"}` | Replace only if the selected original bytes equal `expect` exactly. |
+| `{"kind":"span","span":"r12..r18"}` | Replace a run of disclosed lines, from the start of line 12's body to the end of line 18's. |
 
-`scope` is a disclosed span ID such as `r5`, `selection`, or `m2`, never literal
-source text. Obtain an arbitrary line region with a range snapshot and use its
-`selection`; inline `{first,last}` scopes are not supported. Prefer `exact` or
-add `span.expect` when a mistaken positional ID should fail instead of replacing
-the wrong text. An expectation mismatch returns `EXPECTED_TEXT_MISMATCH`.
+`scope` is a disclosed span ID such as `r5`, `selection`, or `m2`, or a line
+range `rA..rB`, never literal source text. A line range is accepted wherever a
+span ID is, as `span` or `scope`, when its base disclosed every line from A to B
+(as the `spans` summary `r12..r18` reports). It means what `selection` means
+for a range read of those lines: it excludes line B's terminator, so `""` blanks
+the lines rather than deleting them, and `expect` stays byte-exact (`\r\n` in
+CRLF source). A range with an undisclosed line, or with A after B, is
+`UNKNOWN_SPAN`. Arbitrary undisclosed line regions need a range snapshot first;
+inline `{first,last}` scopes are not supported. Prefer `exact` or add
+`span.expect` when a mistaken positional ID should fail instead of replacing the
+wrong text. An expectation mismatch returns `EXPECTED_TEXT_MISMATCH`.
+
+`UNKNOWN_SPAN` lists what the base discloses, in line numbers rather than IDs,
+for example `This base discloses lines 146-150, 1875-1879; selection = lines
+1875-1879`, bounded to about 100 characters. An ID of another shape, such as
+`146-150`, `L146`, or `r146-r150`, is answered with the shapes span IDs take,
+and a range past the file's last line names that line instead of suggesting
+another read.
 
 Empty exact search strings are rejected. Use a returned zero-width span with
 `expect: ""` for insertion where one exists. Line snapshots do not synthesize a
@@ -226,7 +279,9 @@ line of the selection.
 starts in `aaa`. For `TARGET_AMBIGUOUS`, `actual` remains that overlapping-start
 count; the message also gives the non-overlapping count required by a corresponding
 same-scope `{"kind":"all"}` target, for example
-`found 6 overlapping starts (4 non-overlapping)`. `all` counts and replaces those
+`found 6 overlapping starts (4 non-overlapping)`, and the lines of the first five
+starts, as in `at lines 41, 89, 137`, so a longer `old` or a scope can single one
+out. `all` counts and replaces those
 non-overlapping matches from left to right: `aa` in `aaaa` requires `expected: 2`,
 and eight spaces contain four replacements of `"  "`.
 Use the parenthesized value only with the same `old` and disclosed scope. Because
@@ -270,7 +325,9 @@ Only the first six failed targets of a request are searched, within 32 MiB of
 scanned text, so a request with many failures cannot hold the workspace lock
 for long; later failures get no candidates.
 For `exact` and `whitespace` candidates, copy `text` verbatim into `old` and
-write the replacement with the file's tabs and line endings. Confirm that a
+write the replacement with the file's tabs and line endings. When the best
+`whitespace` candidate differs from a multi-line `old` only by CRLF where `old`
+has LF, as text copied from a view that hides `\r` does, the message says so. Confirm that a
 `similar` candidate is the intended region first: it can be a structurally
 similar but different line, most often for single-line targets. Then repair only
 the failed change ID, or submit a new request. If `text` is absent, read
@@ -286,6 +343,19 @@ Ready plans and receipts carry nonblocking `NUL_BYTE` and `MIXED_LINE_ENDINGS`
 warnings when candidate output contains NUL or both CRLF and bare LF. Warnings
 also report pre-existing conditions retained in the candidate; they do not alter
 bytes or reject the request. Inspect them before committing a preview.
+
+A nonblocking `WHITESPACE_EDGE` warning flags an `exact` or `all` change whose
+`old` and `new` agree on their first (or last) visible character but differ in
+the whitespace beyond it, where that matters in the file: whitespace `old` has
+and `new` drops beside visible text joins them (`unit_price * Decimal` written as
+`unit_price *Decimal`), as does a dropped line ending beside indentation; and
+spaces or tabs `new` adds and `old` lacks land beside more whitespace or, at the
+end, before a line end. Added leading indentation at a line start is not
+flagged. The message quotes the resulting line, as in `line 2 now reads
+"…_quantize(line.unit_price *Decimal(line.qty))"`, once per change and edge and
+at most eight per file. The bytes are still written exactly as given. These
+warnings follow every `NUL_BYTE` and `MIXED_LINE_ENDINGS` warning of the plan, so
+the six warnings a compact response shows never trade one of those for this lint.
 
 ## Preview, repair, retry, and undo
 

@@ -35,6 +35,7 @@ fn request(id: &str, snapshot: &Snapshot, changes: Vec<Change>) -> EditRequest {
     EditRequest {
         request_id: id.into(),
         files: vec![FileRequest {
+            path: None,
             base: snapshot.id.clone(),
             changes,
         }],
@@ -157,6 +158,7 @@ fn preflight_retry_preserves_history_candidates_and_request_identity_after_resta
     let second = workspace.read("second.txt").unwrap();
     let mut original_request = request("original", &snapshot, vec![change("first", "one", "two")]);
     original_request.files.push(FileRequest {
+        path: None,
         base: second.id,
         changes: vec![change("second", "one", "two")],
     });
@@ -299,6 +301,7 @@ fn failed_batch_keeps_every_target_unchanged_and_repair_retains_positions() {
         ],
     );
     request.files.push(FileRequest {
+        path: None,
         base: second.id,
         changes: vec![change("third", "also missing", "FOUR")],
     });
@@ -480,6 +483,7 @@ fn aliases_cannot_overwrite_separate_candidates() {
     let alias = workspace.read("./file.txt").unwrap();
     let mut request = request("aliases", &first, vec![change("a", "one", "ONE")]);
     request.files.push(FileRequest {
+        path: None,
         base: alias.id,
         changes: vec![change("b", "two", "TWO")],
     });
@@ -488,6 +492,7 @@ fn aliases_cannot_overwrite_separate_candidates() {
     let hardlink = workspace.read("link.txt").unwrap();
     let mut request = self::request("hardlinks", &first, vec![change("a", "one", "ONE")]);
     request.files.push(FileRequest {
+        path: None,
         base: hardlink.id,
         changes: vec![change("b", "two", "TWO")],
     });
@@ -529,6 +534,7 @@ fn invalid_snapshot_references_are_not_misreported_as_file_paths() {
         .prepare(EditRequest {
             request_id: "invalid-reference".into(),
             files: vec![FileRequest {
+                path: None,
                 base: reference.into(),
                 changes: vec![change("unused", "one", "two")],
             }],
@@ -567,10 +573,12 @@ fn invalid_snapshot_references_are_not_misreported_as_file_paths() {
             request_id: "two-invalid-references".into(),
             files: vec![
                 FileRequest {
+                    path: None,
                     base: "sdoesnotexist000".into(),
                     changes: vec![change("first", "one", "two")],
                 },
                 FileRequest {
+                    path: None,
                     base: reference.into(),
                     changes: vec![change("second", "one", "two")],
                 },
@@ -765,6 +773,7 @@ fn pruning_removes_unreferenced_and_orphaned_blobs_and_keeps_referenced_ones() {
         .prepare(EditRequest {
             request_id: "planned".into(),
             files: vec![FileRequest {
+                path: None,
                 base: planned.snapshot.clone(),
                 changes: vec![Change {
                     id: "c".into(),
@@ -1022,6 +1031,7 @@ fn omitted_change_ids_become_their_one_based_positions() {
         vec![change("", "one", "ONE"), change("", "two", "TWO")],
     );
     automatic.files.push(FileRequest {
+        path: None,
         base: second.id.clone(),
         changes: vec![change("", "three", "THREE")],
     });
@@ -1219,4 +1229,78 @@ fn a_replay_notice_counts_against_the_report_bounds() {
     }
     assert_eq!(replayed.lines().next(), Some(REPLAY_NOTICE));
     assert_eq!(replayed.lines().nth(1), fresh.lines().next());
+}
+
+/// Derived request IDs are persisted as binding keys, so the IDs 0.3.0 derived for
+/// these requests must never change: a different ID would re-attempt an edit whose
+/// output was lost instead of replaying its receipt.
+#[test]
+fn derived_request_ids_match_0_3_0() {
+    let file = |base: &str, target: Target, text: &str| EditRequest {
+        request_id: String::new(),
+        files: vec![FileRequest {
+            path: None,
+            base: base.into(),
+            changes: vec![Change {
+                id: String::new(),
+                target,
+                text: text.into(),
+            }],
+        }],
+    };
+    let golden = [
+        (
+            file(
+                "s00000000000000000000000000000001",
+                Target::Exact {
+                    old: "alpha = 1".into(),
+                    scope: None,
+                },
+                "alpha = 2",
+            ),
+            "auto-5449ca50c1835a6f1d12d9ffa2b1e0b7",
+        ),
+        (
+            file(
+                "s00000000000000000000000000000002",
+                Target::All {
+                    old: "old_name".into(),
+                    scope: "r0".into(),
+                    expected: 3,
+                },
+                "new_name",
+            ),
+            "auto-f0a764ec9036620a82f665c4348a55dc",
+        ),
+        (
+            file(
+                "s00000000000000000000000000000003",
+                Target::Span {
+                    span: "r12".into(),
+                    expect: Some("    return x;".into()),
+                },
+                "    return y;",
+            ),
+            "auto-63beb797ae5975a3c95f9cd7f30c8a08",
+        ),
+    ];
+    for (request, id) in golden {
+        assert_eq!(resolve_ids(request).unwrap().request_id, id);
+    }
+    let corrections = [Change {
+        id: "1.1".into(),
+        target: Target::Exact {
+            old: "two".into(),
+            scope: Some("r2".into()),
+        },
+        text: "2".into(),
+    }];
+    assert_eq!(
+        repair_request_id("", "d00000000000000000000000000000004", &corrections).unwrap(),
+        "auto-de1755d7e9acadbd0ee7c77d576a350d"
+    );
+    assert_eq!(
+        undo_request_id("", "p00000000000000000000000000000005").unwrap(),
+        "auto-6bef3b0b08e8021d34d1eb63f244f1ac"
+    );
 }

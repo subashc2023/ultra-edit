@@ -175,11 +175,17 @@ pub(crate) fn find_target(
 }
 
 /// Completes a message for a target with no occurrences and some candidates.
-/// `exact` candidates here lie outside the target's scope.
-pub(crate) fn not_found(expected: usize, candidates: &[Candidate]) -> String {
+/// `exact` candidates here lie outside the target's scope. A `whitespace`
+/// candidate that equals `needle` once its CRLFs become LF gets a line-ending
+/// hint: text copied from a view that hides `\r` never matches a CRLF file.
+pub(crate) fn not_found(expected: usize, needle: &str, candidates: &[Candidate]) -> String {
     match candidates.first() {
         Some(first) if first.kind == CandidateKind::Exact => format!(
             "Expected {expected} occurrence(s) in the scope, found 0; the text is outside it, first at {}. Use a scope that contains the intended occurrence {REPAIR}.",
+            place(first)
+        ),
+        Some(first) if differs_only_in_line_endings(first, needle) => format!(
+            "Expected {expected} occurrence(s), found 0; a candidate at {} differs only in its CRLF line endings. Copy its exact text, \\r\\n included, into `old` {REPAIR}.",
             place(first)
         ),
         _ => format!(
@@ -187,6 +193,20 @@ pub(crate) fn not_found(expected: usize, candidates: &[Candidate]) -> String {
             advice(candidates)
         ),
     }
+}
+
+/// Whether a `whitespace` candidate is `needle` with CRLF where it has bare LF.
+/// The candidate may stop short of spaces or tabs at the needle's edges, which the
+/// whitespace tier trims, so those edges are ignored on both sides.
+fn differs_only_in_line_endings(candidate: &Candidate, needle: &str) -> bool {
+    let edges = [' ', '\t'];
+    candidate.kind == CandidateKind::Whitespace
+        && needle.contains('\n')
+        && !needle.contains('\r')
+        && candidate.text.as_deref().is_some_and(|text| {
+            text.contains("\r\n")
+                && text.replace("\r\n", "\n").trim_matches(edges) == needle.trim_matches(edges)
+        })
 }
 
 /// Describes an unmet span expectation, quoting the text the span selected.
@@ -251,7 +271,7 @@ fn place(candidate: &Candidate) -> String {
 
 /// Source text on one line, escaped like a Rust string literal and clipped at
 /// `limit` escaped characters; an ellipsis after the closing quote marks a clip.
-fn quoted(text: &str, limit: usize) -> String {
+pub(crate) fn quoted(text: &str, limit: usize) -> String {
     let mut output = String::from('"');
     let mut width = 0;
     for character in text.chars() {
@@ -1044,7 +1064,7 @@ mod tests {
                 for text in [false, true] {
                     let candidates = vec![candidate(kind, line - 1, line, text); count];
                     for message in [
-                        not_found(usize::MAX, &candidates),
+                        not_found(usize::MAX, "a\nb", &candidates),
                         mismatch(&actual, &candidates),
                     ] {
                         assert!(message.chars().count() <= MESSAGE_CHARS, "{message}");
@@ -1059,6 +1079,30 @@ mod tests {
             &[candidate(CandidateKind::Exact, 3, 3, true)],
         );
         assert!(message.contains(&format!("\"{}\"…", "x".repeat(QUOTED_CHARS))));
+        // The line-ending hint fits as well.
+        let mut crlf = candidate(CandidateKind::Whitespace, line - 1, line, true);
+        crlf.text = Some("a\r\nb".into());
+        let message = not_found(usize::MAX, "a\nb", &[crlf]);
+        assert!(message.contains("CRLF line endings"), "{message}");
+        assert!(message.chars().count() <= MESSAGE_CHARS, "{message}");
+    }
+
+    #[test]
+    fn only_a_crlf_twin_of_an_lf_needle_gets_the_line_ending_hint() {
+        let text = "fn main() {\r\n    let x = 1;\r\n}\r\n";
+        let hint = |needle: &str| {
+            let mut budget = usize::MAX;
+            let found = find_target(&mut budget, text, 0..text.len(), needle);
+            assert_eq!(found[0].kind, CandidateKind::Whitespace, "{needle:?}");
+            not_found(1, needle, &found).contains("CRLF line endings")
+        };
+        assert!(hint("fn main() {\n    let x = 1;\n}"));
+        // Indentation the whitespace tier trims from the needle still counts.
+        assert!(hint("    let x = 1;\n}"));
+        // Other whitespace differences get the general advice.
+        assert!(!hint("fn main() {\n  let x = 1;\n}"));
+        // A one-line needle has no line ending to blame.
+        assert!(!hint("let  x = 1;"));
     }
 
     #[test]

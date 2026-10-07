@@ -56,32 +56,33 @@ pub(crate) fn read_range(
             "Line numbers must be positive and the first must not exceed the last",
         ));
     }
-    let too_many_lines = last - first >= MAX_RANGE_LINES;
-    let mut total_lines = 0;
-    let mut disclosed = Vec::new();
-    for (index, range) in line_ranges(&text).enumerate() {
-        total_lines = index + 1;
-        if !too_many_lines && (first..=last).contains(&total_lines) {
-            disclosed.push(Span {
-                id: format!("r{total_lines}"),
-                start: range.start,
-                end: range.end,
-                line: total_lines,
-            });
-        }
-    }
-    if last > total_lines {
+    let total_lines = line_ranges(&text).count();
+    if first > total_lines {
         return Err(Error::new(
             "INVALID_LINE_RANGE",
-            format!("File has {total_lines} line(s); requested through line {last}"),
+            format!("File has {total_lines} line(s); the range starts at line {first}"),
         ));
     }
-    if too_many_lines {
+    // A range past the end reads through the last line, as native Read does; the
+    // response's `end` and `total_lines` say where the file stopped.
+    let last = last.min(total_lines);
+    if last - first >= MAX_RANGE_LINES {
         return Err(Error::new(
             "READ_TOO_LARGE",
             "A focused read supports at most 200 lines; choose a smaller range",
         ));
     }
+    let disclosed: Vec<Span> = line_ranges(&text)
+        .enumerate()
+        .map(|(index, range)| (index + 1, range))
+        .filter(|(line, _)| (first..=last).contains(line))
+        .map(|(line, range)| Span {
+            id: format!("r{line}"),
+            start: range.start,
+            end: range.end,
+            line,
+        })
+        .collect();
     let start = disclosed[0].start;
     let end = disclosed[disclosed.len() - 1].end;
     let selected = &text[start..end];
@@ -166,6 +167,97 @@ pub(crate) fn span_summary(spans: &[Span]) -> Vec<String> {
     summary
 }
 
+/// Characters of a disclosure list in a diagnostic; longer lists end in `…`.
+const MAX_DISCLOSED_CHARS: usize = 100;
+
+/// Describes what a base discloses in words a diagnostic can teach with, such as
+/// `lines 146-150, 1875-1879; selection = lines 1875-1879; m1-m3`. Unlike
+/// [`span_summary`], line runs read as line numbers rather than as span IDs, so the
+/// list is not mistaken for an ID. Bounded to about 100 characters, so a
+/// diagnostic quoting it still fits the 240 characters clients display.
+pub(crate) fn disclosed_lines(spans: &[Span]) -> String {
+    let mut lines: Vec<usize> = spans.iter().filter_map(|span| line_id(&span.id)).collect();
+    lines.sort_unstable();
+    let mut matches: Vec<usize> = spans.iter().filter_map(|span| match_id(&span.id)).collect();
+    matches.sort_unstable();
+    let mut groups = Vec::new();
+    if spans.iter().any(|span| span.id == "r0") {
+        groups.push("r0 (whole file)".to_owned());
+    }
+    if !lines.is_empty() {
+        let noun = if lines.len() == 1 { "line" } else { "lines" };
+        groups.push(format!("{noun} {}", runs(&lines, "")));
+    }
+    if let Some(selection) = spans.iter().find(|span| span.id == "selection") {
+        // A range read discloses each line it selects, so the last line span inside
+        // the selection ends it.
+        let last = spans
+            .iter()
+            .filter(|span| span.start >= selection.start && span.end <= selection.end)
+            .filter_map(|span| line_id(&span.id))
+            .max()
+            .unwrap_or(selection.line);
+        groups.push(if last > selection.line {
+            format!("selection = lines {}-{last}", selection.line)
+        } else {
+            format!("selection = line {}", selection.line)
+        });
+    }
+    if !matches.is_empty() {
+        groups.push(runs(&matches, "m"));
+    }
+    groups.extend(
+        spans
+            .iter()
+            .filter(|span| {
+                !matches!(span.id.as_str(), "r0" | "selection")
+                    && line_id(&span.id).is_none()
+                    && match_id(&span.id).is_none()
+            })
+            .map(|span| span.id.clone()),
+    );
+    if groups.is_empty() {
+        return "no spans".into();
+    }
+    let list = groups.join("; ");
+    if list.chars().count() <= MAX_DISCLOSED_CHARS {
+        return list;
+    }
+    // Clip at a separator so no partial number is shown.
+    let clipped: String = list.chars().take(MAX_DISCLOSED_CHARS).collect();
+    let cut = clipped.rfind([',', ';']).unwrap_or(clipped.len());
+    format!("{}, …", &clipped[..cut])
+}
+
+/// Collapses sorted numbers into runs such as `1-3, 7`, each number with `prefix`.
+fn runs(numbers: &[usize], prefix: &str) -> String {
+    let mut parts = Vec::new();
+    let mut index = 0;
+    while index < numbers.len() {
+        let first = numbers[index];
+        let mut last = first;
+        while index + 1 < numbers.len() && numbers[index + 1] <= last + 1 {
+            index += 1;
+            last = numbers[index];
+        }
+        parts.push(if first == last {
+            format!("{prefix}{first}")
+        } else {
+            format!("{prefix}{first}-{prefix}{last}")
+        });
+        index += 1;
+    }
+    parts.join(", ")
+}
+
+/// Search-match IDs are `m` and a one-based match ordinal.
+fn match_id(id: &str) -> Option<usize> {
+    id.strip_prefix('m')
+        .filter(|ordinal| ordinal.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|ordinal| ordinal.parse().ok())
+        .filter(|ordinal| *ordinal > 0)
+}
+
 /// Lists every disclosed line body as `"{id} | {body}"` so a line can be chosen
 /// without counting newlines in the selected text. Whole-file `r0` is not a line.
 pub(crate) fn line_listing(spans: &[Span], text: &str) -> Vec<String> {
@@ -178,7 +270,7 @@ pub(crate) fn line_listing(spans: &[Span], text: &str) -> Vec<String> {
 
 /// Line-body IDs are `r` and a one-based line number. `r0` covers the whole
 /// file, so it never joins a line range or the listing.
-fn line_id(id: &str) -> Option<usize> {
+pub(crate) fn line_id(id: &str) -> Option<usize> {
     id.strip_prefix('r')
         .and_then(|line| line.parse().ok())
         .filter(|line| *line > 0)
@@ -277,4 +369,67 @@ pub(crate) fn search(
         matches,
     };
     Ok((snapshot, result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn span(id: &str, start: usize, end: usize) -> Span {
+        Span {
+            id: id.into(),
+            start,
+            end,
+            line: line_id(id).unwrap_or(1),
+        }
+    }
+
+    #[test]
+    fn disclosure_lists_read_as_line_numbers_and_never_as_span_ranges() {
+        let full = snapshot("full.txt".into(), "a\nb\nc\n".into());
+        assert_eq!(disclosed_lines(&full.spans), "r0 (whole file); lines 1-3");
+        let (one, _) = read_range("f.txt".into(), "a\nb\nc\n".into(), 2, 2, Vec::new()).unwrap();
+        assert_eq!(disclosed_lines(&one.spans), "line 2; selection = line 2");
+        let text = "a\nb\nc\nd\ne\nf\n";
+        let (first, _) = read_range("f.txt".into(), text.into(), 1, 2, Vec::new()).unwrap();
+        let (continued, _) = read_range("f.txt".into(), text.into(), 4, 6, first.spans).unwrap();
+        assert_eq!(
+            disclosed_lines(&continued.spans),
+            "lines 1-2, 4-6; selection = lines 4-6"
+        );
+        let (searched, _) = search(
+            "f.txt".into(),
+            text.into(),
+            "\n",
+            0,
+            continued.spans.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            disclosed_lines(&searched.spans),
+            "lines 1-2, 4-6; selection = lines 4-6; m1-m6"
+        );
+        assert_eq!(
+            disclosed_lines(&[span("m2", 0, 1), span("m4", 2, 3), span("odd", 0, 0)]),
+            "m2, m4; odd"
+        );
+        assert_eq!(disclosed_lines(&[]), "no spans");
+        assert!(!disclosed_lines(&continued.spans).contains(".."));
+    }
+
+    #[test]
+    fn long_disclosure_lists_clip_at_a_separator() {
+        let spans: Vec<_> = (1..=200)
+            .map(|line| span(&format!("r{}", line * 2), 0, 0))
+            .collect();
+        let list = disclosed_lines(&spans);
+        assert!(list.starts_with("lines 2, 4, 6,"), "{list}");
+        assert!(list.ends_with(", …"), "{list}");
+        assert!(list.chars().count() <= MAX_DISCLOSED_CHARS + 3, "{list}");
+        // No number is cut: every entry before the ellipsis is a whole even number.
+        let numbers = list.trim_start_matches("lines ").trim_end_matches(", …");
+        for number in numbers.split(", ") {
+            assert_eq!(number.parse::<usize>().unwrap() % 2, 0, "{list}");
+        }
+    }
 }

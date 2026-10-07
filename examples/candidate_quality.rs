@@ -264,6 +264,7 @@ fn search(file: &File, needle: &str) -> Option<Vec<Candidate>> {
     let request = EditRequest {
         request_id: "quality".into(),
         files: vec![FileRequest {
+            path: None,
             base: file.base.id.clone(),
             changes: vec![change],
         }],

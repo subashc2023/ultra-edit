@@ -1,0 +1,4 @@
+{"checksum":"1c405a58a8161b7882a051bc3fa314125618ea645a736058e961f4d5fdc7502e","payload":{"event":"begin","file_count":1,"plan_digest":"ea8850a568c75d2aabfc718a35e1c9b095b194621e14e35b11456aa90dd1681b","plan_id":"pc6bb68dac4e54c5ca867f185c488f135","preflight_failed":false}}
+{"checksum":"dccd24a25e1d19c151cf21f20397aa5c9b04ee9bc148dfea7d758ceb0a3bd1b6","payload":{"event":"intent","index":0}}
+{"checksum":"7ed1ee626c73a746c9620453f379368deb001d0950251e6ac963d1d2935a954c","payload":{"after":"s943f60a58df845deb592fd7de5bd38fa","error":null,"event":"outcome","index":0,"status":"committed"}}
+{"checksum":"161ae3b3155ec646a1221d474c1579e2ae075e5dd766aa9fdf46fadccbf968f5","payload":{"event":"finished"}}

@@ -26,6 +26,7 @@ fn plan(storage: &Storage, paths: &[&str]) -> PreparedPlan {
             storage.read(Path::new(path)).expect("read"),
         );
         files.push(FileRequest {
+            path: None,
             base: snapshot.id.clone(),
             changes: vec![Change {
                 id: format!("change-{index}"),

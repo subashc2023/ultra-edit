@@ -232,6 +232,32 @@ Code, so the package uses context hooks instead of modifying a user's instructio
 files. See the official
 [plugin layout reference](https://code.claude.com/docs/en/plugins-reference#plugin-directory-structure).
 
+## Claude Code tool loading and result visibility
+
+Two probes with a throwaway stdio MCP server and headless Claude Code 2.1.292
+(`claude -p … --output-format stream-json --mcp-config FILE`, and the same server
+in a minimal plugin `.mcp.json` loaded with `--plugin-dir`) settle how the host
+treats what an MCP server sends. They are maintainer measurements, not a host
+contract, so recheck them on major Claude Code upgrades.
+
+- Loading. A tool whose definition carries `_meta: {"anthropic/alwaysLoad":
+  true}` arrives with its full schema, so the model calls it without a
+  `ToolSearch` round trip, both from an `--mcp-config` server and from a plugin
+  server. A server-level `"alwaysLoad": true` key in the MCP server
+  configuration, including a plugin's `.mcp.json`, loads every tool of that
+  server. Tools with neither are deferred behind `ToolSearch`, though the model
+  sometimes calls a deferred tool directly. Ultra Edit marks `ultra_edit_snapshot`
+  and `ultra_edit`, the two tools every edit uses, so an editing session skips
+  the round trip (about 0.9 extra API calls per run in the benchmark); the other
+  tools, used only for recovery, stay deferred. The two schemas add about 5.5 KB
+  to every request, which the prompt cache serves after the first.
+- Results. When a tool result has only text `content`, the model sees that text.
+  When it has both text `content` and `structuredContent`, the model sees only
+  the serialized `structuredContent` JSON and never the text. A results mode
+  meant to show the model plain text must therefore omit `structuredContent`
+  entirely. No Ultra Edit tool declares an `outputSchema`, so omitting it is
+  spec-compliant.
+
 ## Validation
 
 Validate packaging without installing the plugin:

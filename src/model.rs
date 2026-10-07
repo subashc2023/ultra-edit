@@ -103,6 +103,12 @@ pub struct EditRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FileRequest {
+    /// A file inside the workspace, edited like native Edit: the server reads its current
+    /// bytes under the workspace lock as the base. Give `path` or `base`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// A snapshot ID from ultra_edit_snapshot, needed for span targets. Give `path` or `base`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub base: String,
     pub changes: Vec<Change>,
 }

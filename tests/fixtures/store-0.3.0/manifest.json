@@ -1,0 +1,270 @@
+{
+  "generator": "ultra-edit 0.3.0 (examples/store_fixture.rs)",
+  "objects": {
+    "drafts/dd89866ecf7e94ecfa80ac08260c94a5e": "8aa8c7fcdb5cc572ac0f8cff8ea6f129d242081cc67d8d68447b426691c06e34",
+    "inspections/i3258fa9f3b324b9190a856f2c434ab87": "974efaab9507bbd42375b3970286855fea118f15b6ba10dfa5990792b33ac45b",
+    "plans/p27ae989b7286489d895ed6cb28f85c9e": "57783b2f746dbbb05070e292d38128eb1fcc6f2efecdee3ed45cc28576e8bdaf",
+    "plans/p544c6289e7024988af26e4b9dafe99c6": "87540c111c50e239ac82dce241d2bd4f45268a54a69605025bbcacb6b69aa100",
+    "plans/p69fc919f9f0c48a6ac541f5f0c14d0b2": "81e9ec0f221ead1a213dd4060ae192550ee20060ea280ab014a4a3fa4ad9af47",
+    "plans/pafb650c1b36a424b9d1bd68bd6423e26": "2099fc851a6435c26f8fa4f51a90df4617adf194587c0ab75cbd47fa073c26e0",
+    "plans/pc6bb68dac4e54c5ca867f185c488f135": "ea8850a568c75d2aabfc718a35e1c9b095b194621e14e35b11456aa90dd1681b",
+    "reconciliations/p69fc919f9f0c48a6ac541f5f0c14d0b2": "646c38d0633c7f4b7774457d1f7ffbaeb337261d9a9cd069944e79d29d7e2872",
+    "snapshots/s04b44dd1d545447fa620a3b545e21df7": "abd57ce0a2b364610e7edff1405a9e4a1db16e3dd5403c13df66741e5cb7dec9",
+    "snapshots/s5970c8ab5db34561a4f66a943b5c4bf5": "69389981d536a6961323960d23c2e3c6350bf4140eff936d41f20bd192389300",
+    "snapshots/s6eafe2ea03414680a2fb2d1187b47ff9": "d1f641802d096e9efc76fdc4563c8baa849a650c1bf771a02aaf511fab2b6752",
+    "snapshots/s708d88473a364a5098183c1f8c1e03c4": "04350d0c55d988896e40a061a8cd101776c8a9c0bca726fb55096beae64a9ea8",
+    "snapshots/s774ee2fd83f648e88302b6c6f842efa1": "360c7da28650c6d776ae2dd5298efb5ea499b2c27f10fb72965a9e348839bc88",
+    "snapshots/s8152c4fc2db54f918d4a7b8a248d5bde": "3b83a6020c9c0bcb816b59de25c61f44f3b4178617033c730bd434313a98a3dd",
+    "snapshots/s943f60a58df845deb592fd7de5bd38fa": "d02712c18a9f39162d3b2d2e694eddcdbfc6e7ec7ab6ec55dbf4d4cf72fb88e8",
+    "snapshots/sbdab7348b51846429bba880730556486": "d30a642e3f5c941a52770376c94346e1740f06700cd6de347fb0d427952684f6",
+    "snapshots/sc808222c9c194a5a9f2b8b8117c36c95": "af737f998d57fadab96cd471a38065a24493f844fe2bedbaad0920190bebac20",
+    "snapshots/sf2af7b2a49da4183be3d599cf2dfcdea": "e6873e367734e6b79b691e5cc57a5503c2ce7285863a2c52b656fbd3657ab472"
+  },
+  "requests": {
+    "edit": {
+      "arguments": {
+        "files": [
+          {
+            "base": "sc808222c9c194a5a9f2b8b8117c36c95",
+            "changes": [
+              {
+                "id": "",
+                "target": {
+                  "kind": "exact",
+                  "old": "beta = 2",
+                  "scope": null
+                },
+                "text": "beta = 3"
+              },
+              {
+                "id": "",
+                "target": {
+                  "expected": 2,
+                  "kind": "all",
+                  "old": "alpha",
+                  "scope": "r0"
+                },
+                "text": "gamma"
+              }
+            ]
+          },
+          {
+            "base": "s774ee2fd83f648e88302b6c6f842efa1",
+            "changes": [
+              {
+                "id": "",
+                "target": {
+                  "expect": "line 101: stored as a blob once it passes 4 KiB",
+                  "kind": "span",
+                  "span": "r101"
+                },
+                "text": "line one hundred one"
+              }
+            ]
+          }
+        ],
+        "request_id": ""
+      },
+      "receipt": {
+        "commit": "committed",
+        "files": [
+          {
+            "after": "sbdab7348b51846429bba880730556486",
+            "before": "sc808222c9c194a5a9f2b8b8117c36c95",
+            "changes_applied": 2,
+            "error": null,
+            "intended_digest": "364163876c29978e5d436478fa5da012271d952d971371278d1715e58ab404ed",
+            "path": "/tmp/.tmpNWWSoL/root/a.txt",
+            "status": "committed"
+          },
+          {
+            "after": "s8152c4fc2db54f918d4a7b8a248d5bde",
+            "before": "s774ee2fd83f648e88302b6c6f842efa1",
+            "changes_applied": 1,
+            "error": null,
+            "intended_digest": "f10a4b0c4cfcc757c0ce12ab2931b696ef2e990bec12abdd00c04d2a84457dc0",
+            "path": "/tmp/.tmpNWWSoL/root/b.txt",
+            "status": "committed"
+          }
+        ],
+        "plan_id": "p27ae989b7286489d895ed6cb28f85c9e",
+        "request_id": "auto-c4399cc1a91569b1453764be67e35261",
+        "undo": "p27ae989b7286489d895ed6cb28f85c9e",
+        "validation": "not_requested"
+      },
+      "request_id": "auto-c4399cc1a91569b1453764be67e35261"
+    },
+    "interrupted": {
+      "arguments": {
+        "files": [
+          {
+            "base": "s708d88473a364a5098183c1f8c1e03c4",
+            "changes": [
+              {
+                "id": "",
+                "target": {
+                  "kind": "exact",
+                  "old": "before",
+                  "scope": null
+                },
+                "text": "after"
+              }
+            ]
+          }
+        ],
+        "request_id": "interrupted-0.3.0"
+      },
+      "inspection": "i3258fa9f3b324b9190a856f2c434ab87",
+      "plan": "p69fc919f9f0c48a6ac541f5f0c14d0b2",
+      "receipt": {
+        "commit": "outcome_unknown",
+        "files": [
+          {
+            "before": "s708d88473a364a5098183c1f8c1e03c4",
+            "changes_applied": 0,
+            "error": "INTERRUPTED: write intent exists without a durable outcome; reconciliation required",
+            "intended_digest": "7b9a72466d3960eb2aacccfc848939453490db0678bd4725def3f789b891c919",
+            "path": "/tmp/.tmpNWWSoL/root/e.txt",
+            "status": "outcome_unknown"
+          }
+        ],
+        "plan_id": "p69fc919f9f0c48a6ac541f5f0c14d0b2",
+        "request_id": "interrupted-0.3.0",
+        "undo": null,
+        "validation": "not_requested"
+      },
+      "reconciliation": {
+        "journal_digest": "0bd01ca73139d9f1f48fb114f12622c7f6de195cc733a9f3a403f8ca52a82aef",
+        "plan_digest": "81e9ec0f221ead1a213dd4060ae192550ee20060ea280ab014a4a3fa4ad9af47",
+        "plan_id": "p69fc919f9f0c48a6ac541f5f0c14d0b2",
+        "request": {
+          "decision": "accept_current",
+          "inspection": "i3258fa9f3b324b9190a856f2c434ab87",
+          "note": "Fixture: accept the current file after an interrupted commit."
+        }
+      },
+      "request_id": "interrupted-0.3.0"
+    },
+    "rejected": {
+      "arguments": {
+        "files": [
+          {
+            "base": "s6eafe2ea03414680a2fb2d1187b47ff9",
+            "changes": [
+              {
+                "id": "",
+                "target": {
+                  "kind": "exact",
+                  "old": "tow",
+                  "scope": null
+                },
+                "text": "2"
+              }
+            ]
+          }
+        ],
+        "request_id": ""
+      },
+      "draft": "dd89866ecf7e94ecfa80ac08260c94a5e",
+      "receipt": null,
+      "request_id": "auto-cfad5e677857e7a926d6ee12628bc29e"
+    },
+    "repair": {
+      "changes": [
+        {
+          "id": "1.1",
+          "target": {
+            "kind": "exact",
+            "old": "two",
+            "scope": null
+          },
+          "text": "2"
+        }
+      ],
+      "plan": "p544c6289e7024988af26e4b9dafe99c6",
+      "receipt": {
+        "commit": "committed",
+        "files": [
+          {
+            "after": "s04b44dd1d545447fa620a3b545e21df7",
+            "before": "s6eafe2ea03414680a2fb2d1187b47ff9",
+            "changes_applied": 1,
+            "error": null,
+            "intended_digest": "bc85caa9b61bcf3a54ccfc800e2b0eda6c11fa5df4e0481c896d31cda2462eb2",
+            "path": "/tmp/.tmpNWWSoL/root/c.txt",
+            "status": "committed"
+          }
+        ],
+        "plan_id": "p544c6289e7024988af26e4b9dafe99c6",
+        "request_id": "auto-939191fa8442f169b9ed506b31027824",
+        "undo": "p544c6289e7024988af26e4b9dafe99c6",
+        "validation": "not_requested"
+      },
+      "reference": "dd89866ecf7e94ecfa80ac08260c94a5e",
+      "request_id": "auto-939191fa8442f169b9ed506b31027824"
+    },
+    "stale": {
+      "arguments": {
+        "files": [
+          {
+            "base": "sf2af7b2a49da4183be3d599cf2dfcdea",
+            "changes": [
+              {
+                "id": "",
+                "target": {
+                  "kind": "exact",
+                  "old": "before",
+                  "scope": null
+                },
+                "text": "after"
+              }
+            ]
+          }
+        ],
+        "request_id": "stale-0.3.0"
+      },
+      "plan": "pafb650c1b36a424b9d1bd68bd6423e26",
+      "receipt": {
+        "commit": "not_committed",
+        "files": [
+          {
+            "before": "sf2af7b2a49da4183be3d599cf2dfcdea",
+            "changes_applied": 0,
+            "error": "STALE_SNAPSHOT: Current bytes differ from the prepared base",
+            "intended_digest": "7b9a72466d3960eb2aacccfc848939453490db0678bd4725def3f789b891c919",
+            "path": "/tmp/.tmpNWWSoL/root/f.txt",
+            "status": "not_committed"
+          }
+        ],
+        "plan_id": "pafb650c1b36a424b9d1bd68bd6423e26",
+        "request_id": "stale-0.3.0",
+        "undo": null,
+        "validation": "not_requested"
+      },
+      "request_id": "stale-0.3.0"
+    },
+    "undo": {
+      "receipt": {
+        "commit": "committed",
+        "files": [
+          {
+            "after": "s943f60a58df845deb592fd7de5bd38fa",
+            "before": "s5970c8ab5db34561a4f66a943b5c4bf5",
+            "changes_applied": 1,
+            "error": null,
+            "intended_digest": "b6285c57e8797db5d4c51c80d6f11938afda9b11c6a003549709189e9b4b92a2",
+            "path": "/tmp/.tmpNWWSoL/root/c.txt",
+            "status": "committed"
+          }
+        ],
+        "plan_id": "pc6bb68dac4e54c5ca867f185c488f135",
+        "request_id": "auto-e5102d12153ca5339a220f4d1db75ab1",
+        "undo": "pc6bb68dac4e54c5ca867f185c488f135",
+        "validation": "not_requested"
+      },
+      "reference": "p544c6289e7024988af26e4b9dafe99c6",
+      "request_id": "auto-e5102d12153ca5339a220f4d1db75ab1"
+    }
+  },
+  "root": "/tmp/.tmpNWWSoL/root"
+}

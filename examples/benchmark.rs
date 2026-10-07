@@ -28,6 +28,7 @@ fn request(snapshots: &[Snapshot], changed: &[usize]) -> EditRequest {
             .iter()
             .enumerate()
             .map(|(file, snapshot)| FileRequest {
+                path: None,
                 base: snapshot.id.clone(),
                 changes: changed
                     .iter()
