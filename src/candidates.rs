@@ -248,14 +248,25 @@ pub(crate) fn line_advice(candidates: &[Candidate]) -> String {
 }
 
 /// Where whole-line text was found again: one place, or how many and the first.
-pub(crate) fn line_places(starts: &[usize], retarget: impl Fn(usize) -> String) -> String {
+/// `starts` beyond `cap` mean there are more than `cap`.
+pub(crate) fn line_places(
+    starts: &[usize],
+    cap: usize,
+    retarget: impl Fn(usize) -> String,
+) -> String {
     match starts {
         [] => String::new(),
         [only] => format!("it is at line {only} now, so {} {REPAIR}.", retarget(*only)),
-        [first, ..] => format!(
-            "it occurs {} times, first at line {first}; use the intended place's line numbers {REPAIR}.",
-            starts.len()
-        ),
+        [first, ..] => {
+            let count = if starts.len() > cap {
+                format!("more than {cap}")
+            } else {
+                starts.len().to_string()
+            };
+            format!(
+                "it occurs {count} times, first at line {first}; use the intended place's line numbers {REPAIR}."
+            )
+        }
     }
 }
 
@@ -1122,7 +1133,7 @@ mod tests {
                 .count()
                 <= MESSAGE_CHARS
         );
-        let places = line_places(&[line; 3], |_| String::new());
+        let places = line_places(&[line; 6], 5, |_| String::new());
         assert!(
             line_mismatch(&lines, &actual, "the expected last line", &places)
                 .chars()

@@ -238,12 +238,14 @@ where
                     Ok(None) => return Ok(items),
                     Err(error) => {
                         let error = error.to_string();
-                        // A change's error inside a file's reads "file 2, change 3: ...".
-                        let separator = if error.starts_with("change ") {
-                            ", "
-                        } else {
-                            ": "
-                        };
+                        // A change's error inside a file's reads "file 2, change 3: ...";
+                        // a change's own message may also begin with "change".
+                        let nested = error
+                            .strip_prefix("change ")
+                            .filter(|rest| rest.starts_with(|ch: char| ch.is_ascii_digit()))
+                            .map(|rest| rest.trim_start_matches(|ch: char| ch.is_ascii_digit()))
+                            .is_some_and(|rest| rest.starts_with(": ") || rest.starts_with(", "));
+                        let separator = if nested { ", " } else { ": " };
                         return Err(serde::de::Error::custom(format!(
                             "{} {position}{separator}{error}",
                             self.noun
@@ -396,7 +398,14 @@ fn expect_pair(value: serde_json::Value) -> Result<Result<[String; 2], String>, 
     }
     Ok(match <[String; 2]>::try_from(lines) {
         Ok(pair) => Ok(pair),
-        Err(lines) if !lines.is_empty() => Err(lines.join("\n")),
+        Err(lines) if !lines.is_empty() => {
+            let mut joined = lines.join("\n");
+            // A final LF only ends the last line, so an empty last line needs its own.
+            if lines.last().is_some_and(String::is_empty) {
+                joined.push('\n');
+            }
+            Err(joined)
+        }
         Err(_) => return Err(EXPECT_FORM.into()),
     })
 }
