@@ -1,0 +1,17 @@
+{
+  "app.title": "Wanderplaner",
+  "route.plan": "Route planen",
+  "route.loop": "Rundweg",
+  "route.outAndBack": "Hin und zurück",
+  "route.maxDistance": "Maximale Strecke (km)",
+  "route.difficulty.easy": "Leicht",
+  "route.difficulty.moderate": "Mittel",
+  "route.difficulty.steep": "Steil",
+  "poi.heart": "Im Herzen des Nationalparks",
+  "trail.seasonal": "Im Winter geschlossen",
+  "trail.closedNotice": "Dieser Weg ist bis auf Weiteres gesperrt.",
+  "street.hint": "Startpunkt an der Hauptstraße wählen",
+  "export.title": "Route exportieren",
+  "export.success": "Route erfolgreich exportiert.",
+  "error.noRoute": "Keine Route gefunden"
+}

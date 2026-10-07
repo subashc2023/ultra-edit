@@ -1,0 +1,41 @@
+# Local development stack. Run with: docker compose -f deploy/compose.yaml up
+x-defaults: &defaults
+  restart: unless-stopped
+  stop_grace_period: 30s
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  api:
+    <<: *defaults
+    image: registry.example.com/shop/api:2.4.1
+    ports:
+      - "8080:8080"
+    environment:
+      LOG_LEVEL: debug
+      DB_POOL_SIZE: "5"
+    depends_on:
+      - db
+  worker:
+    <<: *defaults
+    image: registry.example.com/shop/worker:1.8.2
+    command: ["--queue", "orders", "--concurrency", "1"]
+    ports:
+      - "9090:9090"
+    environment:
+      LOG_LEVEL: debug
+    depends_on:
+      - db
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      POSTGRES_PASSWORD: dev-only

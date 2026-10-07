@@ -1,0 +1,19 @@
+{
+  "app.title": "Planificateur de randonn\u00e9es",
+  "route.plan": "Planifier un itin\u00e9raire",
+  "route.loop": "Boucle",
+  "route.outAndBack": "Aller-retour",
+  "route.maxDistance": "Distance maximale (km)",
+  "route.difficulty.easy": "Facile",
+  "route.difficulty.moderate": "Intermédiaire",
+  "route.difficulty.steep": "Raide",
+  "legend.moderate": "Mod\u00e9r\u00e9e",
+  "poi.heart": "Au cœur de la réserve naturelle",
+  "poi.viewpoint": "Point de vue à 1 200 m",
+  "trail.seasonal": "Fermé en hiver",
+  "trail.closedNotice": "Ce sentier est ferm\u00e9 jusqu'\u00e0 nouvel ordre.",
+  "trail.bridge": "Passerelle en façade du lac",
+  "export.title": "Exporter l\u2019itin\u00e9raire",
+  "export.success": "Itinéraire exporté avec succès.",
+  "error.noRoute": "Aucun itinéraire trouvé"
+}

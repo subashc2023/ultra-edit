@@ -1,0 +1,65 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment (staging|production)"
+        required: true
+        default: staging
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build bundle
+        run: make dist VERSION="${GITHUB_REF_NAME#v}"
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: acme-${{ matrix.os }}-${{ github.sha }}
+          path: dist/*.tar.gz
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-22.04
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    env:
+      REGION: ${{ vars.DEPLOY_REGION || 'eu-central-1' }}
+      DEPLOY_TOKEN: ${{ secrets.PROD_DEPLOY_TOKEN || secrets.DEPLOY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: acme-ubuntu-22.04-${{ github.sha }}
+          path: dist
+      - name: Deploy
+        run: |
+          echo "Deploying ${GITHUB_REF_NAME} to ${{ github.event.inputs.environment || 'staging' }}"
+          ./scripts/deploy.sh "${{ github.event.inputs.environment || 'staging' }}" --verbose 2>&1 | tee deploy.log
+          test "${PIPESTATUS[0]}" -eq 0 && echo 'deploy ok!' || { echo "::error::deploy failed"; exit 1; }
+      - name: Smoke test
+        env:
+          API_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+        run: |
+          curl -fsS -H "Authorization: Bearer $API_TOKEN" "https://${{ github.event.inputs.environment || 'staging' }}.acme.example/api/v1/version" | grep -q "${GITHUB_REF_NAME#v}"
+      - name: Notify
+        if: always()
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        run: |
+          curl -fsS -X POST -d "{\"text\": \"release ${{ github.ref_name }}: ${{ job.status }}\"}" "$SLACK_WEBHOOK" || true
