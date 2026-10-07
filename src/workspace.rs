@@ -25,6 +25,10 @@ pub const REPLAY_NOTICE: &str = "Replayed the recorded result; nothing new was a
 /// Filesystem host. Each operation coordinates with other hosts using the same workspace root.
 pub struct Workspace {
     storage: Storage,
+    /// The root as the caller spelled it, made absolute without resolving links. The
+    /// storage root is canonical, so a path the caller spells from this root (through a
+    /// symlink, as macOS temporary directories are) needs it to normalize the same way.
+    spelled_root: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,8 +86,10 @@ pub enum Evidence {
 
 impl Workspace {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, Error> {
+        let root = root.as_ref();
         Ok(Self {
-            storage: Storage::open(root.as_ref())?,
+            storage: Storage::open(root)?,
+            spelled_root: std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf()),
         })
     }
 
@@ -228,7 +234,10 @@ impl Workspace {
     /// Normalizes file paths, as by [`normalize_paths`], then resolves omitted IDs, as by
     /// [`resolve_ids`]. Both are pure, so a caller can resolve before taking the lock.
     pub fn resolve_request(&self, request: EditRequest) -> Result<EditRequest, Error> {
-        resolve_ids(normalize_paths(request, self.root()))
+        resolve_ids(normalize_paths(
+            request,
+            &[self.root(), self.spelled_root.as_path()],
+        ))
     }
 
     /// Paths and omitted IDs are resolved first, as by [`Self::resolve_request`].
@@ -979,14 +988,18 @@ impl Workspace {
 }
 
 /// Rewrites each file `path` lexically, without touching the filesystem, so spellings of
-/// one file derive one request ID: a leading workspace root is stripped, and `.`
-/// components and repeated separators are dropped. `..` is kept, because collapsing it
-/// past a symlinked directory would name a different file.
-pub fn normalize_paths(mut request: EditRequest, root: &Path) -> EditRequest {
+/// one file derive one request ID: a leading spelling of the workspace root (`roots`,
+/// such as its canonical and its given form) is stripped, and `.` components and
+/// repeated separators are dropped. `..` is kept, because collapsing it past a
+/// symlinked directory would name a different file.
+pub fn normalize_paths(mut request: EditRequest, roots: &[&Path]) -> EditRequest {
     for file in &mut request.files {
         if let Some(path) = &mut file.path {
             let given = Path::new(path.as_str());
-            let relative = given.strip_prefix(root).unwrap_or(given);
+            let relative = roots
+                .iter()
+                .find_map(|root| given.strip_prefix(root).ok())
+                .unwrap_or(given);
             let normal: PathBuf = relative
                 .components()
                 .filter(|component| *component != Component::CurDir)

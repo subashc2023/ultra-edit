@@ -314,3 +314,27 @@ fn two_paths_to_one_file_are_an_alias_and_write_nothing() {
     assert_eq!(codes(&outcome), ["TARGET_ALIAS"]);
     assert_eq!(read(&dir, "a.txt"), "one\n");
 }
+
+/// The workspace root is stored canonical; a path spelled through the root as the
+/// caller gave it (here through a symlink, as macOS temp directories are) must still
+/// derive the same request ID, or a resend would apply an insertion twice.
+#[cfg(unix)]
+#[test]
+fn a_path_spelled_through_a_symlinked_root_replays() {
+    let real = TempDir::new().unwrap();
+    fs::write(real.path().join("a.txt"), "head\n").unwrap();
+    let links = TempDir::new().unwrap();
+    let root = links.path().join("project");
+    std::os::unix::fs::symlink(real.path(), &root).unwrap();
+    let workspace = Workspace::open(&root).unwrap();
+    let insert = |path: &str| request(vec![at(path, vec![exact("head\n", "head\nadded\n")])]);
+    receipt(workspace.edit(insert("a.txt")).unwrap());
+    for spelling in [
+        root.join("a.txt"),
+        real.path().canonicalize().unwrap().join("a.txt"),
+    ] {
+        let (_, replayed) = receipt(workspace.edit(insert(spelling.to_str().unwrap())).unwrap());
+        assert!(replayed, "{}", spelling.display());
+    }
+    assert_eq!(read(&real, "a.txt"), "head\nadded\n");
+}
