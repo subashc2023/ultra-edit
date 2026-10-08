@@ -93,14 +93,17 @@ All notable changes to Ultra Edit are documented here. Releases follow
   span IDs take. `TARGET_AMBIGUOUS` names the lines of the first five matches.
   `TARGET_NOT_FOUND` says when the best whitespace candidate differs from `old`
   only in CRLF line endings. Codes, fields, and the `spans` summary are unchanged.
-- The shell guard now checks script files the way it checks inline code. When
-  a command writes a script outside the project and then runs it
-  (`cat > /tmp/edit.py <<'EOF' … EOF; python3 /tmp/edit.py`), or an interpreter
-  or shell runs a script left in the temporary directory, a script that calls a
-  file-write API is denied as `a python3 script file that writes a file`. In the
-  benchmark, 4 of 14 guarded native sessions wrote project files this way past
-  the guard. Scripts elsewhere on disk, such as the project's own tools, are
-  not read.
+- The shell guard now checks scripts. When Write or a shell command saves a
+  script outside the project whose `#!` line or extension names its language,
+  or a command runs a script it saved
+  (`cat > /tmp/edit.py <<'EOF' … EOF; python3 /tmp/edit.py`, `source`, or by
+  path), the guard denies it as `a python3 script that may write project files`
+  when a write call's target is not a literal path outside the project. Scripts
+  that write only such paths are allowed. The guard reads no files from disk,
+  so downloaded installers, earlier scratch files, and a project's own tools
+  are never judged. The `PreToolUse` matcher is now `Bash|PowerShell|Write`. In
+  the benchmark, 4 of 14 guarded native sessions wrote project files past the
+  guard by saving a script with Write and running it.
 
 ## [0.3.0] - 2026-09-25
 

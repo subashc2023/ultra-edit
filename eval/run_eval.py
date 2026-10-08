@@ -66,7 +66,7 @@ KNOWN_PLUGIN_IDS = ("ultra-edit@ultra-edit", "ultra-edit@skills-dir")
 GUARD_HOOK_ARGS = ("--claude-hook", "PreToolUse")
 GUARD_HOOK_TIMEOUT_S = 30
 # The plugin's matcher: the guard classifies Bash and PowerShell commands.
-DEFAULT_GUARD_MATCHER = "Bash|PowerShell"
+DEFAULT_GUARD_MATCHER = "Bash|PowerShell|Write"
 RUNTIME_NAMES = ("ultra-edit", "ultra-edit-mcp", "ultra-edit.exe", "ultra-edit-mcp.exe")
 IGNORED_TOP_LEVEL = frozenset({".git", ".ultra-edit"})
 SCORED_OUTCOMES = ("pass", "fail", "timeout")

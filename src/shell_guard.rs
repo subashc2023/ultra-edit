@@ -11,7 +11,6 @@
 use std::cell::RefCell;
 use std::fmt;
 use std::ops::Range;
-use std::path::{Path, PathBuf};
 
 mod powershell;
 mod scope;
@@ -36,8 +35,8 @@ const MAX_CALL_SPAN: usize = 512;
 const MAX_PROGRAM_CHARS: usize = 16;
 /// Files a command list writes that later commands may run as scripts.
 const MAX_WRITTEN: usize = 64;
-/// The largest temporary script read from disk.
-const MAX_SCRIPT_BYTES: u64 = 1 << 20;
+/// The largest recorded script text; longer appends are not recorded.
+const MAX_SCRIPT_BYTES: usize = 1 << 20;
 
 /// Reserved words that can precede a command without changing what it runs.
 const KEYWORDS: &[&str] = &[
@@ -85,8 +84,9 @@ pub enum Pattern {
     GeneratedToFile,
     /// Inline interpreter code that calls a file-write API.
     InlineScriptWrite,
-    /// A script file, written earlier in the command or left in the temporary
-    /// directory, that an interpreter runs and that calls a file-write API.
+    /// A script saved outside the project, by the Write tool or by the shell,
+    /// or run after the command saved it, that may write a project file: it
+    /// calls a file-write API on a path that is not a literal outside it.
     ScriptFileWrite,
     /// An in-place editor such as `sed -i` or `perl -pi`.
     InPlaceEdit,
@@ -116,7 +116,10 @@ impl fmt::Display for Finding {
                 write!(formatter, "inline `{program}` code that writes a file")
             }
             Pattern::ScriptFileWrite => {
-                write!(formatter, "a `{program}` script file that writes a file")
+                write!(
+                    formatter,
+                    "a `{program}` script that may write project files"
+                )
             }
             Pattern::InPlaceEdit => write!(formatter, "in-place editing with `{program}`"),
             Pattern::AppliedContent => {
@@ -131,6 +134,15 @@ impl fmt::Display for Finding {
 
 /// The `permissionDecisionReason` shown to Claude for a denied command.
 pub fn deny_reason(finding: &Finding) -> String {
+    if finding.pattern == Pattern::ScriptFileWrite {
+        return format!(
+            "Ultra Edit guard blocked {finding}: scripted edits can lose line endings or \
+             encoding. Edit files with ultra_edit or native Edit, or create them with Write; a \
+             script may write only literal paths outside the project. If the user explicitly \
+             asked for it, report that the Ultra Edit guard blocked it; {ESCAPE_HATCH}=allow \
+             disables the guard."
+        );
+    }
     format!(
         "Ultra Edit guard blocked {finding}: shell writes can lose backslashes, line endings, or \
          encoding. Edit existing files with ultra_edit or native Edit; create files, including \
@@ -147,7 +159,12 @@ pub fn classify(command: &str) -> Option<Finding> {
 
 /// Returns the first write into the project in a Bash tool command.
 pub fn classify_bash(command: &str, scope: &Scope) -> Option<Finding> {
-    scan(&command.replace("\r\n", "\n"), scope, 0)
+    scan(
+        &command.replace("\r\n", "\n"),
+        scope,
+        0,
+        &Written::default(),
+    )
 }
 
 /// Returns the first write into the project in a PowerShell tool command.
@@ -155,16 +172,36 @@ pub fn classify_powershell(command: &str, scope: &Scope) -> Option<Finding> {
     powershell::scan(&command.replace("\r\n", "\n"), scope, 0)
 }
 
-fn scan(script: &str, scope: &Scope, depth: usize) -> Option<Finding> {
+/// Returns a finding when the Write tool saves, outside the project, a script
+/// that may write project files. Files inside the project, and files that are
+/// not scripts by their `#!` line or extension, are never judged.
+pub fn classify_write(path: &str, content: &str, scope: &Scope) -> Option<Finding> {
+    if scope.literal_inside(path) {
+        return None;
+    }
+    let written = Written::default();
+    let context = Context {
+        source: "",
+        dialect: Dialect::Bash,
+        scope,
+        depth: 0,
+        written: &written,
+    };
+    saved_script(path, &content.replace("\r\n", "\n"), context)
+}
+
+/// Checks a Bash script. `written` holds the files that commands before it
+/// wrote, shared with the scripts it runs through `bash -c`, `eval`, and
+/// backticks.
+fn scan(script: &str, scope: &Scope, depth: usize, written: &Written) -> Option<Finding> {
     let mut lexer = Lexer::new(script);
     let commands = lexer.list(false);
-    let written = Written::default();
     let context = Context {
         source: script,
         dialect: Dialect::Bash,
         scope,
         depth,
-        written: &written,
+        written,
     };
     check(&commands, context)
         .or_else(|| {
@@ -179,7 +216,7 @@ fn scan(script: &str, scope: &Scope, depth: usize) -> Option<Finding> {
                     lexer
                         .backticks
                         .iter()
-                        .find_map(|body| scan(body, scope, depth + 1))
+                        .find_map(|body| scan(body, scope, depth + 1, written))
                 })
                 .flatten()
         })
@@ -210,32 +247,59 @@ struct Context<'a> {
 pub(super) type Written = RefCell<Vec<(String, String)>>;
 
 impl Context<'_> {
-    /// Notes that `target` now holds `text`, when `target` is a file outside
-    /// the project; a write inside it is reported before this is reached.
-    fn record(&self, target: &Word, text: &str) {
-        let mut written = self.written.borrow_mut();
-        if is_file(&target.text) && written.len() < MAX_WRITTEN {
-            written.push((target.text.clone(), text.to_owned()));
+    /// Notes that `target`, a file outside the project, now holds `text`, or
+    /// `text` appended to what it held (a write inside the project is reported
+    /// before this is reached). A script it saves that may write project files
+    /// is reported here, whether or not a later command runs it.
+    fn record(&self, target: &Word, text: &str, append: bool) -> Result<(), Finding> {
+        if !is_file(&target.text) {
+            return Ok(());
+        }
+        let path = normalized(&target.text);
+        let text = {
+            let mut written = self.written.borrow_mut();
+            let earlier = written.iter().rposition(|(known, _)| *known == path);
+            match (append, earlier) {
+                (true, Some(at)) => {
+                    let content = &mut written[at].1;
+                    if content.len() + text.len() <= MAX_SCRIPT_BYTES {
+                        content.push_str(text);
+                    }
+                    content.clone()
+                }
+                _ if written.len() < MAX_WRITTEN => {
+                    written.push((path.clone(), text.to_owned()));
+                    text.to_owned()
+                }
+                _ => text.to_owned(),
+            }
+        };
+        match saved_script(&path, &text, *self) {
+            Some(finding) => Err(finding),
+            None => Ok(()),
         }
     }
 
-    /// The text of a script file that `path` names: one written earlier in this
-    /// script, matched by name when either spelling is relative (a `cd` may lie
-    /// between them), or else one already in the temporary directory.
+    /// The text of a script file that `path` names, when an earlier command
+    /// of this script wrote it: the same path, or the same name when `path`
+    /// is a bare name (a `cd` may lie between them). Files on disk are not
+    /// read, since a script this session saved was judged when it was saved.
     fn script(&self, path: &str) -> Option<String> {
+        let path = normalized(path);
+        let bare = !path.contains(['/', '\\']);
         let name = |text: &str| text.rsplit(['/', '\\']).next().unwrap_or(text).to_owned();
         let written = self.written.borrow();
         written
             .iter()
             .rev()
-            .find(|(target, _)| target == path)
+            .find(|(target, _)| *target == path)
             .or_else(|| {
-                written.iter().rev().find(|(target, _)| {
-                    (!is_absolute(target) || !is_absolute(path)) && name(target) == name(path)
-                })
+                written
+                    .iter()
+                    .rev()
+                    .find(|(target, _)| bare && name(target) == path)
             })
             .map(|(_, text)| text.clone())
-            .or_else(|| temporary_script(path))
     }
 
     /// Whether a write to `word` may reach a file inside the project.
@@ -264,8 +328,13 @@ struct Word {
 
 #[derive(Debug)]
 enum Redirect {
-    /// Output to a path; `stdout` is false for other descriptors.
-    Output { stdout: bool, target: Word },
+    /// Output to a path; `stdout` is false for other descriptors, and
+    /// `append` is true for `>>`.
+    Output {
+        stdout: bool,
+        append: bool,
+        target: Word,
+    },
     /// Heredoc or here-string content on standard input.
     Input(String),
     /// Descriptor duplication, input files, and other descriptors.
@@ -435,6 +504,7 @@ impl<'a> Lexer<'a> {
                 self.at += if next == Some(b'>') { 3 } else { 2 };
                 Redirect::Output {
                     stdout: true,
+                    append: next == Some(b'>'),
                     target: self.target(),
                 }
             }
@@ -450,13 +520,18 @@ impl<'a> Lexer<'a> {
                 {
                     Redirect::Other
                 } else {
-                    Redirect::Output { stdout, target }
+                    Redirect::Output {
+                        stdout,
+                        append: false,
+                        target,
+                    }
                 }
             }
-            (Some(b'>'), Some(b'>' | b'|'), _) => {
+            (Some(b'>'), Some(next @ (b'>' | b'|')), _) => {
                 self.at += 2;
                 Redirect::Output {
                     stdout,
+                    append: next == b'>',
                     target: self.target(),
                 }
             }
@@ -464,6 +539,7 @@ impl<'a> Lexer<'a> {
                 self.at += 1;
                 Redirect::Output {
                     stdout,
+                    append: false,
                     target: self.target(),
                 }
             }
@@ -862,6 +938,7 @@ enum Family {
     Awk,
     Interpreter(Language),
     Shell,
+    Source,
     Eval,
     Find,
     Applier,
@@ -882,6 +959,7 @@ fn family(program: &str) -> Family {
         "sed" | "gsed" => Family::Sed,
         "awk" | "gawk" | "mawk" | "nawk" => Family::Awk,
         "bash" | "sh" | "zsh" | "dash" | "ksh" => Family::Shell,
+        "source" | "." => Family::Source,
         "eval" => Family::Eval,
         "find" => Family::Find,
         "git" | "patch" | "ultra-edit" => Family::Applier,
@@ -922,7 +1000,7 @@ fn inspect(
         });
     let stdin = heredoc.or(piped);
     let to_file = command.redirects.iter().any(|redirect| {
-        matches!(redirect, Redirect::Output { stdout: true, target } if context.counts(target))
+        matches!(redirect, Redirect::Output { stdout: true, target, .. } if context.counts(target))
     });
     let found = |pattern| {
         Err(Finding {
@@ -932,15 +1010,24 @@ fn inspect(
     };
     match family(&program) {
         Family::Generator => {
+            let text = join(arguments);
             let content = Content {
-                text: join(arguments),
+                // printf, and echo -e, turn `\047` and `\"` into the quotes
+                // a write call needs.
+                text: if program == "printf"
+                    || arguments.first().is_some_and(|word| word.text == "-e")
+                {
+                    unescape(&text)
+                } else {
+                    text
+                },
                 pattern: Pattern::GeneratedToFile,
                 origin: program.clone(),
             };
             if to_file {
                 Err(content.finding())
             } else {
-                record_outputs(command, &content.text, context);
+                record_outputs(command, &content.text, context)?;
                 Ok(Some(content))
             }
         }
@@ -948,8 +1035,14 @@ fn inspect(
             Some(content) if tee_writes(arguments, context) => Err(content.finding()),
             stdin => {
                 if let Some(content) = &stdin {
+                    let append = arguments.iter().any(|word| {
+                        word.text == "--append"
+                            || word.text.strip_prefix('-').is_some_and(|cluster| {
+                                !cluster.starts_with('-') && cluster.contains('a')
+                            })
+                    });
                     for file in arguments.iter().filter(|word| !word.text.starts_with('-')) {
-                        context.record(file, &content.text);
+                        context.record(file, &content.text, append)?;
                     }
                 }
                 Ok(stdin)
@@ -966,7 +1059,7 @@ fn inspect(
             stdin => {
                 // `cat > /tmp/edit.py <<'EOF'` leaves a script a later command may run.
                 if let (Family::Filter, Some(content)) = (family(&program), &stdin) {
-                    record_outputs(command, &content.text, context);
+                    record_outputs(command, &content.text, context)?;
                 }
                 Ok(stdin)
             }
@@ -977,23 +1070,30 @@ fn inspect(
             if invocation.in_place && context.edits(&files.iter().collect::<Vec<_>>()) {
                 return found(Pattern::InPlaceEdit);
             }
-            // A script file runs instead of inline code. Its text counts when it
-            // is known: written earlier in the command, or left in the
-            // temporary directory, as edit scripts usually are.
+            // A syntax check such as `perl -c` or `node --check` runs nothing.
+            if invocation.check {
+                return Ok(None);
+            }
+            // A script file runs instead of inline code. Its text counts when an
+            // earlier command of this script wrote it.
             let script = invocation
                 .script_at
                 .and_then(|at| arguments.get(at))
                 .and_then(|word| context.script(&word.text));
-            let pattern = if script.is_some() {
-                Pattern::ScriptFileWrite
-            } else {
-                Pattern::InlineScriptWrite
-            };
+            if invocation.code.is_empty()
+                && invocation.script
+                && let Some(script) = script
+            {
+                return match script_writes(&program, &script, context) {
+                    Some(finding) => Err(finding),
+                    None => Ok(None),
+                };
+            }
             // Without inline code or a script file, standard input is the program.
             let code = if !invocation.code.is_empty() {
                 invocation.code.join("\n")
             } else if invocation.script {
-                script.unwrap_or_default()
+                String::new()
             } else {
                 stdin.map(|content| content.text).unwrap_or_default()
             };
@@ -1015,38 +1115,42 @@ fn inspect(
                 }
                 _ => writes(language, &code),
             };
-            if writes { found(pattern) } else { Ok(None) }
+            if writes {
+                found(Pattern::InlineScriptWrite)
+            } else {
+                Ok(None)
+            }
         }
         Family::Shell => match shell_script(arguments, stdin) {
             Some(ShellInput::Code(script)) => nested(&script, context),
             Some(ShellInput::File(word)) => match context.script(&word.text) {
-                Some(script) => nested(&script, context),
+                Some(script) => script_writes(&program, &script, context).map_or(Ok(None), Err),
                 None => Ok(None),
             },
             None => Ok(None),
         },
+        // `source FILE` and `. FILE` run a script in the current shell.
+        Family::Source => {
+            let file = arguments.iter().find(|word| word.text != "--");
+            match file.and_then(|word| context.script(&word.text)) {
+                Some(script) => script_writes("source", &script, context).map_or(Ok(None), Err),
+                None => Ok(None),
+            }
+        }
         Family::Eval => nested(&join(arguments), context),
         Family::Find => find_exec(arguments, context),
         Family::Applier if stdin.is_some() && applies(&program, arguments) => {
             found(Pattern::AppliedContent)
         }
         Family::Applier => Ok(None),
-        // `chmod +x /tmp/edit.py && /tmp/edit.py` runs the script by its path.
+        // `chmod +x /tmp/edit.py && /tmp/edit.py` runs the script by its path;
+        // without a `#!` line, the shell runs it as a shell script.
         Family::Other if first.text.contains(['/', '\\']) => {
             let Some(script) = context.script(&first.text) else {
                 return Ok(None);
             };
-            let interpreter = shebang(&script).unwrap_or_default();
-            match family(&interpreter) {
-                Family::Interpreter(language) if language_writes(language, &script, context) => {
-                    Err(Finding {
-                        pattern: Pattern::ScriptFileWrite,
-                        program: interpreter,
-                    })
-                }
-                Family::Shell => nested(&script, context),
-                _ => Ok(None),
-            }
+            let interpreter = shebang(&script).unwrap_or_else(|| "sh".to_owned());
+            script_writes(&interpreter, &script, context).map_or(Ok(None), Err)
         }
         Family::Other => Ok(None),
     }
@@ -1054,16 +1158,18 @@ fn inspect(
 
 /// Records `text` as the content of each file the command's standard output
 /// is redirected to.
-fn record_outputs(command: &Command, text: &str, context: Context) {
+fn record_outputs(command: &Command, text: &str, context: Context) -> Result<(), Finding> {
     for redirect in &command.redirects {
         if let Redirect::Output {
             stdout: true,
+            append,
             target,
         } = redirect
         {
-            context.record(target, text);
+            context.record(target, text, *append)?;
         }
     }
+    Ok(())
 }
 
 /// The program a script's `#!` line names, past `env` and its options.
@@ -1077,37 +1183,115 @@ fn shebang(script: &str) -> Option<String> {
     Some(program)
 }
 
-/// Whether code in `language` writes a file, as `inspect` decides for inline code.
-fn language_writes(language: Language, code: &str, context: Context) -> bool {
-    match language {
-        Language::PowerShell => {
-            let foreign = context.scope.foreign();
-            context.depth < MAX_SCRIPT_DEPTH
-                && powershell::scan(code, &foreign, context.depth + 1).is_some()
-        }
-        _ => writes(language, code),
-    }
+/// The finding for a script saved at `path` with `text` when it may write
+/// project files. Its language comes from its `#!` line, else from the
+/// file's extension; a file with neither is not a script.
+fn saved_script(path: &str, text: &str, context: Context) -> Option<Finding> {
+    let program = shebang(text).or_else(|| {
+        let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+        let (_, extension) = name.rsplit_once('.')?;
+        let program = match extension.to_ascii_lowercase().as_str() {
+            "py" | "pyw" => "python3",
+            "js" | "mjs" | "cjs" | "ts" | "mts" | "cts" => "node",
+            "pl" | "pm" => "perl",
+            "rb" => "ruby",
+            "php" => "php",
+            "ps1" => "pwsh",
+            "sh" => "sh",
+            "bash" => "bash",
+            "zsh" => "zsh",
+            _ => return None,
+        };
+        Some(program.to_owned())
+    })?;
+    script_writes(&program, text, context)
 }
 
-/// An absolute path's text, when it names a small file in the temporary
-/// directory. Scripts elsewhere, such as the project's own tools, are not read.
-fn temporary_script(path: &str) -> Option<String> {
-    let path = Path::new(path);
-    if !path.is_absolute() || path.components().any(|part| part.as_os_str() == "..") {
-        return None;
+/// The finding for a script that `program` runs when it may write project
+/// files: an interpreter's write call whose target is not a literal path
+/// outside the project, or any write the shell checks report.
+fn script_writes(program: &str, script: &str, context: Context) -> Option<Finding> {
+    let writes = match family(program) {
+        Family::Interpreter(Language::PowerShell) => {
+            let foreign = context.scope.foreign();
+            context.depth < MAX_SCRIPT_DEPTH
+                && powershell::scan(script, &foreign, context.depth + 1).is_some()
+        }
+        Family::Interpreter(language) => writes_inside(language, script, context.scope),
+        Family::Shell | Family::Source => nested(script, context).is_err(),
+        _ => false,
+    };
+    writes.then(|| Finding {
+        pattern: Pattern::ScriptFileWrite,
+        program: program.to_owned(),
+    })
+}
+
+/// Text after printf's backslash escapes: `\n`, `\t`, `\\`, quotes, octal
+/// `\NNN` or `\0NNN`, and hex `\xHH`. Others stay as written.
+fn unescape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            out.push(character);
+            continue;
+        }
+        let digits = |chars: &mut std::iter::Peekable<std::str::Chars>, radix: u32, most: usize| {
+            let mut value = 0;
+            let mut count = 0;
+            while count < most
+                && let Some(digit) = chars.peek().and_then(|next| next.to_digit(radix))
+            {
+                value = value * radix + digit;
+                count += 1;
+                chars.next();
+            }
+            (count > 0).then(|| char::from_u32(value).unwrap_or('\u{fffd}'))
+        };
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some(quote @ ('\\' | '\'' | '"')) => out.push(quote),
+            Some('x') => match digits(&mut chars, 16, 2) {
+                Some(decoded) => out.push(decoded),
+                None => out.push_str("\\x"),
+            },
+            Some(first @ '0'..='7') => {
+                let rest = if first == '0' { 3 } else { 2 };
+                let value = first.to_digit(8).unwrap_or_default();
+                let mut decoded = value;
+                let mut count = 0;
+                while count < rest
+                    && let Some(digit) = chars.peek().and_then(|next| next.to_digit(8))
+                {
+                    decoded = decoded * 8 + digit;
+                    count += 1;
+                    chars.next();
+                }
+                out.push(char::from_u32(decoded).unwrap_or('\u{fffd}'));
+            }
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
     }
-    let mut roots = vec![std::env::temp_dir()];
-    if cfg!(unix) {
-        roots.extend(["/tmp", "/var/tmp"].map(PathBuf::from));
+    out
+}
+
+/// A script path compared as text: without `./` segments or doubled slashes.
+fn normalized(path: &str) -> String {
+    let mut path = path.to_owned();
+    while path.contains("//") && !path.starts_with("//") {
+        path = path.replace("//", "/");
     }
-    if !roots.iter().any(|root| path.starts_with(root)) {
-        return None;
+    while path.contains("/./") {
+        path = path.replace("/./", "/");
     }
-    let metadata = std::fs::metadata(path).ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_SCRIPT_BYTES {
-        return None;
-    }
-    std::fs::read_to_string(path).ok()
+    path.strip_prefix("./").map(str::to_owned).unwrap_or(path)
 }
 
 /// Classifies a Bash script that the command runs, such as `bash -c` text.
@@ -1122,7 +1306,7 @@ fn nested(script: &str, context: Context) -> Result<Option<Content>, Finding> {
         }
     };
     match (context.depth < MAX_SCRIPT_DEPTH)
-        .then(|| scan(script, scope, context.depth + 1))
+        .then(|| scan(script, scope, context.depth + 1, context.written))
         .flatten()
     {
         Some(finding) => Err(finding),
@@ -1277,9 +1461,10 @@ fn program_name(text: &str) -> String {
 /// or a process substitution.
 fn is_file(target: &str) -> bool {
     !target.is_empty()
-        && !["/dev/", "/proc/", "/sys/", ">(", "<("]
-            .iter()
-            .any(|device| target.starts_with(device))
+        && (target.starts_with("/dev/shm/")
+            || !["/dev/", "/proc/", "/sys/", ">(", "<("]
+                .iter()
+                .any(|device| target.starts_with(device)))
         && !target.eq_ignore_ascii_case("nul")
 }
 
@@ -1457,6 +1642,10 @@ fn shell_script(arguments: &[Word], stdin: Option<Content>) -> Option<ShellInput
         };
         command |= cluster.contains('c');
         read_stdin |= cluster.contains('s');
+        // `bash -n` reads the script without running it.
+        if text.starts_with('-') && cluster.contains('n') {
+            return None;
+        }
         index += 1;
         // `-o pipefail` and `-O extglob` take the next word.
         if cluster.contains(['o', 'O']) {
@@ -1520,6 +1709,8 @@ struct Invocation {
     /// Which argument names that script file, when it is one.
     script_at: Option<usize>,
     in_place: bool,
+    /// Whether an option such as `perl -c` only checks the syntax.
+    check: bool,
     /// Where the operands after the options, code, and any script file start.
     operands: usize,
 }
@@ -1538,8 +1729,11 @@ struct Switches {
     stops: &'static str,
     /// Whether `-i` edits files in place.
     in_place: bool,
+    /// Options that only check the syntax.
+    check: &'static str,
     long_code: &'static [&'static str],
     long_valued: &'static [&'static str],
+    long_check: &'static [&'static str],
 }
 
 const PYTHON: Switches = Switches {
@@ -1549,8 +1743,10 @@ const PYTHON: Switches = Switches {
     attached: "",
     stops: "m",
     in_place: false,
+    check: "",
     long_code: &[],
     long_valued: &["check-hash-based-pycs"],
+    long_check: &[],
 };
 
 const NODE: Switches = Switches {
@@ -1560,14 +1756,18 @@ const NODE: Switches = Switches {
     attached: "",
     stops: "",
     in_place: false,
+    check: "c",
     long_code: &["eval", "print"],
     long_valued: &[
         "conditions",
+        "env-file",
+        "env-file-if-exists",
         "experimental-loader",
         "import",
         "loader",
         "require",
     ],
+    long_check: &["check"],
 };
 
 const PERL: Switches = Switches {
@@ -1577,8 +1777,10 @@ const PERL: Switches = Switches {
     attached: "CDFMVdmx",
     stops: "",
     in_place: true,
+    check: "c",
     long_code: &[],
     long_valued: &[],
+    long_check: &[],
 };
 
 const RUBY: Switches = Switches {
@@ -1588,8 +1790,10 @@ const RUBY: Switches = Switches {
     attached: "FKTWx",
     stops: "",
     in_place: true,
+    check: "c",
     long_code: &[],
     long_valued: &["encoding", "external-encoding", "internal-encoding"],
+    long_check: &[],
 };
 
 const PHP: Switches = Switches {
@@ -1599,8 +1803,10 @@ const PHP: Switches = Switches {
     attached: "",
     stops: "f",
     in_place: false,
+    check: "l",
     long_code: &[],
     long_valued: &[],
+    long_check: &["syntax-check"],
 };
 
 fn invocation(language: Language, program: &str, arguments: &[Word]) -> Invocation {
@@ -1648,6 +1854,7 @@ fn invocation(language: Language, program: &str, arguments: &[Word]) -> Invocati
             } else if value.is_none() && spec.long_valued.contains(&name) {
                 index += 1;
             }
+            invocation.check |= spec.long_check.contains(&name);
             continue;
         }
         let Some(cluster) = text.strip_prefix('-').filter(|cluster| !cluster.is_empty()) else {
@@ -1677,8 +1884,13 @@ fn invocation(language: Language, program: &str, arguments: &[Word]) -> Invocati
                 }
                 break;
             }
+            invocation.check |= spec.check.contains(flag);
             if spec.stops.contains(flag) {
                 invocation.script = true;
+                // `php -f FILE` names the script; `python -m` a module.
+                if flag == 'f' && rest.is_empty() && index < arguments.len() {
+                    invocation.script_at = Some(index);
+                }
                 return invocation;
             }
             if spec.valued.contains(flag) {
@@ -1744,64 +1956,151 @@ fn powershell(program: &str, arguments: &[Word]) -> Invocation {
 
 /// Whether inline code calls a file-write API of its language.
 fn writes(language: Language, code: &str) -> bool {
+    !write_targets(language, code).is_empty()
+}
+
+/// Whether script code may write a project file: a write call's target is not
+/// a string literal, or names a path that is not certainly outside.
+fn writes_inside(language: Language, code: &str, scope: &Scope) -> bool {
+    write_targets(language, code).iter().any(|target| {
+        target
+            .as_deref()
+            .is_none_or(|path| scope.literal_inside(path))
+    })
+}
+
+/// The file-write calls in code, each with its target when that is a string
+/// literal: `open('out.txt', 'w')`, `Path('out.txt').write_text(...)`,
+/// `fs.writeFileSync('out.txt', ...)`, `open(my $f, '>', 'out.txt')`, and so on.
+fn write_targets(language: Language, code: &str) -> Vec<Option<String>> {
     match language {
         Language::Python => {
-            calls(code, "write_text(").next().is_some()
-                || calls(code, "write_bytes(").next().is_some()
-                || calls(code, "open(").any(|at| {
-                    // `open(path, mode)` takes the path first; `Path.open(mode)` does not.
-                    let receiver = code[..at].strip_suffix('.').map(|before| {
-                        before
-                            .rsplit(|character: char| {
-                                !(character.is_alphanumeric() || character == '_')
-                            })
-                            .next()
-                            .unwrap_or_default()
+            let mut targets: Vec<_> = ["write_text(", "write_bytes("]
+                .iter()
+                .flat_map(|name| calls(code, name).map(|at| receiver_path(&code[..at])))
+                .collect();
+            for at in calls(code, "open(") {
+                // `open(path, mode)` takes the path first; `Path.open(mode)` does not.
+                let receiver = code[..at].strip_suffix('.').map(|before| {
+                    before
+                        .rsplit(|character: char| {
+                            !(character.is_alphanumeric() || character == '_')
+                        })
+                        .next()
+                        .unwrap_or_default()
+                });
+                let skip = usize::from(matches!(
+                    receiver,
+                    None | Some("bz2" | "codecs" | "gzip" | "io" | "lzma" | "os")
+                ));
+                let call = &code[at + "open".len()..];
+                if call_writes(call, skip, "+Uabrtwx") {
+                    targets.push(if skip == 1 {
+                        first_literal(call)
+                    } else {
+                        receiver_path(&code[..at])
                     });
-                    let skip = usize::from(matches!(
-                        receiver,
-                        None | Some("bz2" | "codecs" | "gzip" | "io" | "lzma" | "os")
-                    ));
-                    call_writes(&code[at + "open".len()..], skip, "+Uabrtwx")
-                })
+                }
+            }
+            targets
         }
         Language::Node => ["writeFile", "appendFile", "createWriteStream"]
             .iter()
-            .any(|name| calls(code, name).next().is_some()),
-        Language::Perl => calls(code, "open").any(|at| {
-            let rest = &code[at + "open".len()..];
-            if !rest.starts_with(|character: char| character == '(' || character.is_whitespace()) {
-                return false;
-            }
-            let statement = prefix(rest, MAX_CALL_SPAN);
-            let statement = statement.split(';').next().unwrap_or_default();
-            statement.match_indices(['\'', '"']).any(|(quote, _)| {
-                let mode = statement[quote + 1..].trim_start();
-                mode.starts_with('>') || mode.starts_with("+<") || mode.starts_with("+>")
+            .flat_map(|name| {
+                calls(code, name).map(move |at| {
+                    let rest = &code[at + name.len()..];
+                    let call =
+                        rest.trim_start_matches(|character: char| character.is_alphanumeric());
+                    first_literal(call)
+                })
             })
-        }),
+            .collect(),
+        Language::Perl => calls(code, "open")
+            .filter_map(|at| {
+                let rest = &code[at + "open".len()..];
+                if !rest
+                    .starts_with(|character: char| character == '(' || character.is_whitespace())
+                {
+                    return None;
+                }
+                let statement = prefix(rest, MAX_CALL_SPAN);
+                let statement = statement.split(';').next().unwrap_or_default();
+                let arguments = arguments(statement.trim_start());
+                let (index, mode) =
+                    arguments.iter().enumerate().find_map(|(index, argument)| {
+                        let mode = leading_literal(argument)?.trim_start();
+                        (mode.starts_with('>') || mode.starts_with("+<") || mode.starts_with("+>"))
+                            .then_some((index, mode))
+                    })?;
+                // Two arguments put the path after the mode: `open(F, '>out.txt')`.
+                let path = mode.trim_start_matches(['+', '<', '>']).trim();
+                Some(if path.is_empty() || path.starts_with(':') {
+                    arguments
+                        .get(index + 1)
+                        .and_then(|argument| whole_literal(argument))
+                } else {
+                    Some(path.to_owned())
+                })
+            })
+            .collect(),
         Language::Ruby => {
-            ["File.write", "File.binwrite", "IO.write", "IO.binwrite"]
+            let mut targets: Vec<_> = ["File.write", "File.binwrite", "IO.write", "IO.binwrite"]
                 .iter()
-                .any(|name| calls(code, name).next().is_some())
-                || ["File.open", "File.new"].iter().any(|name| {
-                    calls(code, name).any(|at| {
-                        call_writes(
-                            code[at + name.len()..].trim_start_matches(' '),
-                            1,
-                            "+abrtwx",
-                        )
+                .flat_map(|name| {
+                    calls(code, name).map(move |at| {
+                        first_literal(code[at + name.len()..].trim_start_matches(' '))
                     })
                 })
+                .collect();
+            for name in ["File.open", "File.new"] {
+                for at in calls(code, name) {
+                    let call = code[at + name.len()..].trim_start_matches(' ');
+                    if call_writes(call, 1, "+abrtwx") {
+                        targets.push(first_literal(call));
+                    }
+                }
+            }
+            targets
         }
         Language::Php => {
-            calls(code, "file_put_contents").next().is_some()
-                || calls(code, "fopen(")
-                    .any(|at| call_writes(&code[at + "fopen".len()..], 1, "+abcertwx"))
+            let mut targets: Vec<_> = calls(code, "file_put_contents")
+                .map(|at| first_literal(&code[at + "file_put_contents".len()..]))
+                .collect();
+            for at in calls(code, "fopen(") {
+                let call = &code[at + "fopen".len()..];
+                if call_writes(call, 1, "+abcertwx") {
+                    targets.push(first_literal(call));
+                }
+            }
+            targets
         }
         // `inspect` classifies PowerShell code as a script of its own.
-        Language::PowerShell => false,
+        Language::PowerShell => Vec::new(),
     }
+}
+
+/// The path literal that a call's first argument is, when it is nothing else.
+fn first_literal(call: &str) -> Option<String> {
+    arguments(call)
+        .first()
+        .and_then(|argument| whole_literal(argument))
+}
+
+/// The path of a `Path('...')` receiver just before a method call's `.`.
+fn receiver_path(before: &str) -> Option<String> {
+    let call = before.strip_suffix('.')?.trim_end().strip_suffix(')')?;
+    let open = call.rfind("Path(")?;
+    whole_literal(&call[open + "Path(".len()..])
+}
+
+/// The body of `argument` when it is a single string literal, with escaped
+/// backslashes undone so a Windows path reads as the path.
+fn whole_literal(argument: &str) -> Option<String> {
+    let argument = argument.trim();
+    let body = leading_literal(argument)?;
+    // At most two prefix letters and the two quotes surround the body.
+    (argument.len() <= body.len() + 4 && !body.contains(['{', '$', '#']))
+        .then(|| body.replace("\\\\", "\\"))
 }
 
 /// Offsets where `name` occurs in `code` without an identifier character

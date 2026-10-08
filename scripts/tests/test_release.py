@@ -40,7 +40,7 @@ def _hook_events() -> dict[str, list[dict[str, object]]]:
     return {
         "SessionStart": group(["--claude-context", "SessionStart"]),
         "SubagentStart": group(["--claude-context", "SubagentStart"]),
-        "PreToolUse": group(["--claude-hook", "PreToolUse"], "Bash|PowerShell"),
+        "PreToolUse": group(["--claude-hook", "PreToolUse"], "Bash|PowerShell|Write"),
     }
 
 
@@ -186,20 +186,23 @@ class ReleasePackagingTests(unittest.TestCase):
         del without_guard["PreToolUse"]
         with self.assertRaisesRegex(release.ReleaseError, "exactly one PreToolUse hook group"):
             release._validate_hooks_config({"hooks": without_guard}, "hooks.json")
-        # The guard must see both shell tools, named exactly; order and extra
-        # names do not matter.
-        for matcher in ("PowerShell|Bash", "Bash|PowerShell|Monitor"):
+        # The guard must see both shell tools and Write, named exactly; order
+        # and extra names do not matter.
+        for matcher in ("Write|PowerShell|Bash", "Bash|PowerShell|Write|Monitor"):
             events = _hook_events()
             events["PreToolUse"][0]["matcher"] = matcher
             release._validate_hooks_config({"hooks": events}, "hooks.json")
-        for matcher in (None, "", "*", "Bash", "PowerShell", "Bash|Power.*", "Bash|PowerShell\n", 1):
+        for matcher in (
+            None, "", "*", "Bash", "PowerShell", "Bash|PowerShell", "Bash|Power.*|Write", "Bash|PowerShell|Write\n", 1
+        ):
             events = _hook_events()
             if matcher is None:
                 del events["PreToolUse"][0]["matcher"]
             else:
                 events["PreToolUse"][0]["matcher"] = matcher
             with self.subTest(matcher=matcher), self.assertRaisesRegex(
-                release.ReleaseError, r"PreToolUse\.matcher must list the tool names 'Bash' and 'PowerShell'"
+                release.ReleaseError,
+                r"PreToolUse\.matcher must list the tool names 'Bash' and 'PowerShell' and 'Write'",
             ):
                 release._validate_hooks_config({"hooks": events}, "hooks.json")
         wrong_mode = _hook_events()

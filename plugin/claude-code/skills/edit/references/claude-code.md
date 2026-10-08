@@ -187,9 +187,9 @@ update the entire plugin copy, then start a new Claude session. Bundling a
 plugin-root `CLAUDE.md` would not load these instructions automatically; the
 plugin does not edit the user's `CLAUDE.md` or settings files.
 
-A `PreToolUse` hook matched to `Bash|PowerShell` backs the shell rule. It runs
-`ultra-edit-mcp --claude-hook PreToolUse`, which denies commands that write
-content embedded in the command into project files:
+A `PreToolUse` hook matched to `Bash|PowerShell|Write` backs the shell rule.
+It runs `ultra-edit-mcp --claude-hook PreToolUse`, which denies commands that
+write content embedded in the command into project files:
 
 - heredocs or here-strings passed through programs such as `cat`, `tee`, `sed`,
   or `awk` and redirected or `tee`d into a file;
@@ -207,7 +207,14 @@ content embedded in the command into project files:
   `.Remove()`, `+` with a literal, an item assignment, or `ForEach-Object` and
   written back, directly or through a variable; and .NET writes such as
   `[IO.File]::WriteAllText` or `[IO.StreamWriter]::new`. External programs run
-  from PowerShell get the Bash checks.
+  from PowerShell get the Bash checks;
+- scripts that may write project files, judged when Write or a shell command
+  saves them outside the project and their `#!` line or extension (`.py`,
+  `.js`, `.pl`, `.rb`, `.php`, `.ps1`, `.sh`) names the language, and when a
+  command runs a script it saved (`python3 /tmp/edit.py`, `bash`, `source`,
+  `.`, or by path). A write call counts unless its target is a string literal
+  naming a path outside the project; syntax checks (`bash -n`, `perl -c`,
+  `node --check`, `php -l`) run nothing. No file is read from disk.
 
 It looks inside shells run with `-c` (three levels deep), `eval`, `$(…)`,
 backticks, `find -exec`, and wrappers such as `env`, `sudo`, `timeout`, and
@@ -235,8 +242,10 @@ that do not write them to files (`git commit -F -`, `kubectl apply -f -`, and
 open: malformed input, other tools, parse failures, and internal errors allow
 the call. The deny reason names the pattern and says to edit existing files
 with Ultra Edit or Edit and to create files, including multiline command input,
-with Write; if the user explicitly asked for the command, report the block.
-Each shell call starts the hook executable, which takes a few milliseconds.
+with Write; for a script, it says a script may write only literal paths outside
+the project. If the user explicitly asked for the command, report the block.
+Each shell or Write call starts the hook executable, which takes a few
+milliseconds.
 
 ## Root and permissions
 
@@ -262,8 +271,9 @@ blocked command to evade the guard. See Claude Code's
 The guard is not a sandbox. It misses dynamic commands (`$CMD`, `bash -c "$S"`,
 `pwsh -EncodedCommand`, `Invoke-Expression $s`), redirects on grouped commands,
 subshells, loops, or `exec >`, rewrites through temporary files
-(`sed … f > f.tmp && mv f.tmp f`), scripts on disk outside the temporary
-directory, interpreter output
+(`sed … f > f.tmp && mv f.tmp f`), scripts it did not see saved (downloaded,
+edited after saving, or saved without a `#!` line or extension and run by a
+later call), interpreter output
 redirected with `>`, other write APIs (`os.open`, `dd of=`, `vim -c`,
 `Start-Process`, `cmd /c`), content passed through PowerShell function
 parameters or splatting, and symlinks, junctions, or short 8.3 names that lead

@@ -731,7 +731,7 @@ class CommandTests(unittest.TestCase):
             {
                 "PreToolUse": [
                     {
-                        "matcher": "Bash|PowerShell",
+                        "matcher": "Bash|PowerShell|Write",
                         "hooks": [
                             {
                                 "type": "command",

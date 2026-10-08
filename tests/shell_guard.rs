@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 use ultra_edit::shell_guard::{
     ESCAPE_HATCH, Finding, Pattern, SCOPE_VARIABLES, Scope, classify, classify_bash,
-    classify_powershell, deny_reason, is_absolute,
+    classify_powershell, classify_write, deny_reason, is_absolute,
 };
 
 use Pattern::{
@@ -559,12 +559,49 @@ fn hook_allows_other_commands_and_tools_silently() {
         ),
         other_tool.to_string().into_bytes(),
     ];
-    // Tool names match exactly; only Bash and PowerShell are classified.
+    // Tool names match exactly; only Bash, PowerShell, and Write are classified.
     for tool in ["bash", "powershell", "Monitor", "Edit", ""] {
         inputs.push(event(tool, "echo x > out.txt", Some("/tmp/project")));
     }
     for input in inputs {
         assert_silent_success(&hook(&input, &[]));
+    }
+}
+
+#[test]
+fn hook_judges_scripts_the_write_tool_saves_outside_the_project() {
+    let write = |path: &str, content: &str| {
+        json!({
+            "session_id": "abc123",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Write",
+            "tool_input": {"file_path": path, "content": content},
+            "cwd": "/work/repo",
+        })
+        .to_string()
+        .into_bytes()
+    };
+    let output = hook(
+        &write("/tmp/ed.py", "open('src/a.rs', 'w').write('x')\n"),
+        &[],
+    );
+    assert!(denied(&output));
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let reason = value["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap();
+    assert!(
+        reason.starts_with(
+            "Ultra Edit guard blocked a `python3` script that may write project files"
+        ),
+        "{reason}"
+    );
+    assert!(reason.chars().count() <= 400, "{reason}");
+    for (path, content) in [
+        ("/tmp/ed.py", "open('/tmp/out.txt', 'w')"),
+        ("/work/repo/src/gen.py", "open('src/a.rs', 'w')"),
+    ] {
+        assert_silent_success(&hook(&write(path, content), &[]));
     }
 }
 
@@ -837,10 +874,17 @@ fn scoped_bash_denies_writes_that_may_reach_the_project() {
     assert!(classify_bash("echo x > '\\\\SERVER\\Share\\repo\\a.txt'", &unc).is_some());
 }
 
-/// Scripts written outside the project, then run in the same command.
-const SCRIPTS_RUN: &[(&str, Pattern, &str)] = &[
+/// Scripts saved outside the project, or run after the command saved them,
+/// that may write project files.
+const SCRIPTS_DENIED: &[(&str, Pattern, &str)] = &[
     (
         "cat > /tmp/ed.py <<'E'\nopen('a.txt', 'w').write('x')\nE\npython3 /tmp/ed.py && git diff --stat",
+        ScriptFileWrite,
+        "python3",
+    ),
+    // Saving the script is enough; it need not run in the same command.
+    (
+        "cat > /tmp/ed.py <<'E'\nopen('a.txt', 'w')\nE\npython3 /tmp/other.py",
         ScriptFileWrite,
         "python3",
     ),
@@ -850,7 +894,17 @@ const SCRIPTS_RUN: &[(&str, Pattern, &str)] = &[
         "python3",
     ),
     (
+        "cat > /tmp/ed.py <<'E'\nimport sys\nopen(sys.argv[1], 'w').write('x')\nE",
+        ScriptFileWrite,
+        "python3",
+    ),
+    (
         "printf 'open(\"a\", \"w\")' > $TMPDIR/x.py; python3 -u $TMPDIR/x.py",
+        ScriptFileWrite,
+        "python3",
+    ),
+    (
+        "printf 'open(\\047src/a.rs\\047, \\047w\\047)\\n' > /tmp/q.py",
         ScriptFileWrite,
         "python3",
     ),
@@ -866,30 +920,96 @@ const SCRIPTS_RUN: &[(&str, Pattern, &str)] = &[
     ),
     (
         "cat > /tmp/x.sh <<'EOF'\nsed -i 's/a/b/' src/a.txt\nEOF\nbash /tmp/x.sh",
-        InPlaceEdit,
-        "sed",
+        ScriptFileWrite,
+        "sh",
     ),
     (
         "cat > /tmp/x.py <<'EOF'\n#!/usr/bin/env python3\nopen('a', 'w')\nEOF\nchmod +x /tmp/x.py && /tmp/x.py",
         ScriptFileWrite,
         "python3",
     ),
+    (
+        "cat > /dev/shm/x.py <<'E'\nopen('a', 'w')\nE",
+        ScriptFileWrite,
+        "python3",
+    ),
+    // Scripts without a #! line or extension are judged when they run.
+    (
+        "echo \"import pathlib\" > /tmp/ed\necho \"pathlib.Path('src/a.rs').write_text('x')\" >> /tmp/ed\n\
+         echo \"print('done')\" >> /tmp/ed\npython3 /tmp/ed",
+        ScriptFileWrite,
+        "python3",
+    ),
+    (
+        "cat <<'A' | tee /tmp/ed > /dev/null\ndef fix(p):\n    open(p, 'w').write('x')\nA\n\
+         echo \"fix('src/a.rs')\" | tee -a /tmp/ed\npython3 /tmp/ed",
+        ScriptFileWrite,
+        "python3",
+    ),
+    (
+        "cat > /tmp/x <<'EOF'\nsed -i 's/a/b/' src/a.rs\nEOF\nsource /tmp/x",
+        ScriptFileWrite,
+        "source",
+    ),
+    (
+        "cat > /tmp/x <<'EOF'\nsed -i 's/a/b/' src/a.rs\nEOF\n. /tmp/x",
+        ScriptFileWrite,
+        "source",
+    ),
+    (
+        "cat > /tmp/x <<'EOF'\nsed -i s/a/b/ src/a.rs\nEOF\nchmod +x /tmp/x && /tmp/x",
+        ScriptFileWrite,
+        "sh",
+    ),
+    (
+        "cat > /tmp/x <<'EOF'\n<?php file_put_contents('a', 'x');\nEOF\nphp -f /tmp/x",
+        ScriptFileWrite,
+        "php",
+    ),
+    (
+        "cat > /tmp/x <<'E'\nopen('a', 'w')\nE\nbash -c 'python3 /tmp/x'",
+        ScriptFileWrite,
+        "python3",
+    ),
+    (
+        "cat > /tmp/./x <<'E'\nopen('a', 'w')\nE\npython3 /tmp/x",
+        ScriptFileWrite,
+        "python3",
+    ),
 ];
 
-/// Scripts that are run without writing files, or whose text is unknown.
+/// Scripts that write nothing in the project, that are not scripts, or whose
+/// text is unknown.
 const SCRIPTS_ALLOWED: &[&str] = &[
     "cat > /tmp/ed.py <<'E'\nprint(open('a.txt').read())\nE\npython3 /tmp/ed.py",
-    "cat > /tmp/ed.py <<'E'\nopen('a.txt', 'w')\nE\npython3 /tmp/other.py",
     "cat > /tmp/x.sh <<'EOF'\ngrep -n x src/a.txt\nEOF\nbash /tmp/x.sh",
+    // Every write names a literal path outside the project.
+    "cat > /tmp/bench.py <<'E'\nimport json\nfrom pathlib import Path\n\
+     json.dump({}, open('/tmp/out.json', 'w'))\nPath('/tmp/log.txt').write_text(open('src/a.rs').read())\nE\n\
+     python3 /tmp/bench.py",
+    "cat > /tmp/x.pl <<'E'\nopen(my $f, '>', '/tmp/out.txt');\nopen(G, \">/tmp/two.txt\");\nE",
+    "cat > /tmp/x.js <<'E'\nrequire('fs').writeFileSync('/tmp/out.json', '{}')\nE\nnode /tmp/x.js",
+    "cat > /tmp/x.rb <<'E'\nFile.write('/tmp/out.txt', 'x')\nE",
+    "cat > /tmp/x.php <<'E'\n<?php file_put_contents('/tmp/out.txt', 'x');\nE",
+    // Not a script by its #! line or extension, and never run.
+    "cat > /tmp/notes.txt <<'E'\nopen('a', 'w')\nE",
+    // Syntax checks run nothing.
+    "cat > /tmp/x <<'E'\nsed -i s/a/b/ src/a.rs\nE\nbash -n /tmp/x",
+    "cat > /tmp/x <<'E'\nopen(F, '>', 'a');\nE\nperl -c /tmp/x",
+    "cat > /tmp/x <<'E'\nrequire('fs').writeFileSync('a', 'x')\nE\nnode --check /tmp/x",
+    "cat > /tmp/x <<'E'\n<?php file_put_contents('a', 'x');\nE\nphp -l /tmp/x",
+    // A run path with a directory is not matched to a saved file by name.
+    "cat > /tmp/fixture/build <<'E'\nsed -i s/a/b/ src/a.rs\nE\nbash scripts/build",
+    "cat > /tmp/x <<'E'\nrequire('fs').writeFileSync('a', 'x')\nE\nnode --env-file .env /tmp/other.js",
     "python3 scripts/generate.py",
     "python3 /tmp/no-such-ultra-edit-script.py",
     "python3 -m pytest -q",
 ];
 
 #[test]
-fn scoped_bash_checks_scripts_written_then_run() {
+fn scoped_bash_checks_scripts_saved_or_run() {
     let scope = unix_scope();
-    for (command, pattern, program) in SCRIPTS_RUN {
+    for (command, pattern, program) in SCRIPTS_DENIED {
         let expected = Finding {
             pattern: *pattern,
             program: (*program).to_owned(),
@@ -906,32 +1026,119 @@ fn scoped_bash_checks_scripts_written_then_run() {
 }
 
 #[test]
-fn scoped_bash_reads_a_script_left_in_the_temporary_directory() {
+fn scoped_bash_does_not_read_scripts_from_disk() {
+    // Installers, stale scratch files, and a project's own tools under the
+    // temporary directory: the guard judges scripts when they are saved.
     let mut writer = tempfile::Builder::new().suffix(".py").tempfile().unwrap();
     writer
         .write_all(b"open('src/a.txt', 'w').write('x')\n")
         .unwrap();
-    let path = writer.path().to_str().unwrap().to_owned();
-    let command = format!("python3 '{path}'");
-    assert_eq!(
-        classify_bash(&command, &unix_scope()),
+    let mut shell = tempfile::Builder::new().suffix(".sh").tempfile().unwrap();
+    shell.write_all(b"sed -i s/a/b/ src/a.txt\n").unwrap();
+    let python = writer.path().to_str().unwrap();
+    let shell = shell.path().to_str().unwrap();
+    for command in [
+        format!("python3 '{python}'"),
+        format!("bash '{shell}'"),
+        format!("source '{shell}'"),
+        format!("'{shell}'"),
+    ] {
+        assert_eq!(classify_bash(&command, &unix_scope()), None, "{command}");
+    }
+}
+
+#[test]
+fn write_tool_saves_of_scripts_are_judged() {
+    let unix = unix_scope();
+    let finding = |program: &str| {
         Some(Finding {
             pattern: ScriptFileWrite,
-            program: "python3".to_owned(),
+            program: program.to_owned(),
         })
+    };
+    assert_eq!(
+        classify_write(
+            "/tmp/ed.py",
+            "s = open('src/a.rs').read()\nopen('src/a.rs', 'w').write(s)\n",
+            &unix
+        ),
+        finding("python3")
     );
-    let mut reader = tempfile::Builder::new().suffix(".py").tempfile().unwrap();
-    reader
-        .write_all(b"print(open('src/a.txt').read())\n")
-        .unwrap();
-    let command = format!("python3 '{}'", reader.path().to_str().unwrap());
-    assert_eq!(classify_bash(&command, &unix_scope()), None);
-    // A script inside the project is its own tooling and is not read.
-    let project = TempDir::new_in(".").unwrap();
-    let tool = project.path().canonicalize().unwrap().join("tool.py");
-    fs::write(&tool, "open('a', 'w')\n").unwrap();
-    let command = format!("python3 '{}'", tool.to_str().unwrap());
-    assert_eq!(classify_bash(&command, &unix_scope()), None);
+    assert_eq!(
+        classify_write("/tmp/fix", "#!/bin/sh\r\nsed -i s/a/b/ src/a.rs\r\n", &unix),
+        finding("sh")
+    );
+    assert_eq!(
+        classify_write(
+            "/home/dev/ed.js",
+            "require('fs').writeFileSync(process.argv[2], 'x')",
+            &unix
+        ),
+        finding("node")
+    );
+    for (path, content) in [
+        (
+            "/tmp/ed.py",
+            "open('/tmp/out.json', 'w').write(open('src/a.rs').read())",
+        ),
+        ("/tmp/notes.md", "open('src/a.rs', 'w')"),
+        // A file inside the project is the project's own, created with Write.
+        ("/work/repo/tools/gen.py", "open('src/a.rs', 'w')"),
+        ("/tmp/ed.py", "print(open('src/a.rs').read())"),
+    ] {
+        assert_eq!(
+            classify_write(path, content, &unix),
+            None,
+            "{path}: {content}"
+        );
+    }
+    // Without a project root nothing is certainly outside, so nothing is judged.
+    assert_eq!(
+        classify_write("/tmp/ed.py", "open('src/a.rs', 'w')", &Scope::default()),
+        None
+    );
+    let windows = windows_scope();
+    assert_eq!(
+        classify_write(
+            "C:\\Users\\dev\\AppData\\Local\\Temp\\ed.py",
+            "open('C:\\\\repo\\\\src\\\\a.rs', 'w')",
+            &windows
+        ),
+        finding("python3")
+    );
+    assert_eq!(
+        classify_write(
+            "C:\\Users\\dev\\AppData\\Local\\Temp\\ed.py",
+            "open('C:\\\\Users\\\\dev\\\\out.txt', 'w')",
+            &windows
+        ),
+        None
+    );
+}
+
+#[test]
+fn powershell_checks_scripts_it_saves() {
+    let scope = windows_scope();
+    for command in [
+        "Set-Content -Path C:\\Temp\\ed.py -Value \"open('src/a.rs', 'w')\"",
+        "@'\nopen('src/a.rs', 'w').write('x')\n'@ | Out-File C:\\Temp\\ed.py",
+        "\"open('src/a.rs', 'w')\" > C:\\Temp\\ed.py",
+    ] {
+        assert_eq!(
+            classify_powershell(command, &scope),
+            Some(Finding {
+                pattern: ScriptFileWrite,
+                program: "python3".to_owned(),
+            }),
+            "{command:?}"
+        );
+    }
+    for command in [
+        "Set-Content -Path C:\\Temp\\ed.py -Value \"print(open('src/a.rs').read())\"",
+        "Set-Content -Path C:\\Temp\\notes.txt -Value \"open('src/a.rs', 'w')\"",
+    ] {
+        assert_eq!(classify_powershell(command, &scope), None, "{command:?}");
+    }
 }
 
 #[test]

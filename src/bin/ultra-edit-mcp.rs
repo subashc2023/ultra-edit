@@ -131,8 +131,9 @@ fn main() -> ExitCode {
 
 /// Answers a `PreToolUse` hook: prints a deny decision for a Bash or
 /// PowerShell command that writes file content into the project through the
-/// shell, and nothing otherwise. Every failure allows the call, because a
-/// broken guard must never block a session.
+/// shell, or a Write call that saves a script outside the project that may
+/// write project files, and nothing otherwise. Every failure allows the call,
+/// because a broken guard must never block a session.
 fn guard_shell_writes() {
     let mut input = Vec::new();
     // Read before deciding so the host never writes into a closed pipe.
@@ -147,20 +148,20 @@ fn guard_shell_writes() {
     let Ok(event) = serde_json::from_slice::<serde_json::Value>(&input) else {
         return;
     };
-    let classify = match event["tool_name"].as_str() {
-        Some("Bash") => shell_guard::classify_bash,
-        Some("PowerShell") => shell_guard::classify_powershell,
-        _ => return,
-    };
-    let Some(command) = event["tool_input"]["command"].as_str() else {
-        return;
-    };
+    let input = &event["tool_input"];
     let scope = guard_scope(event["cwd"].as_str());
-    // A classifier bug must not turn into a hook error on every shell call.
-    let Some(finding) = std::panic::catch_unwind(|| classify(command, &scope))
-        .ok()
-        .flatten()
-    else {
+    let classify = || match event["tool_name"].as_str() {
+        Some("Bash") => shell_guard::classify_bash(input["command"].as_str()?, &scope),
+        Some("PowerShell") => shell_guard::classify_powershell(input["command"].as_str()?, &scope),
+        Some("Write") => shell_guard::classify_write(
+            input["file_path"].as_str()?,
+            input["content"].as_str()?,
+            &scope,
+        ),
+        _ => None,
+    };
+    // A classifier bug must not turn into a hook error on every tool call.
+    let Some(finding) = std::panic::catch_unwind(classify).ok().flatten() else {
         return;
     };
     let output = serde_json::json!({"hookSpecificOutput": {

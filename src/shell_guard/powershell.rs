@@ -1473,8 +1473,8 @@ impl Checker<'_> {
             Some(value) => self.value(value),
             None => input,
         };
-        let finding = match content {
-            Some(Flow::Embedded(content)) => attribute(&content, writer.name()),
+        let finding = match &content {
+            Some(Flow::Embedded(content)) => attribute(content, writer.name()),
             Some(Flow::Transformed) => Finding {
                 pattern: Pattern::InPlaceEdit,
                 program: writer.name().to_owned(),
@@ -1484,7 +1484,24 @@ impl Checker<'_> {
         let inside = bound.uncertain
             || bound.paths.is_empty()
             || bound.paths.iter().any(|path| self.counts(path));
-        if inside { Err(finding) } else { Ok(passed) }
+        if inside {
+            return Err(finding);
+        }
+        if let Some(Flow::Embedded(content)) = &content {
+            for path in &bound.paths {
+                self.saved(path, content)?;
+            }
+        }
+        Ok(passed)
+    }
+
+    /// Checks embedded text saved outside the project as a script that may
+    /// write project files, as the Bash checks do.
+    fn saved(&self, path: &[Atom], content: &Content) -> Result<(), Finding> {
+        match super::saved_script(&self.text(path), &content.text, self.context) {
+            Some(finding) => Err(finding),
+            None => Ok(()),
+        }
     }
 
     /// Sends an element's output through its redirections. Embedded or
@@ -1496,8 +1513,9 @@ impl Checker<'_> {
         redirects: &[Redirect],
     ) -> Result<Option<Flow>, Finding> {
         for redirect in redirects.iter().filter(|redirect| redirect.output) {
-            let finding = match output.take() {
-                Some(Flow::Embedded(content)) => attribute(&content, &redirect.operator),
+            let flow = output.take();
+            let finding = match &flow {
+                Some(Flow::Embedded(content)) => attribute(content, &redirect.operator),
                 Some(Flow::Transformed) => Finding {
                     pattern: Pattern::InPlaceEdit,
                     program: redirect.operator.clone(),
@@ -1506,6 +1524,11 @@ impl Checker<'_> {
             };
             if !redirect.target.is_empty() && self.counts(&redirect.target) {
                 return Err(finding);
+            }
+            if let Some(Flow::Embedded(content)) = &flow
+                && !redirect.target.is_empty()
+            {
+                self.saved(&redirect.target, content)?;
             }
         }
         Ok(output)

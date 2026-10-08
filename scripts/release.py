@@ -53,8 +53,8 @@ CATALOG_KEYS = frozenset({"name", "description", "owner", "plugins"})
 CATALOG_PLUGIN_KEYS = frozenset({"name", "source", "description", "author"})
 CATALOG_SOURCE_KEYS = frozenset({"source", "url", "sha256"})
 TEXT_SUFFIXES = frozenset({".json", ".md", ".txt", ".toml", ".yaml", ".yml", ".sh"})
-# Claude Code tools whose commands the shell-write guard classifies.
-SHELL_TOOLS = frozenset({"Bash", "PowerShell"})
+# Claude Code tools the shell-write guard classifies: shell commands, and scripts Write saves.
+GUARDED_TOOLS = frozenset({"Bash", "PowerShell", "Write"})
 TOOL_NAME_RE = re.compile(r"[A-Za-z0-9_]+")
 
 
@@ -240,11 +240,11 @@ def _validate_hooks_config(config: Mapping[str, object], source: str) -> None:
         raise ReleaseError(f"{source} must contain a hooks object")
     command = "${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp"
     # Context hooks cover every source of their event; the shell-write guard
-    # applies to the Bash and PowerShell tools.
+    # applies to the Bash and PowerShell tools, and to scripts Write saves.
     events = {
         "SessionStart": (None, ["--claude-context", "SessionStart"]),
         "SubagentStart": (None, ["--claude-context", "SubagentStart"]),
-        "PreToolUse": (SHELL_TOOLS, ["--claude-hook", "PreToolUse"]),
+        "PreToolUse": (GUARDED_TOOLS, ["--claude-hook", "PreToolUse"]),
     }
     for event, (matcher, args) in events.items():
         groups = hooks.get(event)

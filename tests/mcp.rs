@@ -1089,8 +1089,9 @@ fn bundled_plugin_launches_hooks_and_mcp_without_path_lookup() {
     }
     let guards = configuration["hooks"]["PreToolUse"].as_array().unwrap();
     assert_eq!(guards.len(), 1);
-    // Exact tool names: the guard only understands Bash and PowerShell commands.
-    assert_eq!(guards[0]["matcher"], "Bash|PowerShell");
+    // Exact tool names: the guard understands Bash and PowerShell commands and
+    // scripts that Write saves.
+    assert_eq!(guards[0]["matcher"], "Bash|PowerShell|Write");
     let handler = &guards[0]["hooks"][0];
     assert_eq!(handler["type"], "command");
     assert_ne!(handler["async"], true);

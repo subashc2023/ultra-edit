@@ -156,9 +156,9 @@ contract, persistence, crash reconciliation, and limits.
 
 ## Shell-write guard
 
-The plugin registers a `PreToolUse` hook for Claude Code's Bash and PowerShell
-tools. It parses each command and denies ones that write content embedded in
-the command into project files:
+The plugin registers a `PreToolUse` hook for Claude Code's Bash, PowerShell,
+and Write tools. It parses each command and denies ones that write content
+embedded in the command into project files:
 
 - heredocs, here-strings, and `echo`/`printf`, `Write-Output`, or string
   literals redirected, `tee`d, or passed to `Set-Content`, `Add-Content`,
@@ -168,10 +168,15 @@ the command into project files:
 - in-place editors such as `sed -i` and `perl -pi`, and `Get-Content` text
   rewritten with `-replace` or `.Replace()` and written back;
 - patches or edit JSON piped into `patch`, `git apply`, or `ultra-edit`;
-- script files that an interpreter or shell runs and that call those write
-  APIs, when the command itself wrote the script
-  (`cat > /tmp/edit.py <<'EOF' … EOF; python3 /tmp/edit.py`) or the script sits
-  in the temporary directory.
+- scripts that may write project files: ones that call those write APIs on a
+  path that is not a literal outside the project, or run such commands. A
+  script is judged when Write or a shell command saves it outside the project
+  and its `#!` line or extension (`.py`, `.js`, `.pl`, `.rb`, `.php`, `.ps1`,
+  `.sh`) names its language, and when a command runs a script it saved
+  (`cat > /tmp/edit.py <<'EOF' … EOF; python3 /tmp/edit.py`, `source`, or by
+  path). Scripts that write only literal paths outside the project are
+  allowed, and no file is read from disk, so downloaded installers and a
+  project's own tools are never judged.
 
 Only writes that may land in the project count. The project is
 `CLAUDE_PROJECT_DIR`, or the hook event's working directory. Targets certainly
@@ -187,8 +192,9 @@ plain copies, and heredocs passed to commands that don't write them to files
 (`git commit -F -`, Claude Code's `git commit -m "$(cat <<'EOF' …)"` pattern)
 are allowed. The guard allows anything it cannot parse and is not a sandbox: it
 misses dynamic commands, redirects on grouped commands, rewrites through
-temporary files, scripts on disk outside the temporary directory, and symlinks
-into the project.
+temporary files, scripts it did not see saved (downloaded, edited after saving,
+or saved without a `#!` line or extension and run by a later call), and
+symlinks into the project.
 
 To turn the guard off, set `ULTRA_EDIT_SHELL_WRITES=allow` in Claude Code's
 environment, for example `"env": {"ULTRA_EDIT_SHELL_WRITES": "allow"}` in

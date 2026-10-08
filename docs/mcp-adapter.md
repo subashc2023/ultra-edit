@@ -210,10 +210,11 @@ tools remain available for new files and isolated edits. If required MCP tools
 are unavailable or denied, Claude is instructed to report the blocker. The
 backslash concern comes from a user's 2026-09-05 Bash observation, not a claim
 that this project reproduced it on every host. The context hooks inject
-instructions. The `PreToolUse` hook, matched to `Bash|PowerShell`, denies
-commands that write content embedded in the command into project files and
-leaves other tools and commands alone; it is a guard against common patterns,
-not a sandbox.
+instructions. The `PreToolUse` hook, matched to `Bash|PowerShell|Write`,
+denies commands that write content embedded in the command into project files,
+and scripts saved outside the project that may write project files, and leaves
+other tools and commands alone; it is a guard against common patterns, not a
+sandbox.
 Explicit user instructions and host permissions take precedence over plugin
 guidance. Report conflicting workflow instructions; generic advice to use sed
 or heredocs is not a reason to silently abandon the user's explicit Ultra Edit

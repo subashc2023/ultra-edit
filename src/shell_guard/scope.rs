@@ -106,6 +106,23 @@ impl Scope {
     }
 }
 
+impl Scope {
+    /// Whether a write to `path`, taken as written rather than as a shell word
+    /// (a string literal in script code, or the Write tool's path), may reach
+    /// a project file: without a root, or unless it is absolute and outside.
+    pub(super) fn literal_inside(&self, path: &str) -> bool {
+        let Some(root) = &self.root else {
+            return true;
+        };
+        let dialect = if root.windows {
+            Dialect::PowerShell
+        } else {
+            Dialect::Bash
+        };
+        path.len() > MAX_TARGET_BYTES || !root.excludes(path, dialect)
+    }
+}
+
 /// Whether `path` is absolute as a POSIX, drive-letter, or UNC path.
 pub fn is_absolute(path: &str) -> bool {
     Root::parse(path).is_some()
