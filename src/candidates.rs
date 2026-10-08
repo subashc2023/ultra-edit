@@ -217,21 +217,25 @@ pub(crate) fn mismatch(subject: &str, actual: &str, candidates: &[Candidate]) ->
     } else {
         advice(candidates)
     };
-    // The quote yields room to the advice; the three extra characters are its
-    // quotes and a clipping ellipsis.
-    let fixed = subject.len() + " holds , not expect; ".len() + rest.chars().count() + 3;
-    let room = MESSAGE_CHARS.saturating_sub(fixed);
-    let actual = quoted(actual, room.min(QUOTED_CHARS));
-    format!("{subject} holds {actual}, not expect; {rest}")
+    line_mismatch(subject, actual, "expect", &rest)
 }
 
 /// Describes a line target's unmet expectation: what `subject` (such as "Lines
 /// 4-5") holds instead of `wanted` (such as "expect"), then `rest`, the advice.
 pub(crate) fn line_mismatch(subject: &str, actual: &str, wanted: &str, rest: &str) -> String {
-    let fixed = subject.len() + " holds , not ; ".len() + wanted.len() + rest.chars().count() + 3;
+    // A plural subject such as "Lines 4-5" takes the plural verb.
+    let verb = if subject.starts_with("Lines ") {
+        "hold"
+    } else {
+        "holds"
+    };
+    // The quote yields room to the advice; the three extra characters are its
+    // quotes and a clipping ellipsis.
+    let fixed =
+        subject.len() + verb.len() + "  , not ; ".len() + wanted.len() + rest.chars().count() + 3;
     let room = MESSAGE_CHARS.saturating_sub(fixed);
     let actual = quoted(actual, room.min(QUOTED_CHARS));
-    format!("{subject} holds {actual}, not {wanted}; {rest}")
+    format!("{subject} {verb} {actual}, not {wanted}; {rest}")
 }
 
 /// Advice for line-wise `expect` text found nowhere as whole lines. An `exact`
@@ -1153,6 +1157,19 @@ mod tests {
         let message = not_found(usize::MAX, "a\nb", &[crlf]);
         assert!(message.contains("CRLF line endings"), "{message}");
         assert!(message.chars().count() <= MESSAGE_CHARS, "{message}");
+    }
+
+    #[test]
+    fn a_range_of_lines_takes_the_plural_verb() {
+        assert_eq!(
+            line_mismatch("Lines 4-5", "a\nb", "expect", "advice"),
+            r#"Lines 4-5 hold "a\nb", not expect; advice"#
+        );
+        assert_eq!(
+            line_mismatch("Line 4", "a", "expect", "advice"),
+            r#"Line 4 holds "a", not expect; advice"#
+        );
+        assert!(mismatch("Span", "a", &[]).starts_with(r#"Span holds "a", not expect;"#));
     }
 
     #[test]

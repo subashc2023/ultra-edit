@@ -15,12 +15,12 @@ generated-content redirection, or inline editing scripts.
 The server-side names are below; select the corresponding namespaced tools
 exposed by this host.
 
-- Name each file by `path`, the same absolute path you Read. The server reads
-  the file's current bytes under its lock as the base, so every change resolves
-  against the file as it was when the call started, never another change's
-  output. The server root stays fixed after directory changes or a subagent's
-  worktree change; never use a relative path that would redirect a worktree edit
-  to the parent checkout, and report files outside the root.
+- Name each file by its absolute `path`. The server reads the file's current
+  bytes under its lock as the base, so every change resolves against the file as
+  it was when the call started, never another change's output. The server root
+  stays fixed after directory changes or a subagent's worktree change; never use
+  a relative path that would redirect a worktree edit to the parent checkout,
+  and report files outside the root.
 - Replacement text is literal. Preserve intended Unicode, whitespace, and
   newline bytes; no regex or formatting runs. One exception: in a file whose
   lines all end in CRLF, which Read shows without `\r`, text holding LF but no

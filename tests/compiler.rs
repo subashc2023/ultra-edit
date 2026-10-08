@@ -2117,7 +2117,7 @@ fn line_expect_compares_whole_lines_ignoring_line_endings() {
     );
     assert_eq!(error.code, "EXPECTED_TEXT_MISMATCH");
     assert!(
-        error.message.starts_with("Lines 5-6 holds"),
+        error.message.starts_with("Lines 5-6 hold \""),
         "{}",
         error.message
     );
