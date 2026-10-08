@@ -2,6 +2,7 @@
 //! match counts, and suggested ranges that can be followed.
 
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 use ultra_edit::compiler::{compile, snapshot};
@@ -447,10 +448,10 @@ fn a_long_repetitive_insertion_is_checked_quickly() {
 }
 
 /// Changes apply to the original file, so a restated line that another change
-/// replaces as a whole appears once, and the batch commits; a token edit, or an
-/// insertion between restated lines, leaves the line twice and is refused.
+/// deletes appears once, and the batch commits; a rewrite would leave both the
+/// rewritten line and its restated original, and is refused.
 #[test]
-fn a_restated_line_that_the_batch_rewrites_is_not_refused() {
+fn a_restated_line_is_allowed_only_when_the_batch_deletes_it() {
     let anchor = "    tax_table=resolve(region),";
     let text = format!("totals = compute(\n{anchor}\n)\n");
     let base = spanless(&text);
@@ -467,13 +468,114 @@ fn a_restated_line_that_the_batch_rewrites_is_not_refused() {
     deleted.id = "d".into();
     let plan = compile(&request(&base, vec![deleted, insert("i")]), &bases(&base));
     assert_eq!(plan.unwrap().files[0].output, wanted);
-    let whole = parsed(json!({"id":"o","old":anchor,"new":"    tax_table=None,"}));
+    let whole = parsed(json!({"id":"o","old":format!("{anchor}\n"),"new":""}));
     let plan = compile(&request(&base, vec![whole, insert("i")]), &bases(&base));
-    assert_eq!(
-        plan.unwrap().files[0].output,
-        format!("totals = compute(\n    tax_table=None,\n{anchor}\n    rounding=1,\n)\n")
+    assert_eq!(plan.unwrap().files[0].output, wanted);
+    // A rewrite, however its `old` is cut, would leave both versions.
+    for (old, new) in [
+        (anchor, "    tax_table=resolve(country),"),
+        ("resolve(region)", "resolve(country)"),
+        (anchor, "tax_table=resolve(region),"),
+    ] {
+        let other = parsed(json!({"id":"o","old":old,"new":new}));
+        let errors = compile(&request(&base, vec![other, insert("i")]), &bases(&base)).unwrap_err();
+        assert_eq!(errors[0].code, "INSERT_REPEATS_LINE", "{errors:?}");
+        assert!(
+            errors[0].message.contains("another change edits"),
+            "{}",
+            errors[0].message
+        );
+    }
+}
+
+/// Equal lines above the anchor let several runs match; the one `expect` spans
+/// is named, so either remedy the message gives commits the intended bytes.
+#[test]
+fn equal_lines_above_are_named_as_expect_spans_them() {
+    let tick = "    sim.advance_tick()";
+    let base = spanless(&format!(
+        "def test():\n{tick}\n{tick}\n    assert sim.ok()\n"
+    ));
+    let expect = format!("{tick}\n{tick}");
+    let new = format!("{tick}\n{tick}\n    sim.check()");
+    let wanted = format!("def test():\n{tick}\n{tick}\n    sim.check()\n    assert sim.ok()\n");
+    let error = rejected(&base, insert(3, Some(&expect), &new));
+    assert!(
+        error
+            .message
+            .contains("keeps lines 2-3, and new starts with their text"),
+        "{}",
+        error.message
     );
-    let token = parsed(json!({"id":"o","old":"resolve(region)","new":"resolve(country)"}));
-    let errors = compile(&request(&base, vec![token, insert("i")]), &bases(&base)).unwrap_err();
-    assert_eq!(errors[0].code, "INSERT_REPEATS_LINE", "{errors:?}");
+    assert!(error.message.contains("lines:[2,3]"), "{}", error.message);
+    let dropped = outcome(&base, insert(3, Some(&expect), "    sim.check()"));
+    assert_eq!(dropped.unwrap(), wanted);
+    let replaced = outcome(&base, ends([2, 3], Some(tick), Some(tick), &new));
+    assert_eq!(replaced.unwrap(), wanted);
+    // Restating the anchor alone with one line more: `expect` names the anchor.
+    let error = rejected(&base, insert(3, Some(tick), &new));
+    assert!(error.message.contains("keeps line 3"), "{}", error.message);
+}
+
+/// Lines below the anchor are compared to the end of the copy, so the
+/// replacement the message offers leaves no line twice.
+#[test]
+fn a_long_copy_is_named_through_its_end() {
+    let rows: Vec<String> = (1..=500)
+        .map(|number| format!("row_{number:04} = value_{number:04}"))
+        .collect();
+    let base = snapshot("full.txt".into(), rows.join("\n") + "\n");
+    let new = format!("{}\nnew_row = 1", rows[..450].join("\n"));
+    let error = rejected(&base, insert(1, None, &new));
+    assert!(
+        error
+            .message
+            .contains("If copied, send this new as lines:[1,450]"),
+        "{}",
+        error.message
+    );
+    let replaced = outcome(&base, ends([1, 450], None, None, &new)).unwrap();
+    assert_eq!(replaced.matches("row_0401 = ").count(), 1);
+    assert_eq!(replaced.matches("new_row = 1").count(), 1);
+    let error = rejected(&base, insert(1, None, &rows[..401].join("\n")));
+    assert!(
+        error.message.contains("only repeats lines 1-401"),
+        "{}",
+        error.message
+    );
+}
+
+/// Visible characters are counted only for runs that match, so long lines
+/// above an anchor and a thousand restating insertions stay cheap.
+#[test]
+fn restating_checks_stay_quick_beside_long_lines_and_many_insertions() {
+    let row = "x".repeat(40_000);
+    let base = snapshot("full.txt".into(), format!("{row}\n").repeat(201));
+    let started = Instant::now();
+    assert!(outcome(&base, insert(201, None, &vec!["y = 1"; 200].join("\n"))).is_ok());
+    let rows: Vec<String> = (1..=9_000)
+        .map(|number| format!("value_{number:05} = item"))
+        .collect();
+    let base = snapshot("full.txt".into(), rows.join("\n") + "\n");
+    let changes: Vec<Change> = (200..1_199)
+        .map(|anchor| {
+            let mut change = insert(
+                anchor,
+                None,
+                &format!(
+                    "{}\nadded_{anchor} = 1",
+                    rows[anchor - 200..anchor].join("\n")
+                ),
+            );
+            change.id = format!("i{anchor}");
+            change
+        })
+        .collect();
+    let errors = compile(&request(&base, changes), &bases(&base)).unwrap_err();
+    assert_eq!(errors.len(), 999);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
 }

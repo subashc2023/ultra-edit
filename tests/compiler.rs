@@ -192,7 +192,7 @@ fn exact_ambiguity_reports_replace_all_cardinality() {
     assert_eq!(errors[0].actual, Some(6));
     assert_eq!(
         errors[0].message,
-        "Expected 1 occurrence(s), found 6 overlapping starts (4 non-overlapping) at line 4 and later; add surrounding text to `old`, or restrict it with \"in\":[4,4]"
+        "Expected 1 occurrence(s), found 6 overlapping starts (4 non-overlapping) at line 4 and later; add surrounding text to `old`"
     );
 
     let all = Change {
@@ -2767,5 +2767,144 @@ fn a_single_old_inside_a_word_is_refused_unless_counted() {
         errors[0].message.contains("\"in\":[2,2]"),
         "{}",
         errors[0].message
+    );
+}
+
+fn compiled(text: &str, change: serde_json::Value) -> Result<String, Vec<Diagnostic>> {
+    let base = snapshot("w.py".into(), text.into());
+    let change: Change = serde_json::from_value(change).unwrap();
+    compile(&request(&base, vec![change]), &bases(&base)).map(|plan| plan.files[0].output.clone())
+}
+
+/// Each end of a match is a cut of its own, a line feed ending `old` does not
+/// make it span lines, and uncased scripts such as Han separate ASCII words.
+#[test]
+fn a_word_cut_is_found_at_either_end_and_beside_any_script() {
+    let refused = |text: &str, old: &str, new: &str| {
+        let errors = compiled(text, json!({"id":"w","old":old,"new":new})).unwrap_err();
+        assert_eq!(errors[0].code, "OLD_INSIDE_WORD", "{old:?} in {text:?}");
+    };
+    // A line feed, or CRLF after adaptation, ends one line.
+    refused("x = 1\nmax_retries = 2\n", "retries = 2\n", "retries = 5\n");
+    refused(
+        "x = 1\r\nmax_retries = 2\r\n",
+        "retries = 2\n",
+        "retries = 5\n",
+    );
+    // The start of an `old` spanning lines still counts.
+    refused(
+        "[default]\nmax_retries = 3\ntimeout = 30\n",
+        "retries = 3\ntimeout = 30",
+        "retries = 5\ntimeout = 60",
+    );
+    // A non-ASCII word at one end does not excuse a cut number at the other.
+    refused("x = 0\ncafé_count = 10\n", "count = 1", "count = 5");
+    refused("Adresse:\nHauptstraße 12\n", "straße 1", "straße 3");
+    // Han and kana are not letters of the ASCII word beside them.
+    refused(
+        "# 配置\n# 默认端口为8080\n",
+        "默认端口为80",
+        "默认端口为443",
+    );
+    refused(
+        "設定:\nタイムアウトは300秒\n",
+        "タイムアウトは30",
+        "タイムアウトは60",
+    );
+    refused(
+        "x = 1\n# 调用get_user_info获取用户\n",
+        "调用get_user",
+        "调用fetch_user",
+    );
+    // Whole ASCII words beside Han text, and cased prose, still match.
+    for (text, old) in [
+        ("# 默认端口为8080\n", "默认端口为8080"),
+        ("# 调用get_user获取用户\n", "调用get_user"),
+        ("an der Hauptstraße wählen\n", "an der Haupt"),
+    ] {
+        assert!(
+            compiled(text, json!({"id":"w","old":old,"new":"y"})).is_ok(),
+            "{old:?} in {text:?}"
+        );
+    }
+}
+
+/// Ambiguity advice offers `in` lines only where a whole-word match is the one
+/// match, so following it commits that match or the advice is left out.
+#[test]
+fn ambiguity_advice_names_lines_that_hold_one_whole_word_match() {
+    let advised = |message: &str| {
+        let rest = &message[message.find("\"in\":[")? + 6..];
+        let pair: Vec<usize> = rest[..rest.find(']')?]
+            .split(',')
+            .map(|number| number.parse().unwrap())
+            .collect();
+        Some([pair[0], pair[1]])
+    };
+    let follow = |text: &str, old: &str, new: &str| {
+        let errors = compiled(text, json!({"id":"w","old":old,"new":new})).unwrap_err();
+        assert_eq!(errors[0].code, "TARGET_AMBIGUOUS", "{errors:?}");
+        let range = advised(&errors[0].message)?;
+        Some(compiled(
+            text,
+            json!({"id":"w","old":old,"new":new,"in":range}),
+        ))
+    };
+    let section =
+        "[default]\nmax_retries = 3\ntimeout = 30\n\n[upload]\nretries = 3\ntimeout = 30\n";
+    assert_eq!(
+        follow(
+            section,
+            "retries = 3\ntimeout = 30",
+            "retries = 5\ntimeout = 60"
+        )
+        .unwrap()
+        .unwrap(),
+        "[default]\nmax_retries = 3\ntimeout = 30\n\n[upload]\nretries = 5\ntimeout = 60\n"
+    );
+    assert_eq!(
+        follow(
+            "MAX_RETRIES = 3\nRETRIES = 3\n",
+            "RETRIES = 3\n",
+            "RETRIES = 5\n"
+        )
+        .unwrap()
+        .unwrap(),
+        "MAX_RETRIES = 3\nRETRIES = 5\n"
+    );
+    // The whole-word match past the five lines shown is found.
+    let late =
+        "a_retries = 2\nb_retries = 2\nc_retries = 2\nd_retries = 2\ne_retries = 2\nretries = 2\n";
+    assert_eq!(
+        follow(late, "retries = 2", "retries = 3").unwrap().unwrap(),
+        late.replace("\nretries = 2", "\nretries = 3")
+    );
+    // No whole-word match: the message says so and names no lines.
+    let errors = compiled(
+        "max_retries = 20\nmin_retries = 25\n",
+        json!({"id":"w","old":"retries = 2","new":"retries = 3"}),
+    )
+    .unwrap_err();
+    assert!(
+        advised(&errors[0].message).is_none(),
+        "{}",
+        errors[0].message
+    );
+    assert!(
+        errors[0].message.contains("inside a longer word"),
+        "{}",
+        errors[0].message
+    );
+    // Lines holding two matches, overlapping or not, are not offered.
+    for (text, old) in [
+        ("a = 0\nif retries: retries -= 1\n", "retries"),
+        ("x\nab ab ab\n", "ab ab"),
+    ] {
+        assert!(follow(text, old, "Z").is_none(), "{old:?} in {text:?}");
+    }
+    let both = "a = 0\nif retries: retries -= 1\nretries = 4\n";
+    assert_eq!(
+        follow(both, "retries", "tries").unwrap().unwrap(),
+        "a = 0\nif retries: retries -= 1\ntries = 4\n"
     );
 }

@@ -51,20 +51,26 @@ All notable changes to Ultra Edit are documented here. Releases follow
   insertion, which would leave those lines twice. It says to drop them from
   `new`, or to send a `lines` replacement when the following lines were copied
   as well; lines below the anchor that only look the same, such as a sibling
-  method's decorator, are offered as possibly new. It stays quiet when other
-  changes in the request replace every restated line whole, and compares at most
-  200 lines on each side. One benchmark session sent such an insertion and
-  committed the duplicate; none of the other 614 recorded insertions restated
-  their anchor.
-- `OLD_INSIDE_WORD`: a single-line `old` without `count` whose match starts or
-  ends inside an ASCII word or number, such as `retries = 2` inside
-  `max_retries = 20` or `timeout = 30` inside `timeout = 300`, is refused,
-  naming the word and its line. Text written without reading the file can
-  otherwise match a longer name. `count`, even 1, still matches inside words on
-  purpose; words with non-ASCII letters (`Hauptstraße`), letters after a
-  backslash escape, and multi-line `old` are exempt, and ambiguity advice points
-  at a whole-word match. None of the 3,494 single-line `old` edits in the
-  benchmark transcripts that matched once would be refused.
+  method's decorator, are offered as possibly new. Among equal lines it names
+  the run `expect` spans, or else the longest. It stays quiet only when other
+  changes in the request delete every restated line; a rewritten one would
+  appear twice in two versions. It compares at most 200 lines above the anchor,
+  and follows a copy below it to its end. One benchmark session sent such an
+  insertion and committed the duplicate; none of the other 614 recorded
+  insertions restated their anchor.
+- `OLD_INSIDE_WORD`: an `old` without `count` whose match starts inside an
+  ASCII word or number, such as `retries = 2` inside `max_retries = 20`, or,
+  on one line, ends inside one, such as `timeout = 30` inside `timeout = 300`,
+  is refused, naming the word and its line. Text written without reading the
+  file can otherwise match a longer name. `count`, even 1, still matches inside
+  words on purpose; words with cased non-ASCII letters (`Hauptstraße`) and
+  letters after a backslash escape are exempt, while Han, kana, and other
+  uncased scripts separate words. Ambiguity advice names `in` lines only where
+  a whole-word match is the only match. Replayed against each task's initial
+  files, none of the 3,709 `ultra_edit` `old` strings in the benchmark
+  transcripts that match once would be refused (3,546 on one line, 163 across
+  lines); of 1,712 native Edit `old_string`s, one would: `once_with(` cut from
+  `assert_called_once_with`.
 - Line-ending adaptation: in a file whose every line ends in CRLF, `old`, `new`,
   and `expect` text holding LF but no CR is matched and written as CRLF, with an
   `EOL_ADAPTED` warning. Native Read hides the CR, so multi-line text copied

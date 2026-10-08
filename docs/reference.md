@@ -299,22 +299,28 @@ restating it is `INSERT_REPEATS_LINE`: its leading lines equal the lines ending
 at `after`, compared without trailing whitespace, as when `expect` or the lines
 to replace were copied into `new`, with at least 8 non-whitespace characters in
 those lines. The message names the kept lines and says to drop them from `new`
-or send a `lines` replacement. When the next lines of `new` also equal the lines
-below `after`, they may be copied context or new lines that look the same, such
-as a sibling method's decorator, so the message gives the replacement for the
-first case and dropping the kept lines for the second. It is not reported when
-other changes in the request replace every restated line that has text, as a
-whole and without keeping its text, since changes apply to the original file.
-A duplicate meant on purpose replaces the lines through `lines`, giving them
-twice. At most 200 lines on each side of `after` are compared.
+or send a `lines` replacement. When equal lines above `after` let several runs
+match, it names the lines `expect` spans, or else the longest run. When the next
+lines of `new` also equal the lines below `after`, through the end of the copy,
+they may be copied context or new lines that look the same, such as a sibling
+method's decorator, so the message gives the replacement for the first case and
+dropping the kept lines for the second. It is not reported when other changes in
+the request delete every restated line that has text, since changes apply to the
+original file; a line another change rewrites would appear both rewritten and
+as restated, and the message says so. A duplicate meant on purpose replaces the
+lines through `lines`, giving them twice. At most 200 lines above `after` are
+compared.
 
-A single-line `old` without `count` whose match starts or ends inside an ASCII
-word (letters, digits, and `_`), such as `retries = 2` inside
-`max_retries = 20`, is `OLD_INSIDE_WORD`; the message names the word and its
-line. A word holding non-ASCII letters, such as `Hauptstraße`, and a letter right
-after a backslash, as in the escape `\nRestart`, do not count. `count`, even 1,
-matches inside words, and an ambiguity message suggests `in` lines that hold a
-whole-word match.
+An `old` without `count` whose match starts inside an ASCII word (letters,
+digits, and `_`), such as `retries = 2` inside `max_retries = 20`, or, for an
+`old` on one line (a final line ending aside), ends inside one, is
+`OLD_INSIDE_WORD`; the message names the word and its line. Each end is judged
+on its own. A word holding cased non-ASCII letters, such as `Hauptstraße`, and a
+letter right after a backslash, as in the escape `\nRestart`, do not count; Han,
+kana, and other uncased scripts separate words, so `80` inside `端口为8080` is
+refused. `count`, even 1, matches inside words. An ambiguity message suggests
+`in` lines where a whole-word match is the only match, and otherwise says to
+add surrounding text, or that every match is inside a longer word.
 
 A span ID is a disclosed ID such as `r5`, `selection`, or `m2`, or a line range
 `rA..rB`, never literal source text. A line range is accepted wherever a span ID

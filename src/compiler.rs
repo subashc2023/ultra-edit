@@ -27,7 +27,8 @@ const AMBIGUOUS_LINES: usize = 5;
 /// Visible characters that make a line guard strong wherever else its text occurs:
 /// repeated lines such as `port = 8080` are what line numbers tell apart.
 pub const MIN_GUARD_CHARS: usize = 8;
-/// How far a quoted word reaches on each side of a match boundary.
+/// How far a word is read on each side of a match boundary, to quote it and to
+/// look for non-ASCII letters.
 const WORD_CHARS: usize = 40;
 /// Change IDs an `EOL_ADAPTED` warning names before counting the rest.
 const ADAPTED_IDS: usize = 3;
@@ -147,6 +148,11 @@ impl LineIndex {
 
     fn body(&self, line: usize) -> Range<usize> {
         self.bodies[line - 1].clone()
+    }
+
+    /// The line holding byte `offset`.
+    fn line_of(&self, offset: usize) -> usize {
+        self.bodies.partition_point(|body| body.start <= offset)
     }
 
     /// Where the line's terminator ends: the next body's start, or the text's end.
@@ -1361,8 +1367,8 @@ struct Restated<'a> {
     bare: bool,
 }
 
-/// Lines a restatement is compared over on each side of the anchor: a longer
-/// one is not the slip this check catches, and the bound keeps the search small.
+/// Lines above the anchor a restatement is compared over: a longer one is not
+/// the slip this check catches, and the bound keeps the search small.
 const RESTATED_LINES: usize = 200;
 
 fn visible(text: &str) -> usize {
@@ -1373,7 +1379,8 @@ fn visible(text: &str) -> usize {
 /// compared without trailing whitespace, as when `expect` or the lines to
 /// replace were copied into the text. Restated lines with fewer than
 /// `MIN_GUARD_CHARS` visible characters, such as a lone `}`, may repeat on
-/// purpose.
+/// purpose. Equal lines above can make several runs match: the one `expect`
+/// spans is what a copied `expect` restates, and otherwise the longest.
 fn restated_lines<'a>(
     change: &'a Change,
     context: &FileContext,
@@ -1386,42 +1393,55 @@ fn restated_lines<'a>(
     }
     let body = |number: usize| context.base.text[lines.body(number)].trim_end();
     let text = text.strip_suffix('\n').unwrap_or(text);
-    let total = text.split('\n').count();
-    let pieces: Vec<&str> = text
-        .split('\n')
-        .take(2 * RESTATED_LINES)
-        .map(|piece| piece.strip_suffix('\r').unwrap_or(piece).trim_end())
-        .collect();
-    let lowest = (line + 1)
-        .saturating_sub(pieces.len().min(RESTATED_LINES))
-        .max(1);
-    (lowest..=line).rev().find_map(|first| {
-        let kept = line + 1 - first;
-        let restated = (first..=line)
+    fn trimmed(piece: &str) -> &str {
+        piece.strip_suffix('\r').unwrap_or(piece).trim_end()
+    }
+    let pieces: Vec<&str> = text.split('\n').take(RESTATED_LINES).map(trimmed).collect();
+    let restates = |first: usize| {
+        (first..=line)
             .zip(&pieces)
-            .all(|(number, piece)| body(number) == *piece);
-        let shown: usize = (first..=line).map(|number| visible(body(number))).sum();
-        if !restated || shown < MIN_GUARD_CHARS {
-            return None;
-        }
-        let more = pieces[kept..]
-            .iter()
-            .zip(line + 1..=lines.count())
-            .take_while(|(piece, number)| body(*number) == **piece)
-            .count();
-        Some(Restated {
-            change,
-            line,
-            first,
-            last: line + more,
-            bare: kept + more == total,
-        })
+            .all(|(number, piece)| body(number) == *piece)
+            && (first..=line)
+                .map(|number| visible(body(number)))
+                .sum::<usize>()
+                >= MIN_GUARD_CHARS
+    };
+    let lowest = (line + 1).saturating_sub(pieces.len()).max(1);
+    let spanned = match &change.target {
+        Target::Insert {
+            expect: Some(expect),
+            ..
+        } => expect
+            .strip_suffix('\n')
+            .unwrap_or(expect)
+            .split('\n')
+            .count(),
+        _ => 0,
+    };
+    let first = (line + 1)
+        .checked_sub(spanned)
+        .filter(|&first| spanned > 0 && first >= lowest && restates(first))
+        .or_else(|| (lowest..=line).find(|&first| restates(first)))?;
+    let kept = line + 1 - first;
+    let more = text
+        .split('\n')
+        .skip(kept)
+        .zip(line + 1..=lines.count())
+        .take_while(|(piece, number)| body(*number) == trimmed(piece))
+        .count();
+    Some(Restated {
+        change,
+        line,
+        first,
+        last: line + more,
+        bare: kept + more == text.split('\n').count(),
     })
 }
 
-/// Refuses each restating insertion unless other changes in the file replace
-/// every restated line that has text, as a whole and without keeping its text:
-/// changes apply to the original file, so those lines then appear once.
+/// Refuses each restating insertion unless other changes in the file delete
+/// every restated line that has text: changes apply to the original file, so
+/// those lines then appear once. A line another change rewrites would appear
+/// both rewritten and as restated.
 fn refuse_restatements(
     context: &FileContext,
     replacements: &[Replacement],
@@ -1436,20 +1456,27 @@ fn refuse_restatements(
             last,
             bare,
         } = *restated;
-        let rewritten = (first..=line).map(|number| lines.body(number)).all(|body| {
-            let kept = context.base.text[body.clone()].trim_end();
-            visible(kept) == 0
-                || replacements.iter().any(|other| {
-                    other.change_id != change.id
-                        && other.start <= body.start
+        let (low, high) = (lines.body(first).start, lines.body(line).end);
+        let near: Vec<_> = replacements
+            .iter()
+            .filter(|other| other.change_id != change.id && other.start <= high && other.end >= low)
+            .collect();
+        let deleted = (first..=line).map(|number| lines.body(number)).all(|body| {
+            visible(&context.base.text[body.clone()]) == 0
+                || near.iter().any(|other| {
+                    other.start <= body.start
                         && other.end >= body.end
                         && other.start < other.end
-                        && !other.text.contains(kept)
+                        && visible(&other.text) == 0
                 })
         });
-        if rewritten {
+        if deleted {
             continue;
         }
+        let edited = (first..=line).map(|number| lines.body(number)).any(|body| {
+            near.iter()
+                .any(|other| other.start < body.end && other.end > body.start)
+        });
         let Target::Insert { after, .. } = change.target else {
             continue;
         };
@@ -1466,7 +1493,19 @@ fn refuse_restatements(
         } else {
             ("they", "them", "their")
         };
-        let message = if bare {
+        let message = if edited {
+            let below = if last > line {
+                format!(
+                    "; its next lines equal {} too, so drop those as well if they were copied",
+                    named(line + 1, last)
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "after:{after} keeps {kept}, which another change edits, and new starts with {their} original text, so both versions would appear; drop {them} from new{below}"
+            )
+        } else if bare {
             format!(
                 "after:{after} keeps {kept}, and new only repeats {}; to repeat text on purpose, send lines:[{first},{last}] with those lines given twice",
                 named(first, last)
@@ -1568,14 +1607,16 @@ fn resolve_exact(
             let mut lines = line_numbers(&base.text, &starts);
             lines.dedup();
             let noun = if lines.len() == 1 { "line" } else { "lines" };
-            // The first whole-word match's lines: a line scope that holds it alone
-            // and that a single `old` may take.
-            let first = starts
-                .iter()
-                .find(|&&at| old.contains('\n') || inside_word(&base.text, at, old.len()).is_none())
-                .map_or(lines[0], |&at| line_numbers(&base.text, &[at])[0]);
-            // A final line feed ends the match's last line, which `in` already includes.
-            let last = first + old.strip_suffix('\n').unwrap_or(old).matches('\n').count();
+            let advice = match alone_lines(context.lines(), &base.text, start..end, old) {
+                Ok((first, last)) => format!(
+                    "add surrounding text to `old`, or restrict it with \"in\":[{first},{last}]"
+                ),
+                Err(true) => "add surrounding text to `old`".to_owned(),
+                Err(false) => {
+                    "each match is inside a longer word; copy whole words from those lines into `old`"
+                        .to_owned()
+                }
+            };
             let lines: Vec<_> = lines.iter().map(usize::to_string).collect();
             let more = if actual > starts.len() {
                 " and later"
@@ -1583,7 +1624,7 @@ fn resolve_exact(
                 ""
             };
             format!(
-                "Expected {expected} occurrence(s), found {actual} overlapping starts ({non_overlapping} non-overlapping) at {noun} {}{more}; add surrounding text to `old`, or restrict it with \"in\":[{first},{last}]",
+                "Expected {expected} occurrence(s), found {actual} overlapping starts ({non_overlapping} non-overlapping) at {noun} {}{more}; {advice}",
                 lines.join(", ")
             )
         } else if !found.is_empty() {
@@ -1621,15 +1662,14 @@ fn resolve_exact(
         return;
     }
     if exact
-        && !old.contains('\n')
         && let Some(&position) = positions.first()
-        && let Some(message) = inside_word(&base.text, start + position, old.len())
+        && let Some(boundary) = word_cut(&base.text, start + position, old)
     {
         diagnostics.push(at(
             Some(&base.path),
             Some(change),
             "OLD_INSIDE_WORD",
-            message,
+            inside_word(&base.text, boundary),
         ));
         return;
     }
@@ -1645,13 +1685,14 @@ fn resolve_exact(
     }));
 }
 
-/// Refuses a single-line `old` whose match at `start` starts or ends inside an
-/// ASCII word, such as `retries = 2` inside `max_retries = 20`: text written
-/// without reading the file can match a longer name or number by accident.
-/// `count`, even 1, takes part of a word on purpose. A word holding non-ASCII
-/// letters, such as `Hauptstraße`, is prose that callers cut to avoid typing
-/// them, and a letter after a backslash, as in `\nRestart`, is an escape.
-fn inside_word(text: &str, start: usize, len: usize) -> Option<String> {
+/// Where a match of `old` at `start` cuts an ASCII word, such as `retries = 2`
+/// inside `max_retries = 20`: text written without reading the file can match
+/// a longer name or number by accident. Only the start of an `old` spanning
+/// lines counts, since its last line may end on part of a name as context. A
+/// word holding cased non-ASCII letters, such as `Hauptstraße`, is prose that
+/// callers cut to avoid typing them, while uncased scripts such as Han separate
+/// words; a letter after a backslash, as in `\nRestart`, is an escape.
+fn word_cut(text: &str, start: usize, old: &str) -> Option<usize> {
     let bytes = text.as_bytes();
     let word = |at: usize| {
         bytes
@@ -1660,25 +1701,32 @@ fn inside_word(text: &str, start: usize, len: usize) -> Option<String> {
     };
     let joined =
         |at: usize| at > 0 && word(at - 1) && word(at) && !(at >= 2 && bytes[at - 2] == b'\\');
-    let end = start + len;
-    let boundary = if joined(start) {
-        start
-    } else if len > 0 && joined(end) {
-        end
-    } else {
-        return None;
+    let letter = |ch: &char| {
+        *ch == '_' || ch.is_ascii_alphanumeric() || ch.is_lowercase() || ch.is_uppercase()
     };
-    let letter = |ch: &char| ch.is_alphanumeric() || *ch == '_';
-    let ascii = text[..boundary]
-        .chars()
-        .rev()
-        .take_while(letter)
-        .chain(text[boundary..].chars().take_while(letter))
-        .all(|ch| ch.is_ascii());
-    if !ascii {
-        return None;
-    }
-    // The whole word around the boundary, clipped for the message; it is ASCII.
+    let ascii = |at: usize| {
+        text[..at]
+            .chars()
+            .rev()
+            .take_while(letter)
+            .take(WORD_CHARS)
+            .chain(text[at..].chars().take_while(letter).take(WORD_CHARS))
+            .all(|ch| ch.is_ascii())
+    };
+    let line = old.strip_suffix('\n').unwrap_or(old);
+    let end = (!line.contains('\n')).then_some(start + old.len());
+    std::iter::once(start)
+        .chain(end)
+        .find(|&at| joined(at) && ascii(at))
+}
+
+/// Names the ASCII word that `boundary` cuts, clipped, and its line.
+fn inside_word(text: &str, boundary: usize) -> String {
+    let word = |at: usize| {
+        text.as_bytes()
+            .get(at)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    };
     let (mut low, mut high) = (boundary, boundary);
     while low > 0 && word(low - 1) && boundary - low < WORD_CHARS {
         low -= 1;
@@ -1687,10 +1735,46 @@ fn inside_word(text: &str, start: usize, len: usize) -> Option<String> {
         high += 1;
     }
     let line = line_numbers(text, &[boundary])[0];
-    Some(format!(
+    format!(
         "`old` matches inside the word `{}` at line {line}; give whole words, or add \"count\":1 to replace part of a word",
         &text[low..high]
-    ))
+    )
+}
+
+/// The lines of the first whole-word match of `old` in `range` that no other
+/// match shares, which `in` then finds alone. Otherwise whether any match was
+/// whole words.
+fn alone_lines(
+    lines: &LineIndex,
+    text: &str,
+    range: Range<usize>,
+    old: &str,
+) -> Result<(usize, usize), bool> {
+    let scope = &text[range.clone()];
+    let step = old.chars().next().map_or(1, char::len_utf8);
+    let mut starts = std::iter::successors(scope.find(old), |&at| {
+        scope[at + step..].find(old).map(|next| at + step + next)
+    })
+    .map(|at| range.start + at)
+    .peekable();
+    // A final line feed ends the match's last line, which `in` already includes.
+    let spanned = old.strip_suffix('\n').unwrap_or(old).matches('\n').count();
+    let (mut previous, mut whole) = (None, false);
+    while let Some(at) = starts.next() {
+        if word_cut(text, at, old).is_none() {
+            whole = true;
+            let first = lines.line_of(at);
+            let last = first + spanned;
+            let (low, high) = (lines.body(first).start, lines.end(last));
+            if previous.is_none_or(|before| before < low)
+                && starts.peek().is_none_or(|&after| after + old.len() > high)
+            {
+                return Ok((first, last));
+            }
+        }
+        previous = Some(at);
+    }
+    Err(whole)
 }
 
 fn push_replacement(
