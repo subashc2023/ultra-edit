@@ -510,7 +510,7 @@ impl schemars::JsonSchema for Change {
                 "after": {"type": "integer", "minimum": 0},
                 "expect": {
                     "anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2}],
-                    "description": "The line's current text, or [first line, last line]; exact bytes for span."
+                    "description": "The line's current text, or [first line, last line]; each may hold several lines, and a short one such as a blank line or `}` must not recur in the file. Exact bytes for span."
                 },
                 "span": {"type": "string", "description": "A span ID the base disclosed."}
             }
