@@ -321,7 +321,12 @@ impl TryFrom<ChangeInput> for Change {
             }
         }
         if input.old.is_none() {
-            if input.count.is_some() {
+            // `count: 1` asks for what every other target already does.
+            if input
+                .count
+                .as_ref()
+                .is_some_and(|count| count.as_u64() != Some(1))
+            {
                 return Err("`count` is a positive occurrence count and needs `old`".into());
             }
             if input.within.is_some() {
@@ -886,6 +891,16 @@ mod tests {
                 },
                 json!({"kind":"lines","lines":[146,150],"expect":"x"}),
             ),
+            // `count: 1` is what every target does, so it is accepted anywhere.
+            (
+                json!({"lines":[146,150],"new":"b","expect":"x","count":1}),
+                Target::Lines {
+                    lines: [146, 150],
+                    expect: Some("x".into()),
+                    expect_last: None,
+                },
+                json!({"kind":"lines","lines":[146,150],"expect":"x"}),
+            ),
             (
                 json!({"after":0,"text":"b"}),
                 Target::Insert {
@@ -969,6 +984,10 @@ mod tests {
             ),
             (
                 json!({"span":"r1","count":2,"new":"b"}),
+                "`count` is a positive occurrence count and needs `old`",
+            ),
+            (
+                json!({"lines":[1,1],"count":0,"new":"b"}),
                 "`count` is a positive occurrence count and needs `old`",
             ),
             (

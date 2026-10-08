@@ -104,6 +104,8 @@ All notable changes to Ultra Edit are documented here. Releases follow
   are never judged. The `PreToolUse` matcher is now `Bash|PowerShell|Write`. In
   the benchmark, 4 of 14 guarded native sessions wrote project files past the
   guard by saving a script with Write and running it.
+- `count: 1` on a span, lines, or after change is accepted and ignored, since
+  every target replaces one place; another count there is still an error.
 - An insertion at either edge of a deletion no longer conflicts, since either
   order gives the same text: `{after:11}` with `{lines:[11,11],new:""}` puts
   the new lines where line 11 was. Insertions beside replaced text or inside a
