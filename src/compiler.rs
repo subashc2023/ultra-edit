@@ -302,12 +302,29 @@ pub(crate) fn derives(
     match change.target {
         Target::Lines { .. } | Target::Insert { .. } => {
             let lines = lines.get_or_init(|| LineIndex::new(text));
-            let found = Some((replacement.start..replacement.end, replacement.text.clone()));
-            derived_replacement(text, lines, &change.target, &change.text) == found
-                || derived_replacement(text, lines, &change.target, &adapted) == found
+            [change.text.as_str(), &adapted].into_iter().any(|written| {
+                derived_replacement(text, lines, &change.target, written).is_some_and(
+                    |(range, derived)| {
+                        range.start == replacement.start
+                            && kept_tail(text, replacement, range.end, &derived)
+                    },
+                )
+            })
         }
-        _ => replacement.text == change.text || replacement.text == adapted,
+        _ => [change.text.as_str(), &adapted].into_iter().any(|written| {
+            let rest = written.len().saturating_sub(replacement.text.len());
+            kept_tail(text, replacement, replacement.end + rest, written)
+        }),
     }
+}
+
+/// Whether `replacement` writes `derived` over the base up to `end`, or stops
+/// early where the next change starts: then `derived` ends with the base bytes
+/// it stops before, which [`merge_kept_overlaps`] left in place.
+fn kept_tail(text: &str, replacement: &Replacement, end: usize, derived: &str) -> bool {
+    replacement.end <= end
+        && derived.starts_with(replacement.text.as_str())
+        && text.get(replacement.end..end) == derived.get(replacement.text.len()..)
 }
 
 /// How a compile treats LF-only text for an all-CRLF base.

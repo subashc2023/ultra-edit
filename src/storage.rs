@@ -13,7 +13,7 @@ use tempfile::NamedTempFile;
 use crate::compiler::{self, MAX_TEXT_BYTES};
 use crate::model::{
     Change, CommitStatus, Error, FileOutcome, FileStatus, PreparedFile, PreparedPlan, Receipt,
-    Snapshot, Target, digest, new_id,
+    Replacement, Snapshot, Target, digest, new_id,
 };
 
 mod reconciliation;
@@ -1271,7 +1271,7 @@ fn validate_plan(plan: &PreparedPlan) -> Result<(), Error> {
         }
         let mut end = 0;
         let mut output = String::new();
-        let mut previous_start = None;
+        let mut previous: Option<&Replacement> = None;
         let mut seen = std::collections::HashSet::new();
         let changes: HashMap<&str, &Change> = request
             .changes
@@ -1281,14 +1281,22 @@ fn validate_plan(plan: &PreparedPlan) -> Result<(), Error> {
         // Computed only when a replacement needs them.
         let (lines, crlf) = (OnceCell::new(), OnceCell::new());
         for replacement in &file.replacements {
+            // An insertion may touch another change only beside a deletion, where
+            // either order gives the same text.
+            let insertion = |replacement: &Replacement| replacement.start == replacement.end;
+            let deletion = |replacement: &Replacement| {
+                replacement.start < replacement.end && replacement.text.is_empty()
+            };
+            let touches = previous.is_some_and(|previous| {
+                (previous.start == replacement.start
+                    && !(insertion(previous) && deletion(replacement)))
+                    || (replacement.start == end && insertion(replacement) && !deletion(previous))
+            });
             if replacement.start < end
                 || replacement.end < replacement.start
                 || !file.base.text.is_char_boundary(replacement.start)
                 || !file.base.text.is_char_boundary(replacement.end)
-                || previous_start == Some(replacement.start)
-                || (previous_start.is_some()
-                    && replacement.start == end
-                    && replacement.start == replacement.end)
+                || touches
             {
                 return Err(Error::new(
                     "INVALID_PLAN",
@@ -1314,7 +1322,7 @@ fn validate_plan(plan: &PreparedPlan) -> Result<(), Error> {
             output.push_str(&file.base.text[end..replacement.start]);
             output.push_str(&replacement.text);
             end = replacement.end;
-            previous_start = Some(replacement.start);
+            previous = Some(replacement);
         }
         output.push_str(&file.base.text[end..]);
         if output != file.output || seen.len() != file.change_ids.len() {

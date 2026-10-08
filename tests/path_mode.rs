@@ -534,3 +534,66 @@ fn a_path_spelled_through_a_symlinked_root_replays() {
     }
     assert_eq!(read(&real, "a.txt"), "head\nadded\n");
 }
+
+#[test]
+fn merged_and_adjacent_changes_commit_and_undo() {
+    let shell = "log() { printf '%s' \"$(date)\" \"$*\"; }\n";
+    let main = "fn main() {\n    let port = \"8080\";\n    serve(port);\n}\n";
+    let doc = "intro\n\n## Legacy\n\nbody text here\n\n## Next\n";
+    let (dir, workspace) = setup(&[("log.sh", shell), ("main.rs", main), ("doc.md", doc)]);
+    let lines = |range: [usize; 2], first: &str, last: Option<&str>, new: &str| Change {
+        id: String::new(),
+        target: Target::Lines {
+            lines: range,
+            expect: Some(first.into()),
+            expect_last: last.map(str::to_owned),
+        },
+        text: new.into(),
+    };
+    let insert = Change {
+        id: String::new(),
+        target: Target::Insert {
+            after: 2,
+            expect: Some("    let port = \"8080\";".into()),
+        },
+        text: "    let port = \"9090\";".into(),
+    };
+    let (done, _) = receipt(
+        workspace
+            .edit(request(vec![
+                // Two `old` anchors share `"$(date`, which both keep.
+                at(
+                    "log.sh",
+                    vec![
+                        exact("printf '%s' \"$(date", "printf '[%s] %s' \"$(date"),
+                        exact("\"$(date)\" \"$*\"", "\"$(date)\" \"$ENV\" \"$*\""),
+                    ],
+                ),
+                // Inserting after line 2 and deleting it replaces it.
+                at(
+                    "main.rs",
+                    vec![insert, lines([2, 2], "    let port = \"8080\";", None, "")],
+                ),
+                // A range ending in a blank line, guarded by the text before it.
+                at(
+                    "doc.md",
+                    vec![lines([3, 6], "## Legacy", Some("body text here"), "")],
+                ),
+            ]))
+            .unwrap(),
+    );
+    assert_eq!(done.commit, CommitStatus::Committed);
+    assert_eq!(
+        read(&dir, "log.sh"),
+        "log() { printf '[%s] %s' \"$(date)\" \"$ENV\" \"$*\"; }\n"
+    );
+    assert_eq!(
+        read(&dir, "main.rs"),
+        "fn main() {\n    let port = \"9090\";\n    serve(port);\n}\n"
+    );
+    assert_eq!(read(&dir, "doc.md"), "intro\n\n## Next\n");
+    receipt(workspace.undo(&done.plan_id, "").unwrap());
+    assert_eq!(read(&dir, "log.sh"), shell);
+    assert_eq!(read(&dir, "main.rs"), main);
+    assert_eq!(read(&dir, "doc.md"), doc);
+}
