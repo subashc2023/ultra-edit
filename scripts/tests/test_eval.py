@@ -1780,6 +1780,7 @@ class RichMetricsTests(unittest.TestCase):
         self.assertEqual(metrics["api_calls"], 4)
         self.assertEqual(metrics["subagent_api_calls"], 1)
         self.assertEqual(metrics["first_call_context_tokens"], 15010)
+        self.assertEqual(metrics["first_call_cache_read_tokens"], 0, "a cold start")
         self.assertEqual(metrics["peak_context_tokens"], 15205)
         self.assertEqual(metrics["context_tokens_total"], 15010 + 15205 + 4003 + 15202)
         self.assertEqual(metrics["output_tokens_calls"], 80 + 40 + 30 + 25)
@@ -1788,6 +1789,7 @@ class RichMetricsTests(unittest.TestCase):
         empty = evaluation.compute_metrics(transcript_from(init_message()))
         self.assertEqual(empty["api_calls"], 0)
         self.assertIsNone(empty["first_call_context_tokens"])
+        self.assertIsNone(empty["first_call_cache_read_tokens"])
         self.assertIsNone(empty["context_tokens_total"])
         self.assertIsNone(empty["final_text_bytes"])
         self.assertEqual(empty["context_series"], [])
@@ -1878,7 +1880,6 @@ class RichMetricsTests(unittest.TestCase):
         self.assertFalse(evaluation.first_attempt(metrics, correct=True))
         plain = evaluation.compute_metrics(transcript)
         self.assertEqual((plain["edit_calls"], plain["tool_errors"]), (0, 1))
-
 
     def test_masked_and_missing_viewer_edit_outcomes(self):
         edit = "mcp__text-editor__patch_text_file_contents"
@@ -1995,8 +1996,12 @@ class SpreadSummaryTests(unittest.TestCase):
         self.assertIn("| native | 1 | 0.50 | 0.50 |", summary)
         self.assertIn("| shell-sed | 1 | 0.00 | 0.00 |", summary)
         self.assertIn("## Fixed context overhead", summary)
-        self.assertIn("| native | 4 | 915 |", summary)
-        self.assertIn("| shell-sed | 0 | - |", summary)
+        self.assertIn("| native | 4 | 915 | 0 |", summary)
+        self.assertIn("| shell-sed | 0 | - | 0 |", summary)
+        cold = self.records()
+        cold[0]["metrics"]["first_call_cache_read_tokens"] = 0
+        cold[1]["metrics"]["first_call_cache_read_tokens"] = 880
+        self.assertIn("| native | 4 | 915 | 1 |", evaluation.summarize(cold))
         self.assertIn("### Errors and bytes by task and arm", summary)
         self.assertIn("| t1 / shell-sed | 2 | 0.00 | 1.00 |", summary)
         self.assertLess(summary.index("| native |"), summary.index("| shell-sed |"))
@@ -2262,6 +2267,85 @@ class ParallelAndThirdPartyRunTests(unittest.TestCase):
         self.assertTrue((out / "runs.csv").is_file())
         self.assertIn("## Fixed context overhead", (out / "summary.md").read_text(encoding="utf-8"))
         self.assertEqual(list(self.work.iterdir()), [])
+
+    def main_args(self, out, *extra, arms=("native", "shell-sed")):
+        return [
+            "--task", "markdown-hard-breaks",
+            *(item for arm in arms for item in ("--arm", arm)),
+            "--claude", str(self.fake_claude),
+            "--permission-mode", "acceptEdits",
+            "--third-party-arms", NO_THIRD_PARTY,
+            "--work-dir", str(self.work),
+            "--yes",
+            *extra,
+        ]  # fmt: skip
+
+    def test_main_warms_each_arm_up_once_and_records_the_environment(self):
+        self.write_plan()
+        out = self.root / "results"
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, self.env()), redirect_stdout(output):
+            code = evaluation.main(self.main_args(out, "--out", str(out)))
+        self.assertEqual(code, 0, output.getvalue())
+        warmups = [
+            json.loads(line) for line in (out / "warmup.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertEqual(sorted(w["arm"] for w in warmups), ["native", "shell-sed"])
+        self.assertTrue(all((out / w["run_dir"]).is_dir() for w in warmups))
+        self.assertIn("warm-up native: prefix already cached", output.getvalue())
+        self.assertFalse(any(name.startswith("warmup") for name in os.listdir(out / "runs")))
+        records = evaluation.load_records(out)
+        self.assertEqual(len(records), 2, "warm-ups are not measured runs")
+        for record in records:
+            self.assertEqual(
+                record["environment"], {"claude": "2.1.282 (Claude Code)", "runtime_sha256": None}
+            )
+        manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(sorted(manifest["environment"]), ["native", "shell-sed"])
+        self.assertEqual(list(self.work.iterdir()), [])
+
+    def test_no_warmup_skips_the_warm_up(self):
+        self.write_plan()
+        out = self.root / "results"
+        with mock.patch.dict(os.environ, self.env()), redirect_stdout(io.StringIO()) as output:
+            code = evaluation.main(self.main_args(out, "--out", str(out), "--no-warmup"))
+        self.assertEqual(code, 0, output.getvalue())
+        self.assertFalse((out / "warmup.jsonl").exists())
+
+    def test_resume_refuses_runs_recorded_with_another_claude_build(self):
+        self.write_plan()
+        out = self.root / "results"
+        with mock.patch.dict(os.environ, self.env()), redirect_stdout(io.StringIO()):
+            self.assertEqual(evaluation.main(self.main_args(out, "--out", str(out), "--no-warmup")), 0)
+        records = evaluation.load_records(out)
+        records[0]["environment"]["claude"] = "2.1.100 (Claude Code)"
+        with open(out / "runs.jsonl", "w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+        args = self.main_args(out, "--resume", str(out), "--reps", "2", "--no-warmup")
+        with mock.patch.dict(os.environ, self.env()), redirect_stdout(io.StringIO()):
+            with mock.patch("sys.stderr", io.StringIO()) as errors:
+                self.assertEqual(evaluation.main(args), 2)
+        self.assertIn("Claude Code 2.1.100 (Claude Code), now 2.1.282 (Claude Code)", errors.getvalue())
+        self.assertEqual(len(evaluation.load_records(out)), 2, "a refused resume changes nothing")
+        with mock.patch.dict(os.environ, self.env()), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(evaluation.main([*args, "--allow-drift"]), 0, output.getvalue())
+        self.assertEqual(len(evaluation.load_records(out)), 4)
+
+    def test_resume_accumulates_arms_and_history_in_the_manifest(self):
+        self.write_plan()
+        out = self.root / "results"
+        first = self.main_args(out, "--out", str(out), "--no-warmup", arms=["native"])
+        with mock.patch.dict(os.environ, self.env()), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(evaluation.main(first), 0, output.getvalue())
+        second = self.main_args(out, "--resume", str(out), "--no-warmup", arms=["shell-sed"])
+        with mock.patch.dict(os.environ, self.env()), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(evaluation.main(second), 0, output.getvalue())
+        manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["arms"], ["native", "shell-sed"])
+        self.assertEqual(sorted(manifest["arm_specs"]), ["native", "shell-sed"])
+        self.assertEqual([entry["arms"] for entry in manifest["history"]], [["native"], ["shell-sed"]])
+        self.assertEqual(sorted(r["arm"] for r in evaluation.load_records(out)), ["native", "shell-sed"])
 
     def test_main_rejects_an_unavailable_third_party_arm_before_paid_runs(self):
         self.write_plan()

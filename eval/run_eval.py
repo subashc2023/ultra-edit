@@ -14,8 +14,10 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+import dataclasses
 import datetime
 import difflib
+import hashlib
 import json
 import os
 import platform
@@ -1146,6 +1148,8 @@ def api_call_metrics(transcript: Transcript) -> dict[str, Any]:
         "api_calls": len(calls),
         "subagent_api_calls": len(calls) - len(main),
         "first_call_context_tokens": main[0].context if main else None,
+        # 0 means a cold start: the shared system-and-tools prefix was not cached yet.
+        "first_call_cache_read_tokens": main[0].cache_read_input_tokens if main else None,
         "peak_context_tokens": max((call.context for call in calls), default=None),
         "context_tokens_total": sum(call.context for call in calls) if calls else None,
         "output_tokens_calls": sum(call.output_tokens for call in calls) if calls else None,
@@ -1676,6 +1680,7 @@ class StagedPlugin:
     mcp_executable: Path
     runtime_files: list[str]
     plugin_version: str | None
+    runtime_sha256: str | None = None
 
 
 def mcp_executable_name(windows: bool) -> str:
@@ -1733,7 +1738,8 @@ def stage_plugin(
             path = runtime / name
             if path.is_file():
                 path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    return StagedPlugin(destination.resolve(), executable.resolve(), copied, plugin_version(source))
+    digest = hashlib.sha256(executable.read_bytes()).hexdigest() if executable.is_file() else None
+    return StagedPlugin(destination.resolve(), executable.resolve(), copied, plugin_version(source), digest)
 
 
 def hook_output_denies(returncode: int, stdout: bytes | str) -> bool:
@@ -2159,9 +2165,47 @@ def run_one(config: Config, spec: RunSpec) -> dict[str, Any]:
             "tools": init.get("tools"),
         },
         "files": {"dir": f"runs/{spec.run_id}"},
+        "environment": run_environment(config, arm),
     }
     _write_json(run_dir / "result.json", record)
     return record
+
+
+def run_environment(config: Config, arm: ArmSpec) -> dict[str, Any]:
+    """What a run's measurement depends on outside the task: the Claude Code build and, for
+    arms that start the Ultra Edit executable (plugin or guard hook), that executable."""
+    return _environment(config.claude, config.staged, arm)
+
+
+def _environment(claude: ClaudeInfo, staged: StagedPlugin | None, arm: ArmSpec) -> dict[str, Any]:
+    uses_runtime = arm.plugin or arm.guard_hook
+    return {
+        "claude": claude.version_text,
+        "runtime_sha256": staged.runtime_sha256 if staged and uses_runtime else None,
+    }
+
+
+def environment_drift(
+    kept: Iterable[Mapping[str, Any]], current: Mapping[str, Mapping[str, Any]]
+) -> list[str]:
+    """Kept runs measured under a different Claude Code build or Ultra Edit executable than
+    the runs about to start; mixing them would compare different software. `current` maps
+    each arm in this plan to its run_environment."""
+    problems = []
+    claude = next(iter(current.values()), {}).get("claude")
+    for record in kept:
+        env = record.get("environment")
+        if not isinstance(env, dict):
+            continue
+        if claude and env.get("claude") and env["claude"] != claude:
+            problems.append(f"{record['run_id']}: Claude Code {env['claude']}, now {claude}")
+        arm_env = current.get(record.get("arm"))
+        recorded = env.get("runtime_sha256")
+        if arm_env and recorded and arm_env.get("runtime_sha256") and recorded != arm_env["runtime_sha256"]:
+            problems.append(
+                f"{record['run_id']}: Ultra Edit executable {recorded[:12]}, now {arm_env['runtime_sha256'][:12]}"
+            )
+    return problems
 
 
 # ---------------------------------------------------------------------------
@@ -2405,14 +2449,18 @@ def summarize(records: Sequence[Mapping[str, Any]], title: str = "Ultra Edit eva
         "## Fixed context overhead",
         "",
         "Median context tokens of the first API call: system prompt, tool definitions, and the task "
-        "prompt before any work. Every later request pays it again, mostly as cache reads.",
+        "prompt before any work. Every later request pays it again, mostly as cache reads. Cold starts "
+        "are runs whose first call read nothing from the prompt cache and so paid to write the shared "
+        "prefix; they inflate cost but not context tokens.",
         "",
-        "| Arm | Runs | First-call context tok |",
-        "| --- | --- | --- |",
+        "| Arm | Runs | First-call context tok | Cold starts |",
+        "| --- | --- | --- | --- |",
     ]
     for arm in arms:
-        first_calls = _numbers(_metric(scored_records(by_arm[arm]), "first_call_context_tokens"))
-        lines.append(f"| {arm} | {len(first_calls)} | {_fmt(_median(first_calls), 0)} |")
+        scored = scored_records(by_arm[arm])
+        first_calls = _numbers(_metric(scored, "first_call_context_tokens"))
+        cold = sum(1 for value in _metric(scored, "first_call_cache_read_tokens") if value == 0)
+        lines.append(f"| {arm} | {len(first_calls)} | {_fmt(_median(first_calls), 0)} | {cold} |")
     groups = [
         (f"{task} / {arm}", subset)
         for task in tasks
@@ -2486,6 +2534,7 @@ METRIC_COLUMNS = (
     "api_calls",
     "subagent_api_calls",
     "first_call_context_tokens",
+    "first_call_cache_read_tokens",
     "peak_context_tokens",
     "context_tokens_total",
     "output_tokens",
@@ -2698,6 +2747,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0, help="arm-order shuffle seed")
     parser.add_argument("--no-shuffle", action="store_true", help="run arms in the listed order")
     parser.add_argument("--yes", action="store_true", help="start paid runs without the confirmation prompt")
+    parser.add_argument(
+        "--no-warmup",
+        dest="warmup",
+        action="store_false",
+        help="skip the one-call warm-up per arm that caches the shared prompt prefix before the runs",
+    )
+    parser.add_argument(
+        "--allow-drift",
+        action="store_true",
+        help="with --resume, keep runs recorded under a different Claude Code build or Ultra Edit executable",
+    )
     args = parser.parse_args(argv)
     if args.reps < 1:
         parser.error("--reps must be at least 1")
@@ -2918,7 +2978,8 @@ def _progress_line(record: Mapping[str, Any], prefix: str = "          ") -> str
         f"cost=${metrics.get('cost_usd') or 0:.4f}",
         f"wall={record['wall_s']:.1f}s",
     )
-    return f"{prefix}{record['outcome'].upper():11} " + " ".join(fields)
+    cold = " cold-start" if metrics.get("first_call_cache_read_tokens") == 0 else ""
+    return f"{prefix}{record['outcome'].upper():11} " + " ".join(fields) + cold
 
 
 def _harness_commit() -> str | None:
@@ -3026,6 +3087,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             if unknown:
                 raise EvalError(f"--rerun-arm names arms outside this plan: {', '.join(unknown)}")
             kept, todo = resume_plan(out_dir, plan, args.rerun_arms, apply=False)
+            current = {spec.name: _environment(info, staged, spec) for spec in specs}
+            drift = environment_drift(kept, current)
+            if drift and not args.allow_drift:
+                shown = "\n  ".join(drift[:10]) + (
+                    f"\n  ... {len(drift) - 10} more" if len(drift) > 10 else ""
+                )
+                raise EvalError(
+                    "kept runs were measured with different software:\n  "
+                    + shown
+                    + "\nrerun their arms with --rerun-arm, or pass --allow-drift to mix them"
+                )
             if todo and not _confirm(len(todo), args.yes):
                 return 1
             kept, plan = resume_plan(out_dir, plan, args.rerun_arms)
@@ -3192,6 +3264,49 @@ def run_plan(
     return skipped
 
 
+WARMUP_PROMPT = "This is a prompt-cache warm-up. Reply with the single word OK. Do not call any tools.\n"
+
+
+def warm_up(config: Config, arms: Sequence[str], log: RunLog, jobs: int = 1) -> None:
+    """One short session per arm before the measured runs, so each arm's shared prefix (system
+    prompt and tool definitions) is already in the prompt cache when its first runs start.
+
+    Without it an arm's first wave of runs pays to write that prefix and later ones do not, so
+    an arm run alone after a pause looks dearer than one that ran while its prefix was cached.
+    The sessions are recorded in warmup.jsonl and count toward --max-total-usd."""
+    task = Task("warmup", config.out_dir, WARMUP_PROMPT, {"README.md": b"warm-up\n"}, {})
+    warm = dataclasses.replace(config, out_dir=config.out_dir / "warmup", max_turns=1)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    def one(arm: str) -> dict[str, Any]:
+        spec = RunSpec(dataclasses.replace(task, name=f"warmup-{stamp}"), arm, 1)
+        record = run_one(warm, spec)
+        metrics = record["metrics"]
+        return {
+            "arm": arm,
+            "run_dir": f"warmup/runs/{spec.run_id}",
+            "outcome": record["outcome"],
+            "cost_usd": metrics.get("cost_usd"),
+            "first_call_cache_read_tokens": metrics.get("first_call_cache_read_tokens"),
+            "cache_creation_input_tokens": metrics.get("cache_creation_input_tokens"),
+            "api_errors": metrics.get("api_errors"),
+        }
+
+    with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+        results = list(pool.map(one, arms))
+    with open(config.out_dir / "warmup.jsonl", "a", encoding="utf-8") as handle:
+        for result in results:
+            handle.write(json.dumps(result) + "\n")
+    for result in results:
+        with log.lock:
+            log.spent += result["cost_usd"] or 0.0
+        state = "already cached" if result["first_call_cache_read_tokens"] else "written"
+        _print(
+            f"warm-up {result['arm']}: prefix {state}, cost ${result['cost_usd'] or 0:.4f}"
+            + (f", errors: {', '.join(result['api_errors'])}" if result["api_errors"] else "")
+        )
+
+
 def resume_plan(
     out_dir: Path, plan: Sequence[RunSpec], rerun_arms: Collection[str] = (), apply: bool = True
 ) -> tuple[list[dict[str, Any]], list[RunSpec]]:
@@ -3226,6 +3341,27 @@ def resume_plan(
     return kept, todo
 
 
+INVOCATION_KEYS = ("created", "harness_commit", "claude", "plugin", "arms", "reps", "options", "environment")
+
+
+def merge_manifest(previous: Mapping[str, Any], current: Mapping[str, Any]) -> dict[str, Any]:
+    """The manifest of a resumed evaluation: the current invocation's fields, arms and arm specs
+    accumulated over every invocation, and each earlier invocation kept in `history`."""
+    history = list(previous.get("history") or [])
+    if not history:
+        legacy = previous.get("resumed_from")
+        if isinstance(legacy, dict):
+            history.append(dict(legacy))
+        history.append({key: previous.get(key) for key in INVOCATION_KEYS if key in previous})
+    merged = dict(current)
+    merged["arms"] = list(dict.fromkeys([*(previous.get("arms") or []), *current.get("arms", [])]))
+    merged["arm_specs"] = {**(previous.get("arm_specs") or {}), **current.get("arm_specs", {})}
+    merged["environment"] = {**(previous.get("environment") or {}), **current.get("environment", {})}
+    merged["tasks"] = list(dict.fromkeys([*(previous.get("tasks") or []), *current.get("tasks", [])]))
+    merged["history"] = [*history, {key: current.get(key) for key in INVOCATION_KEYS if key in current}]
+    return merged
+
+
 def execute(
     config: Config,
     plan: Sequence[RunSpec],
@@ -3255,15 +3391,15 @@ def execute(
             if key not in ("dry_run", "preflight", "summarize", "yes")
         },
     }
+    manifest["environment"] = {name: run_environment(config, config.spec(name)) for name in arms}
     manifest_path = config.out_dir / "manifest.json"
     if kept and manifest_path.exists():
-        previous = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest["resumed_from"] = {
-            key: previous.get(key) for key in ("created", "harness_commit", "options")
-        }
+        manifest = merge_manifest(json.loads(manifest_path.read_text(encoding="utf-8")), manifest)
     _write_json(manifest_path, manifest)
     log = RunLog(config.out_dir / "runs.jsonl", kept)
     try:
+        if plan and getattr(args, "warmup", True):
+            warm_up(config, list(dict.fromkeys(spec.arm for spec in plan)), log, args.jobs)
         run_plan(config, plan, log, args.jobs, args.max_total_usd)
     except KeyboardInterrupt:
         _print("interrupted; summarizing completed runs")
