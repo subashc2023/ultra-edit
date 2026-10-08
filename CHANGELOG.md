@@ -104,6 +104,23 @@ All notable changes to Ultra Edit are documented here. Releases follow
   are never judged. The `PreToolUse` matcher is now `Bash|PowerShell|Write`. In
   the benchmark, 4 of 14 guarded native sessions wrote project files past the
   guard by saving a script with Write and running it.
+- The guard resolves script and inline-code targets instead of requiring a
+  bare literal. Constants, f-strings and template literals, `+`, `%`,
+  `.format()`, `os.path.join` and `Path('/tmp') / name` with a known leading
+  directory, `tempfile`, `os.tmpdir()`, `Path.home()`, `os.devnull`, pytest's
+  `tmp_path`, and stream targets count as outside; arguments and parameters
+  still count as inside. Saves are judged only in temporary directories, so
+  Write can create another repository's sources or a `~/.claude` hook; a
+  script saved anywhere is still judged when the same command runs it. Moves
+  and copies into the project (`shutil.move`, `os.replace`, `fs.renameSync`)
+  count as writes, a `#!` launcher such as `uv run --script` or `tsx` no longer
+  hides a `.py` or `.ts` script, and `[IO.File]::WriteAllText` saves are judged
+  like `Set-Content`. Inline code that writes only outside the project, such as
+  `python3 -c "open('/tmp/x', 'w')"`, is allowed, as heredocs to `/tmp` already
+  were. Bash variables assigned once (`OUT=/tmp/o.txt`, `t=$(mktemp)`) and
+  targets with a known leading directory (`/tmp/out_$i.txt`) are outside. Each
+  saved file is judged once, on its final text, so self-appending commands no
+  longer take seconds.
 
 ## [0.3.0] - 2026-09-25
 

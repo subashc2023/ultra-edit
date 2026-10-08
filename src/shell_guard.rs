@@ -12,6 +12,7 @@ use std::cell::RefCell;
 use std::fmt;
 use std::ops::Range;
 
+mod code;
 mod powershell;
 mod scope;
 
@@ -29,8 +30,6 @@ const MAX_NESTING: usize = 64;
 /// the bound keeps a command of millions of tiny statements from costing
 /// gigabytes of memory and more than the hook's timeout.
 const MAX_TOKENS: usize = 250_000;
-/// Bytes of interpreter code examined for each candidate write call.
-const MAX_CALL_SPAN: usize = 512;
 /// Program names longer than this are shortened in the deny reason.
 const MAX_PROGRAM_CHARS: usize = 16;
 /// Files a command list writes that later commands may run as scripts.
@@ -137,9 +136,9 @@ pub fn deny_reason(finding: &Finding) -> String {
     if finding.pattern == Pattern::ScriptFileWrite {
         return format!(
             "Ultra Edit guard blocked {finding}: scripted edits can lose line endings or \
-             encoding. Edit files with ultra_edit or native Edit, or create them with Write; a \
-             script may write only literal paths outside the project. If the user explicitly \
-             asked for it, report that the Ultra Edit guard blocked it; {ESCAPE_HATCH}=allow \
+             encoding; use ultra_edit or native Edit. Scratch scripts may write only paths \
+             they name outside the project, such as /tmp; argument paths count as project \
+             files. If the user explicitly asked for it, report the block; {ESCAPE_HATCH}=allow \
              disables the guard."
         );
     }
@@ -159,12 +158,31 @@ pub fn classify(command: &str) -> Option<Finding> {
 
 /// Returns the first write into the project in a Bash tool command.
 pub fn classify_bash(command: &str, scope: &Scope) -> Option<Finding> {
-    scan(
-        &command.replace("\r\n", "\n"),
+    let written = Written::default();
+    scan(&command.replace("\r\n", "\n"), scope, 0, &written)
+        .or_else(|| judge_saves(&written.take(), scope))
+}
+
+/// The finding for a file the command saved in a temporary directory, as a
+/// script that may write project files. Each file is judged once, on the
+/// text it holds when the command ends, and judging it records nothing.
+fn judge_saves(saves: &[Saved], scope: &Scope) -> Option<Finding> {
+    let scratch = Written::default();
+    let context = Context {
+        source: "",
+        dialect: Dialect::Bash,
         scope,
-        0,
-        &Written::default(),
-    )
+        depth: 0,
+        written: &scratch,
+        verbatim: false,
+    };
+    saves.iter().enumerate().find_map(|(index, save)| {
+        let last = !saves[index + 1..]
+            .iter()
+            .any(|later| later.target == save.target);
+        let place = save.place.as_deref().filter(|_| last)?;
+        saved(place, &save.text, context)
+    })
 }
 
 /// Returns the first write into the project in a PowerShell tool command.
@@ -186,8 +204,9 @@ pub fn classify_write(path: &str, content: &str, scope: &Scope) -> Option<Findin
         scope,
         depth: 0,
         written: &written,
+        verbatim: true,
     };
-    saved_script(path, &content.replace("\r\n", "\n"), context)
+    saved(path, &content.replace("\r\n", "\n"), context)
 }
 
 /// Checks a Bash script. `written` holds the files that commands before it
@@ -196,12 +215,14 @@ pub fn classify_write(path: &str, content: &str, scope: &Scope) -> Option<Findin
 fn scan(script: &str, scope: &Scope, depth: usize, written: &Written) -> Option<Finding> {
     let mut lexer = Lexer::new(script);
     let commands = lexer.list(false);
+    let scope = &scope.with_locals(&bindings(&commands, script));
     let context = Context {
         source: script,
         dialect: Dialect::Bash,
         scope,
         depth,
         written,
+        verbatim: false,
     };
     check(&commands, context)
         .or_else(|| {
@@ -222,6 +243,69 @@ fn scan(script: &str, scope: &Scope, depth: usize, written: &Written) -> Option<
         })
 }
 
+/// The shell variables a script's commands bind, in order: each name with
+/// its raw value, or with none where a loop, `read`, or a single command's
+/// environment binds it.
+fn bindings(commands: &[Command], source: &str) -> Vec<(String, Option<String>)> {
+    let mut bindings = Vec::new();
+    let assign = |word: &Word, bindings: &mut Vec<(String, Option<String>)>| {
+        let raw = source.get(word.span.clone()).unwrap_or_default();
+        if let Some((name, value)) = raw.split_once('=') {
+            match name
+                .strip_suffix('+')
+                .or_else(|| name.split_once('[').map(|(name, _)| name))
+            {
+                Some(name) => bindings.push((name.to_owned(), None)),
+                None => bindings.push((name.to_owned(), Some(value.to_owned()))),
+            }
+        }
+    };
+    for command in commands {
+        let words: Vec<&Word> = command
+            .words
+            .iter()
+            .skip_while(|word| KEYWORDS.contains(&word.text.as_str()))
+            .collect();
+        let Some(first) = words.first() else {
+            continue;
+        };
+        match first.text.as_str() {
+            "for" | "select" => {
+                if let Some(name) = words.get(1) {
+                    bindings.push((name.text.clone(), None));
+                }
+            }
+            "getopts" | "mapfile" | "read" | "readarray" => {
+                for word in words
+                    .iter()
+                    .skip(1)
+                    .filter(|word| !word.text.starts_with('-'))
+                {
+                    bindings.push((word.text.clone(), None));
+                }
+            }
+            "declare" | "export" | "local" | "readonly" | "typeset" => {
+                for word in words.iter().skip(1).filter(|word| word.assignment) {
+                    assign(word, &mut bindings);
+                }
+            }
+            _ if words.iter().all(|word| word.assignment) => {
+                for word in &words {
+                    assign(word, &mut bindings);
+                }
+            }
+            // `NAME=value command` sets the variable for that command only.
+            _ => {
+                for word in words.iter().take_while(|word| word.assignment) {
+                    let name = word.text.split(['=', '+', '[']).next().unwrap_or_default();
+                    bindings.push((name.to_owned(), None));
+                }
+            }
+        }
+    }
+    bindings
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Dialect {
     Bash,
@@ -240,43 +324,55 @@ struct Context<'a> {
     depth: usize,
     /// Files outside the project that earlier commands wrote, with their text.
     written: &'a Written,
+    /// Whether a script's text is exactly what its file holds, as the Write
+    /// tool saves it, rather than text a shell may have expanded.
+    verbatim: bool,
 }
 
-/// Files that commands of one script wrote outside the project, as (target
-/// word, text), so a later command that runs one as a script can be checked.
-pub(super) type Written = RefCell<Vec<(String, String)>>;
+/// Files that commands of one script wrote outside the project, so a later
+/// command that runs one as a script can be checked.
+pub(super) type Written = RefCell<Vec<Saved>>;
+
+/// A file a command wrote outside the project.
+#[derive(Debug)]
+pub(super) struct Saved {
+    /// The target word as written, which a later command may name to run it.
+    target: String,
+    /// The path the target names, when it is fully known.
+    place: Option<String>,
+    text: String,
+}
 
 impl Context<'_> {
     /// Notes that `target`, a file outside the project, now holds `text`, or
     /// `text` appended to what it held (a write inside the project is reported
-    /// before this is reached). A script it saves that may write project files
-    /// is reported here, whether or not a later command runs it.
-    fn record(&self, target: &Word, text: &str, append: bool) -> Result<(), Finding> {
+    /// before this is reached). The Bash tool's command judges the scripts it
+    /// saved when it ends.
+    fn record(&self, target: &Word, text: &str, append: bool) {
         if !is_file(&target.text) {
-            return Ok(());
+            return;
         }
         let path = normalized(&target.text);
-        let text = {
-            let mut written = self.written.borrow_mut();
-            let earlier = written.iter().rposition(|(known, _)| *known == path);
-            match (append, earlier) {
-                (true, Some(at)) => {
-                    let content = &mut written[at].1;
-                    if content.len() + text.len() <= MAX_SCRIPT_BYTES {
-                        content.push_str(text);
-                    }
-                    content.clone()
+        let mut written = self.written.borrow_mut();
+        match (
+            append,
+            written.iter().rposition(|saved| saved.target == path),
+        ) {
+            (true, Some(at)) => {
+                let content = &mut written[at].text;
+                if content.len() + text.len() <= MAX_SCRIPT_BYTES {
+                    content.push_str(text);
                 }
-                _ if written.len() < MAX_WRITTEN => {
-                    written.push((path.clone(), text.to_owned()));
-                    text.to_owned()
-                }
-                _ => text.to_owned(),
             }
-        };
-        match saved_script(&path, &text, *self) {
-            Some(finding) => Err(finding),
-            None => Ok(()),
+            _ if written.len() < MAX_WRITTEN => {
+                let raw = self.source.get(target.span.clone()).unwrap_or_default();
+                written.push(Saved {
+                    place: self.scope.path(self.dialect, raw),
+                    target: path,
+                    text: text.to_owned(),
+                });
+            }
+            _ => {}
         }
     }
 
@@ -292,14 +388,14 @@ impl Context<'_> {
         written
             .iter()
             .rev()
-            .find(|(target, _)| *target == path)
+            .find(|saved| saved.target == path)
             .or_else(|| {
                 written
                     .iter()
                     .rev()
-                    .find(|(target, _)| bare && name(target) == path)
+                    .find(|saved| bare && name(&saved.target) == path)
             })
-            .map(|(_, text)| text.clone())
+            .map(|saved| saved.text.clone())
     }
 
     /// Whether a write to `word` may reach a file inside the project.
@@ -1012,10 +1108,17 @@ fn inspect(
         Family::Generator => {
             let text = join(arguments);
             let content = Content {
-                // printf, and echo -e, turn `\047` and `\"` into the quotes
+                // printf, and echo -e or -ne, turn `\047` and `\"` into the quotes
                 // a write call needs.
                 text: if program == "printf"
-                    || arguments.first().is_some_and(|word| word.text == "-e")
+                    || arguments
+                        .iter()
+                        .map_while(|word| {
+                            word.text.strip_prefix('-').filter(|flags| {
+                                !flags.is_empty() && flags.chars().all(|flag| "eEn".contains(flag))
+                            })
+                        })
+                        .any(|flags| flags.contains('e'))
                 {
                     unescape(&text)
                 } else {
@@ -1027,7 +1130,7 @@ fn inspect(
             if to_file {
                 Err(content.finding())
             } else {
-                record_outputs(command, &content.text, context)?;
+                record_outputs(command, &content.text, context);
                 Ok(Some(content))
             }
         }
@@ -1042,7 +1145,7 @@ fn inspect(
                             })
                     });
                     for file in arguments.iter().filter(|word| !word.text.starts_with('-')) {
-                        context.record(file, &content.text, append)?;
+                        context.record(file, &content.text, append);
                     }
                 }
                 Ok(stdin)
@@ -1059,7 +1162,7 @@ fn inspect(
             stdin => {
                 // `cat > /tmp/edit.py <<'EOF'` leaves a script a later command may run.
                 if let (Family::Filter, Some(content)) = (family(&program), &stdin) {
-                    record_outputs(command, &content.text, context)?;
+                    record_outputs(command, &content.text, context);
                 }
                 Ok(stdin)
             }
@@ -1113,7 +1216,7 @@ fn inspect(
                     context.depth < MAX_SCRIPT_DEPTH
                         && powershell::scan(&code, scope, context.depth + 1).is_some()
                 }
-                _ => writes(language, &code),
+                _ => code::writes_inside(language, &code, context.scope),
             };
             if writes {
                 found(Pattern::InlineScriptWrite)
@@ -1149,8 +1252,16 @@ fn inspect(
             let Some(script) = context.script(&first.text) else {
                 return Ok(None);
             };
-            let interpreter = shebang(&script).unwrap_or_else(|| "sh".to_owned());
-            script_writes(&interpreter, &script, context).map_or(Ok(None), Err)
+            let interpreter = match shebang(&script) {
+                Some(_) => script_program(&first.text, &script),
+                None => Some("sh".to_owned()),
+            };
+            match interpreter {
+                Some(interpreter) => {
+                    script_writes(&interpreter, &script, context).map_or(Ok(None), Err)
+                }
+                None => Ok(None),
+            }
         }
         Family::Other => Ok(None),
     }
@@ -1158,7 +1269,7 @@ fn inspect(
 
 /// Records `text` as the content of each file the command's standard output
 /// is redirected to.
-fn record_outputs(command: &Command, text: &str, context: Context) -> Result<(), Finding> {
+fn record_outputs(command: &Command, text: &str, context: Context) {
     for redirect in &command.redirects {
         if let Redirect::Output {
             stdout: true,
@@ -1166,58 +1277,97 @@ fn record_outputs(command: &Command, text: &str, context: Context) -> Result<(),
             target,
         } = redirect
         {
-            context.record(target, text, *append)?;
+            context.record(target, text, *append);
         }
     }
-    Ok(())
 }
 
-/// The program a script's `#!` line names, past `env` and its options.
+/// The program a script's `#!` line names, past `env`, its options, and
+/// its `NAME=value` settings.
 fn shebang(script: &str) -> Option<String> {
+    let script = script.strip_prefix('\u{feff}').unwrap_or(script);
     let line = script.lines().next()?.strip_prefix("#!")?;
     let mut words = line.split_whitespace();
     let mut program = program_name(words.next()?);
     if program == "env" {
-        program = program_name(words.find(|word| !word.starts_with('-'))?);
+        program = program_name(words.find(|word| !word.starts_with('-') && !word.contains('='))?);
     }
     Some(program)
 }
 
-/// The finding for a script saved at `path` with `text` when it may write
-/// project files. Its language comes from its `#!` line, else from the
-/// file's extension; a file with neither is not a script.
-fn saved_script(path: &str, text: &str, context: Context) -> Option<Finding> {
-    let program = shebang(text).or_else(|| {
-        let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
-        let (_, extension) = name.rsplit_once('.')?;
-        let program = match extension.to_ascii_lowercase().as_str() {
-            "py" | "pyw" => "python3",
-            "js" | "mjs" | "cjs" | "ts" | "mts" | "cts" => "node",
-            "pl" | "pm" => "perl",
-            "rb" => "ruby",
-            "php" => "php",
-            "ps1" => "pwsh",
-            "sh" => "sh",
-            "bash" => "bash",
-            "zsh" => "zsh",
-            _ => return None,
-        };
-        Some(program.to_owned())
-    })?;
-    script_writes(&program, text, context)
+/// The language a launcher such as `uv` or `tsx` runs a script in.
+fn launched(program: &str) -> Option<&'static str> {
+    match program {
+        "hatch" | "ipython" | "pdm" | "pipx" | "poetry" | "rye" | "uv" | "uvx" => Some("python3"),
+        _ if program.starts_with("pypy") => Some("python3"),
+        "bun" | "deno" | "esno" | "npx" | "pnpm" | "ts-node" | "tsx" | "vite-node" | "yarn"
+        | "zx" => Some("node"),
+        _ => None,
+    }
+}
+
+/// The program a script file's extension names.
+fn by_extension(path: &str) -> Option<&'static str> {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let (_, extension) = name.rsplit_once('.')?;
+    Some(match extension.to_ascii_lowercase().as_str() {
+        "py" | "pyw" => "python3",
+        "js" | "mjs" | "cjs" | "ts" | "mts" | "cts" => "node",
+        "pl" | "pm" => "perl",
+        "rb" => "ruby",
+        "php" => "php",
+        "ps1" => "pwsh",
+        "sh" => "sh",
+        "bash" => "bash",
+        "zsh" => "zsh",
+        _ => return None,
+    })
+}
+
+/// The program that runs a script saved at `path` with `text`: the
+/// interpreter or shell its `#!` line names, the language of a launcher
+/// such as `uv` or `tsx`, else what its extension names.
+fn script_program(path: &str, text: &str) -> Option<String> {
+    match shebang(text) {
+        Some(program) if !matches!(family(&program), Family::Other) => Some(program),
+        Some(program) => launched(&program)
+            .or_else(|| by_extension(path))
+            .map(str::to_owned),
+        None => by_extension(path).map(str::to_owned),
+    }
+}
+
+/// The finding for a script saved at `path` with `text` that may write
+/// project files. It is judged when saved only in a temporary directory,
+/// where scratch scripts go; code saved anywhere else, such as another
+/// repository's sources, is judged when the command that saved it runs it.
+fn saved(path: &str, text: &str, context: Context) -> Option<Finding> {
+    if !context.scope.scratch(path) {
+        return None;
+    }
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    script_writes(&script_program(path, text)?, text, context)
 }
 
 /// The finding for a script that `program` runs when it may write project
-/// files: an interpreter's write call whose target is not a literal path
-/// outside the project, or any write the shell checks report.
+/// files: an interpreter's write call whose target is not certainly outside
+/// the project, or any write the shell checks report.
 fn script_writes(program: &str, script: &str, context: Context) -> Option<Finding> {
     let writes = match family(program) {
         Family::Interpreter(Language::PowerShell) => {
-            let foreign = context.scope.foreign();
+            // Bash may have expanded `$` in text it saved; a file the Write
+            // tool or PowerShell saved keeps its own variables.
+            let foreign;
+            let scope = if context.verbatim || context.dialect == Dialect::PowerShell {
+                context.scope
+            } else {
+                foreign = context.scope.foreign();
+                &foreign
+            };
             context.depth < MAX_SCRIPT_DEPTH
-                && powershell::scan(script, &foreign, context.depth + 1).is_some()
+                && powershell::scan(script, scope, context.depth + 1).is_some()
         }
-        Family::Interpreter(language) => writes_inside(language, script, context.scope),
+        Family::Interpreter(language) => code::writes_inside(language, script, context.scope),
         Family::Shell | Family::Source => nested(script, context).is_err(),
         _ => false,
     };
@@ -1952,261 +2102,4 @@ fn powershell(program: &str, arguments: &[Word]) -> Invocation {
         }
     }
     invocation
-}
-
-/// Whether inline code calls a file-write API of its language.
-fn writes(language: Language, code: &str) -> bool {
-    !write_targets(language, code).is_empty()
-}
-
-/// Whether script code may write a project file: a write call's target is not
-/// a string literal, or names a path that is not certainly outside.
-fn writes_inside(language: Language, code: &str, scope: &Scope) -> bool {
-    write_targets(language, code).iter().any(|target| {
-        target
-            .as_deref()
-            .is_none_or(|path| scope.literal_inside(path))
-    })
-}
-
-/// The file-write calls in code, each with its target when that is a string
-/// literal: `open('out.txt', 'w')`, `Path('out.txt').write_text(...)`,
-/// `fs.writeFileSync('out.txt', ...)`, `open(my $f, '>', 'out.txt')`, and so on.
-fn write_targets(language: Language, code: &str) -> Vec<Option<String>> {
-    match language {
-        Language::Python => {
-            let mut targets: Vec<_> = ["write_text(", "write_bytes("]
-                .iter()
-                .flat_map(|name| calls(code, name).map(|at| receiver_path(&code[..at])))
-                .collect();
-            for at in calls(code, "open(") {
-                // `open(path, mode)` takes the path first; `Path.open(mode)` does not.
-                let receiver = code[..at].strip_suffix('.').map(|before| {
-                    before
-                        .rsplit(|character: char| {
-                            !(character.is_alphanumeric() || character == '_')
-                        })
-                        .next()
-                        .unwrap_or_default()
-                });
-                let skip = usize::from(matches!(
-                    receiver,
-                    None | Some("bz2" | "codecs" | "gzip" | "io" | "lzma" | "os")
-                ));
-                let call = &code[at + "open".len()..];
-                if call_writes(call, skip, "+Uabrtwx") {
-                    targets.push(if skip == 1 {
-                        first_literal(call)
-                    } else {
-                        receiver_path(&code[..at])
-                    });
-                }
-            }
-            targets
-        }
-        Language::Node => ["writeFile", "appendFile", "createWriteStream"]
-            .iter()
-            .flat_map(|name| {
-                calls(code, name).map(move |at| {
-                    let rest = &code[at + name.len()..];
-                    let call =
-                        rest.trim_start_matches(|character: char| character.is_alphanumeric());
-                    first_literal(call)
-                })
-            })
-            .collect(),
-        Language::Perl => calls(code, "open")
-            .filter_map(|at| {
-                let rest = &code[at + "open".len()..];
-                if !rest
-                    .starts_with(|character: char| character == '(' || character.is_whitespace())
-                {
-                    return None;
-                }
-                let statement = prefix(rest, MAX_CALL_SPAN);
-                let statement = statement.split(';').next().unwrap_or_default();
-                let arguments = arguments(statement.trim_start());
-                let (index, mode) =
-                    arguments.iter().enumerate().find_map(|(index, argument)| {
-                        let mode = leading_literal(argument)?.trim_start();
-                        (mode.starts_with('>') || mode.starts_with("+<") || mode.starts_with("+>"))
-                            .then_some((index, mode))
-                    })?;
-                // Two arguments put the path after the mode: `open(F, '>out.txt')`.
-                let path = mode.trim_start_matches(['+', '<', '>']).trim();
-                Some(if path.is_empty() || path.starts_with(':') {
-                    arguments
-                        .get(index + 1)
-                        .and_then(|argument| whole_literal(argument))
-                } else {
-                    Some(path.to_owned())
-                })
-            })
-            .collect(),
-        Language::Ruby => {
-            let mut targets: Vec<_> = ["File.write", "File.binwrite", "IO.write", "IO.binwrite"]
-                .iter()
-                .flat_map(|name| {
-                    calls(code, name).map(move |at| {
-                        first_literal(code[at + name.len()..].trim_start_matches(' '))
-                    })
-                })
-                .collect();
-            for name in ["File.open", "File.new"] {
-                for at in calls(code, name) {
-                    let call = code[at + name.len()..].trim_start_matches(' ');
-                    if call_writes(call, 1, "+abrtwx") {
-                        targets.push(first_literal(call));
-                    }
-                }
-            }
-            targets
-        }
-        Language::Php => {
-            let mut targets: Vec<_> = calls(code, "file_put_contents")
-                .map(|at| first_literal(&code[at + "file_put_contents".len()..]))
-                .collect();
-            for at in calls(code, "fopen(") {
-                let call = &code[at + "fopen".len()..];
-                if call_writes(call, 1, "+abcertwx") {
-                    targets.push(first_literal(call));
-                }
-            }
-            targets
-        }
-        // `inspect` classifies PowerShell code as a script of its own.
-        Language::PowerShell => Vec::new(),
-    }
-}
-
-/// The path literal that a call's first argument is, when it is nothing else.
-fn first_literal(call: &str) -> Option<String> {
-    arguments(call)
-        .first()
-        .and_then(|argument| whole_literal(argument))
-}
-
-/// The path of a `Path('...')` receiver just before a method call's `.`.
-fn receiver_path(before: &str) -> Option<String> {
-    let call = before.strip_suffix('.')?.trim_end().strip_suffix(')')?;
-    let open = call.rfind("Path(")?;
-    whole_literal(&call[open + "Path(".len()..])
-}
-
-/// The body of `argument` when it is a single string literal, with escaped
-/// backslashes undone so a Windows path reads as the path.
-fn whole_literal(argument: &str) -> Option<String> {
-    let argument = argument.trim();
-    let body = leading_literal(argument)?;
-    // At most two prefix letters and the two quotes surround the body.
-    (argument.len() <= body.len() + 4 && !body.contains(['{', '$', '#']))
-        .then(|| body.replace("\\\\", "\\"))
-}
-
-/// Offsets where `name` occurs in `code` without an identifier character
-/// immediately before it.
-fn calls<'c>(code: &'c str, name: &'c str) -> impl Iterator<Item = usize> + 'c {
-    code.match_indices(name)
-        .map(|(at, _)| at)
-        .filter(move |&at| {
-            !code[..at].ends_with(|character: char| {
-                character.is_alphanumeric() || character == '_' || character == '$'
-            })
-        })
-}
-
-/// Whether the call whose arguments start `call` passes a writing file mode
-/// after its first `skip` arguments or as a `mode` keyword.
-fn call_writes(call: &str, skip: usize, letters: &str) -> bool {
-    arguments(call).iter().enumerate().any(|(index, argument)| {
-        let argument = argument.trim_start();
-        match argument
-            .strip_prefix("mode")
-            .and_then(|rest| rest.trim_start().strip_prefix(['=', ':']))
-        {
-            Some(value) => write_mode(value, letters),
-            None => index >= skip && write_mode(argument, letters),
-        }
-    })
-}
-
-/// Top-level arguments of a call: within its parentheses, or else to the end
-/// of the line as in Ruby's `File.open path, "w"`.
-fn arguments(call: &str) -> Vec<&str> {
-    let call = prefix(call, MAX_CALL_SPAN);
-    let bytes = call.as_bytes();
-    let parenthesized = bytes.first() == Some(&b'(');
-    let mut arguments = Vec::new();
-    let mut depth = 0_usize;
-    let mut start = usize::from(parenthesized);
-    let mut index = start;
-    while let Some(&byte) = bytes.get(index) {
-        match byte {
-            b'\'' | b'"' => {
-                index += 1;
-                while let Some(&inner) = bytes.get(index) {
-                    if inner == byte {
-                        break;
-                    }
-                    index += if inner == b'\\' { 2 } else { 1 };
-                }
-            }
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' if depth > 0 => depth -= 1,
-            b')' | b']' | b'}' => {
-                arguments.push(&call[start..index]);
-                return arguments;
-            }
-            b'\n' | b';' if !parenthesized && depth == 0 => {
-                arguments.push(&call[start..index]);
-                return arguments;
-            }
-            b',' if depth == 0 => {
-                arguments.push(&call[start..index]);
-                start = index + 1;
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    if let Some(rest) = call.get(start..) {
-        arguments.push(rest);
-    }
-    arguments
-}
-
-/// Whether `argument` starts with a string literal naming a writing file mode.
-fn write_mode(argument: &str, letters: &str) -> bool {
-    leading_literal(argument).is_some_and(|literal| {
-        // Ruby and `tarfile` append `:encoding` or `:compression`.
-        let mode = literal.split(':').next().unwrap_or_default();
-        (1..=4).contains(&mode.len())
-            && mode.chars().all(|character| letters.contains(character))
-            && mode.contains(['+', 'a', 'c', 'w', 'x'])
-    })
-}
-
-/// The body of the string literal that starts `text`, after at most two
-/// prefix letters such as Python's `rb`.
-fn leading_literal(text: &str) -> Option<&str> {
-    let text = text.trim_start();
-    let body = text.trim_start_matches(|character: char| character.is_ascii_alphabetic());
-    if text.len() - body.len() > 2 {
-        return None;
-    }
-    let quote = body
-        .chars()
-        .next()
-        .filter(|&character| character == '\'' || character == '"')?;
-    let body = &body[1..];
-    body.find(quote).map(|end| &body[..end])
-}
-
-/// At most `limit` bytes of `text`, ending on a character boundary.
-fn prefix(text: &str, limit: usize) -> &str {
-    let mut end = limit.min(text.len());
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
 }

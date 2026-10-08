@@ -61,6 +61,18 @@ const PASS_THROUGH: &[&str] = &[
     "where-object",
 ];
 
+/// `[IO.File]` methods whose second argument is the text they write.
+const TEXT_WRITES: &[&str] = &[
+    "appendalllines",
+    "appendalllinesasync",
+    "appendalltext",
+    "appendalltextasync",
+    "writealllines",
+    "writealllinesasync",
+    "writealltext",
+    "writealltextasync",
+];
+
 /// `[IO.File]` methods that write files.
 const FILE_WRITES: &[&str] = &[
     "appendalllines",
@@ -813,6 +825,7 @@ pub(super) fn scan(script: &str, scope: &Scope, depth: usize) -> Option<Finding>
             scope,
             depth,
             written: &written,
+            verbatim: false,
         },
         variables: HashMap::new(),
         flows: HashMap::new(),
@@ -1243,6 +1256,11 @@ fn transforms(atoms: &[Atom]) -> bool {
 
 /// The first argument of the `(...)` call joined to a method name.
 fn first_argument(call: Option<&Atom>) -> Option<&[Atom]> {
+    argument(call, 0)
+}
+
+/// The argument at `index` of a .NET call's parenthesized argument list.
+fn argument(call: Option<&Atom>, index: usize) -> Option<&[Atom]> {
     let Some(Atom {
         kind: Kind::Group(Bracket::Paren, script),
         spaced: false,
@@ -1260,7 +1278,7 @@ fn first_argument(call: Option<&Atom>) -> Option<&[Atom]> {
     element
         .atoms
         .split(|atom| matches!(atom.kind, Kind::Punct(b',')))
-        .next()
+        .nth(index)
 }
 
 /// Attributes embedded content to the program it came from or, for a
@@ -1498,7 +1516,10 @@ impl Checker<'_> {
     /// Checks embedded text saved outside the project as a script that may
     /// write project files, as the Bash checks do.
     fn saved(&self, path: &[Atom], content: &Content) -> Result<(), Finding> {
-        match super::saved_script(&self.text(path), &content.text, self.context) {
+        let word = self.word(path);
+        let raw = self.context.source.get(word.span).unwrap_or_default();
+        let place = self.context.scope.path(Dialect::PowerShell, raw);
+        match place.and_then(|place| super::saved(&place, &content.text, self.context)) {
             Some(finding) => Err(finding),
             None => Ok(()),
         }
@@ -1716,8 +1737,10 @@ impl Checker<'_> {
 
     /// Checks an element for .NET file-write calls such as
     /// `[IO.File]::WriteAllText(...)` and `[IO.StreamWriter]::new(...)`. A
-    /// call whose first argument is certainly outside the project is allowed.
-    fn dotnet(&self, atoms: &[Atom]) -> Result<(), Finding> {
+    /// call whose first argument is certainly outside the project is allowed,
+    /// unless the embedded text it saves there is a script that may write
+    /// project files.
+    fn dotnet(&mut self, atoms: &[Atom]) -> Result<(), Finding> {
         for (index, atom) in atoms.iter().enumerate() {
             let (Kind::Type(class), Some(Kind::Member(member))) =
                 (&atom.kind, atoms.get(index + 1).map(|atom| &atom.kind))
@@ -1730,8 +1753,18 @@ impl Checker<'_> {
                 "io.streamwriter" => member == "new",
                 _ => false,
             };
-            if writes && self.call_inside(atoms.get(index + 2)) {
+            if !writes {
+                continue;
+            }
+            let call = atoms.get(index + 2);
+            if self.call_inside(call) {
                 return Err(inline_write());
+            }
+            if TEXT_WRITES.contains(&member.as_str())
+                && let (Some(path), Some(text)) = (argument(call, 0), argument(call, 1))
+                && let Some(Flow::Embedded(content)) = self.value(text)
+            {
+                self.saved(path, &content)?;
             }
         }
         Ok(())
