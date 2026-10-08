@@ -75,6 +75,9 @@ Add an entry to `arms.json`:
 - `edit_tools`: tool names counted as edit calls.
 - `required_tools`: tool names that must be listed at session start, or the run
   is marked `invalid`.
+- `shell_tools`: the server's tools that run shell commands (a `command` or
+  `input` field), held with Bash to the arm's method: no file writes through a
+  shell, so `edit_tools` make every change.
 - `append_system_prompt` and `disallowed_tools`: how the arm routes edits.
 
 Pin the package in `package.json` and `package-lock.json`, or

@@ -2258,7 +2258,9 @@ class ParallelAndThirdPartyRunTests(unittest.TestCase):
         records = {r["arm"]: r for r in evaluation.load_records(out)}
         fs = records["fs-test"]
         self.assertEqual(fs["outcome"], "pass", fs["integrity"])
-        self.assertEqual(fs["metrics"]["edit_calls"], len(self.task.expected))
+        # The fake replays a heredoc Bash write, which the method hook denies.
+        self.assertEqual(fs["metrics"]["edit_calls"], len(self.task.expected) + 1)
+        self.assertEqual((fs["metrics"]["off_method_attempts"], fs["metrics"]["off_method_writes"]), (1, 0))
         self.assertEqual(records["shell-sed"]["outcome"], "pass", records["shell-sed"]["integrity"])
         run_dir = out / "runs" / "markdown-hard-breaks__fs-test__r1"
         mcp = json.loads((run_dir / "mcp.json").read_text(encoding="utf-8"))
@@ -2277,6 +2279,12 @@ class ParallelAndThirdPartyRunTests(unittest.TestCase):
         self.assertFalse((out / "runs" / "markdown-hard-breaks__shell-sed__r1" / "mcp.json").exists())
         settings = json.loads((run_dir / "settings.json").read_text(encoding="utf-8"))
         self.assertIs(settings["enabledPlugins"]["cc-plugin-telemetry@builtin"], False)
+        (method_hook,) = settings["hooks"]["PreToolUse"]
+        self.assertEqual(method_hook["matcher"], "Bash")
+        self.assertEqual(
+            method_hook["hooks"][0]["args"][1:],
+            ["--method", "mcp", "--how", "the fs MCP server's tools (edit_file, write_file)"],
+        )
         manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["arm_specs"]["fs-test"]["server_name"], "fs")
         self.assertTrue((out / "runs.csv").is_file())
@@ -2433,6 +2441,12 @@ class ShellMethodTests(unittest.TestCase):
         ("T=$(mktemp -d); cd $T; printf 'a\\n' > notes; cd -; git apply $T/p.diff", "patch", False),
         ("cd /tmp && echo x > a.txt; cd /tmp/ue-eval-ab/repo; echo y > b.txt", "patch", True),
         (None, "sed", False),
+        # Third-party MCP arms: no file writes through a shell at all.
+        ("sed -i 's/a/b/' f.txt", "mcp", True),
+        ("python3 - <<'P'\nopen('f','w')\nP", "mcp", True),
+        ("git apply x.patch", "mcp", True),
+        ("grep -n x f; sed -n 1,5p f; python3 -c 'print(1)'", "mcp", False),
+        ("cat > /tmp/notes.txt <<'E'\nx\nE", "mcp", False),
     ]
 
     def test_off_method_writes(self):
@@ -2452,6 +2466,36 @@ class ShellMethodTests(unittest.TestCase):
         self.assertIsNone(hook.decision(bash("cat -A f.txt"), "patch"))
         self.assertIsNone(hook.decision({"tool_name": "Read", "tool_input": {}}, "patch"))
         self.assertIsNone(hook.decision("not an event", "patch"))
+
+    def test_mcp_arms_hold_bash_and_server_process_tools_to_the_server(self):
+        spec = evaluation.third_party_arm(
+            "dc", third_party_entry(server_name="dc", shell_tools=["start_process", "interact_with_process"])
+        )
+        self.assertEqual(spec.method, "mcp")
+        self.assertEqual(
+            spec.method_tools, ("Bash", "mcp__dc__start_process", "mcp__dc__interact_with_process")
+        )
+        settings = evaluation.build_settings(spec, None)
+        (entry,) = settings["hooks"]["PreToolUse"]
+        self.assertEqual(entry["matcher"], "Bash|mcp__dc__start_process|mcp__dc__interact_with_process")
+        hook = importlib.util.module_from_spec(METHOD_HOOK_SPEC)
+        METHOD_HOOK_SPEC.loader.exec_module(hook)
+        process = {"tool_name": "mcp__dc__start_process", "tool_input": {"command": "perl -pi -e 's/a/b/' f"}}
+        denied = hook.decision(process, "mcp", spec.method_how)
+        reason = denied["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("the dc MCP server's tools (edit_file, write_file)", reason)
+        typed = {"tool_name": "mcp__dc__interact_with_process", "tool_input": {"pid": 1, "input": "sed -i s/a/b/ f"}}
+        self.assertIsNotNone(hook.decision(typed, "mcp", spec.method_how))
+        self.assertIsNone(hook.decision({"tool_name": "mcp__dc__start_process", "tool_input": {"command": "ls"}}, "mcp"))
+        transcript = transcript_from(
+            init_message(tools=("Read", "Bash", "mcp__dc__start_process")),
+            hook_response("PreToolUse"),
+            assistant("m1", tool_use("t1", "mcp__dc__start_process", {"command": "sed -i s/a/b/ f"})),
+            tool_result("t1", ""),
+            result_message(),
+        )
+        metrics = evaluation.compute_metrics(transcript, spec.edit_tools, spec.method, spec.method_tools)
+        self.assertEqual((metrics["off_method_attempts"], metrics["off_method_writes"]), (1, 1))
 
     def test_hook_runs_as_configured(self):
         event = {
@@ -2492,7 +2536,7 @@ class ShellMethodTests(unittest.TestCase):
                 self.assertEqual(metrics["off_method_writes"], 0 if denied else 1)
                 errors, warnings = evaluation.check_integrity("shell-sed", transcript)
                 self.assertEqual(errors, [])
-                expected = [] if denied else ["1 Bash command(s) wrote files other than by sed, unblocked"]
+                expected = [] if denied else ["1 shell command(s) wrote files other than by sed, unblocked"]
                 self.assertEqual(warnings, expected)
         self.assertNotIn("off_method_attempts", evaluation.compute_metrics(self.transcript(False)))
 

@@ -47,8 +47,19 @@ sessions used `git apply` for every write, the rest using `sed -i` or Python.
 Other programs may read files and print output, and `>` or `tee` may save that
 output under the temporary directory (a patch built from `sed -n` slices, say),
 but no other program may write a file itself, scratch files included, so a
-Python-generated diff does not pass for `git apply`. Each shell run records `off_method_attempts` and `off_method_writes` (attempts that ran
-unblocked; any are an integrity warning).
+Python-generated diff does not pass for `git apply`.
+
+The third-party MCP arms get the same hook with `--method mcp`: no command may
+write files through a shell, so the server's tools make every change, as Ultra
+Edit's own guard makes the `ultra-edit` arms use Ultra Edit. It also covers a
+server's process tools listed as `shell_tools` in `arms.json` (Desktop
+Commander's `start_process` and `interact_with_process`). Without it, in the
+first pilot, 10 of 42 `mcp-filesystem` and 11 of 42 `mcp-text-editor` sessions
+made some edits with `sed -i` or Python through Bash, and Desktop Commander made
+8 edits through `start_process`, which no Bash count saw.
+
+Each run held to a method records `off_method_attempts` and `off_method_writes`
+(attempts that ran unblocked; any are an integrity warning).
 
 Before an arm's measured runs, one short session per arm caches its shared
 system-and-tools prompt prefix (`warmup.jsonl`; `--no-warmup` skips it), so an

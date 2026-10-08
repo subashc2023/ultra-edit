@@ -227,7 +227,10 @@ class ArmSpec:
     mcp_server: Mapping[str, Any] | None = field(default=None, hash=False, compare=False)
     edit_tools: tuple[str, ...] = NATIVE_EDIT_TOOL_NAMES  # full names; counted as edit calls
     required_tools: tuple[str, ...] = ()  # full names that must be listed at init
-    method: str | None = None  # shell arms: the method key in SHELL_METHODS, enforced by a hook
+    method: str | None = None  # the method key in METHODS, enforced by a hook
+    # Full names of the tools whose commands the method hook checks.
+    method_tools: tuple[str, ...] = ("Bash",)
+    method_how: str | None = None  # how the prompt and hook name the method; else METHODS'
 
     @property
     def third_party(self) -> bool:
@@ -259,7 +262,16 @@ class ArmSpec:
             "edit_tools": list(self.edit_tools),
             "required_tools": list(self.required_tools),
             "method": self.method,
+            "method_tools": list(self.method_tools),
+            "method_how": self.method_how,
         }
+
+    @property
+    def how(self) -> str | None:
+        """How the method hook's denial names the arm's method."""
+        if self.method is None:
+            return None
+        return self.method_how or METHODS[self.method]
 
 
 # Shell arm methods: what the description names, and how the prompt and hook say it.
@@ -273,6 +285,12 @@ SHELL_METHODS = {
         "git apply",
         "applying unified diffs with git apply through the Bash tool, for example git apply <<'PATCH' ... PATCH",
     ),
+}
+# Third-party MCP arms: no file writes through a shell at all, so the server's tools
+# make every change, as Ultra Edit's guard makes its arms use Ultra Edit.
+MCP_METHOD = "mcp"
+METHODS = {key: how for key, (_, how) in SHELL_METHODS.items()} | {
+    MCP_METHOD: "the MCP server's file-editing tools"
 }
 METHOD_HOOK = EVAL_DIR / "method_hook.py"
 METHOD_HOOK_TIMEOUT_S = 30
@@ -383,6 +401,7 @@ def third_party_arm(name: str, entry: Any) -> ArmSpec:
         # Without them the server's edits and failures would not count as edit calls.
         raise ValueError("edit_tools must name the server's file-changing tools")
     required = _string_list(entry.get("required_tools"), "required_tools")
+    shells = _string_list(entry.get("shell_tools"), "shell_tools")
     if "disallowed_tools" in entry:
         disallowed = _string_list(entry.get("disallowed_tools"), "disallowed_tools")
     else:
@@ -396,6 +415,9 @@ def third_party_arm(name: str, entry: Any) -> ArmSpec:
         mcp_server=server,
         edit_tools=tuple(full_tool_name(server_name, tool) for tool in edit_tools),
         required_tools=tuple(full_tool_name(server_name, tool) for tool in required),
+        method=MCP_METHOD,
+        method_tools=("Bash", *(full_tool_name(server_name, tool) for tool in shells)),
+        method_how=f"the {server_name} MCP server's tools ({', '.join(edit_tools)})",
     )
 
 
@@ -1145,6 +1167,17 @@ def shell_methods(command: Any) -> set[str]:
     return found
 
 
+def method_command(tool_input: Any) -> str | None:
+    """The shell text a method tool runs: Bash's command, or a process tool's command or
+    input (Desktop Commander's start_process and interact_with_process)."""
+    if not isinstance(tool_input, dict):
+        return None
+    for key in ("command", "input"):
+        if isinstance(tool_input.get(key), str):
+            return tool_input[key]
+    return None
+
+
 def off_method_write(command: Any, method: str) -> bool:
     """Whether a command writes files other than by `method`: it writes with another
     method's program, or writes (by the write and edit heuristics) without its own.
@@ -1300,12 +1333,16 @@ def api_call_metrics(transcript: Transcript) -> dict[str, Any]:
 
 
 def compute_metrics(
-    transcript: Transcript, edit_tools: Collection[str] = (), method: str | None = None
+    transcript: Transcript,
+    edit_tools: Collection[str] = (),
+    method: str | None = None,
+    method_tools: Collection[str] = ("Bash",),
 ) -> dict[str, Any]:
     """Run metrics. edit_tools adds full tool names (third-party MCP edit tools) to the
     edit calls; native writes, content-writing shell commands, and Ultra Edit commits
-    always count. A shell arm's method adds counts of Bash commands that write files
-    another way: attempted, and run without an error (past the method hook)."""
+    always count. An arm's method adds counts of method_tools commands (Bash, or a
+    server's process tool) that write files another way: attempted, and run without an
+    error (past the method hook)."""
     by_name: Counter[str] = Counter()
     ultra_statuses: Counter[str] = Counter()
     write_kinds: Counter[str] = Counter()
@@ -1326,6 +1363,10 @@ def compute_metrics(
         if result is None:
             counts["unanswered_tool_calls"] += 1
         failed = result is not None and result.is_error
+        if method and call.name in method_tools and off_method_write(method_command(call.input), method):
+            counts["off_method_attempts"] += 1
+            if result is not None and not result.is_error:
+                counts["off_method_writes"] += 1
         is_edit = False
         ultra = ultra_tool(call.name)
         target = _read_target(call, cwd if isinstance(cwd, str) else None)
@@ -1356,10 +1397,6 @@ def compute_metrics(
             if result is not None and result.is_error:
                 counts["shell_errors"] += 1
             command = call.input.get("command") if isinstance(call.input, dict) else None
-            if method and call.name == "Bash" and off_method_write(command, method):
-                counts["off_method_attempts"] += 1
-                if result is not None and not result.is_error:
-                    counts["off_method_writes"] += 1
             kinds = shell_write_kinds(command, call.name)
             other_edits = shell_edit_kinds(command) if call.name == "Bash" else []
             edit_kinds.update(other_edits)
@@ -1574,7 +1611,7 @@ def check_integrity(
         hook = "guard" if spec.guard_hook else "method"
         if failed:
             errors.append(f"{hook} hook failed {len(failed)} time(s)")
-        guarded = guarded_tools(guard_matcher) if spec.guard_hook else frozenset({"Bash"})
+        guarded = guarded_tools(guard_matcher) if spec.guard_hook else frozenset(spec.method_tools)
         shell_calls = sorted({call.name for call in transcript.tool_calls if call.name in guarded})
         if hook_events_expected and shell_calls and not pre_tool:
             errors.append(
@@ -1588,14 +1625,13 @@ def check_integrity(
         through = sum(
             1
             for call in transcript.tool_calls
-            if call.name == "Bash"
-            and isinstance(call.input, dict)
-            and off_method_write(call.input.get("command"), spec.method)
+            if call.name in spec.method_tools
+            and off_method_write(method_command(call.input), spec.method)
             and call.result is not None
             and not call.result.is_error
         )
         if through:
-            warnings.append(f"{through} Bash command(s) wrote files other than by {spec.method}, unblocked")
+            warnings.append(f"{through} shell command(s) wrote files other than by {spec.method}, unblocked")
     expected_servers = {spec.server_name} | set(third_party_servers)
     other_servers = sorted(
         str(entry.get("name"))
@@ -1751,15 +1787,16 @@ def build_settings(
             ]
         }
     if spec.method:
+        how = ["--how", spec.method_how] if spec.method_how else []
         settings["hooks"] = {
             "PreToolUse": [
                 {
-                    "matcher": "Bash",
+                    "matcher": "|".join(spec.method_tools),
                     "hooks": [
                         {
                             "type": "command",
                             "command": sys.executable,
-                            "args": [str(METHOD_HOOK), "--method", spec.method],
+                            "args": [str(METHOD_HOOK), "--method", spec.method, *how],
                             "timeout": METHOD_HOOK_TIMEOUT_S,
                         }
                     ],
@@ -2297,7 +2334,7 @@ def run_one(config: Config, spec: RunSpec) -> dict[str, Any]:
         (run_dir / "diff.txt").write_text(
             describe_differences(expected, actual, comparison), encoding="utf-8"
         )
-    metrics = compute_metrics(transcript, arm.edit_tools, arm.method)
+    metrics = compute_metrics(transcript, arm.edit_tools, arm.method, arm.method_tools)
     errors, warnings = check_integrity(
         arm,
         transcript,
@@ -3196,10 +3233,11 @@ def rescore_records(results_dir: Path, registry: ArmRegistry) -> list[dict[str, 
             edit_tools = NATIVE_EDIT_TOOL_NAMES
         # Runs recorded before arms had methods were not held to one.
         method = recorded.get("method") if "method" in recorded else None
+        method_tools = tuple(recorded.get("method_tools") or ("Bash",))
         stream = results_dir / "runs" / str(record.get("run_id")) / "stream.jsonl"
         updated = dict(record)
         if stream.exists():
-            metrics = compute_metrics(parse_stream_file(stream), edit_tools, method)
+            metrics = compute_metrics(parse_stream_file(stream), edit_tools, method, method_tools)
             updated["metrics"] = metrics
             updated["first_attempt"] = first_attempt(metrics, bool(record.get("correct")))
         rescored.append(updated)

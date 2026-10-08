@@ -18,7 +18,7 @@
       "required_tools": [
         "edit_file"
       ],
-      "append_system_prompt": "For this session the Edit, Write, MultiEdit, and NotebookEdit tools are unavailable. Make every file change with the filesystem MCP server's tools, such as edit_file.",
+      "append_system_prompt": "For this session the Edit, Write, MultiEdit, and NotebookEdit tools are unavailable. Make every file change with the filesystem MCP server's tools, such as edit_file. Commands that write files any other way are blocked.",
       "disallowed_tools": [
         "Edit",
         "Write",
@@ -47,7 +47,11 @@
       "required_tools": [
         "edit_block"
       ],
-      "append_system_prompt": "For this session the Edit, Write, MultiEdit, and NotebookEdit tools are unavailable. Make every file change with the desktop-commander MCP server's tools, such as edit_block.",
+      "shell_tools": [
+        "start_process",
+        "interact_with_process"
+      ],
+      "append_system_prompt": "For this session the Edit, Write, MultiEdit, and NotebookEdit tools are unavailable. Make every file change with the desktop-commander MCP server's tools, such as edit_block. Commands that write files any other way, including through start_process, are blocked.",
       "disallowed_tools": [
         "Edit",
         "Write",
@@ -74,7 +78,7 @@
       "required_tools": [
         "patch_text_file_contents"
       ],
-      "append_system_prompt": "For this session the Edit, Write, MultiEdit, and NotebookEdit tools are unavailable. Make every file change with the text-editor MCP server's tools, such as patch_text_file_contents.",
+      "append_system_prompt": "For this session the Edit, Write, MultiEdit, and NotebookEdit tools are unavailable. Make every file change with the text-editor MCP server's tools, such as patch_text_file_contents. Commands that write files any other way are blocked.",
       "disallowed_tools": [
         "Edit",
         "Write",
