@@ -144,12 +144,47 @@ A bare Bash or Python substitution also does less work than an edit with retaine
 snapshots, conditional writes, and synced recovery records, so its execution
 time is not an equivalent performance baseline.
 
+## Model-level results
+
 A model-level comparison runs the same edit tasks through each route. The
-[evaluation harness](../eval/README.md) runs six fixture tasks, including
-escape-heavy, line-ending, and large-file cases, under three arms: `native` (no
-plugin), `native-guard` (native tools plus only the shell guard hook), and
-`ultra-edit` (the full plugin). It scores exact final bytes, first-try success,
+[evaluation harness](../eval/README.md) runs 14 fixture tasks, including
+escape-heavy, line-ending, near-duplicate, and large-file cases, under 10 arms:
+native Claude Code tools with and without the shell guard, the full plugin and
+the plugin with native edit tools disabled, three shell-edit arms, and three
+third-party MCP edit servers. It scores exact final bytes, first-try success,
 tool calls, tool errors, Bash file writes, turns, tokens, and cost, so the
 plugin's instruction and snapshot overhead counts. It has no stale-file task
-yet. No harness results are recorded here, so token savings and model cost
-claims still wait for that evidence.
+yet.
+
+One round on 2026-10-08: Claude Code 2.1.294, Sonnet, 3 repetitions, 420 runs,
+none invalid. Cost is the geometric mean of per-task cost ratios against
+`native`, with a 95% bootstrap interval.
+
+| Arm | Correct | First try | Cost vs native |
+| --- | --- | --- | --- |
+| `native` | 42/42 | 39/42 | 1.00 |
+| `native-guard` | 41/42 | 15/42 | 1.58 (1.53-1.64) |
+| `ultra-edit` | 42/42 | 39/42 | 1.20 (1.16-1.25) |
+| `ultra-edit-only` | 42/42 | 37/42 | 1.20 (1.16-1.24) |
+| `shell-python` | 42/42 | 41/42 | 0.85 (0.82-0.88) |
+| `shell-sed` | 42/42 | 39/42 | 0.99 (0.94-1.04) |
+| `shell-patch` | 42/42 | 26/42 | 1.38 (1.29-1.46) |
+| `desktop-commander` | 42/42 | 41/42 | 1.81 (1.74-1.89) |
+| `mcp-filesystem` | 30/42 | 30/42 | 1.66 (1.59-1.73) |
+| `mcp-text-editor` | 38/42 | 29/42 | 2.48 (2.36-2.61) |
+
+- All 12 `mcp-filesystem` failures and three of the four `mcp-text-editor`
+  failures wrote wrong bytes while the tool reported success: the first
+  rewrote CRLF files with LF, the second added a final newline to a file that
+  had none.
+- The task prompts state every change exactly, so a blind shell substitution
+  is enough, and `native` wrote through the shell in 30 of 42 runs. Where shell
+  edits are not acceptable, `native-guard` is the comparable native route; it
+  attempted shell writes in 26 runs, all blocked, and cost 1.32x (1.28-1.36)
+  what `ultra-edit` did.
+- Most of Ultra Edit's remaining cost over `native` is fixed context, about
+  2.1k tokens per API call for the session card and the always-loaded tool
+  schema, plus reading before editing: 2.4 Read calls per run against 1.4.
+- `ultra-edit-only` had the steadiest cost across repetitions of any arm: a
+  mean per-task coefficient of variation of 0.04, against 0.06 for
+  `ultra-edit`, 0.05 for `shell-python`, and 0.10 for `native`.

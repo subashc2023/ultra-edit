@@ -291,7 +291,8 @@ and test stale/retry behavior. Manifest validation alone does not prove that the
 host can locate the
 executable or discover and invoke the tools. The
 [evaluation harness](../eval/README.md) compares native editing, native editing
-with only the shell guard, and the full plugin on six fixture tasks.
+with only the shell guard, the plugin, shell edits, and third-party MCP edit
+servers on 14 fixture tasks.
 
 The initial smoke test passed with Claude Code 2.1.263 on 2026-09-07: the plugin
 server connected, Claude loaded the skill, called snapshot → edit → status,

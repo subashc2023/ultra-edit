@@ -89,9 +89,11 @@ A span edit avoids retransmitting the old block. Focused snapshots return only
 the requested source, and direct MCP arguments avoid shell quoting and generated
 editing code. These are concrete ways to reduce payloads compared with heredoc
 rewrites; actual token and cost savings depend on the task, model, and retries.
-Snapshots and tool instructions also cost context. No model-level token-savings
-percentage or speed advantage over native Edit has been measured yet; the
-[evaluation harness](eval/README.md) exists to measure exactly that.
+Snapshots and tool instructions also cost context. Measured with the
+[evaluation harness](eval/README.md), Ultra Edit cost 1.20x native Claude Code
+on tasks that native editing often finished with a blind shell substitution,
+and 0.76x native editing with shell writes blocked; see
+[the results](docs/performance.md#model-level-results).
 
 ### What you give up
 
