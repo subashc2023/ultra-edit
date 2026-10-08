@@ -52,21 +52,21 @@ All notable changes to Ultra Edit are documented here. Releases follow
   `new`, or to send a `lines` replacement when the following lines were copied
   as well; lines below the anchor that only look the same, such as a sibling
   method's decorator, are offered as possibly new. Among equal lines it names
-  the longest run. It stays quiet only when other changes in the request delete
-  every restated line and any copied line below it; a line edited in place
-  would appear in two versions, and one replaced along with other lines is
-  left to the caller to send as one `lines` change. It compares at most 200
-  lines above the anchor, trims each line once per file, and follows a copy
-  below it to its end; every message fits 240 characters at 8-digit lines. One benchmark session sent such an
+  the longest run. It stays quiet when other changes in the request delete
+  every restated and copied line whole; when they touch those lines any other
+  way, it names one `lines` change covering every touched line to send in
+  place of both. It compares at most 200 lines above the anchor, reads each
+  line once per file, and follows a copy below it to its end; every message
+  fits 240 characters at 8-digit lines. One benchmark session sent such an
   insertion and committed the duplicate; none of the other 614 recorded
   insertions restated their anchor.
 - `OLD_INSIDE_WORD`: an `old` without `count` whose match starts inside an
   ASCII word or number, such as `retries = 2` inside `max_retries = 20`, or,
-  on one line, ends inside one, such as `timeout = 30` inside `timeout = 300`
-  (also when `old` starts with a line feed), is refused, naming the word and
-  its line. Text written without reading the file can otherwise match a longer
-  name. `count`, even 1, still matches inside words on purpose; words with
-  cased non-ASCII letters near the cut (`Hauptstraße`) and letters after a
+  with text on one line, ends inside one, such as `timeout = 30` inside
+  `timeout = 300` (also with blank lines around it), is refused, naming the
+  word and its line. Text written without reading the file can otherwise match
+  a longer name. `count`, even 1, still matches inside words on purpose; words
+  with cased non-ASCII letters near the cut (`Hauptstraße`) and letters after a
   backslash escape are exempt, while Han, kana, and other uncased scripts
   separate words and a cut between digits always counts (`10` in `100µs`).
   Ambiguity advice names `in` lines only where a whole-word match is the only

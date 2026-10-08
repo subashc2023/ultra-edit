@@ -305,28 +305,27 @@ restates `after` again. When the next lines of `new` also equal the lines below
 `after`, through the end of the copy, they may be copied context or new lines
 that look the same, such as a sibling method's decorator, so the message gives
 the replacement for the first case and dropping the kept lines for the second.
-Other changes in the request decide the rest, since changes apply to the
-original file. It is not reported when they delete every restated line that has
-text, or leave only whitespace on it, and every copied line below it; when only
-the restated lines go, the message offers one `lines` change for either reading.
-A line another change edits in place would appear in both versions, so the
-message says to drop it from `new`, and a change that replaces it along with
-other lines may have dropped or rewritten it, so the message asks for one
-`lines` change. A duplicate meant on purpose replaces the lines through `lines`,
-giving them twice. At most 200 lines above `after` are compared.
+Changes apply to the original file, so it is not reported when other changes
+in the request delete every restated or copied line that has text, whole. When
+other changes touch those lines in any other way, which lines end up where is
+the caller's to say: the message names one `lines` change covering every
+touched line, to send in place of both, and its diagnostic lists the other
+changes as `conflicts`. A duplicate meant on purpose replaces the lines through
+`lines`, giving them twice. At most 200 lines above `after` are compared.
 
 An `old` without `count` whose match starts inside an ASCII word (letters,
 digits, and `_`), such as `retries = 2` inside `max_retries = 20`, or, for an
-`old` on one line (line endings at either end aside), ends inside one, is
+`old` with text on one line (blank lines around it aside), ends inside one, is
 `OLD_INSIDE_WORD`; the message names the word and its line. Each end is judged
 on its own. A word holding cased non-ASCII letters within 40 characters of the
-cut, such as `Hauptstraße`, and a letter right after a backslash, as in the
-escape `\nRestart`, do not count; Han, kana, and other uncased scripts separate
-words, so `80` inside `端口为8080` is refused, and a cut between two digits is
-refused whatever follows, as `10` inside `100µs`. `count`, even 1, matches
-inside words. An ambiguity message suggests `in` lines where a whole-word match
-is the only match, and otherwise says to add surrounding text, or that every
-match is inside a longer word; it examines at most 10,000 matches.
+cut, such as `Hauptstraße`, and an ASCII letter right after a backslash, as in
+the escape `\nRestart`, do not count, though `\_` and `\1` do; Han, kana, and
+other uncased scripts separate words, so `80` inside `端口为8080` is refused,
+and a cut between two digits is refused whatever letter follows, as `10` inside
+`100µs`. `count`, even 1, matches inside words. An ambiguity message suggests
+`in` lines where a whole-word match is the only match in those whole lines, and
+otherwise says to add surrounding text, or that every match is inside a longer
+word; it examines at most 10,000 matches.
 
 A span ID is a disclosed ID such as `r5`, `selection`, or `m2`, or a line range
 `rA..rB`, never literal source text. A line range is accepted wherever a span ID

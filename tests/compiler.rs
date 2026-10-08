@@ -2797,13 +2797,30 @@ fn a_word_cut_is_found_at_either_end_and_beside_any_script() {
         "retries = 3\ntimeout = 30",
         "retries = 5\ntimeout = 60",
     );
-    // A line ending at the start does not make a one-line `old` span lines.
+    // Blank lines around one line of text do not make `old` span lines.
     refused("x = 1\ntimeout = 300\n", "\ntimeout = 30", "\ntimeout = 60");
     refused(
         "x = 1\r\ntimeout = 300\r\n",
         "\ntimeout = 30",
         "\ntimeout = 60",
     );
+    refused(
+        "x = 1\n\ntimeout = 300\n",
+        "\n\ntimeout = 30",
+        "\n\ntimeout = 60",
+    );
+    refused(
+        "x = 1\n  \ntimeout = 300\n",
+        "\n  \ntimeout = 30",
+        "\n  \ntimeout = 60",
+    );
+    // Only a letter after a backslash is an escape.
+    refused(
+        "x\nThe max\\_retries option defaults to 3.\n",
+        "retries option defaults to 3",
+        "retries option defaults to 5",
+    );
+    refused("x\nout = re.sub(pat, r\"\\10\", s)\n", "r\"\\1", "r\"\\2");
     // A cut between digits is a number cut, whatever unit letter follows.
     refused("delay = 100µs\n", "delay = 10", "delay = 50");
     refused("R1 = 10kΩ\n", "R1 = 1", "R1 = 4");
@@ -2920,9 +2937,11 @@ fn ambiguity_advice_names_lines_that_hold_one_whole_word_match() {
 }
 
 /// Ambiguity advice walks every match once, so a long repetitive `old` stays
-/// linear, and a match at the very start of a file with a BOM is on line 1.
+/// linear; a match inside a leading BOM, which no line's scope holds, is passed
+/// over for one `in` can name, as is one whose lines reach past a partial
+/// scope to another match.
 #[test]
-fn ambiguity_advice_is_linear_and_counts_a_bom_as_line_one() {
+fn ambiguity_advice_is_linear_and_names_only_followable_lines() {
     let text = format!("static const char pad[] = \"{}\";\n", "a".repeat(80_000));
     let started = Instant::now();
     let errors = compiled(&text, json!({"id":"w","old":"a".repeat(40_000),"new":"b"})).unwrap_err();
@@ -2945,8 +2964,45 @@ fn ambiguity_advice_is_linear_and_counts_a_bom_as_line_one() {
     .unwrap_err();
     assert_eq!(errors[0].code, "TARGET_AMBIGUOUS");
     assert!(
-        errors[0].message.contains("\"in\":[1,1]"),
+        errors[0].message.contains("\"in\":[2,2]"),
         "{}",
         errors[0].message
     );
+    let followed = compiled(
+        "\u{feff}name = 1\n\u{feff}name = 1\n",
+        json!({"id":"w","old":"\u{feff}name = 1","new":"name = 2","in":[2,2]}),
+    );
+    assert_eq!(followed.unwrap(), "\u{feff}name = 1\nname = 2\n");
+}
+
+/// The advice cap tells "every match is inside a word" from "matches were left
+/// unexamined" by whether any remain, and lines reaching past a partial scope
+/// are offered only when they hold no other match.
+#[test]
+fn ambiguity_advice_at_the_cap_and_under_a_partial_scope() {
+    let inside = "x_retries = 2\n".repeat(10_000);
+    let errors = compiled(&inside, json!({"id":"w","old":"retries = 2","new":"y"})).unwrap_err();
+    assert!(
+        errors[0].message.contains("inside a longer word"),
+        "{}",
+        errors[0].message
+    );
+    let text = "x = 1; a = 1\nb = 1\n";
+    let mut base = snapshot("w.py".into(), text.into());
+    base.spans.push(Span {
+        id: "m1".into(),
+        start: 7,
+        end: 18,
+        line: 1,
+    });
+    let change = |scope: serde_json::Value| -> Change {
+        serde_json::from_value(json!({"id":"w","old":"= 1","new":"= 2","in":scope})).unwrap()
+    };
+    let errors = compile(&request(&base, vec![change(json!("m1"))]), &bases(&base)).unwrap_err();
+    assert_eq!(errors[0].code, "TARGET_AMBIGUOUS");
+    // Line 1 also holds the `= 1` of `x = 1`, outside the scope.
+    let message = &errors[0].message;
+    assert!(message.contains("\"in\":[2,2]"), "{message}");
+    let plan = compile(&request(&base, vec![change(json!([2, 2]))]), &bases(&base));
+    assert_eq!(plan.unwrap().files[0].output, "x = 1; a = 1\nb = 2\n");
 }
