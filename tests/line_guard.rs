@@ -290,3 +290,48 @@ fn line_guard_boundaries_behave_as_intended() {
         "EXPECTED_TEXT_MISMATCH"
     );
 }
+
+/// An insertion that restates the line it follows would hold that line twice, as
+/// a benchmark session did when it wrote a replacement as `after`.
+#[test]
+fn an_insertion_that_restates_its_anchor_line_is_refused() {
+    let text = "totals = compute(\n    tax_table=resolve(region),\n)\n";
+    let base = spanless(text);
+    let anchor = "    tax_table=resolve(region),";
+    let error = rejected(
+        &base,
+        insert(
+            2,
+            Some(anchor),
+            &format!("{anchor}\n    rounding=\"half_even\","),
+        ),
+    );
+    assert_eq!(error.code, "INSERT_REPEATS_LINE");
+    assert!(error.message.contains("lines:[2,2]"), "{}", error.message);
+    // Without the restated line it inserts.
+    assert_eq!(
+        outcome(
+            &base,
+            insert(2, Some(anchor), "    rounding=\"half_even\",")
+        )
+        .unwrap(),
+        "totals = compute(\n    tax_table=resolve(region),\n    rounding=\"half_even\",\n)\n"
+    );
+    // A deliberate duplicate replaces the line with itself twice.
+    let twice = ends([2, 2], Some(anchor), None, &format!("{anchor}\n{anchor}"));
+    assert_eq!(
+        outcome(&base, twice).unwrap(),
+        format!("totals = compute(\n{anchor}\n{anchor}\n)\n")
+    );
+    // LF text restating a CRLF line is caught after line-ending adaptation.
+    let crlf = spanless(&text.replace('\n', "\r\n"));
+    assert_eq!(
+        rejected(&crlf, insert(2, Some(anchor), &format!("{anchor}\nx"))).code,
+        "INSERT_REPEATS_LINE"
+    );
+    // A short line such as `)` may follow itself.
+    assert_eq!(
+        outcome(&base, insert(3, Some(")"), ")")).unwrap(),
+        format!("{text})\n")
+    );
+}

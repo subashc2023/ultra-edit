@@ -294,7 +294,10 @@ the range's end only weakly, so prefer lines with text as `[first, last]`. `afte
 `EXPECTED_TEXT_MISMATCH`: the message quotes the addressed lines and, when the
 expected lines occur elsewhere, gives the current range, and the diagnostic
 carries them as `exact` candidates, or near misses as below. `after` with empty
-text is `EMPTY_INSERTION`.
+text is `EMPTY_INSERTION`. `after` keeps line `after`, so text whose first line
+restates it, when that line has at least 8 non-whitespace characters, is
+`INSERT_REPEATS_LINE`: the output would hold the line twice. A duplicate meant
+on purpose replaces the line through `lines`, giving it twice.
 
 A span ID is a disclosed ID such as `r5`, `selection`, or `m2`, or a line range
 `rA..rB`, never literal source text. A line range is accepted wherever a span ID

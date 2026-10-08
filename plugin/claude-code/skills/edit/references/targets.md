@@ -130,8 +130,10 @@ occur elsewhere the message gives the current range. A line past the end is
 
 Unrestricted `old` searches the complete original file even after a focused
 read. Empty `old` is rejected with `EMPTY_TARGET`; insert with `after` instead,
-and give `after` nonempty text (`EMPTY_INSERTION`). `in` takes lines or a span
-ID, never literal text.
+and give `after` nonempty text (`EMPTY_INSERTION`). `after` keeps its line, so
+text that starts by restating a line of 8 or more visible characters is refused
+(`INSERT_REPEATS_LINE`); to duplicate a line on purpose, replace it with
+`lines` and give it twice. `in` takes lines or a span ID, never literal text.
 
 A line range `rA..rB` works as a `span` or `in` when the base disclosed every
 line from A to B, for instance across a range continued with another range. It

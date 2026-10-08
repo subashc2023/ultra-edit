@@ -1312,6 +1312,17 @@ fn resolve_change<'a>(
     if !line_guard(context, change, guard, expect, diagnostics, budget) {
         return;
     }
+    if let Guard::Above { line } = guard
+        && let Some(message) = repeated_anchor(context, line, &text)
+    {
+        diagnostics.push(at(
+            Some(&base.path),
+            Some(change),
+            "INSERT_REPEATS_LINE",
+            message,
+        ));
+        return;
+    }
     let found = derived_replacement(&base.text, context.lines(), &change.target, &text);
     let Some((range, written)) = found else {
         return;
@@ -1334,6 +1345,25 @@ fn resolve_change<'a>(
         diagnostics,
         budget,
     );
+}
+
+/// Refuses an insertion after line `line` whose first line restates that line,
+/// one with `MIN_GUARD_CHARS` visible characters: `after` keeps the line, so the
+/// output would hold it twice. That is a replacement written as an insertion;
+/// a deliberate duplicate can still replace the line with itself twice.
+fn repeated_anchor(context: &FileContext, line: usize, text: &str) -> Option<String> {
+    if line == 0 {
+        return None;
+    }
+    let anchor = &context.base.text[context.lines().body(line)];
+    let first = text.split('\n').next().unwrap_or_default();
+    let first = first.strip_suffix('\r').unwrap_or(first);
+    let visible = anchor.chars().filter(|ch| !ch.is_whitespace()).count();
+    (first == anchor && visible >= MIN_GUARD_CHARS).then(|| {
+        format!(
+            "after:{line} inserts below line {line} and keeps it, but new starts with line {line}'s text, which would then appear twice; drop that line from new, or replace with lines:[{line},{line}] to duplicate it on purpose"
+        )
+    })
 }
 
 /// Resolves an `exact` or `all` target by searching its scope for `old`, adapted

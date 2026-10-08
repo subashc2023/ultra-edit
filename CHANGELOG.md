@@ -45,6 +45,10 @@ All notable changes to Ultra Edit are documented here. Releases follow
   that file's path.
   New diagnostics: `LINE_OUT_OF_RANGE`, `EMPTY_INSERTION`, and an
   `OVERLAPPING_CHANGES` message naming the single `lines` change to send.
+  `INSERT_REPEATS_LINE` refuses an `after` insertion whose first line restates
+  the line it follows (8 or more visible characters), a replacement written as
+  an insertion that would leave the line twice. One benchmark session committed
+  that duplicate; no other insertion of 616 recorded did it.
 - Line-ending adaptation: in a file whose every line ends in CRLF, `old`, `new`,
   and `expect` text holding LF but no CR is matched and written as CRLF, with an
   `EOL_ADAPTED` warning. Native Read hides the CR, so multi-line text copied
