@@ -113,6 +113,9 @@ stay byte-identical, and no file may be added or removed.
 | `signature-threading` | A new parameter threaded through Python, CRLF TypeScript, tests, and docs, beside look-alike names |
 | `unicode-quotes` | Curly quotes, dashes, no-break spaces, and invisible characters that must keep their code points |
 | `yaml-near-duplicates` | Near-identical staging and prod YAML documents where only one occurrence changes |
+| `bump-version-in-context` | Intent-level: bump the package's own version where the same string also pins another dependency and appears in history |
+| `remove-deprecated-option` | Intent-level: remove an option's parser entry, handler, config field, docs, and tests, beside a look-alike option that stays |
+| `rename-function-not-method` | Intent-level: rename a module function and its references, but not methods, other modules' functions, or prose with the same name |
 
 ## Setup
 
@@ -416,9 +419,13 @@ error inside an MCP result. A shell edit whose only failure is a missing viewer
 
 ## Adding a task
 
-Create `tasks/<name>/prompt.md`, `fixture/`, and `expected/`. State the exact
-old and new text, so exactly one byte-level result is correct. Name each
-changed file in backticks, and use a prompt that needs no formatting judgment.
+Create `tasks/<name>/prompt.md`, `fixture/`, and `expected/`. The prompt must
+allow exactly one byte-level result. Most tasks state the exact old and new
+text, which lets a model edit without reading the files; the intent-level tasks
+instead describe the change and settle every judgment call in words (which
+look-alikes stay, how blank lines around a removal go), so the model has to
+find the sites. Name each changed file in backticks, and use a prompt that
+needs no formatting judgment.
 `python -m unittest discover -s scripts/tests` checks the task: expected files
 exist in the fixture and differ from it, and each keeps its newline style, BOM,
 and final newline.

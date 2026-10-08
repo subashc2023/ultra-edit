@@ -50,6 +50,12 @@ NEW_TASKS = [
     "unicode-quotes",
     "yaml-near-duplicates",
 ]
+# Prompts describe the change without quoting the lines, so a model must read to find them.
+INTENT_TASKS = [
+    "bump-version-in-context",
+    "remove-deprecated-option",
+    "rename-function-not-method",
+]
 # Keeps tests independent of whatever eval/third_party/arms.json holds.
 NO_THIRD_PARTY = str(REPO_ROOT / "eval" / "third_party" / "no-such-arms-file.json")
 ULTRA = evaluation.ULTRA_TOOL_PREFIX
@@ -878,7 +884,7 @@ class CommandTests(unittest.TestCase):
 class TaskFixtureTests(unittest.TestCase):
     def test_all_tasks_are_well_formed(self):
         tasks = evaluation.discover_tasks(TASKS_DIR)
-        self.assertEqual([task.name for task in tasks], sorted(ORIGINAL_TASKS + NEW_TASKS))
+        self.assertEqual([task.name for task in tasks], sorted(ORIGINAL_TASKS + NEW_TASKS + INTENT_TASKS))
         for task in tasks:
             with self.subTest(task=task.name):
                 self.assertEqual(evaluation.validate_task(task), [])

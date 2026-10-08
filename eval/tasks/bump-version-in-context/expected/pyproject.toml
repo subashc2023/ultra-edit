@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "quakefeed"
+version = "1.5.0"
+description = "Client for the Quakefeed earthquake event API"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [{ name = "Quakefeed maintainers", email = "maintainers@quakefeed.example" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+    "httpx>=0.25,<1",
+    "backoff>=1.4.2,<3",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/quakefeed/quakefeed"
+Changelog = "https://github.com/quakefeed/quakefeed/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/quakefeed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
