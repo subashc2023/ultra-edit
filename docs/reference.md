@@ -307,9 +307,14 @@ that look the same, such as a sibling method's decorator, so the message gives
 the replacement for the first case and dropping the kept lines for the second.
 Changes apply to the original file, so it is not reported when other changes
 in the request delete every restated or copied line that has text, whole. When
-other changes touch those lines in any other way, which lines end up where is
-the caller's to say: the message names one `lines` change covering every
-touched line, to send in place of both, and its diagnostic lists the other
+other changes edit those lines in place, each keeping text on one line, the
+lines stay where they are, so the message says to drop them from `new`, or to
+drop the insertion when it only repeats them; with copied lines below, it says
+to insert after the last of them instead. When other changes touch those lines
+in any other way, which lines end up where is the caller's to say: the message
+names one `lines` change covering them and every change touching or bordering
+them, to send in place of all of those, and says when a change with matches
+elsewhere must be narrowed to leave them. Its diagnostic lists the other
 changes as `conflicts`. A duplicate meant on purpose replaces the lines through
 `lines`, giving them twice. At most 200 lines above `after` are compared.
 

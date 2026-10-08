@@ -136,8 +136,9 @@ text whose leading lines restate the lines ending at it is refused
 other changes in the call delete each of them, and any copied lines below,
 whole. Drop the restated lines from `new`, or send the named `lines`
 replacement if the following lines of `new` were copied from the file too;
-when another change also touches those lines, send the one `lines` change the
-message names in place of both. A `lines` replacement that gives lines twice
+when another change also edits those lines, follow the message: drop them
+from `new` when the edits are in place, and otherwise send the one `lines`
+change it names in place of the changes on those lines. A `lines` replacement that gives lines twice
 duplicates them on purpose. `in` takes lines or a span ID, never literal
 text.
 

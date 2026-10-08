@@ -1457,16 +1457,17 @@ fn restated_lines<'a>(
 
 /// Refuses each restating insertion unless other changes in the file delete
 /// every restated or copied line that has text, whole: changes apply to the
-/// original file, so those lines then appear once. Any other change touching
-/// those lines makes which lines end up where the caller's to say, so it is
-/// asked for one `lines` change in place of both.
+/// original file, so those lines then appear once. Other changes that edit
+/// those lines in place, each line keeping text, apply to the original lines
+/// that stay, so the restated copy is dropped from `new`. Any other touch
+/// makes which lines end up where the caller's to say, so it is asked for one
+/// `lines` change in place of all the changes on those lines.
 fn refuse_restatements(
     context: &FileContext,
     replacements: &[Replacement],
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let lines = context.lines();
-    let text = &context.base.text;
     for restated in &context.restated {
         let Restated {
             change,
@@ -1484,45 +1485,17 @@ fn refuse_restatements(
                         || (other.start == other.end && low < other.start && other.start < high))
             })
             .collect();
-        let merge = if touching.is_empty() {
-            None
+        touching.sort_by_key(|other| other.start);
+        let advice = if touching.is_empty() {
+            Advice::Drop
+        } else if deleted_whole(context, &touching, first, last) {
+            continue;
+        } else if edited_in_place(context, &touching) {
+            Advice::Edited
         } else {
-            touching.sort_by_key(|other| other.start);
-            // Ranges deleted whole, merged where they meet.
-            let mut deleted: Vec<Range<usize>> = Vec::new();
-            for other in &touching {
-                if other.start == other.end || visible(&other.text) != 0 {
-                    continue;
-                }
-                match deleted.last_mut() {
-                    Some(range) if range.end >= other.start => range.end = range.end.max(other.end),
-                    _ => deleted.push(other.start..other.end),
-                }
-            }
-            let mut ranges = deleted.iter().peekable();
-            let gone = (first..=last).all(|number| {
-                let body = lines.body(number);
-                if visible(&text[body.clone()]) == 0 {
-                    return true;
-                }
-                while ranges.next_if(|range| range.end < body.end).is_some() {}
-                ranges
-                    .peek()
-                    .is_some_and(|range| range.start <= body.start && range.end >= body.end)
-            });
-            if gone {
-                continue;
-            }
-            let start = touching[0].start;
-            let end = touching
-                .iter()
-                .map(|other| other.end.saturating_sub(1).max(other.start))
-                .max()
-                .unwrap_or(start);
-            Some((
-                first.min(lines.line_of(start)),
-                last.max(lines.line_of(end)),
-            ))
+            let (low, high, partial) =
+                merged_lines(context, replacements, change, [first, last], &touching);
+            Advice::Merge(low, high, partial)
         };
         let Target::Insert { after, .. } = change.target else {
             continue;
@@ -1531,7 +1504,7 @@ fn refuse_restatements(
             Some(&context.base.path),
             Some(change),
             "INSERT_REPEATS_LINE",
-            restatement_message(after, [first, line, last], bare, merge),
+            restatement_message(after, [first, line, last], bare, advice),
         );
         diagnostic.conflicts = touching
             .iter()
@@ -1543,14 +1516,153 @@ fn refuse_restatements(
     }
 }
 
+/// Whether `touching`, sorted by start, deletes every line of `first..=last`
+/// that has text, whole.
+fn deleted_whole(
+    context: &FileContext,
+    touching: &[&Replacement],
+    first: usize,
+    last: usize,
+) -> bool {
+    let lines = context.lines();
+    let mut deleted: Vec<Range<usize>> = Vec::new();
+    for other in touching {
+        if other.start == other.end || visible(&other.text) != 0 {
+            continue;
+        }
+        match deleted.last_mut() {
+            Some(range) if range.end >= other.start => range.end = range.end.max(other.end),
+            _ => deleted.push(other.start..other.end),
+        }
+    }
+    let mut ranges = deleted.iter().peekable();
+    (first..=last).all(|number| {
+        let body = lines.body(number);
+        if context.trimmed(number).1 == 0 {
+            return true;
+        }
+        while ranges.next_if(|range| range.end < body.end).is_some() {}
+        ranges
+            .peek()
+            .is_some_and(|range| range.start <= body.start && range.end >= body.end)
+    })
+}
+
+/// Whether every change in `touching`, sorted by start, edits within one
+/// line's body and leaves that line with text, so the line stays where it is.
+fn edited_in_place(context: &FileContext, touching: &[&Replacement]) -> bool {
+    let lines = context.lines();
+    let text = &context.base.text;
+    let mut index = 0;
+    while index < touching.len() {
+        let number = lines.line_of(touching[index].start);
+        let body = lines.body(number);
+        let (mut written, mut cursor) = (String::new(), body.start);
+        while let Some(other) = touching.get(index) {
+            let inside = if other.start == other.end {
+                body.start < other.start && other.start < body.end
+            } else {
+                body.start <= other.start && other.end <= body.end
+            };
+            if !inside {
+                if lines.line_of(other.start) == number {
+                    return false;
+                }
+                break;
+            }
+            // Overlapping changes are refused on their own.
+            if other.start < cursor {
+                return false;
+            }
+            written.push_str(&text[cursor..other.start]);
+            written.push_str(&other.text);
+            cursor = other.end;
+            index += 1;
+        }
+        written.push_str(&text[cursor..body.end]);
+        if written.contains('\n') || visible(&written) == 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// The lines one `lines` change must cover to stand in for the insertion, the
+/// lines `first..=last` it restates, and every change touching or bordering
+/// them, widened until none is left partly outside, and whether a change also
+/// edits beyond them.
+fn merged_lines(
+    context: &FileContext,
+    replacements: &[Replacement],
+    change: &Change,
+    [first, last]: [usize; 2],
+    touching: &[&Replacement],
+) -> (usize, usize, bool) {
+    let lines = context.lines();
+    let line_at = |other: &Replacement| {
+        (
+            lines.line_of(other.start),
+            lines.line_of(other.end.saturating_sub(1).max(other.start)),
+        )
+    };
+    let (mut low, mut high) = touching.iter().fold((first, last), |(low, high), other| {
+        let (first, last) = line_at(other);
+        (low.min(first), high.max(last))
+    });
+    let mut ids: BTreeSet<&str> = touching
+        .iter()
+        .map(|other| other.change_id.as_str())
+        .collect();
+    loop {
+        let (start, end) = (lines.body(low).start, lines.end(high));
+        let mut grew = false;
+        for other in replacements {
+            if other.change_id == change.id {
+                continue;
+            }
+            let meets = (other.start < end && other.end > start)
+                || (other.start == other.end && start <= other.start && other.start <= end);
+            if !meets {
+                continue;
+            }
+            ids.insert(&other.change_id);
+            let (first, last) = line_at(other);
+            if first < low || last > high {
+                (low, high) = (low.min(first), high.max(last));
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    let (start, end) = (lines.body(low).start, lines.end(high));
+    let partial = replacements.iter().any(|other| {
+        ids.contains(other.change_id.as_str()) && !(start <= other.start && other.end <= end)
+    });
+    (low, high, partial)
+}
+
+/// What a refused restatement tells the caller to do.
+#[derive(Clone, Copy)]
+enum Advice {
+    /// No other change touches the lines: drop them, or replace them.
+    Drop,
+    /// Other changes edit the lines in place, which stay.
+    Edited,
+    /// One `lines` change over these lines stands in for all of them; true when
+    /// a change also edits elsewhere and must be narrowed.
+    Merge(usize, usize, bool),
+}
+
 /// The refusal for an insertion `after` whose text restates lines
-/// `first..=line`, then lines down to `last`, where `merge` names the lines
-/// other changes also touch; within `MESSAGE_CHARS` at 8-digit line numbers.
+/// `first..=line`, then lines down to `last`; within `MESSAGE_CHARS` at
+/// 8-digit line numbers.
 fn restatement_message(
     after: usize,
     [first, line, last]: [usize; 3],
     bare: bool,
-    merge: Option<(usize, usize)>,
+    advice: Advice,
 ) -> String {
     let named = |low: usize, high: usize| {
         if low == high {
@@ -1560,30 +1672,42 @@ fn restatement_message(
         }
     };
     let kept = named(first, line);
-    let (they, them) = if first == line {
-        ("it", "it")
+    let all = named(first, last);
+    let (they, them, their) = if first == line {
+        ("it", "it", "its")
     } else {
-        ("they", "them")
+        ("they", "them", "their")
     };
-    if let Some((low, high)) = merge {
-        format!(
-            "after:{after} repeats {}, which another change also edits; send both as one change, lines:[{low},{high}], with the text those lines should end up as",
-            named(first, last)
-        )
-    } else if bare {
-        format!(
-            "after:{after} keeps {kept} and new only repeats {}; to repeat text on purpose, send lines:[{first},{last}] with those lines given twice",
-            named(first, last)
-        )
-    } else if last > line {
-        format!(
+    match advice {
+        Advice::Merge(low, high, partial) => {
+            let narrow = if partial {
+                "; narrow any change with matches elsewhere to leave them"
+            } else {
+                ""
+            };
+            format!(
+                "after:{after} repeats {all}, which other changes also touch; send them as one change, lines:[{low},{high}], with those lines as they should end{narrow}"
+            )
+        }
+        Advice::Edited if bare => format!(
+            "after:{after} keeps {all}, which another change edits in place, and new only repeats the old text; drop this insertion"
+        ),
+        Advice::Edited if last > line => format!(
+            "after:{after} keeps {all}, which other changes edit in place, and new repeats their old text first; drop {all} from new and insert after:{last}, with line {last} as expect"
+        ),
+        Advice::Edited => format!(
+            "after:{after} keeps {kept}, which another change edits in place, and new repeats {their} old text, so both versions would appear; drop {them} from new"
+        ),
+        Advice::Drop if bare => format!(
+            "after:{after} keeps {kept} and new only repeats {all}; to repeat text on purpose, send lines:[{first},{last}] with those lines given twice"
+        ),
+        Advice::Drop if last > line => format!(
             "after:{after} keeps {kept} and new repeats {them} first, then {} too; if copied, send this new as lines:[{first},{last}], and if new, drop {kept} from new",
             named(line + 1, last)
-        )
-    } else {
-        format!(
+        ),
+        Advice::Drop => format!(
             "after:{after} keeps {kept} and new repeats {them} first, so {they} would appear twice; drop {them} from new, or send this new as lines:[{first},{line}]"
-        )
+        ),
     }
 }
 
@@ -1666,11 +1790,11 @@ fn resolve_exact(
             lines.dedup();
             let noun = if lines.len() == 1 { "line" } else { "lines" };
             let advice = match advice(context.lines(), &base.text, start..end, old) {
-                Advice::Alone(first, last) => format!(
+                Ambiguity::Alone(first, last) => format!(
                     "add surrounding text to `old`, or restrict it with \"in\":[{first},{last}]"
                 ),
-                Advice::Context => "add surrounding text to `old`".to_owned(),
-                Advice::InsideWords => {
+                Ambiguity::Context => "add surrounding text to `old`".to_owned(),
+                Ambiguity::InsideWords => {
                     "each match is inside a longer word; copy whole words from those lines into `old`"
                         .to_owned()
                 }
@@ -1721,7 +1845,7 @@ fn resolve_exact(
     }
     if exact
         && let Some(&position) = positions.first()
-        && let Some(boundary) = word_cut(&base.text, start + position, old)
+        && let Some(boundary) = word_cut(&base.text, start + position, old.len(), one_line(old))
     {
         diagnostics.push(at(
             Some(&base.path),
@@ -1743,6 +1867,15 @@ fn resolve_exact(
     }));
 }
 
+/// Whether `old` holds text on at most one line, so the end of its match is
+/// judged as well as the start.
+fn one_line(old: &str) -> bool {
+    old.split('\n')
+        .filter(|line| !line.trim().is_empty())
+        .nth(1)
+        .is_none()
+}
+
 /// Where a match of `old` at `start` cuts an ASCII word, such as `retries = 2`
 /// inside `max_retries = 20`: text written without reading the file can match
 /// a longer name or number by accident. Only the start of an `old` with text on
@@ -1754,7 +1887,7 @@ fn resolve_exact(
 /// scripts such as Han separate words; a cut between two digits is a number
 /// cut whatever follows, as in `100µs`. A letter after a backslash, as in
 /// `\nRestart`, is an escape, but `\_` or `\1` is not.
-fn word_cut(text: &str, start: usize, old: &str) -> Option<usize> {
+fn word_cut(text: &str, start: usize, len: usize, one_line: bool) -> Option<usize> {
     let bytes = text.as_bytes();
     let word = |at: usize| {
         bytes
@@ -1777,11 +1910,7 @@ fn word_cut(text: &str, start: usize, old: &str) -> Option<usize> {
             .all(|ch| ch.is_ascii())
     };
     let digits = |at: usize| bytes[at - 1].is_ascii_digit() && bytes[at].is_ascii_digit();
-    let with_text = old
-        .split('\n')
-        .filter(|line| !line.trim().is_empty())
-        .count();
-    let end = (with_text <= 1).then_some(start + old.len());
+    let end = one_line.then_some(start + len);
     std::iter::once(start)
         .chain(end)
         .find(|&at| joined(at) && (digits(at) || ascii(at)))
@@ -1809,7 +1938,7 @@ fn inside_word(text: &str, boundary: usize) -> String {
 }
 
 /// What ambiguity advice can offer for `old` in a scope.
-enum Advice {
+enum Ambiguity {
     /// `in` lines where a whole-word match is the only match.
     Alone(usize, usize),
     /// Every match examined shares its lines or cuts a word.
@@ -1820,18 +1949,19 @@ enum Advice {
 
 /// Finds the first whole-word match of `old` in `range` that no other match
 /// shares lines with, which `in` with those lines then finds alone.
-fn advice(lines: &LineIndex, text: &str, range: Range<usize>, old: &str) -> Advice {
+fn advice(lines: &LineIndex, text: &str, range: Range<usize>, old: &str) -> Ambiguity {
     let mut starts = overlapping_starts(&text[range.clone()], old)
         .map(|at| range.start + at)
         .peekable();
     // A final line feed ends the match's last line, which `in` already includes.
     let spanned = old.strip_suffix('\n').unwrap_or(old).matches('\n').count();
     let (mut previous, mut whole, mut examined) = (None, false, 0);
+    let one_line = one_line(old);
     while examined < ADVISED_MATCHES
         && let Some(at) = starts.next()
     {
         examined += 1;
-        if word_cut(text, at, old).is_none() {
+        if word_cut(text, at, old.len(), one_line).is_none() {
             whole = true;
             let first = lines.line_of(at);
             let last = first + spanned;
@@ -1844,15 +1974,15 @@ fn advice(lines: &LineIndex, text: &str, range: Range<usize>, old: &str) -> Advi
                 && (range.start <= low && high <= range.end
                     || overlapping_starts(&text[low..high], old).nth(1).is_none())
             {
-                return Advice::Alone(first, last);
+                return Ambiguity::Alone(first, last);
             }
         }
         previous = Some(at);
     }
     if whole || starts.peek().is_some() {
-        Advice::Context
+        Ambiguity::Context
     } else {
-        Advice::InsideWords
+        Ambiguity::InsideWords
     }
 }
 
@@ -2480,10 +2610,15 @@ mod tests {
     #[test]
     fn restatement_messages_fit_at_eight_digit_lines() {
         let (first, line) = (99_999_990, 99_999_996);
-        for merge in [None, Some((99_999_980, 99_999_999))] {
+        for advice in [
+            Advice::Drop,
+            Advice::Edited,
+            Advice::Merge(99_999_980, 99_999_999, false),
+            Advice::Merge(99_999_980, 99_999_999, true),
+        ] {
             for bare in [false, true] {
                 for [first, last] in [[first, line + 2], [line, line + 1], [first, line]] {
-                    let message = restatement_message(line + 1, [first, line, last], bare, merge);
+                    let message = restatement_message(line + 1, [first, line, last], bare, advice);
                     assert!(message.chars().count() <= 240, "{message}");
                 }
             }

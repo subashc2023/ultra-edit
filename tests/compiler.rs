@@ -3006,3 +3006,19 @@ fn ambiguity_advice_at_the_cap_and_under_a_partial_scope() {
     let plan = compile(&request(&base, vec![change(json!([2, 2]))]), &bases(&base));
     assert_eq!(plan.unwrap().files[0].output, "x = 1; a = 1\nb = 2\n");
 }
+
+/// Whether `old` holds text on one line is decided once per `old`, not once
+/// per match the advice examines.
+#[test]
+fn ambiguity_advice_for_a_long_many_line_old_stays_linear() {
+    let text = "ab\n".repeat(40_000);
+    let old = format!("b\n{}", "ab\n".repeat(19_999));
+    let started = Instant::now();
+    let errors = compiled(&text, json!({"id":"w","old":old,"new":"x"})).unwrap_err();
+    assert_eq!(errors[0].code, "TARGET_AMBIGUOUS");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}

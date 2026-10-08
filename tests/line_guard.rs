@@ -594,9 +594,118 @@ fn restated_lines_that_other_changes_delete_whole_appear_once() {
     assert_eq!(plan.unwrap().files[0].output, wanted);
 }
 
+/// Other changes that edit restated lines in place apply to the original
+/// lines, which stay, so the restated copy is dropped from `new`; following
+/// that commits every change, a counted rename's other matches included.
+#[test]
+fn restated_lines_edited_in_place_are_dropped_from_new() {
+    let follow = |text: &str,
+                  changes: Vec<serde_json::Value>,
+                  wanted_advice: &str,
+                  followed: Vec<serde_json::Value>,
+                  wanted: &str| {
+        let base = spanless(text);
+        let errors = compile(
+            &request(&base, changes.into_iter().map(parsed).collect()),
+            &bases(&base),
+        )
+        .unwrap_err();
+        assert_eq!(errors[0].code, "INSERT_REPEATS_LINE", "{errors:?}");
+        assert!(
+            errors[0].message.contains(wanted_advice),
+            "{}",
+            errors[0].message
+        );
+        let plan = compile(
+            &request(&base, followed.into_iter().map(parsed).collect()),
+            &bases(&base),
+        );
+        assert_eq!(plan.unwrap().files[0].output, wanted);
+    };
+    let anchor = "    tax_table=resolve(region),";
+    let call = format!("totals = compute(\n{anchor}\n)\n");
+    let token = json!({"id":"o","old":"resolve(region)","new":"resolve(country)"});
+    follow(
+        &call,
+        vec![
+            token.clone(),
+            json!({"id":"i","after":2,"expect":anchor,"new":format!("{anchor}\n    rounding=1,")}),
+        ],
+        "drop it from new",
+        vec![
+            token.clone(),
+            json!({"id":"i","after":2,"expect":anchor,"new":"    rounding=1,"}),
+        ],
+        "totals = compute(\n    tax_table=resolve(country),\n    rounding=1,\n)\n",
+    );
+    // An insertion that only repeats an edited line is dropped, not emptied.
+    follow(
+        &call,
+        vec![
+            token.clone(),
+            json!({"id":"i","after":2,"expect":anchor,"new":anchor}),
+        ],
+        "drop this insertion",
+        vec![token],
+        "totals = compute(\n    tax_table=resolve(country),\n)\n",
+    );
+    // A counted rename keeps its matches on other lines.
+    let load = "def load(path):\n    cfg = read_config(path)\n    cfg.validate()\n    return cfg\n";
+    let rename = json!({"id":"rename","old":"cfg","new":"config","count":3});
+    follow(
+        load,
+        vec![
+            rename.clone(),
+            json!({"id":"i","after":2,"expect":"    cfg = read_config(path)","new":"    cfg = read_config(path)\n    config.normalize()"}),
+        ],
+        "drop it from new",
+        vec![
+            rename,
+            json!({"id":"i","after":2,"expect":"    cfg = read_config(path)","new":"    config.normalize()"}),
+        ],
+        "def load(path):\n    config = read_config(path)\n    config.normalize()\n    config.validate()\n    return config\n",
+    );
+    // An edited line copied below the anchor: the new line goes below it.
+    let connect = "def connect(host):\n    timeout = 30\n    retries = 3\n    return Client(host, timeout, retries)\n";
+    let edit = json!({"id":"e","old":"retries = 3","new":"retries = 5"});
+    follow(
+        connect,
+        vec![
+            edit.clone(),
+            json!({"id":"i","after":2,"expect":"    timeout = 30","new":"    timeout = 30\n    retries = 3\n    backoff = retries * 2"}),
+        ],
+        "drop lines 2-3 from new and insert after:3, with line 3 as expect",
+        vec![
+            edit,
+            json!({"id":"i","after":3,"expect":"    retries = 3","new":"    backoff = retries * 2"}),
+        ],
+        "def connect(host):\n    timeout = 30\n    retries = 5\n    backoff = retries * 2\n    return Client(host, timeout, retries)\n",
+    );
+    // An insertion above the restated line does not stop the in-place advice.
+    let fetch = "class Service:\n    def fetch(self, url):\n        response = requests.get(url)\n        return response.json()\n";
+    let log = json!({"id":"log","after":2,"expect":"    def fetch(self, url):","new":"        log.info(\"fetching %s\", url)"});
+    let timeout = json!({"id":"t","old":"requests.get(url)","new":"requests.get(url, timeout=10)"});
+    follow(
+        fetch,
+        vec![
+            log.clone(),
+            timeout.clone(),
+            json!({"id":"c","after":3,"expect":"        response = requests.get(url)","new":"        response = requests.get(url)\n        response.raise_for_status()"}),
+        ],
+        "drop it from new",
+        vec![
+            log,
+            timeout,
+            json!({"id":"c","after":3,"expect":"        response = requests.get(url)","new":"        response.raise_for_status()"}),
+        ],
+        "class Service:\n    def fetch(self, url):\n        log.info(\"fetching %s\", url)\n        response = requests.get(url, timeout=10)\n        response.raise_for_status()\n        return response.json()\n",
+    );
+}
+
 /// Any other touch on restated or copied lines leaves which lines end up where
-/// to the caller: the message names one `lines` change covering every touched
-/// line, and sending it commits exactly what it says.
+/// to the caller: the message names one `lines` change covering every change
+/// that touches or borders those lines, and sending it commits exactly what
+/// it says.
 #[test]
 fn restated_lines_that_other_changes_touch_are_merged_into_one_change() {
     let refused = |text: &str, changes: Vec<serde_json::Value>, range: &str| {
@@ -607,7 +716,7 @@ fn restated_lines_that_other_changes_touch_are_merged_into_one_change() {
         assert!(
             errors[0]
                 .message
-                .contains(&format!("send both as one change, lines:{range}")),
+                .contains(&format!("send them as one change, lines:{range}")),
             "{}",
             errors[0].message
         );
@@ -618,13 +727,9 @@ fn restated_lines_that_other_changes_touch_are_merged_into_one_change() {
     let call = format!("totals = compute(\n{anchor}\n)\n");
     let insertion =
         json!({"id":"i","after":2,"expect":anchor,"new":format!("{anchor}\n    rounding=1,")});
-    // A token edit, a cut that leaves the indentation, and a rewrite of the
-    // lines around it all touch line 2 without deleting it whole.
+    // A cut that leaves only the indentation, and a rewrite of the lines
+    // around it, may drop the line or rewrite it.
     for (other, range) in [
-        (
-            json!({"id":"o","old":"resolve(region)","new":"resolve(country)"}),
-            "[2,2]",
-        ),
         (
             json!({"id":"o","old":"tax_table=resolve(region),","new":""}),
             "[2,2]",
@@ -663,25 +768,9 @@ fn restated_lines_that_other_changes_touch_are_merged_into_one_change() {
         outcome(&base, one).unwrap(),
         "import sys\nimport json\nimport re\n\ndef main():\n    pass\n"
     );
-    // An edit on a copied line below the anchor.
+    // A deleted anchor whose copied line below stays.
     let connect =
         "def connect(host):\n    timeout = 30\n    retries = 3\n    return Client(host)\n";
-    let base = refused(
-        connect,
-        vec![
-            json!({"id":"e","old":"retries = 3","new":"retries = 5"}),
-            json!({"id":"i","after":2,"expect":"    timeout = 30","new":"    timeout = 30\n    retries = 3\n    backoff = 2"}),
-        ],
-        "[2,3]",
-    );
-    let one = parsed(
-        json!({"id":"m","lines":[2,3],"expect":["    timeout = 30","    retries = 3"],"new":"    timeout = 30\n    retries = 5\n    backoff = 2"}),
-    );
-    assert_eq!(
-        outcome(&base, one).unwrap(),
-        "def connect(host):\n    timeout = 30\n    retries = 5\n    backoff = 2\n    return Client(host)\n"
-    );
-    // A deleted anchor whose copied line below stays.
     refused(
         connect,
         vec![
@@ -689,6 +778,28 @@ fn restated_lines_that_other_changes_touch_are_merged_into_one_change() {
             json!({"id":"i","after":2,"expect":"    timeout = 30","new":"    timeout = 30\n    retries = 3\n    backoff = 2.0"}),
         ],
         "[2,3]",
+    );
+    // Deleting a final line without a line ending takes the line before's
+    // ending, so the range reaches it, and an insertion at the range's edge
+    // is inside it too.
+    let steps = "steps:\n  - run: make build\n  - run: make test\n  - run: make deploy";
+    let base = refused(
+        steps,
+        vec![
+            json!({"id":"drop","lines":[4,4],"expect":"  - run: make deploy","new":""}),
+            json!({"id":"cut","lines":[2,2],"expect":"  - run: make build","new":""}),
+            json!({"id":"top","after":1,"expect":"steps:","new":"  - run: make setup"}),
+            json!({"id":"i","after":2,"expect":"  - run: make build","new":"  - run: make build\n  - run: make test\n  - run: make lint"}),
+        ],
+        "[2,4]",
+    );
+    let one = vec![parsed(
+        json!({"id":"m","lines":[2,4],"expect":["  - run: make build","  - run: make deploy"],"new":"  - run: make setup\n  - run: make test\n  - run: make lint"}),
+    )];
+    let plan = compile(&request(&base, one), &bases(&base));
+    assert_eq!(
+        plan.unwrap().files[0].output,
+        "steps:\n  - run: make setup\n  - run: make test\n  - run: make lint"
     );
 }
 
@@ -706,6 +817,33 @@ fn many_insertions_beside_long_lines_read_each_line_once() {
             change
         })
         .collect();
+    let started = Instant::now();
+    let _ = compile(&request(&base, changes), &bases(&base));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// Judging other changes beside a thousand restating insertions reads each
+/// long whitespace line once per file.
+#[test]
+fn other_changes_beside_many_restating_insertions_are_judged_quickly() {
+    let blank = " ".repeat(20_000);
+    let text = format!("{}value = 1234\n", format!("{blank}\n").repeat(199));
+    let base = snapshot("full.txt".into(), text);
+    let new = format!("{}value = 1234\nvalue = 5678", "\n".repeat(199));
+    let mut changes: Vec<Change> = (0..999)
+        .map(|index| {
+            let mut change = insert(200, None, &new);
+            change.id = format!("i{index}");
+            change
+        })
+        .collect();
+    changes.push(parsed(
+        json!({"id":"e","old":"value = 1234","new":"value = 4321"}),
+    ));
     let started = Instant::now();
     let _ = compile(&request(&base, changes), &bases(&base));
     assert!(

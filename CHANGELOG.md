@@ -53,9 +53,10 @@ All notable changes to Ultra Edit are documented here. Releases follow
   as well; lines below the anchor that only look the same, such as a sibling
   method's decorator, are offered as possibly new. Among equal lines it names
   the longest run. It stays quiet when other changes in the request delete
-  every restated and copied line whole; when they touch those lines any other
-  way, it names one `lines` change covering every touched line to send in
-  place of both. It compares at most 200 lines above the anchor, reads each
+  every restated and copied line whole; when they edit those lines in place,
+  it says to drop them from `new`, and when they touch them any other way, it
+  names one `lines` change covering every change touching or bordering them
+  to send in place of all of those. It compares at most 200 lines above the anchor, reads each
   line once per file, and follows a copy below it to its end; every message
   fits 240 characters at 8-digit lines. One benchmark session sent such an
   insertion and committed the duplicate; none of the other 614 recorded
