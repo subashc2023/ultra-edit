@@ -2307,6 +2307,47 @@ fn anchors_sharing_context_they_both_keep_merge() {
 }
 
 #[test]
+fn an_insertion_beside_a_deletion_applies_in_either_order() {
+    let text = "1\n2\n3\n4\n";
+    // Deleting line 2 and inserting after it puts the new text where it was.
+    assert_eq!(
+        output(
+            text,
+            vec![
+                insert("a", 2, None, "two"),
+                lines_change("b", [2, 2], None, ""),
+            ]
+        ),
+        "1\ntwo\n3\n4\n"
+    );
+    assert_eq!(
+        output(
+            text,
+            vec![
+                lines_change("a", [2, 3], None, ""),
+                insert("b", 1, None, "x"),
+            ]
+        ),
+        "1\nx\n4\n"
+    );
+    // An insertion inside the deleted lines, or beside replaced text, conflicts.
+    let base = snapshot("conflict.txt".into(), text.into());
+    for changes in [
+        vec![
+            lines_change("a", [2, 3], None, ""),
+            insert("b", 2, None, "x"),
+        ],
+        vec![
+            lines_change("a", [2, 2], None, "B"),
+            insert("b", 2, None, "x"),
+        ],
+    ] {
+        let errors = compile(&request(&base, changes), &bases(&base)).unwrap_err();
+        assert_eq!(errors[0].code, "OVERLAPPING_CHANGES");
+    }
+}
+
+#[test]
 fn line_targets_touching_one_another_conflict_with_a_combining_hint() {
     let text = "1\n2\n3\n4\n5\n6\n";
     assert_eq!(

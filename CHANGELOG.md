@@ -104,10 +104,10 @@ All notable changes to Ultra Edit are documented here. Releases follow
   are never judged. The `PreToolUse` matcher is now `Bash|PowerShell|Write`. In
   the benchmark, 4 of 14 guarded native sessions wrote project files past the
   guard by saving a script with Write and running it.
-- The `expect` schema says that a part may hold several lines and that a short
-  one, such as a blank line or `}`, must not recur in the file. In the
-  benchmark, 5 of 42 Ultra Edit sessions sent a blank-line or `)` guard first
-  and were rejected with `LINE_GUARD_WEAK`.
+- An insertion at either edge of a deletion no longer conflicts, since either
+  order gives the same text: `{after:11}` with `{lines:[11,11],new:""}` puts
+  the new lines where line 11 was. Insertions beside replaced text or inside a
+  deleted range still conflict.
 - Two changes whose targets partly overlap no longer reject the batch when
   both keep the shared bytes unchanged, as when two `old` anchors share a few
   bytes of context: each applies to its own side. Contained or rewritten

@@ -453,8 +453,17 @@ pub fn compile_with(
                 if right.start > left.end {
                     break;
                 }
-                // Boundary insertions also conflict, so there is one explicit ordering policy.
-                let conflict = if left.start == left.end || right.start == right.end {
+                // Boundary insertions also conflict, so there is one explicit ordering
+                // policy, except beside a deletion, where either order gives the same text.
+                let insertion = |replacement: &Replacement| replacement.start == replacement.end;
+                let deletion = |replacement: &Replacement| {
+                    replacement.start < replacement.end && replacement.text.is_empty()
+                };
+                let conflict = if (insertion(left) && deletion(right))
+                    || (deletion(left) && insertion(right))
+                {
+                    right.start < left.end && left.start < right.start
+                } else if insertion(left) || insertion(right) {
                     right.start <= left.end
                 } else {
                     right.start < left.end
