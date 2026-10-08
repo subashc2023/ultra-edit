@@ -90,9 +90,10 @@ the requested source, and direct MCP arguments avoid shell quoting and generated
 editing code. These are concrete ways to reduce payloads compared with heredoc
 rewrites; actual token and cost savings depend on the task, model, and retries.
 Snapshots and tool instructions also cost context. Measured with the
-[evaluation harness](eval/README.md), Ultra Edit cost 1.20x native Claude Code
+[evaluation harness](eval/README.md), Ultra Edit cost 1.06x native Claude Code
 on tasks that native editing often finished with a blind shell substitution,
-and 0.76x native editing with shell writes blocked; see
+0.67x native editing with shell writes blocked, and 1.03x native on tasks that
+leave finding the edit sites to the model; see
 [the results](docs/performance.md#model-level-results).
 
 ### What you give up

@@ -8,7 +8,7 @@ the spread of each across repetitions. It runs headless `claude -p` sessions,
 saves each raw stream-json transcript, and scores the final bytes.
 
 > **Cost warning.** Every run is a real Claude Code session billed to your
-> account: tasks × arms × `--reps` sessions (14 tasks × 3 default arms = 42
+> account: tasks × arms × `--reps` sessions (17 tasks × 3 default arms = 51
 > runs per repetition; `--arm all` runs every arm). `--dry-run` and
 > `--preflight` never call a model. Paid runs need confirmation (or `--yes`),
 > each run is capped by `--max-budget-usd` (default 2), and `--max-total-usd`
