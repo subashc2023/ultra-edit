@@ -104,6 +104,12 @@ All notable changes to Ultra Edit are documented here. Releases follow
   are never judged. The `PreToolUse` matcher is now `Bash|PowerShell|Write`. In
   the benchmark, 4 of 14 guarded native sessions wrote project files past the
   guard by saving a script with Write and running it.
+- A `lines` range that ends in blank lines may give, as the last part of
+  `expect`, the text line just before them, as the plugin's guidance to prefer
+  text lines over blank ones suggests. The range is applied as given. Before,
+  `lines:[25,38]` with the text of line 37 was rejected and the diagnostic
+  proposed `[25,37]`, which would have kept the blank line the model meant to
+  delete; 3 benchmark sessions hit it.
 - `count: 1` on a span, lines, or after change is accepted and ignored, since
   every target replaces one place; another count there is still an error.
 - An insertion at either edge of a deletion no longer conflicts, since either

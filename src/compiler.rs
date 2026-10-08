@@ -1642,8 +1642,23 @@ fn line_guard(
             diagnostics,
         );
     }
+    // Where the tail guard ends: the range's last line or, when the range ends in
+    // blank lines and the tail names the text before them, that text's line.
+    let mut tail_end = match guard {
+        Guard::Prefix { last, .. } => last,
+        Guard::Above { line } => line,
+    };
     if let Guard::Prefix { first, last } = guard
         && !tail.is_empty()
+        && !matches_at(last + 1 - tail.len(), &tail)
+        && let Some(end) = before_blank_end(context, first, last, &head, &tail)
+        && matches_at(end + 1 - tail.len(), &tail)
+    {
+        tail_end = end;
+    }
+    if let Guard::Prefix { first, last } = guard
+        && !tail.is_empty()
+        && tail_end == last
         && !matches_at(last + 1 - tail.len(), &tail)
     {
         // The range keeps its start; its end is where the last lines are now,
@@ -1680,7 +1695,9 @@ fn line_guard(
     }
     // A line that both the head and the tail check is evidence once.
     let overlap = match guard {
-        Guard::Prefix { first, last } => (first + head.len()).saturating_sub(last + 1 - tail.len()),
+        Guard::Prefix { first, .. } => {
+            (first + head.len()).saturating_sub(tail_end + 1 - tail.len())
+        }
         Guard::Above { .. } => 0,
     };
     let visible: usize = head
@@ -1797,6 +1814,39 @@ fn relocated(
     } else {
         fuzzy_advice(context, text.unwrap_or_default(), budget)
     }
+}
+
+/// The last line before the blank lines that end `first..=last`, when a tail
+/// that names text, together with the head, guards strongly enough to stand
+/// there: a model often guards a range that ends in a blank line with the text
+/// line before it. The range itself is unchanged.
+fn before_blank_end(
+    context: &FileContext,
+    first: usize,
+    last: usize,
+    head: &[&str],
+    tail: &[&str],
+) -> Option<usize> {
+    let (base, lines) = (context.base, context.lines());
+    let blank = |line: usize| base.text[lines.body(line)].trim().is_empty();
+    if !blank(last) || tail.last().is_none_or(|piece| piece.trim().is_empty()) {
+        return None;
+    }
+    let mut end = last;
+    while end > first && blank(end) {
+        end -= 1;
+    }
+    if end + 1 < first + head.len().max(tail.len()) {
+        return None;
+    }
+    // A line that both the head and the tail check is evidence once.
+    let overlap = (first + head.len()).saturating_sub(end + 1 - tail.len());
+    let visible: usize = head
+        .iter()
+        .chain(&tail[overlap.min(tail.len())..])
+        .map(|piece| piece.chars().filter(|ch| !ch.is_whitespace()).count())
+        .sum();
+    (visible >= MIN_GUARD_CHARS).then_some(end)
 }
 
 /// Pushes `EXPECTED_TEXT_MISMATCH` quoting the `count` lines from `start`.

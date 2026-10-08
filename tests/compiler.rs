@@ -2307,6 +2307,59 @@ fn anchors_sharing_context_they_both_keep_merge() {
 }
 
 #[test]
+fn a_range_ending_in_blank_lines_may_guard_the_text_before_them() {
+    let text =
+        "intro\n\n## Legacy export\n\nbody\nposition must skip the owner column.\n\n## Next\n";
+    let base = snapshot("doc.md".into(), text.into());
+    let range = |lines: [usize; 2], head: &str, tail: &str| Change {
+        id: "c".into(),
+        target: Target::Lines {
+            lines,
+            expect: Some(head.into()),
+            expect_last: Some(tail.into()),
+        },
+        text: String::new(),
+    };
+    // Lines 3-7 end in a blank line; the tail names line 6, before it.
+    let plan = compile(
+        &request(
+            &base,
+            vec![range(
+                [3, 7],
+                "## Legacy export",
+                "position must skip the owner column.",
+            )],
+        ),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(plan.files[0].output, "intro\n\n## Next\n");
+    for change in [
+        // The tail must be the last text in the range, not text further up.
+        range([3, 7], "## Legacy export", "body"),
+        // Text past the range's end is not skipped to.
+        range([3, 6], "## Legacy export", "## Next"),
+        // A stale range whose head moved still fails on the head.
+        range(
+            [2, 7],
+            "## Legacy export",
+            "position must skip the owner column.",
+        ),
+    ] {
+        let errors = compile(&request(&base, vec![change]), &bases(&base)).unwrap_err();
+        assert_eq!(errors[0].code, "EXPECTED_TEXT_MISMATCH", "{errors:?}");
+    }
+    // A short guard that may recur cannot stand before the blank lines.
+    let short = snapshot("short.txt".into(), "a\n}\n\nb\n}\n\n".into());
+    let errors = compile(
+        &request(&short, vec![range([4, 6], "b", "}")]),
+        &bases(&short),
+    )
+    .unwrap_err();
+    assert_eq!(errors[0].code, "EXPECTED_TEXT_MISMATCH", "{errors:?}");
+}
+
+#[test]
 fn an_insertion_beside_a_deletion_applies_in_either_order() {
     let text = "1\n2\n3\n4\n";
     // Deleting line 2 and inserting after it puts the new text where it was.

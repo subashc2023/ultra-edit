@@ -122,7 +122,8 @@ have 8 or more visible characters or match nowhere else in the file
 the range since your Read is caught. Repeated lines such as `port = 8080` are
 what line numbers tell apart, so a long guard may repeat. Lines between the
 first and last parts are not compared, and a blank last line pins the end only
-weakly, so prefer lines with text as `[first, last]`. `after:0`
+weakly, so prefer lines with text as `[first, last]`: when the range ends in
+blank lines, the last part may name the text line just before them. `after:0`
 takes none. A mismatch is `EXPECTED_TEXT_MISMATCH`, and when the expected lines
 occur elsewhere the message gives the current range. A line past the end is
 `LINE_OUT_OF_RANGE`. On `span`, `expect` is byte-exact.
