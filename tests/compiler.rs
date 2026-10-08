@@ -2797,6 +2797,16 @@ fn a_word_cut_is_found_at_either_end_and_beside_any_script() {
         "retries = 3\ntimeout = 30",
         "retries = 5\ntimeout = 60",
     );
+    // A line ending at the start does not make a one-line `old` span lines.
+    refused("x = 1\ntimeout = 300\n", "\ntimeout = 30", "\ntimeout = 60");
+    refused(
+        "x = 1\r\ntimeout = 300\r\n",
+        "\ntimeout = 30",
+        "\ntimeout = 60",
+    );
+    // A cut between digits is a number cut, whatever unit letter follows.
+    refused("delay = 100µs\n", "delay = 10", "delay = 50");
+    refused("R1 = 10kΩ\n", "R1 = 1", "R1 = 4");
     // A non-ASCII word at one end does not excuse a cut number at the other.
     refused("x = 0\ncafé_count = 10\n", "count = 1", "count = 5");
     refused("Adresse:\nHauptstraße 12\n", "straße 1", "straße 3");
@@ -2906,5 +2916,37 @@ fn ambiguity_advice_names_lines_that_hold_one_whole_word_match() {
     assert_eq!(
         follow(both, "retries", "tries").unwrap().unwrap(),
         "a = 0\nif retries: retries -= 1\ntries = 4\n"
+    );
+}
+
+/// Ambiguity advice walks every match once, so a long repetitive `old` stays
+/// linear, and a match at the very start of a file with a BOM is on line 1.
+#[test]
+fn ambiguity_advice_is_linear_and_counts_a_bom_as_line_one() {
+    let text = format!("static const char pad[] = \"{}\";\n", "a".repeat(80_000));
+    let started = Instant::now();
+    let errors = compiled(&text, json!({"id":"w","old":"a".repeat(40_000),"new":"b"})).unwrap_err();
+    assert_eq!(errors[0].code, "TARGET_AMBIGUOUS");
+    let errors = compiled(
+        &"a".repeat(2_000_000),
+        json!({"id":"w","old":"aa","new":"b"}),
+    )
+    .unwrap_err();
+    assert_eq!(errors[0].code, "TARGET_AMBIGUOUS");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    let errors = compiled(
+        "\u{feff}name = 1\n\u{feff}name = 1\n",
+        json!({"id":"w","old":"\u{feff}name = 1","new":"name = 2"}),
+    )
+    .unwrap_err();
+    assert_eq!(errors[0].code, "TARGET_AMBIGUOUS");
+    assert!(
+        errors[0].message.contains("\"in\":[1,1]"),
+        "{}",
+        errors[0].message
     );
 }

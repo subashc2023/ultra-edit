@@ -133,10 +133,11 @@ read. Empty `old` is rejected with `EMPTY_TARGET`; insert with `after` instead,
 and give `after` nonempty text (`EMPTY_INSERTION`). `after` keeps its line, so
 text whose leading lines restate the lines ending at it is refused
 (`INSERT_REPEATS_LINE`, 8 or more visible characters in those lines) unless
-other changes in the call delete each of them. Drop the restated lines
-from `new`, or send the named `lines` replacement if the following lines of
-`new` were copied from the file too; a `lines` replacement that gives lines
-twice duplicates them on purpose. `in` takes lines or a span ID, never literal
+other changes in the call delete each of them and any copied lines below.
+Drop the restated lines from `new`, or send the named `lines` replacement if
+the following lines of `new` were copied from the file too; when another change
+also edits those lines, follow the message, which names one route. A `lines`
+replacement that gives lines twice duplicates them on purpose. `in` takes lines or a span ID, never literal
 text.
 
 `old` must start and end on word boundaries: a match that begins or ends
@@ -144,9 +145,10 @@ inside an ASCII word or number, such as `retries = 2` inside `max_retries = 20`
 or `2.3.1` inside `v2.3.1`, is `OLD_INSIDE_WORD`, since text written without
 reading the file can match a longer name by accident. Extend `old` to whole
 words, or add `"count":1` to replace part of a word on purpose. Words with
-cased non-ASCII letters (`Hauptstraße`) and escapes such as `\nRestart` are
-exempt, and an `old` spanning lines may end inside a word; Han, kana, and
-other uncased scripts separate words.
+cased non-ASCII letters near the cut (`Hauptstraße`) and escapes such as
+`\nRestart` are exempt, and an `old` spanning lines may end inside a word; Han,
+kana, and other uncased scripts separate words, and a cut between two digits
+always counts.
 
 A line range `rA..rB` works as a `span` or `in` when the base disclosed every
 line from A to B, for instance across a range continued with another range. It

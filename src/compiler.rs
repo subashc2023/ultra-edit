@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::{Range, RangeInclusive};
 
@@ -30,6 +30,9 @@ pub const MIN_GUARD_CHARS: usize = 8;
 /// How far a word is read on each side of a match boundary, to quote it and to
 /// look for non-ASCII letters.
 const WORD_CHARS: usize = 40;
+/// Matches ambiguity advice examines for one alone in its lines, which bounds
+/// the word checks a long run of matches costs.
+const ADVISED_MATCHES: usize = 10_000;
 /// Change IDs an `EOL_ADAPTED` warning names before counting the rest.
 const ADAPTED_IDS: usize = 3;
 
@@ -150,9 +153,11 @@ impl LineIndex {
         self.bodies[line - 1].clone()
     }
 
-    /// The line holding byte `offset`.
+    /// The line holding byte `offset`; a leading BOM belongs to line 1.
     fn line_of(&self, offset: usize) -> usize {
-        self.bodies.partition_point(|body| body.start <= offset)
+        self.bodies
+            .partition_point(|body| body.start <= offset)
+            .max(1)
     }
 
     /// Where the line's terminator ends: the next body's start, or the text's end.
@@ -1070,6 +1075,10 @@ struct FileContext<'a> {
     /// Insertions whose text starts by restating lines that they keep, refused
     /// once the file's other changes show those lines stay.
     restated: Vec<Restated<'a>>,
+    /// Where each line compared for a restatement ends without trailing
+    /// whitespace, so the run search trims a line once however many
+    /// insertions compare it.
+    trimmed: RefCell<HashMap<usize, usize>>,
 }
 
 impl<'a> FileContext<'a> {
@@ -1083,7 +1092,20 @@ impl<'a> FileContext<'a> {
             adapted: Vec::new(),
             extents: HashMap::new(),
             restated: Vec::new(),
+            trimmed: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Line `number`'s body without trailing whitespace.
+    fn trimmed(&self, number: usize) -> &'a str {
+        let base: &'a Snapshot = self.base;
+        let body = self.lines().body(number);
+        let end = *self
+            .trimmed
+            .borrow_mut()
+            .entry(number)
+            .or_insert_with(|| body.start + base.text[body.clone()].trim_end().len());
+        &base.text[body.start..end]
     }
 
     /// Whether LF-only text is adapted for this base.
@@ -1379,8 +1401,9 @@ fn visible(text: &str) -> usize {
 /// compared without trailing whitespace, as when `expect` or the lines to
 /// replace were copied into the text. Restated lines with fewer than
 /// `MIN_GUARD_CHARS` visible characters, such as a lone `}`, may repeat on
-/// purpose. Equal lines above can make several runs match: the one `expect`
-/// spans is what a copied `expect` restates, and otherwise the longest.
+/// purpose. Equal lines above can make several runs match; the longest is
+/// named, since dropping a shorter one leaves text that restates the anchor
+/// again.
 fn restated_lines<'a>(
     change: &'a Change,
     context: &FileContext,
@@ -1391,37 +1414,29 @@ fn restated_lines<'a>(
     if line == 0 || line > lines.count() {
         return None;
     }
-    let body = |number: usize| context.base.text[lines.body(number)].trim_end();
+    let body = |number: usize| context.trimmed(number);
     let text = text.strip_suffix('\n').unwrap_or(text);
     fn trimmed(piece: &str) -> &str {
         piece.strip_suffix('\r').unwrap_or(piece).trim_end()
     }
     let pieces: Vec<&str> = text.split('\n').take(RESTATED_LINES).map(trimmed).collect();
-    let restates = |first: usize| {
-        (first..=line)
-            .zip(&pieces)
-            .all(|(number, piece)| body(number) == *piece)
-            && (first..=line)
-                .map(|number| visible(body(number)))
-                .sum::<usize>()
-                >= MIN_GUARD_CHARS
-    };
     let lowest = (line + 1).saturating_sub(pieces.len()).max(1);
-    let spanned = match &change.target {
-        Target::Insert {
-            expect: Some(expect),
-            ..
-        } => expect
-            .strip_suffix('\n')
-            .unwrap_or(expect)
-            .split('\n')
-            .count(),
-        _ => 0,
+    // The lines a run may take, and visible characters summed from the anchor
+    // up, so a run too faint to count is passed over without comparing it.
+    let window: Vec<&str> = (lowest..=line).map(body).collect();
+    let mut shown = vec![0; window.len() + 1];
+    for (index, line) in window.iter().enumerate().rev() {
+        shown[index] = shown[index + 1] + visible(line);
+    }
+    let restates = |first: usize| {
+        let from = first - lowest;
+        shown[from] >= MIN_GUARD_CHARS
+            && window[from..]
+                .iter()
+                .zip(&pieces)
+                .all(|(line, piece)| line == piece)
     };
-    let first = (line + 1)
-        .checked_sub(spanned)
-        .filter(|&first| spanned > 0 && first >= lowest && restates(first))
-        .or_else(|| (lowest..=line).find(|&first| restates(first)))?;
+    let first = (lowest..=line).find(|&first| restates(first))?;
     let kept = line + 1 - first;
     let more = text
         .split('\n')
@@ -1438,10 +1453,78 @@ fn restated_lines<'a>(
     })
 }
 
-/// Refuses each restating insertion unless other changes in the file delete
-/// every restated line that has text: changes apply to the original file, so
-/// those lines then appear once. A line another change rewrites would appear
-/// both rewritten and as restated.
+/// What the other changes in a file leave of a restated line.
+#[derive(Clone, Copy, PartialEq)]
+enum Fate {
+    /// No other change touches it, so the restated copy repeats it.
+    Kept,
+    /// Deleted, or replaced with other lines by a change that also replaces
+    /// lines around it with text that does not hold it.
+    Removed,
+    /// Rewritten in place, so its new version and the restated copy of its old
+    /// text would both appear.
+    Edited,
+    /// Replaced with other text by a change reaching past it, which may drop it
+    /// or rewrite it: only the caller knows.
+    Unclear,
+}
+
+/// Judges line `number` by what `others`, the file's other changes near it, write.
+fn fate(context: &FileContext, others: &[&Replacement], number: usize) -> Fate {
+    let text = &context.base.text;
+    let lines = context.lines();
+    let body = lines.body(number);
+    let kept = text[body.clone()].trim();
+    if kept.is_empty() {
+        return Fate::Removed;
+    }
+    let (start, end) = (body.start, lines.end(number));
+    let mut touching: Vec<_> = others
+        .iter()
+        .filter(|other| {
+            (other.start < body.end && other.end > body.start)
+                || (other.start == other.end && body.start < other.start && other.start < body.end)
+        })
+        .collect();
+    if touching.is_empty() {
+        return Fate::Kept;
+    }
+    let holds = |written: &str| written.lines().any(|piece| piece.trim() == kept);
+    if touching
+        .iter()
+        .any(|other| other.start < start || other.end > end)
+    {
+        return if touching.iter().all(|other| visible(&other.text) == 0) {
+            Fate::Removed
+        } else if touching.iter().any(|other| holds(&other.text)) {
+            Fate::Edited
+        } else {
+            Fate::Unclear
+        };
+    }
+    touching.sort_by_key(|other| other.start);
+    let (mut written, mut cursor) = (String::new(), start);
+    for other in touching {
+        // Overlapping changes are refused on their own.
+        if other.start < cursor {
+            continue;
+        }
+        written.push_str(&text[cursor..other.start]);
+        written.push_str(&other.text);
+        cursor = other.end;
+    }
+    written.push_str(&text[cursor..end]);
+    if visible(&written) == 0 {
+        Fate::Removed
+    } else {
+        Fate::Edited
+    }
+}
+
+/// Refuses each restating insertion unless other changes in the file remove
+/// every restated line that has text, and every copied line below it:
+/// changes apply to the original file, so those lines then appear once. A line
+/// another change rewrites would appear in both versions.
 fn refuse_restatements(
     context: &FileContext,
     replacements: &[Replacement],
@@ -1456,76 +1539,99 @@ fn refuse_restatements(
             last,
             bare,
         } = *restated;
-        let (low, high) = (lines.body(first).start, lines.body(line).end);
+        let (low, high) = (lines.body(first).start, lines.end(last));
         let near: Vec<_> = replacements
             .iter()
             .filter(|other| other.change_id != change.id && other.start <= high && other.end >= low)
             .collect();
-        let deleted = (first..=line).map(|number| lines.body(number)).all(|body| {
-            visible(&context.base.text[body.clone()]) == 0
-                || near.iter().any(|other| {
-                    other.start <= body.start
-                        && other.end >= body.end
-                        && other.start < other.end
-                        && visible(&other.text) == 0
-                })
-        });
-        if deleted {
-            continue;
-        }
-        let edited = (first..=line).map(|number| lines.body(number)).any(|body| {
-            near.iter()
-                .any(|other| other.start < body.end && other.end > body.start)
-        });
+        let fates: Vec<_> = (first..=line)
+            .map(|number| fate(context, &near, number))
+            .collect();
+        let verdict = if fates.iter().all(|fate| *fate == Fate::Removed) {
+            if (line + 1..=last).all(|number| fate(context, &near, number) == Fate::Removed) {
+                continue;
+            }
+            Verdict::BelowKept
+        } else if fates.contains(&Fate::Unclear) {
+            Verdict::Unclear
+        } else if fates.contains(&Fate::Edited) {
+            Verdict::Edited
+        } else {
+            Verdict::Kept
+        };
         let Target::Insert { after, .. } = change.target else {
             continue;
-        };
-        let named = |low: usize, high: usize| {
-            if low == high {
-                format!("line {low}")
-            } else {
-                format!("lines {low}-{high}")
-            }
-        };
-        let kept = named(first, line);
-        let (they, them, their) = if first == line {
-            ("it", "it", "its")
-        } else {
-            ("they", "them", "their")
-        };
-        let message = if edited {
-            let below = if last > line {
-                format!(
-                    "; its next lines equal {} too, so drop those as well if they were copied",
-                    named(line + 1, last)
-                )
-            } else {
-                String::new()
-            };
-            format!(
-                "after:{after} keeps {kept}, which another change edits, and new starts with {their} original text, so both versions would appear; drop {them} from new{below}"
-            )
-        } else if bare {
-            format!(
-                "after:{after} keeps {kept}, and new only repeats {}; to repeat text on purpose, send lines:[{first},{last}] with those lines given twice",
-                named(first, last)
-            )
-        } else if last > line {
-            format!(
-                "after:{after} keeps {kept}, and new starts with {their} text, so {they} would appear twice; its next lines equal {} too. If copied, send this new as lines:[{first},{last}]; if new, drop {kept} from new",
-                named(line + 1, last)
-            )
-        } else {
-            format!(
-                "after:{after} keeps {kept}, and new starts with {their} text, so {they} would appear twice; drop {them} from new, or send this new as lines:[{first},{line}] instead"
-            )
         };
         diagnostics.push(at(
             Some(&context.base.path),
             Some(change),
             "INSERT_REPEATS_LINE",
-            message,
+            restatement_message(after, [first, line, last], bare, verdict),
         ));
+    }
+}
+
+/// Why a restating insertion is refused.
+#[derive(Clone, Copy)]
+enum Verdict {
+    Kept,
+    Edited,
+    Unclear,
+    /// The restated lines are removed, but copied lines below them stay.
+    BelowKept,
+}
+
+/// The refusal for an insertion `after` whose text restates lines
+/// `first..=line`, then lines down to `last`; within `MESSAGE_CHARS` at 8-digit
+/// line numbers.
+fn restatement_message(
+    after: usize,
+    [first, line, last]: [usize; 3],
+    bare: bool,
+    verdict: Verdict,
+) -> String {
+    let named = |low: usize, high: usize| {
+        if low == high {
+            format!("line {low}")
+        } else {
+            format!("lines {low}-{high}")
+        }
+    };
+    let kept = named(first, line);
+    let below = named(line + 1, last);
+    let (they, them, their) = if first == line {
+        ("it", "it", "its")
+    } else {
+        ("they", "them", "their")
+    };
+    let those = if line + 1 == last { "it" } else { "them" };
+    match verdict {
+        Verdict::Kept if bare => format!(
+            "after:{after} keeps {kept} and new only repeats {}; to repeat text on purpose, send lines:[{first},{last}] with those lines given twice",
+            named(first, last)
+        ),
+        Verdict::Kept if last > line => format!(
+            "after:{after} keeps {kept} and new repeats {them} first, then {below} too; if copied, send this new as lines:[{first},{last}], and if new, drop {kept} from new"
+        ),
+        Verdict::Kept => format!(
+            "after:{after} keeps {kept} and new repeats {them} first, so {they} would appear twice; drop {them} from new, or send this new as lines:[{first},{line}]"
+        ),
+        Verdict::Edited if bare => format!(
+            "after:{after} keeps {kept}, which another change edits, and new only repeats {their} old text; drop this insertion, or give both versions in one lines change"
+        ),
+        Verdict::Edited if last > line => format!(
+            "after:{after} keeps {kept}, which another change edits, and new repeats {their} old text first; drop {them} from new, and if {below} were copied as well, drop {those} too and use after:{last}"
+        ),
+        Verdict::Edited => format!(
+            "after:{after} keeps {kept}, which another change edits, and new repeats {their} old text, so both versions would appear; drop {them} from new"
+        ),
+        Verdict::Unclear => format!(
+            "after:{after} repeats {kept}, which another change replaces along with other lines; send both as one lines change so the result is explicit"
+        ),
+        Verdict::BelowKept => format!(
+            "after:{after} repeats {}, but another change deletes only {kept}; send one change with this new instead: lines:[{first},{last}] if {below} were copied, else lines:[{first},{line}]",
+            named(first, last)
+        ),
     }
 }
 
@@ -1607,12 +1713,12 @@ fn resolve_exact(
             let mut lines = line_numbers(&base.text, &starts);
             lines.dedup();
             let noun = if lines.len() == 1 { "line" } else { "lines" };
-            let advice = match alone_lines(context.lines(), &base.text, start..end, old) {
-                Ok((first, last)) => format!(
+            let advice = match advice(context.lines(), &base.text, start..end, old) {
+                Advice::Alone(first, last) => format!(
                     "add surrounding text to `old`, or restrict it with \"in\":[{first},{last}]"
                 ),
-                Err(true) => "add surrounding text to `old`".to_owned(),
-                Err(false) => {
+                Advice::Context => "add surrounding text to `old`".to_owned(),
+                Advice::InsideWords => {
                     "each match is inside a longer word; copy whole words from those lines into `old`"
                         .to_owned()
                 }
@@ -1688,10 +1794,13 @@ fn resolve_exact(
 /// Where a match of `old` at `start` cuts an ASCII word, such as `retries = 2`
 /// inside `max_retries = 20`: text written without reading the file can match
 /// a longer name or number by accident. Only the start of an `old` spanning
-/// lines counts, since its last line may end on part of a name as context. A
-/// word holding cased non-ASCII letters, such as `Hauptstraße`, is prose that
-/// callers cut to avoid typing them, while uncased scripts such as Han separate
-/// words; a letter after a backslash, as in `\nRestart`, is an escape.
+/// lines counts, since its last line may end on part of a name as context; line
+/// endings at either end of `old` do not make it span lines. A word holding
+/// cased non-ASCII letters within `WORD_CHARS` of the cut, such as
+/// `Hauptstraße`, is prose that callers cut to avoid typing them, while uncased
+/// scripts such as Han separate words; a cut between two digits is a number
+/// cut whatever follows, as in `100µs`. A letter after a backslash, as in
+/// `\nRestart`, is an escape.
 fn word_cut(text: &str, start: usize, old: &str) -> Option<usize> {
     let bytes = text.as_bytes();
     let word = |at: usize| {
@@ -1713,11 +1822,16 @@ fn word_cut(text: &str, start: usize, old: &str) -> Option<usize> {
             .chain(text[at..].chars().take_while(letter).take(WORD_CHARS))
             .all(|ch| ch.is_ascii())
     };
+    let digits = |at: usize| bytes[at - 1].is_ascii_digit() && bytes[at].is_ascii_digit();
     let line = old.strip_suffix('\n').unwrap_or(old);
+    let line = line
+        .strip_prefix("\r\n")
+        .or_else(|| line.strip_prefix('\n'))
+        .unwrap_or(line);
     let end = (!line.contains('\n')).then_some(start + old.len());
     std::iter::once(start)
         .chain(end)
-        .find(|&at| joined(at) && ascii(at))
+        .find(|&at| joined(at) && (digits(at) || ascii(at)))
 }
 
 /// Names the ASCII word that `boundary` cuts, clipped, and its line.
@@ -1741,26 +1855,29 @@ fn inside_word(text: &str, boundary: usize) -> String {
     )
 }
 
-/// The lines of the first whole-word match of `old` in `range` that no other
-/// match shares, which `in` then finds alone. Otherwise whether any match was
-/// whole words.
-fn alone_lines(
-    lines: &LineIndex,
-    text: &str,
-    range: Range<usize>,
-    old: &str,
-) -> Result<(usize, usize), bool> {
-    let scope = &text[range.clone()];
-    let step = old.chars().next().map_or(1, char::len_utf8);
-    let mut starts = std::iter::successors(scope.find(old), |&at| {
-        scope[at + step..].find(old).map(|next| at + step + next)
-    })
-    .map(|at| range.start + at)
-    .peekable();
+/// What ambiguity advice can offer for `old` in a scope.
+enum Advice {
+    /// `in` lines where a whole-word match is the only match.
+    Alone(usize, usize),
+    /// Every match examined shares its lines or cuts a word.
+    Context,
+    /// Every match cuts a word.
+    InsideWords,
+}
+
+/// Finds the first whole-word match of `old` in `range` that no other match
+/// shares lines with, which `in` with those lines then finds alone.
+fn advice(lines: &LineIndex, text: &str, range: Range<usize>, old: &str) -> Advice {
+    let mut starts = overlapping_starts(&text[range.clone()], old)
+        .map(|at| range.start + at)
+        .peekable();
     // A final line feed ends the match's last line, which `in` already includes.
     let spanned = old.strip_suffix('\n').unwrap_or(old).matches('\n').count();
-    let (mut previous, mut whole) = (None, false);
-    while let Some(at) = starts.next() {
+    let (mut previous, mut whole, mut examined) = (None, false, 0);
+    while examined < ADVISED_MATCHES
+        && let Some(at) = starts.next()
+    {
+        examined += 1;
         if word_cut(text, at, old).is_none() {
             whole = true;
             let first = lines.line_of(at);
@@ -1769,12 +1886,43 @@ fn alone_lines(
             if previous.is_none_or(|before| before < low)
                 && starts.peek().is_none_or(|&after| after + old.len() > high)
             {
-                return Ok((first, last));
+                return Advice::Alone(first, last);
             }
         }
         previous = Some(at);
     }
-    Err(whole)
+    if whole || examined == ADVISED_MATCHES {
+        Advice::Context
+    } else {
+        Advice::InsideWords
+    }
+}
+
+/// Overlapping starts of `old` in `source`, found lazily by KMP so a long,
+/// repetitive `old` stays linear.
+fn overlapping_starts<'s>(source: &'s str, old: &'s str) -> impl Iterator<Item = usize> + 's {
+    let needle = old.as_bytes();
+    let prefix = prefix_table(needle);
+    let mut bytes = source.bytes().enumerate();
+    let mut matched = 0;
+    std::iter::from_fn(move || {
+        if needle.is_empty() {
+            return None;
+        }
+        for (index, byte) in bytes.by_ref() {
+            while matched > 0 && byte != needle[matched] {
+                matched = prefix[matched - 1];
+            }
+            if byte == needle[matched] {
+                matched += 1;
+            }
+            if matched == needle.len() {
+                matched = prefix[matched - 1];
+                return Some(index + 1 - needle.len());
+            }
+        }
+        None
+    })
 }
 
 fn push_replacement(
@@ -2364,4 +2512,32 @@ fn resource_limit(base: &Snapshot, change: &Change) -> Diagnostic {
             "A plan supports at most {MAX_REPLACEMENTS} total replacements and {MAX_TEXT_BYTES} total inserted bytes"
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Responses clip messages at 240 characters, which would cut the advice.
+    #[test]
+    fn restatement_messages_fit_at_eight_digit_lines() {
+        let (first, line) = (99_999_990, 99_999_996);
+        for verdict in [
+            Verdict::Kept,
+            Verdict::Edited,
+            Verdict::Unclear,
+            Verdict::BelowKept,
+        ] {
+            for bare in [false, true] {
+                for [first, last] in [[first, line + 2], [line, line + 1], [first, line]] {
+                    // Only copied lines below can stay when the restated ones go.
+                    if matches!(verdict, Verdict::BelowKept) && last == line {
+                        continue;
+                    }
+                    let message = restatement_message(line + 1, [first, line, last], bare, verdict);
+                    assert!(message.chars().count() <= 240, "{message}");
+                }
+            }
+        }
+    }
 }

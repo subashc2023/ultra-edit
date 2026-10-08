@@ -355,7 +355,7 @@ fn restated_runs_are_named_whole_and_their_advice_commits_cleanly() {
     assert_eq!(error.code, "INSERT_REPEATS_LINE");
     assert!(error.message.contains("keeps line 2"), "{}", error.message);
     assert!(
-        error.message.contains("equal line 3 too"),
+        error.message.contains("then line 3 too"),
         "{}",
         error.message
     );
@@ -392,7 +392,7 @@ fn lines_below_the_anchor_that_look_the_same_are_offered_as_new() {
         insert(4, Some(anchor), &format!("{anchor}{sibling}")),
     );
     assert_eq!(error.code, "INSERT_REPEATS_LINE");
-    assert!(error.message.contains("If copied"), "{}", error.message);
+    assert!(error.message.contains("if copied"), "{}", error.message);
     assert!(
         error.message.contains("if new, drop line 4 from new"),
         "{}",
@@ -488,10 +488,10 @@ fn a_restated_line_is_allowed_only_when_the_batch_deletes_it() {
     }
 }
 
-/// Equal lines above the anchor let several runs match; the one `expect` spans
-/// is named, so either remedy the message gives commits the intended bytes.
+/// Equal lines above the anchor let several runs match; the longest is named,
+/// so either remedy the message gives commits the same bytes.
 #[test]
-fn equal_lines_above_are_named_as_expect_spans_them() {
+fn equal_lines_above_are_named_as_the_longest_run() {
     let tick = "    sim.advance_tick()";
     let base = spanless(&format!(
         "def test():\n{tick}\n{tick}\n    assert sim.ok()\n"
@@ -503,7 +503,7 @@ fn equal_lines_above_are_named_as_expect_spans_them() {
     assert!(
         error
             .message
-            .contains("keeps lines 2-3, and new starts with their text"),
+            .contains("keeps lines 2-3 and new repeats them first"),
         "{}",
         error.message
     );
@@ -512,9 +512,16 @@ fn equal_lines_above_are_named_as_expect_spans_them() {
     assert_eq!(dropped.unwrap(), wanted);
     let replaced = outcome(&base, ends([2, 3], Some(tick), Some(tick), &new));
     assert_eq!(replaced.unwrap(), wanted);
-    // Restating the anchor alone with one line more: `expect` names the anchor.
+    // An `expect` naming the anchor alone does not shorten the run: dropping
+    // one tick would leave text that restates the anchor again.
     let error = rejected(&base, insert(3, Some(tick), &new));
-    assert!(error.message.contains("keeps line 3"), "{}", error.message);
+    assert!(
+        error.message.contains("keeps lines 2-3"),
+        "{}",
+        error.message
+    );
+    let dropped = outcome(&base, insert(3, Some(tick), "    sim.check()"));
+    assert_eq!(dropped.unwrap(), wanted);
 }
 
 /// Lines below the anchor are compared to the end of the copy, so the
@@ -530,7 +537,7 @@ fn a_long_copy_is_named_through_its_end() {
     assert!(
         error
             .message
-            .contains("If copied, send this new as lines:[1,450]"),
+            .contains("if copied, send this new as lines:[1,450]"),
         "{}",
         error.message
     );
@@ -573,6 +580,165 @@ fn restating_checks_stay_quick_beside_long_lines_and_many_insertions() {
         .collect();
     let errors = compile(&request(&base, changes), &bases(&base)).unwrap_err();
     assert_eq!(errors.len(), 999);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// Another change's effect on a restated line decides the advice: whitespace
+/// left behind is a deletion, a rewrite reaching past the line is the caller's
+/// to merge, and following the advice for an edited line keeps the new lines
+/// where they were written.
+#[test]
+fn advice_for_a_restated_line_another_change_touches_can_be_followed() {
+    let anchor = "    tax_table=resolve(region),";
+    let base = spanless(&format!("totals = compute(\n{anchor}\n)\n"));
+    let insertion = |text: &str| Change {
+        id: "i".into(),
+        target: Target::Insert {
+            after: 2,
+            expect: Some(anchor.into()),
+        },
+        text: text.into(),
+    };
+    let restating = format!("{anchor}\n    rounding=1,");
+    let wanted = format!("totals = compute(\n{anchor}\n    rounding=1,\n)\n");
+    // An `old` without the indentation leaves only whitespace: a deletion.
+    let cut = parsed(json!({"id":"o","old":"tax_table=resolve(region),","new":""}));
+    let plan = compile(
+        &request(&base, vec![cut, insertion(&restating)]),
+        &bases(&base),
+    );
+    assert_eq!(
+        plan.unwrap().files[0].output,
+        format!("totals = compute(\n    \n{anchor}\n    rounding=1,\n)\n")
+    );
+    // A rewrite of lines 1-2 may drop line 2 or rewrite it; only the caller knows.
+    let wide = parsed(
+        json!({"id":"o","old":format!("totals = compute(\n{anchor}"),"new":"totals = compute_all("}),
+    );
+    let errors = compile(
+        &request(&base, vec![wide, insertion(&restating)]),
+        &bases(&base),
+    )
+    .unwrap_err();
+    assert!(
+        errors[0].message.contains("send both as one lines change"),
+        "{}",
+        errors[0].message
+    );
+    // An insertion that only repeats an edited line is dropped, not emptied.
+    let token = || parsed(json!({"id":"o","old":"resolve(region)","new":"resolve(country)"}));
+    let errors = compile(
+        &request(&base, vec![token(), insertion(anchor)]),
+        &bases(&base),
+    )
+    .unwrap_err();
+    assert!(
+        errors[0].message.contains("drop this insertion"),
+        "{}",
+        errors[0].message
+    );
+    let _ = wanted;
+
+    // Copied lines below an edited anchor: dropping them all and inserting below
+    // the last copied line keeps the new line under the line it reads.
+    let text = "def connect(host):\n    timeout = 30\n    retries = 3\n    return Client(host, timeout, retries)\n";
+    let base = spanless(text);
+    let edit = || parsed(json!({"id":"o","old":"timeout = 30","new":"timeout = 60"}));
+    let copied = Change {
+        id: "i".into(),
+        target: Target::Insert {
+            after: 2,
+            expect: Some("    timeout = 30".into()),
+        },
+        text: "    timeout = 30\n    retries = 3\n    backoff = retries * 2".into(),
+    };
+    let errors = compile(&request(&base, vec![edit(), copied]), &bases(&base)).unwrap_err();
+    let message = &errors[0].message;
+    assert!(message.contains("another change edits"), "{message}");
+    assert!(message.contains("use after:3"), "{message}");
+    let followed = Change {
+        id: "i".into(),
+        target: Target::Insert {
+            after: 3,
+            expect: Some("    retries = 3".into()),
+        },
+        text: "    backoff = retries * 2".into(),
+    };
+    let plan = compile(&request(&base, vec![edit(), followed]), &bases(&base));
+    assert_eq!(
+        plan.unwrap().files[0].output,
+        "def connect(host):\n    timeout = 60\n    retries = 3\n    backoff = retries * 2\n    return Client(host, timeout, retries)\n"
+    );
+}
+
+/// A deleted anchor re-inserted with the line below it copied too would leave
+/// that line twice, so the batch is refused with both readings.
+#[test]
+fn a_deleted_restated_line_with_copied_lines_below_is_refused() {
+    let text = "def connect(host):\n    timeout = 30\n    retries = 3\n    return Client(host)\n";
+    let base = spanless(text);
+    let insertion = Change {
+        id: "i".into(),
+        target: Target::Insert {
+            after: 2,
+            expect: Some("    timeout = 30".into()),
+        },
+        text: "    timeout = 30\n    retries = 3\n    backoff = 2.0".into(),
+    };
+    let mut deleted = ends([2, 2], Some("    timeout = 30"), None, "");
+    deleted.id = "d".into();
+    let errors = compile(
+        &request(&base, vec![deleted, insertion.clone()]),
+        &bases(&base),
+    )
+    .unwrap_err();
+    let message = &errors[0].message;
+    assert!(message.contains("deletes only line 2"), "{message}");
+    // Reading one: line 3 was copied, so one change replaces lines 2-3.
+    assert!(
+        message.contains("lines:[2,3] if line 3 were copied"),
+        "{message}"
+    );
+    let both = ends(
+        [2, 3],
+        Some("    timeout = 30"),
+        Some("    retries = 3"),
+        &insertion.text,
+    );
+    assert_eq!(
+        outcome(&base, both).unwrap(),
+        "def connect(host):\n    timeout = 30\n    retries = 3\n    backoff = 2.0\n    return Client(host)\n"
+    );
+    // Reading two: the lines are new, sent as one replacement of line 2.
+    assert!(message.contains("else lines:[2,2]"), "{message}");
+    let one = ends([2, 2], Some("    timeout = 30"), None, &insertion.text);
+    assert_eq!(
+        outcome(&base, one).unwrap(),
+        "def connect(host):\n    timeout = 30\n    retries = 3\n    backoff = 2.0\n    retries = 3\n    return Client(host)\n"
+    );
+}
+
+/// Lines are trimmed once per file, so insertions that start with blank lines
+/// beside long whitespace-only lines stay cheap.
+#[test]
+fn blank_led_insertions_beside_whitespace_lines_are_checked_quickly() {
+    let blank = " ".repeat(1_000);
+    let text = format!("{}value = 1\n", format!("{blank}\n").repeat(200));
+    let base = snapshot("full.txt".into(), text);
+    let new = format!("{}value = 2", "\n".repeat(199));
+    let changes: Vec<Change> = (0..1_000)
+        .map(|index| {
+            let mut change = insert(200, None, &new);
+            change.id = format!("i{index}");
+            change
+        })
+        .collect();
+    let started = Instant::now();
+    let _ = compile(&request(&base, changes), &bases(&base));
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "{:?}",
