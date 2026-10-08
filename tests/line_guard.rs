@@ -80,10 +80,11 @@ fn an_array_expect_keeps_an_empty_last_line() {
     assert_eq!(rejected(&full, change).code, "EXPECTED_TEXT_MISMATCH");
 }
 
-/// A guard is strong when it matches one place, however short it is, and weak when
-/// it matches more, however it is given.
+/// A guard is strong when it is long, since repeated lines such as `port = 8080`
+/// are what line numbers tell apart, or when it matches one place; a short guard
+/// that matches elsewhere too is weak.
 #[test]
-fn a_guard_must_match_one_place() {
+fn a_guard_must_be_long_or_match_one_place() {
     let unique = spanless("abcd\nefgh ijkl\n");
     for change in [
         ends([1, 1], Some("abcd"), None, "x"),
@@ -98,6 +99,16 @@ fn a_guard_must_match_one_place() {
     ] {
         assert_eq!(rejected(&repeated, change).code, "LINE_GUARD_WEAK");
     }
+    let services = spanless(&"[service]\nport = 8080\n\n".repeat(4));
+    assert_eq!(
+        outcome(
+            &services,
+            ends([5, 5], Some("port = 8080"), None, "port = 9090")
+        )
+        .unwrap(),
+        "[service]\nport = 8080\n\n[service]\nport = 9090\n\n".to_owned()
+            + &"[service]\nport = 8080\n\n".repeat(2)
+    );
 }
 
 /// Past five places, a line's count is given as more than five.
@@ -163,7 +174,7 @@ fn a_weak_expect_is_quoted_without_a_trailing_space() {
     assert!(
         error
             .message
-            .starts_with("expect \"abcd\" matches 2 ranges"),
+            .starts_with("expect \"abcd\" is short and matches 2 ranges"),
         "{}",
         error.message
     );

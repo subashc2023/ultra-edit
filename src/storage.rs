@@ -221,8 +221,9 @@ impl Storage {
             if error.code == "TARGET_MISSING"
                 && let Some(near) = self.ending_like(path)
             {
+                // The diagnostic's file names the path asked for, so this one fits.
                 let near = crate::report::path_for_display(&near.to_string_lossy()).into_owned();
-                error.message = format!("{}; did you mean {near}?", error.message);
+                error.message = format!("No file exists there; did you mean {near}?");
             }
             error
         })?;
@@ -241,10 +242,14 @@ impl Storage {
         Ok(path)
     }
 
-    /// A workspace file whose path ends like `path`, which names none, as when a
-    /// directory was left out of an absolute path. Only paths under the root are
-    /// probed, and only after a miss.
+    /// A workspace file whose path ends like `path`, an absolute path outside the
+    /// root that names no file, as when a directory was left out of it. At least a
+    /// directory and the file name must match, so a file that only shares a name
+    /// is never offered. Only paths under the root are probed, and only after a miss.
     fn ending_like(&self, path: &Path) -> Option<PathBuf> {
+        if self.root.join(path).starts_with(&self.root) {
+            return None;
+        }
         let parts: Vec<&std::ffi::OsStr> = path
             .components()
             .filter_map(|component| match component {
@@ -252,7 +257,7 @@ impl Storage {
                 _ => None,
             })
             .collect();
-        (1..parts.len()).find_map(|skip| {
+        (1..parts.len().saturating_sub(1)).find_map(|skip| {
             let candidate =
                 fs::canonicalize(self.root.join(parts[skip..].iter().collect::<PathBuf>())).ok()?;
             (candidate.starts_with(&self.root)

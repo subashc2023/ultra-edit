@@ -95,7 +95,7 @@ fn errors_are_numbered_from_one_and_nested_under_their_file() {
         repair_error(
             json!({"reference":"p","changes":[{"id":"1.1","lines":[1,1],"expect":7,"new":""}]})
         ),
-        "change 1: `expect` takes the current text as a string, or for lines [first line, last line]"
+        "change 1: `expect` takes the current text as a string, or as an array of lines: for lines [first line, last line], for after the lines ending there"
     );
 }
 
@@ -106,17 +106,27 @@ fn expect_forms_parse_by_target_kind() {
             .map(|c| c.target)
             .map_err(|e| e.to_string())
     };
-    let form = "`expect` takes the current text as a string, or for lines [first line, last line]";
+    let form = "`expect` takes the current text as a string, or as an array of lines: for lines [first line, last line], for after the lines ending there";
     for bad in [
         json!({"lines":[1,2],"expect":[["a"],"b"],"new":""}),
         json!({"lines":[1,2],"expect":["a",null],"new":""}),
         json!({"lines":[1,2],"expect":[],"new":""}),
         json!({"lines":[1,2],"expect":5,"new":""}),
         json!({"lines":[1,2],"expect":{"a":1},"new":""}),
-        json!({"after":3,"expect":["a"],"new":"x"}),
+        json!({"after":3,"expect":[],"new":"x"}),
         json!({"span":"r1","expect":["a","b"],"new":"x"}),
     ] {
         assert_eq!(parse(bad.clone()).unwrap_err(), form, "{bad}");
+    }
+    // An insertion's array lists the lines ending at `after`, however many.
+    for (expect, joined) in [(json!(["a"]), "a"), (json!(["a", "b", ""]), "a\nb\n\n")] {
+        assert_eq!(
+            parse(json!({"after":3,"expect":expect,"new":"x"})).unwrap(),
+            Target::Insert {
+                after: 3,
+                expect: Some(joined.into())
+            }
+        );
     }
     assert_eq!(
         parse(json!({"lines":[1,3],"expect":["a","b","c"],"new":""})).unwrap(),
@@ -312,7 +322,7 @@ fn the_mcp_surface_advertises_the_shorthand() {
     );
     assert_eq!(
         response["result"]["content"][0]["text"],
-        "failed to deserialize parameters: change 2: `expect` takes the current text as a string, or for lines [first line, last line]"
+        "failed to deserialize parameters: change 2: `expect` takes the current text as a string, or as an array of lines: for lines [first line, last line], for after the lines ending there"
     );
 }
 
