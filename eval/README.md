@@ -116,6 +116,11 @@ stay byte-identical, and no file may be added or removed.
 | `bump-version-in-context` | Intent-level: bump the package's own version where the same string also pins another dependency and appears in history |
 | `remove-deprecated-option` | Intent-level: remove an option's parser entry, handler, config field, docs, and tests, beside a look-alike option that stays |
 | `rename-function-not-method` | Intent-level: rename a module function and its references, but not methods, other modules' functions, or prose with the same name |
+| `rename-css-class` | Intent-level: rename a CSS class across HTML (one CRLF template), CSS, JavaScript, a test, and a style guide, beside hyphenated names that contain it: another class, custom properties, a data attribute, and an id |
+| `collapse-feature-flag` | Intent-level: retire a feature flag, keeping the flag-on branches dedented one level, deleting the old path, its import, tests, and docs row, beside a same-shaped `if`/`else` on another flag |
+| `change-default-timeout` | Intent-level: raise a default from 10 to 15 where it is defined, stated, or shown, beside another default of 10 on the next line, numbers containing 10, history, and explicit test values |
+| `rename-yaml-key-in-section` | Intent-level: rename one section's `pool_size` key in YAML (one CRLF file), Python lookups, docs, and test snippets, while two other sections keep a key of the same name |
+| `move-function-between-modules` | Intent-level: move a function and its regex constant to another module at stated positions, split and rewrite imports, and move its docs entry and links |
 | `edit-while-file-changes` | Stale file: another writer changes `settings.py` after the model reads it and again after its first write there, shifting the lines it edits and rewording one of them |
 
 A task may also hold a `concurrent.json`, which simulates another writer (a

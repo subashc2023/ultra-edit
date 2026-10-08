@@ -55,8 +55,13 @@ NEW_TASKS = [
 # Prompts describe the change without quoting the lines, so a model must read to find them.
 INTENT_TASKS = [
     "bump-version-in-context",
+    "change-default-timeout",
+    "collapse-feature-flag",
+    "move-function-between-modules",
     "remove-deprecated-option",
+    "rename-css-class",
     "rename-function-not-method",
+    "rename-yaml-key-in-section",
 ]
 # Another writer changes a file during the run (concurrent.json).
 STALE_TASKS = ["edit-while-file-changes"]

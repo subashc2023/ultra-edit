@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fernhill Library</title>
+  <link rel="stylesheet" href="/static/css/buttons.css">
+</head>
+<body>
+  <header class="site-header">
+    <a class="site-header__brand" href="/">Fernhill Library</a>
+    <nav class="toolbar" aria-label="Account">
+      <a class="btn btn-primary-outline" href="/account">My account</a>
+      <a class="btn btn-primary" href="/card">Get a library card</a>
+    </nav>
+  </header>
+
+  <main id="content">
+    <section class="hero">
+      <h1>Find your next book</h1>
+      <p>Search the catalog of all four Fernhill branches, then reserve a copy
+        for pickup at the branch nearest you.</p>
+
+      <form class="search-form" action="/catalog" method="get" role="search">
+        <label for="q">Title, author, or subject</label>
+        <input id="q" name="q" type="search" required>
+        <!-- One primary button per group of actions; see docs/style-guide.md. -->
+        <div class="form-actions" role="group">
+          <button type="submit" class="btn btn-primary btn-large">Search the catalog</button>
+          <a class="btn btn-link" href="/catalog/advanced">Advanced search</a>
+        </div>
+      </form>
+    </section>
+
+    <section class="opening-hours">
+      <h2>Opening hours</h2>
+      <ul>
+        <li>Orchard Lane: Tuesday to Saturday, 9:00 to 18:00</li>
+        <li>Riverside: Monday to Friday, 10:00 to 19:00</li>
+        <li>Hilltop: Wednesday and Saturday, 9:00 to 13:00</li>
+        <li>Old Mill: Thursday to Sunday, 11:00 to 17:00</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <p>Fernhill Library, 12 Orchard Lane. Questions? Ask at any branch desk.</p>
+    <a class="btn btn-primary-outline btn-small" href="#content">Back to top</a>
+  </footer>
+</body>
+</html>

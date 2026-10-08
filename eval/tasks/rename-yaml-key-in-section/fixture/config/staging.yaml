@@ -1,0 +1,14 @@
+# Staging overrides, merged on top of config/base.yaml.
+#
+# Staging shares its database server with QA, so the database keeps the base
+# pool size. Only the cache pool size goes up, for the nightly load tests.
+
+database:
+  url: postgresql://parcelhub@db.staging.internal:5432/parcelhub_staging
+
+cache:
+  url: redis://cache.staging.internal:6379/0
+  pool_size: 6
+
+logging:
+  level: DEBUG

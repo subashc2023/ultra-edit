@@ -1,0 +1,108 @@
+/*
+ * Buttons for Fernhill pages.
+ *
+ * Every button uses the .btn base class plus one variant class. The colors of
+ * the primary button come from custom properties, so a branch theme can
+ * override them on :root without repeating these rules.
+ * See docs/style-guide.md for when to use each variant.
+ */
+
+:root {
+  --btn-radius: 6px;
+  --btn-primary-bg: #1f6f5c;
+  --btn-primary-bg-hover: #185a4a;
+  --btn-primary-fg: #ffffff;
+  --btn-link-fg: #1f4f8f;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --btn-primary-bg: #3fae92;
+    --btn-primary-bg-hover: #5cc4a9;
+    --btn-primary-fg: #0b1f1a;
+    --btn-link-fg: #8db8f0;
+  }
+}
+
+.btn {
+  display: inline-block;
+  padding: 0.5rem 1rem;
+  border: 2px solid transparent;
+  border-radius: var(--btn-radius);
+  font: inherit;
+  font-weight: 600;
+  line-height: 1.25;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.btn-large {
+  padding: 0.75rem 1.5rem;
+  font-size: 1.125rem;
+}
+
+.btn-small {
+  padding: 0.25rem 0.5rem;
+  font-size: 0.875rem;
+}
+
+/* Primary button: the one main action in a view or a group of buttons. */
+.btn-primary {
+  background: var(--btn-primary-bg);
+  border-color: var(--btn-primary-bg);
+  color: var(--btn-primary-fg);
+}
+
+.btn-primary:hover,
+.btn-primary:focus-visible {
+  background: var(--btn-primary-bg-hover);
+  border-color: var(--btn-primary-bg-hover);
+}
+
+.btn-primary[disabled],
+.btn-primary.is-busy {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+/* Outline variant, for secondary actions next to a primary button. */
+.btn-primary-outline {
+  background: transparent;
+  border-color: var(--btn-primary-bg);
+  color: var(--btn-primary-bg);
+}
+
+.btn-primary-outline:hover,
+.btn-primary-outline:focus-visible {
+  background: var(--btn-primary-bg);
+  color: var(--btn-primary-fg);
+}
+
+.btn-link {
+  background: none;
+  color: var(--btn-link-fg);
+  text-decoration: underline;
+}
+
+/* The account toolbar in the site header uses slimmer buttons. */
+.toolbar .btn-primary,
+.toolbar .btn-primary-outline {
+  padding: 0.25rem 0.75rem;
+}
+
+.form-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+/* An outline button right after the primary button gets a little more room. */
+.form-actions .btn-primary + .btn-primary-outline {
+  margin-left: 0.5rem;
+}
+
+#btn-primary-help {
+  margin-top: 0.25rem;
+  font-size: 0.875rem;
+  color: #555555;
+}
