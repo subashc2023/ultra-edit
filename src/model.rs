@@ -97,27 +97,37 @@ pub struct EditRequest {
     /// Omit to derive it from the files.
     #[serde(default)]
     pub request_id: String,
+    #[serde(deserialize_with = "numbered_files")]
     pub files: Vec<FileRequest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FileRequest {
+    /// The file's absolute path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// A snapshot ID, for span targets.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub base: String,
+    #[serde(deserialize_with = "numbered_changes")]
     pub changes: Vec<Change>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
+/// One change in its canonical form, which is how it is stored, serialized, and
+/// hashed into a derived request ID. It is read from [`ChangeInput`], so callers may
+/// write the shorthand (`old`/`new`, `span`, `lines`, `after`) or this verbose form,
+/// and both spellings of one change derive the same ID.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ChangeInput")]
 pub struct Change {
     /// Unique per request; omit for its 1-based "{file}.{change}" position, e.g. "1.2".
-    #[serde(default)]
     pub id: String,
     pub target: Target,
     pub text: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Target {
     Exact {
@@ -125,14 +135,21 @@ pub enum Target {
         old: String,
         /// A disclosed span ID, not source text; omit to search the entire stored file.
         scope: Option<String>,
+        /// Whole lines `[first, last]` to search instead of a span scope.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lines: Option<[usize; 2]>,
     },
     All {
         old: String,
-        /// A disclosed span ID such as selection, r0, or a returned match ID; never source text.
-        scope: String,
+        /// A disclosed span ID such as selection, r0, or a returned match ID; never
+        /// source text. Omitted, the count guards a search of the whole stored file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
         /// Required number of non-overlapping occurrences, counted left to right.
-        #[schemars(range(min = 1))]
         expected: usize,
+        /// Whole lines `[first, last]` to search instead of a span scope.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lines: Option<[usize; 2]>,
     },
     Span {
         /// A span ID disclosed by this exact base snapshot; never infer it from another read.
@@ -141,6 +158,369 @@ pub enum Target {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expect: Option<String>,
     },
+    /// Whole lines `[first, last]`, terminators included. Text lacking a final line
+    /// feed inherits the last line's terminator; empty text deletes the lines.
+    Lines {
+        lines: [usize; 2],
+        /// The first lines of the range, compared line by line without line endings.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect: Option<String>,
+        /// The last lines of the range, compared like `expect`, so a range whose
+        /// numbers went stale inside it is caught at its end too.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect_last: Option<String>,
+    },
+    /// Whole lines inserted after line `after`; 0 inserts before line 1.
+    Insert {
+        after: usize,
+        /// The lines ending at `after`, compared line by line without line endings.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect: Option<String>,
+    },
+}
+
+/// A change as callers write it. Exactly one of `old`, `span`, `lines`, or `after`
+/// picks the target, or a verbose `target` gives it in canonical form; `text` is an
+/// alias of `new`. Fields that are not plain strings are read as JSON values so a
+/// mistake gets a message that teaches the accepted form.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeInput {
+    #[serde(default)]
+    id: String,
+    old: Option<String>,
+    new: Option<String>,
+    text: Option<String>,
+    count: Option<serde_json::Value>,
+    #[serde(rename = "in")]
+    within: Option<serde_json::Value>,
+    span: Option<String>,
+    lines: Option<serde_json::Value>,
+    after: Option<serde_json::Value>,
+    expect: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "verbose_target")]
+    target: Option<Target>,
+}
+
+/// Reads a verbose `target` directly, so serde still rejects duplicate keys in it.
+fn verbose_target<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Target>, D::Error> {
+    Target::deserialize(deserializer)
+        .map(Some)
+        .map_err(|error| serde::de::Error::custom(format!("invalid `target`: {error}")))
+}
+
+/// Reads a sequence, prefixing an element's error with its 1-based position, so a
+/// refused batch says which file or change to fix.
+fn numbered<'de, D, T>(deserializer: D, noun: &'static str) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct Numbered<T> {
+        noun: &'static str,
+        element: std::marker::PhantomData<T>,
+    }
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for Numbered<T> {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(formatter, "an array of {}s", self.noun)
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<T>, A::Error> {
+            let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(64));
+            loop {
+                let position = items.len() + 1;
+                match seq.next_element() {
+                    Ok(Some(item)) => items.push(item),
+                    Ok(None) => return Ok(items),
+                    Err(error) => {
+                        let error = error.to_string();
+                        // A change's error inside a file's reads "file 2, change 3: ...";
+                        // a change's own message may also begin with "change".
+                        let nested = error
+                            .strip_prefix("change ")
+                            .filter(|rest| rest.starts_with(|ch: char| ch.is_ascii_digit()))
+                            .map(|rest| rest.trim_start_matches(|ch: char| ch.is_ascii_digit()))
+                            .is_some_and(|rest| rest.starts_with(": ") || rest.starts_with(", "));
+                        let separator = if nested { ", " } else { ": " };
+                        return Err(serde::de::Error::custom(format!(
+                            "{} {position}{separator}{error}",
+                            self.noun
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    deserializer.deserialize_seq(Numbered {
+        noun,
+        element: std::marker::PhantomData,
+    })
+}
+
+fn numbered_files<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<FileRequest>, D::Error> {
+    numbered(deserializer, "file")
+}
+
+pub(crate) fn numbered_changes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<Change>, D::Error> {
+    numbered(deserializer, "change")
+}
+
+impl TryFrom<ChangeInput> for Change {
+    type Error = String;
+
+    fn try_from(input: ChangeInput) -> Result<Self, String> {
+        let text = match (input.new, input.text) {
+            (Some(_), Some(_)) => return Err("give `new` or `text`, not both".into()),
+            (Some(text), None) | (None, Some(text)) => Some(text),
+            (None, None) => None,
+        };
+        let selectors: Vec<&str> = [
+            ("old", input.old.is_some()),
+            ("span", input.span.is_some()),
+            ("lines", input.lines.is_some()),
+            ("after", input.after.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, given)| given.then_some(name))
+        .collect();
+        if let Some(target) = input.target {
+            let shorthand = !selectors.is_empty()
+                || input.within.is_some()
+                || input.count.is_some()
+                || input.expect.is_some();
+            if shorthand {
+                return Err("change mixes verbose `target` with shorthand fields (old/span/lines/after/in/count/expect); use one form".into());
+            }
+            let text = text.ok_or("verbose change needs `text` (the replacement; \"\" deletes)")?;
+            return Ok(Self {
+                id: input.id,
+                target,
+                text,
+            });
+        }
+        let text = text.ok_or("change needs `new` (the replacement text; \"\" deletes)")?;
+        match selectors.as_slice() {
+            [_] => {}
+            [] => {
+                return Err(
+                    "change needs one of old, span, lines, or after (or a verbose `target`)".into(),
+                );
+            }
+            [first, second, ..] => {
+                return Err(format!(
+                    "give exactly one of old, span, lines, or after (found {first} and {second})"
+                ));
+            }
+        }
+        if input.old.is_none() {
+            // `count: 1` asks for what every other target already does.
+            if input
+                .count
+                .as_ref()
+                .is_some_and(|count| count.as_u64() != Some(1))
+            {
+                return Err("`count` is a positive occurrence count and needs `old`".into());
+            }
+            if input.within.is_some() {
+                return Err(
+                    "`in` restricts `old`; it does not apply to span, lines, or after".into(),
+                );
+            }
+        } else if input.expect.is_some() {
+            return Err("`expect` guards span, lines, or after; with `old`, the old text is already the guard".into());
+        }
+        let (expect, expect_last) = match input.expect {
+            None => (None, None),
+            Some(serde_json::Value::String(expect)) => (Some(expect), None),
+            Some(value) if input.lines.is_some() => match expect_pair(value)? {
+                Ok([first, last]) => (Some(first), Some(last)),
+                Err(joined) => (Some(joined), None),
+            },
+            // An insertion's lines all end at `after`, so any number are one guard.
+            Some(value) if input.after.is_some() => match expect_pair(value)? {
+                Ok(pair) => (Some(joined_lines(&pair)), None),
+                Err(joined) => (Some(joined), None),
+            },
+            Some(_) => return Err(EXPECT_FORM.into()),
+        };
+        let target = if let Some(old) = input.old {
+            let (scope, lines) = match input.within {
+                Some(within) => scope_input(within)?,
+                None => (None, None),
+            };
+            match input.count {
+                Some(count) => Target::All {
+                    old,
+                    scope,
+                    expected: count_input(&count)?,
+                    lines,
+                },
+                None => Target::Exact { old, scope, lines },
+            }
+        } else if let Some(span) = input.span {
+            Target::Span { span, expect }
+        } else if let Some(lines) = input.lines {
+            Target::Lines {
+                lines: lines_input(&lines)?,
+                expect,
+                expect_last,
+            }
+        } else {
+            let after = input.after.as_ref().and_then(serde_json::Value::as_u64);
+            Target::Insert {
+                after: after
+                    .and_then(|after| usize::try_from(after).ok())
+                    .ok_or("after takes a line number such as 12; 0 inserts before line 1")?,
+                expect,
+            }
+        };
+        Ok(Self {
+            id: input.id,
+            target,
+            text,
+        })
+    }
+}
+
+const EXPECT_FORM: &str = "`expect` takes the current text as a string, or as an array of lines: for lines [first line, last line], for after the lines ending there";
+
+/// Reads an array `expect` of a lines target: two strings are its first and last
+/// lines; any other number of strings are its lines in order, joined.
+fn expect_pair(value: serde_json::Value) -> Result<Result<[String; 2], String>, String> {
+    let serde_json::Value::Array(items) = value else {
+        return Err(EXPECT_FORM.into());
+    };
+    let mut lines = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            serde_json::Value::String(line) => lines.push(line),
+            _ => return Err(EXPECT_FORM.into()),
+        }
+    }
+    Ok(match <[String; 2]>::try_from(lines) {
+        Ok(pair) => Ok(pair),
+        Err(lines) if !lines.is_empty() => Err(joined_lines(&lines)),
+        Err(_) => return Err(EXPECT_FORM.into()),
+    })
+}
+
+/// Lines as one line-wise `expect`.
+fn joined_lines(lines: &[String]) -> String {
+    let mut joined = lines.join("\n");
+    // A final LF only ends the last line, so an empty last line needs its own.
+    if lines.last().is_some_and(String::is_empty) {
+        joined.push('\n');
+    }
+    joined
+}
+
+const LINES_FORM: &str = "lines must be [first,last] with 1 <= first <= last, e.g. [146,150]";
+
+/// Reads `lines` given as `[a, b]`, `[a]`, `a`, `"a"`, or `"a-b"`; all are canonicalized
+/// to the pair, so every spelling derives the same request ID.
+fn lines_input(value: &serde_json::Value) -> Result<[usize; 2], String> {
+    if let Some(text) = value.as_str()
+        && text.trim_start().starts_with(['r', 'R'])
+    {
+        return Err(
+            "lines takes numbers like [146,150]; span IDs such as r146..r150 go in `span`".into(),
+        );
+    }
+    line_pair(value).ok_or_else(|| LINES_FORM.into())
+}
+
+fn line_pair(value: &serde_json::Value) -> Option<[usize; 2]> {
+    let number = |value: &serde_json::Value| usize::try_from(value.as_u64()?).ok();
+    let [first, last] = match value {
+        serde_json::Value::Number(_) => [number(value)?; 2],
+        serde_json::Value::Array(pair) => match pair.as_slice() {
+            [first, last] => [number(first)?, number(last)?],
+            // One line given alone, as in `[8]`.
+            [line] => [number(line)?; 2],
+            _ => return None,
+        },
+        serde_json::Value::String(text) => {
+            let parse = |digits: &str| {
+                let digits = digits.trim();
+                (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+                    .then(|| digits.parse().ok())
+                    .flatten()
+            };
+            match text.split_once('-') {
+                Some((first, last)) => [parse(first)?, parse(last)?],
+                None => [parse(text)?; 2],
+            }
+        }
+        _ => return None,
+    };
+    (1 <= first && first <= last).then_some([first, last])
+}
+
+/// Reads `in`: a span ID string, or lines in any form `lines` accepts.
+fn scope_input(value: serde_json::Value) -> Result<(Option<String>, Option<[usize; 2]>), String> {
+    let numeric = match &value {
+        serde_json::Value::String(text) => text.trim().starts_with(|ch: char| ch.is_ascii_digit()),
+        serde_json::Value::Number(_) | serde_json::Value::Array(_) => true,
+        _ => false,
+    };
+    match value {
+        serde_json::Value::String(span) if !numeric => Ok((Some(span), None)),
+        _ if numeric => Ok((
+            None,
+            Some(line_pair(&value).ok_or(format!("`in` {LINES_FORM}"))?),
+        )),
+        _ => Err("`in` takes a span ID such as \"r12\" or lines like [72,87]".into()),
+    }
+}
+
+fn count_input(value: &serde_json::Value) -> Result<usize, String> {
+    match value.as_u64().map(usize::try_from) {
+        Some(Ok(0)) => Err("`count` must be at least 1: how many times `old` occurs".into()),
+        Some(Ok(count)) => Ok(count),
+        _ => Err("`count` takes a whole number: how many times `old` occurs".into()),
+    }
+}
+
+/// Describes the accepted change forms. The verbose `target` stays opaque, so the
+/// schema a client pays for on every call lists only the shorthand.
+impl schemars::JsonSchema for Change {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Change".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let line = serde_json::json!({"type": "integer", "minimum": 1});
+        let pair =
+            serde_json::json!({"type": "array", "items": line, "minItems": 2, "maxItems": 2});
+        let lines = pair.clone();
+        // `text` (an alias of `new`) and the verbose `target` are accepted but not
+        // advertised, so the schema every call pays for teaches one spelling.
+        schemars::json_schema!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Omit; repair names the change to replace."},
+                "old": {"type": "string"},
+                "new": {"type": "string"},
+                "count": {"type": "integer", "minimum": 1},
+                "in": {"anyOf": [pair, {"type": "string"}]},
+                "lines": lines,
+                "after": {"type": "integer", "minimum": 0},
+                "expect": {
+                    "anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2}],
+                    "description": "The line's current text, or [first line, last line]; exact bytes for span."
+                },
+                "span": {"type": "string", "description": "A span ID the base disclosed."}
+            }
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -431,4 +811,332 @@ pub fn new_id(prefix: &str) -> String {
 pub fn digest(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    fn parse(value: Value) -> Result<Change, String> {
+        serde_json::from_value(value).map_err(|error| error.to_string())
+    }
+
+    fn change(target: Target, text: &str) -> Change {
+        Change {
+            id: String::new(),
+            target,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn each_shorthand_maps_to_its_canonical_change_and_serialization() {
+        let exact = |scope: Option<&str>, lines| Target::Exact {
+            old: "a".into(),
+            scope: scope.map(str::to_owned),
+            lines,
+        };
+        for (input, target, canonical) in [
+            (
+                json!({"old":"a","new":"b"}),
+                exact(None, None),
+                json!({"kind":"exact","old":"a","scope":null}),
+            ),
+            (
+                json!({"old":"a","new":"b","in":"r5"}),
+                exact(Some("r5"), None),
+                json!({"kind":"exact","old":"a","scope":"r5"}),
+            ),
+            (
+                json!({"old":"a","new":"b","in":[72,87]}),
+                exact(None, Some([72, 87])),
+                json!({"kind":"exact","old":"a","scope":null,"lines":[72,87]}),
+            ),
+            (
+                json!({"old":"a","new":"b","count":3}),
+                Target::All {
+                    old: "a".into(),
+                    scope: None,
+                    expected: 3,
+                    lines: None,
+                },
+                json!({"kind":"all","old":"a","expected":3}),
+            ),
+            (
+                json!({"old":"a","new":"b","count":2,"in":"selection"}),
+                Target::All {
+                    old: "a".into(),
+                    scope: Some("selection".into()),
+                    expected: 2,
+                    lines: None,
+                },
+                json!({"kind":"all","old":"a","scope":"selection","expected":2}),
+            ),
+            (
+                json!({"span":"r2..r4","new":"b","expect":"x"}),
+                Target::Span {
+                    span: "r2..r4".into(),
+                    expect: Some("x".into()),
+                },
+                json!({"kind":"span","span":"r2..r4","expect":"x"}),
+            ),
+            (
+                json!({"lines":[146,150],"new":"b","expect":"x"}),
+                Target::Lines {
+                    lines: [146, 150],
+                    expect: Some("x".into()),
+                    expect_last: None,
+                },
+                json!({"kind":"lines","lines":[146,150],"expect":"x"}),
+            ),
+            // `count: 1` is what every target does, so it is accepted anywhere.
+            (
+                json!({"lines":[146,150],"new":"b","expect":"x","count":1}),
+                Target::Lines {
+                    lines: [146, 150],
+                    expect: Some("x".into()),
+                    expect_last: None,
+                },
+                json!({"kind":"lines","lines":[146,150],"expect":"x"}),
+            ),
+            (
+                json!({"after":0,"text":"b"}),
+                Target::Insert {
+                    after: 0,
+                    expect: None,
+                },
+                json!({"kind":"insert","after":0}),
+            ),
+        ] {
+            let parsed = parse(input.clone()).unwrap();
+            assert_eq!(parsed, change(target, "b"), "{input}");
+            assert_eq!(
+                serde_json::to_value(&parsed).unwrap(),
+                json!({"id":"","target":canonical,"text":"b"}),
+                "{input}"
+            );
+            // The canonical form reads back as itself.
+            let verbose = serde_json::to_value(&parsed).unwrap();
+            assert_eq!(parse(verbose).unwrap(), parsed);
+        }
+    }
+
+    #[test]
+    fn every_spelling_of_lines_is_canonicalized() {
+        for lines in [
+            json!([7, 7]),
+            json!([7]),
+            json!(7),
+            json!("7"),
+            json!("7-7"),
+            json!(" 7 - 7 "),
+        ] {
+            let parsed = parse(json!({"lines":lines,"new":""})).unwrap();
+            assert_eq!(
+                parsed.target,
+                Target::Lines {
+                    lines: [7, 7],
+                    expect: None,
+                    expect_last: None
+                },
+                "{lines}"
+            );
+        }
+        let parsed = parse(json!({"old":"a","new":"b","in":"12-14"})).unwrap();
+        assert_eq!(
+            parsed.target,
+            Target::Exact {
+                old: "a".into(),
+                scope: None,
+                lines: Some([12, 14])
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_changes_are_rejected_with_the_accepted_form() {
+        for (input, message) in [
+            (
+                json!({"target":{"kind":"exact","old":"a"},"old":"a","text":"b"}),
+                "change mixes verbose `target` with shorthand fields (old/span/lines/after/in/count/expect); use one form",
+            ),
+            (
+                json!({"target":{"kind":"exact","old":"a"}}),
+                "verbose change needs `text` (the replacement; \"\" deletes)",
+            ),
+            (
+                json!({"old":"a"}),
+                "change needs `new` (the replacement text; \"\" deletes)",
+            ),
+            (
+                json!({"old":"a","new":"b","text":"c"}),
+                "give `new` or `text`, not both",
+            ),
+            (
+                json!({"new":"b"}),
+                "change needs one of old, span, lines, or after (or a verbose `target`)",
+            ),
+            (
+                json!({"old":"a","lines":[1,2],"new":"b"}),
+                "give exactly one of old, span, lines, or after (found old and lines)",
+            ),
+            (
+                json!({"span":"r1","count":2,"new":"b"}),
+                "`count` is a positive occurrence count and needs `old`",
+            ),
+            (
+                json!({"lines":[1,1],"count":0,"new":"b"}),
+                "`count` is a positive occurrence count and needs `old`",
+            ),
+            (
+                json!({"old":"a","count":0,"new":"b"}),
+                "`count` must be at least 1: how many times `old` occurs",
+            ),
+            (
+                json!({"old":"a","count":"all","new":"b"}),
+                "`count` takes a whole number: how many times `old` occurs",
+            ),
+            (
+                json!({"lines":[1,2],"in":"r1","new":"b"}),
+                "`in` restricts `old`; it does not apply to span, lines, or after",
+            ),
+            (
+                json!({"old":"a","expect":"a","new":"b"}),
+                "`expect` guards span, lines, or after; with `old`, the old text is already the guard",
+            ),
+            (
+                json!({"lines":[5,3],"new":"b"}),
+                "lines must be [first,last] with 1 <= first <= last, e.g. [146,150]",
+            ),
+            (
+                json!({"lines":0,"new":"b"}),
+                "lines must be [first,last] with 1 <= first <= last, e.g. [146,150]",
+            ),
+            (
+                json!({"lines":[1,2,3],"new":"b"}),
+                "lines must be [first,last] with 1 <= first <= last, e.g. [146,150]",
+            ),
+            (
+                json!({"lines":"r146..r150","new":"b"}),
+                "lines takes numbers like [146,150]; span IDs such as r146..r150 go in `span`",
+            ),
+            (
+                json!({"old":"a","in":[0,4],"new":"b"}),
+                "`in` lines must be [first,last] with 1 <= first <= last, e.g. [146,150]",
+            ),
+            (
+                json!({"old":"a","in":true,"new":"b"}),
+                "`in` takes a span ID such as \"r12\" or lines like [72,87]",
+            ),
+            (
+                json!({"after":-1,"new":"b"}),
+                "after takes a line number such as 12; 0 inserts before line 1",
+            ),
+            (
+                json!({"after":"12","new":"b"}),
+                "after takes a line number such as 12; 0 inserts before line 1",
+            ),
+        ] {
+            assert_eq!(parse(input.clone()).unwrap_err(), message, "{input}");
+        }
+        let target = parse(json!({"target":{"kind":"lines","lines":"3"},"text":"b"})).unwrap_err();
+        assert!(target.starts_with("invalid `target`: "), "{target}");
+        // Unknown keys list every accepted field.
+        let unknown = parse(json!({"old":"a","new":"b","replace_all":true})).unwrap_err();
+        assert!(
+            unknown.starts_with("unknown field `replace_all`, expected one of"),
+            "{unknown}"
+        );
+        for field in [
+            "id", "old", "new", "text", "count", "in", "span", "lines", "after", "expect", "target",
+        ] {
+            assert!(unknown.contains(&format!("`{field}`")), "{unknown}");
+        }
+    }
+
+    #[test]
+    fn a_lines_expect_may_give_the_first_and_last_lines() {
+        let parsed = parse(json!({"lines":[3,7],"expect":["fn a() {","}"],"new":""})).unwrap();
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap()["target"],
+            json!({"kind":"lines","lines":[3,7],"expect":"fn a() {","expect_last":"}"})
+        );
+        assert_eq!(
+            parse(serde_json::to_value(&parsed).unwrap()).unwrap(),
+            parsed
+        );
+        // Any other number of lines gives the range's lines in order.
+        let parsed = parse(json!({"lines":[3,5],"expect":["a","b","c"],"new":""})).unwrap();
+        assert_eq!(
+            parsed.target,
+            Target::Lines {
+                lines: [3, 5],
+                expect: Some("a\nb\nc".into()),
+                expect_last: None
+            }
+        );
+        // An insertion's array gives the lines ending at `after`.
+        let parsed = parse(json!({"after":2,"expect":["a","b"],"new":"x"})).unwrap();
+        assert_eq!(
+            parsed.target,
+            Target::Insert {
+                after: 2,
+                expect: Some("a\nb".into())
+            }
+        );
+        for input in [
+            json!({"span":"r1","expect":["a","b"],"new":"x"}),
+            json!({"lines":[1,2],"expect":[],"new":"x"}),
+            json!({"lines":[1,2],"expect":["a",1],"new":"x"}),
+        ] {
+            assert_eq!(parse(input.clone()).unwrap_err(), EXPECT_FORM, "{input}");
+        }
+    }
+
+    #[test]
+    fn errors_name_the_file_and_change_and_a_verbose_target_rejects_duplicate_keys() {
+        let error = serde_json::from_value::<EditRequest>(json!({"files":[
+            {"path":"a","changes":[{"old":"a","new":"b"}]},
+            {"path":"b","changes":[{"old":"a","new":"b"},{"old":"a","new":"b","text":"c"}]}
+        ]}))
+        .unwrap_err()
+        .to_string();
+        assert_eq!(error, "file 2, change 2: give `new` or `text`, not both");
+        let error = serde_json::from_value::<EditRequest>(
+            json!({"files":[{"path":"a","bases":"x","changes":[]}]}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.starts_with("file 1: unknown field `bases`"),
+            "{error}"
+        );
+        let error = serde_json::from_str::<Change>(
+            r#"{"target":{"kind":"exact","old":"keep","old":"drop"},"text":"b"}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.starts_with("invalid `target`: duplicate field `old`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_schema_lists_every_shorthand_field_and_requires_none() {
+        let schema = serde_json::to_value(schemars::schema_for!(Change)).unwrap();
+        let properties = schema["properties"].as_object().unwrap();
+        let mut fields: Vec<_> = properties.keys().map(String::as_str).collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "after", "count", "expect", "id", "in", "lines", "new", "old", "span"
+            ]
+        );
+        assert!(schema.get("required").is_none());
+        assert_eq!(schema["properties"]["count"]["minimum"], 1);
+    }
 }

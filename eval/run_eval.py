@@ -13,23 +13,31 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import csv
+import dataclasses
 import datetime
 import difflib
+import hashlib
 import json
 import os
 import platform
+import posixpath
 import random
 import re
 import shlex
 import shutil
 import signal
 import stat
+import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import traceback
 from collections import Counter
-from collections.abc import Container, Iterable, Mapping, Sequence
+from collections.abc import Collection, Container, Iterable, Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -40,8 +48,15 @@ DEFAULT_TASKS_DIR = EVAL_DIR / "tasks"
 DEFAULT_RESULTS_DIR = EVAL_DIR / "results"
 DEFAULT_PLUGIN_SOURCE = REPO_ROOT / "plugin" / "claude-code"
 DEFAULT_RUNTIME_DIR = REPO_ROOT / "target" / "release"
+THIRD_PARTY_DIR = EVAL_DIR / "third_party"
+DEFAULT_THIRD_PARTY_ARMS = THIRD_PARTY_DIR / "arms.json"
+DEFAULT_THIRD_PARTY_INSTALL = THIRD_PARTY_DIR / "install"
+THIRD_PARTY_README = "eval/third_party/README.md"
+# Each run's work directory, which holds the project, is a temporary directory named so.
+WORK_PREFIX = "ue-eval-"
 
-ARMS = ("native", "native-guard", "ultra-edit")
+# The arms that run when no --arm is given; --arm all adds every other arm.
+DEFAULT_ARMS = ("native", "native-guard", "ultra-edit")
 PLUGIN_NAME = "ultra-edit"
 # Plugin MCP tools are namespaced mcp__plugin_<plugin>_<server>__<tool>.
 ULTRA_TOOL_PREFIX = "mcp__plugin_ultra-edit_ultra-edit__"
@@ -51,7 +66,7 @@ KNOWN_PLUGIN_IDS = ("ultra-edit@ultra-edit", "ultra-edit@skills-dir")
 GUARD_HOOK_ARGS = ("--claude-hook", "PreToolUse")
 GUARD_HOOK_TIMEOUT_S = 30
 # The plugin's matcher: the guard classifies Bash and PowerShell commands.
-DEFAULT_GUARD_MATCHER = "Bash|PowerShell"
+DEFAULT_GUARD_MATCHER = "Bash|PowerShell|Write"
 RUNTIME_NAMES = ("ultra-edit", "ultra-edit-mcp", "ultra-edit.exe", "ultra-edit-mcp.exe")
 IGNORED_TOP_LEVEL = frozenset({".git", ".ultra-edit"})
 SCORED_OUTCOMES = ("pass", "fail", "timeout")
@@ -92,6 +107,37 @@ STRIPPED_ENV = (
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",
+    # Behavior knobs that a host (such as a cloud Claude Code session) can set for
+    # itself and that would otherwise change every arm's effort, tools, or MCP
+    # startup: the evaluation measures Claude Code's defaults.
+    "CLAUDE_EFFORT",
+    "CLAUDE_CODE_DEBUG",
+    "CLAUDE_CODE_DIAGNOSTICS_FILE",
+    "CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH",
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
+    "MCP_CONNECTION_NONBLOCKING",
+    "MCP_TOOL_TIMEOUT",
+    "ENABLE_TOOL_SEARCH",
+    "CLAUDE_AUTO_BACKGROUND_TASKS",
+    "CLAUDE_CODE_BG_TASKS_REPORT_RUNNING",
+    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_HOLD_UNANSWERED_PARKED_PERMISSION",
+    "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH",
+    "CLAUDE_CODE_TEE_SDK_STDOUT",
+    "CLAUDE_CODE_DISABLE_BUILTIN_ANTMCP",
+    "CLAUDE_CODE_USE_CCR_V2",
+    "CLAUDE_CODE_WORKER_EPOCH",
+    "CLAUDE_CODE_MODEL_CAPABILITIES",
+    "DOCUMENTS_MCP_SCRATCH_ROOT",
+    "AI_AGENT",
+)
+# Prefixes of host-specific variables that add tools or sync state into a session.
+STRIPPED_ENV_PREFIXES = (
+    "CLAUDE_CODE_ARTIFACT_",
+    "CLAUDE_CODE_REMOTE",
+    "CLAUDE_CODE_SYNC_",
+    "CLAUDE_CODE_MESSAGING_",
 )
 CHILD_ENV = {
     "DISABLE_AUTOUPDATER": "1",
@@ -145,10 +191,316 @@ INFRA_ERRORS = frozenset(
         "cloud_credential_error",
     }
 )
+# API errors worth retrying after a pause: the run never got a fair attempt.
+TRANSIENT_ERRORS = frozenset({"rate_limit", "overloaded", "server_error"})
+RETRY_BASE_DELAY_S = 60.0
 
 
 class EvalError(RuntimeError):
     """A task, configuration, or environment problem that stops the evaluation."""
+
+
+# ---------------------------------------------------------------------------
+# Arms
+
+
+NATIVE_EDIT_TOOL_NAMES = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+_SHELL_ONLY = (
+    "For this session the Edit, Write, MultiEdit, and NotebookEdit tools are unavailable. "
+    "Make every file change by "
+)
+_SERVER_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
+_ARM_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+@dataclass(frozen=True)
+class ArmSpec:
+    """How one arm differs from the others; everything else is shared."""
+
+    name: str
+    description: str
+    plugin: bool = False  # load the staged Ultra Edit plugin with --plugin-dir
+    guard_hook: bool = False  # install the shell guard PreToolUse hook in settings
+    disallowed_tools: tuple[str, ...] = ()
+    append_system_prompt: str | None = None
+    server_name: str | None = None  # third-party MCP server (see eval/third_party/)
+    mcp_server: Mapping[str, Any] | None = field(default=None, hash=False, compare=False)
+    edit_tools: tuple[str, ...] = NATIVE_EDIT_TOOL_NAMES  # full names; counted as edit calls
+    required_tools: tuple[str, ...] = ()  # full names that must be listed at init
+    method: str | None = None  # the method key in METHODS, enforced by a hook
+    # Full names of the tools whose commands the method hook checks.
+    method_tools: tuple[str, ...] = ("Bash",)
+    method_how: str | None = None  # how the prompt and hook name the method; else METHODS'
+
+    @property
+    def third_party(self) -> bool:
+        return self.server_name is not None
+
+    @property
+    def permission_rule(self) -> str | None:
+        return f"mcp__{self.server_name}" if self.server_name else None
+
+    def needs_flags(self) -> list[str]:
+        flags = []
+        if self.disallowed_tools:
+            flags.append("--disallowedTools")
+        if self.append_system_prompt:
+            flags.append("--append-system-prompt")
+        if self.mcp_server is not None:
+            flags.append("--mcp-config")
+        return flags
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "description": self.description,
+            "plugin": self.plugin,
+            "guard_hook": self.guard_hook,
+            "disallowed_tools": list(self.disallowed_tools),
+            "append_system_prompt": self.append_system_prompt,
+            "server_name": self.server_name,
+            "mcp_server": self.mcp_server,
+            "edit_tools": list(self.edit_tools),
+            "required_tools": list(self.required_tools),
+            "method": self.method,
+            "method_tools": list(self.method_tools),
+            "method_how": self.method_how,
+        }
+
+    @property
+    def how(self) -> str | None:
+        """How the method hook's denial names the arm's method."""
+        if self.method is None:
+            return None
+        return self.method_how or METHODS[self.method]
+
+
+# Shell arm methods: what the description names, and how the prompt and hook say it.
+SHELL_METHODS = {
+    "sed": ("sed/awk/perl", "running sed (or awk or perl one-liners) through the Bash tool"),
+    "python": (
+        "Python scripts",
+        "running Python 3 code through the Bash tool, for example python3 - <<'PY' ... PY",
+    ),
+    "patch": (
+        "git apply",
+        "applying unified diffs with git apply through the Bash tool, for example git apply <<'PATCH' ... PATCH",
+    ),
+}
+# Third-party MCP arms: no file writes through a shell at all, so the server's tools
+# make every change, as Ultra Edit's guard makes its arms use Ultra Edit.
+MCP_METHOD = "mcp"
+METHODS = {key: how for key, (_, how) in SHELL_METHODS.items()} | {
+    MCP_METHOD: "the MCP server's file-editing tools"
+}
+METHOD_HOOK = EVAL_DIR / "method_hook.py"
+# A task's concurrent.json makes this hook change a file while the model works on it.
+CONCURRENT_HOOK = EVAL_DIR / "concurrent_hook.py"
+CONCURRENT_SPEC = "concurrent.json"
+CONCURRENT_HOOK_TIMEOUT_S = 30
+METHOD_HOOK_TIMEOUT_S = 30
+METHOD_DENIAL = (
+    "This session measures editing by {how}, and that command writes files with another program, "
+    "so it was blocked. Make every file change by {how}. Other programs may read files and print "
+    "output, and > or tee may save that output under /tmp, but no other program may write files "
+    "itself, not even scratch files."
+)
+
+
+def _shell_arm(name: str, method: str) -> ArmSpec:
+    label, how = SHELL_METHODS[method]
+    return ArmSpec(
+        name,
+        f"Native tools without Edit/Write; every change through Bash with {label}.",
+        disallowed_tools=NATIVE_EDIT_TOOL_NAMES,
+        append_system_prompt=f"{_SHELL_ONLY}{how}. Commands that write files any other way are blocked.",
+        method=method,
+    )
+
+
+BUILTIN_ARMS: dict[str, ArmSpec] = {
+    spec.name: spec
+    for spec in (
+        ArmSpec("native", "Claude Code only: native Read/Edit/Write/Bash."),
+        ArmSpec("native-guard", "Native tools plus Ultra Edit's shell guard hook.", guard_hook=True),
+        ArmSpec("ultra-edit", "The full Ultra Edit plugin alongside native tools.", plugin=True),
+        ArmSpec(
+            "ultra-edit-only",
+            "The full Ultra Edit plugin with Edit/Write/MultiEdit/NotebookEdit disallowed.",
+            plugin=True,
+            disallowed_tools=NATIVE_EDIT_TOOL_NAMES,
+        ),
+        _shell_arm("shell-sed", "sed"),
+        _shell_arm("shell-python", "python"),
+        _shell_arm("shell-patch", "patch"),
+    )
+}
+
+
+@dataclass
+class ArmRegistry:
+    """Built-in arms plus the third-party arms from eval/third_party/arms.json."""
+
+    arms: dict[str, ArmSpec]
+    unavailable: dict[str, str] = field(default_factory=dict)  # arm name -> why it cannot run
+    third_party_servers: frozenset[str] = frozenset()  # every server name in arms.json
+    source: Path | None = None
+
+    def resolve(self, names: Sequence[str] | None) -> list[ArmSpec]:
+        """Arm specs for --arm values; none means the default arms, `all` every arm."""
+        requested = list(names or DEFAULT_ARMS)
+        expanded: list[str] = []
+        for name in requested:
+            if name == "all":
+                expanded += [*self.arms, *self.unavailable]
+            else:
+                expanded.append(name)
+        selected = list(dict.fromkeys(expanded))
+        problems = []
+        for name in selected:
+            if name in self.unavailable:
+                problems.append(f"arm {name!r} is unavailable: {self.unavailable[name]}")
+            elif name not in self.arms:
+                problems.append(f"unknown arm {name!r}")
+        if problems:
+            available = ", ".join([*self.arms, "all"])
+            raise EvalError(
+                "; ".join(problems)
+                + f". Available arms: {available}. Third-party arms are configured in "
+                + f"{self.source or DEFAULT_THIRD_PARTY_ARMS}; see {THIRD_PARTY_README} for setup."
+            )
+        return [self.arms[name] for name in selected]
+
+
+def _string_list(value: Any, what: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
+        raise ValueError(f"{what} must be a list of tool names")
+    return tuple(value)
+
+
+def full_tool_name(server_name: str, tool: str) -> str:
+    return tool if tool.startswith("mcp__") else f"mcp__{server_name}__{tool}"
+
+
+def third_party_arm(name: str, entry: Any) -> ArmSpec:
+    """One arms.json entry as an ArmSpec. Raises ValueError with the reason."""
+    if not isinstance(entry, dict):
+        raise ValueError("entry must be an object")
+    server_name = entry.get("server_name")
+    if not isinstance(server_name, str) or not _SERVER_NAME.match(server_name):
+        raise ValueError("server_name must be letters, digits, '_' or '-'")
+    if is_ultra_name(server_name):
+        raise ValueError("server_name must not name Ultra Edit")
+    server = entry.get("mcp_server")
+    if not isinstance(server, dict) or not isinstance(server.get("command"), str) or not server["command"]:
+        raise ValueError("mcp_server must be an object with a command")
+    if not isinstance(server.get("args", []), list) or not isinstance(server.get("env", {}), dict):
+        raise ValueError("mcp_server args must be a list and env an object")
+    prompt = entry.get("append_system_prompt")
+    if prompt is not None and not isinstance(prompt, str):
+        raise ValueError("append_system_prompt must be a string or null")
+    edit_tools = _string_list(entry.get("edit_tools"), "edit_tools")
+    if not edit_tools:
+        # Without them the server's edits and failures would not count as edit calls.
+        raise ValueError("edit_tools must name the server's file-changing tools")
+    required = _string_list(entry.get("required_tools"), "required_tools")
+    shells = _string_list(entry.get("shell_tools"), "shell_tools")
+    if "disallowed_tools" in entry:
+        disallowed = _string_list(entry.get("disallowed_tools"), "disallowed_tools")
+    else:
+        disallowed = NATIVE_EDIT_TOOL_NAMES
+    return ArmSpec(
+        name,
+        str(entry.get("description") or f"Third-party MCP server {server_name}."),
+        disallowed_tools=disallowed,
+        append_system_prompt=prompt or None,
+        server_name=server_name,
+        mcp_server=server,
+        edit_tools=tuple(full_tool_name(server_name, tool) for tool in edit_tools),
+        required_tools=tuple(full_tool_name(server_name, tool) for tool in required),
+        method=MCP_METHOD,
+        method_tools=("Bash", *(full_tool_name(server_name, tool) for tool in shells)),
+        method_how=f"the {server_name} MCP server's tools ({', '.join(edit_tools)})",
+    )
+
+
+def load_arm_registry(arms_file: Path | None = DEFAULT_THIRD_PARTY_ARMS) -> ArmRegistry:
+    """Built-in arms plus arms.json. A missing file adds nothing; a bad entry is unavailable."""
+    registry = ArmRegistry(dict(BUILTIN_ARMS), source=arms_file)
+    if arms_file is None or not Path(arms_file).is_file():
+        return registry
+    try:
+        data = json.loads(Path(arms_file).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise EvalError(f"cannot read {arms_file}: {error}; see {THIRD_PARTY_README}") from error
+    entries = data.get("arms") if isinstance(data, dict) else None
+    if not isinstance(entries, dict):
+        raise EvalError(f'{arms_file} must hold {{"arms": {{...}}}}; see {THIRD_PARTY_README}')
+    servers = set()
+    for name, entry in entries.items():
+        if isinstance(entry, dict) and isinstance(entry.get("server_name"), str):
+            servers.add(entry["server_name"])
+        if name in BUILTIN_ARMS or name == "all":
+            registry.unavailable[name] = f"{arms_file} redefines a built-in arm name"
+            continue
+        if not _ARM_NAME.match(name) or "__" in name:
+            # Arm names become run directory names (<task>__<arm>__r<rep>).
+            registry.unavailable[name] = f"{arms_file}: arm names must be letters, digits, '.', '_' or '-'"
+            continue
+        try:
+            registry.arms[name] = third_party_arm(name, entry)
+        except ValueError as error:
+            registry.unavailable[name] = f"{arms_file}: {error}"
+    registry.third_party_servers = frozenset(servers)
+    return registry
+
+
+def substitute_placeholders(value: Any, replacements: Mapping[str, str]) -> Any:
+    """Replace {repo} and {third_party_dir} in every string of a JSON value."""
+    if isinstance(value, str):
+        for key, replacement in replacements.items():
+            value = value.replace("{" + key + "}", replacement)
+        return value
+    if isinstance(value, list):
+        return [substitute_placeholders(item, replacements) for item in value]
+    if isinstance(value, dict):
+        return {key: substitute_placeholders(item, replacements) for key, item in value.items()}
+    return value
+
+
+def mcp_config(arm: ArmSpec, repo: Any, third_party_dir: Any) -> dict[str, Any]:
+    """The --mcp-config document for one run of a third-party arm."""
+    if arm.mcp_server is None or arm.server_name is None:
+        raise EvalError(f"arm {arm.name} has no MCP server")
+    replacements = {"repo": str(repo), "third_party_dir": str(third_party_dir)}
+    return {"mcpServers": {arm.server_name: substitute_placeholders(dict(arm.mcp_server), replacements)}}
+
+
+def _executable_found(command: str) -> bool:
+    if os.path.sep in command or (os.path.altsep and os.path.altsep in command):
+        return Path(command).is_file()
+    return shutil.which(command) is not None
+
+
+def third_party_problems(arm: ArmSpec, third_party_dir: Path) -> list[str]:
+    """Local checks for a third-party arm: its command (and any install path) exists."""
+    if arm.mcp_server is None:
+        return []
+    install = str(Path(third_party_dir).resolve())
+    server = mcp_config(arm, Path(tempfile.gettempdir()) / "ue-eval-dummy-repo", install)["mcpServers"][
+        arm.server_name
+    ]
+    problems = []
+    command = server["command"]
+    if not _executable_found(command):
+        problems.append(f"arm {arm.name}: MCP server command not found: {command}")
+    for item in server.get("args") or []:
+        if isinstance(item, str) and item.startswith(install) and not Path(item).exists():
+            problems.append(f"arm {arm.name}: missing install path {item}")
+    if problems:
+        problems[-1] += f" (install it as described in {THIRD_PARTY_README})"
+    return problems
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +514,8 @@ class Task:
     prompt: str
     fixture: dict[str, bytes]
     expected: dict[str, bytes]
+    # From concurrent.json: another writer's changes to one file during the run.
+    concurrent: dict[str, Any] | None = None
 
     def expected_tree(self) -> dict[str, bytes]:
         tree = dict(self.fixture)
@@ -218,7 +572,23 @@ def load_task(path: Path) -> Task:
         prompt = prompt_path.read_bytes().decode("utf-8")
     except UnicodeDecodeError as error:
         raise EvalError(f"task {path.name}: prompt.md is not UTF-8: {error}") from error
-    return Task(path.name, path, prompt, read_tree(fixture_dir), read_tree(expected_dir))
+    concurrent = None
+    spec_path = path / CONCURRENT_SPEC
+    if spec_path.exists():
+        try:
+            concurrent = _concurrent_module().load_spec(spec_path)
+        except ValueError as error:
+            raise EvalError(f"task {path.name}: {CONCURRENT_SPEC}: {error}") from error
+    return Task(path.name, path, prompt, read_tree(fixture_dir), read_tree(expected_dir), concurrent)
+
+
+def _concurrent_module() -> Any:
+    sys.path.insert(0, str(EVAL_DIR))
+    try:
+        import concurrent_hook
+    finally:
+        sys.path.remove(str(EVAL_DIR))
+    return concurrent_hook
 
 
 def validate_task(task: Task) -> list[str]:
@@ -237,7 +607,27 @@ def validate_task(task: Task) -> list[str]:
     for relative in sorted(task.fixture):
         if relative.split("/", 1)[0] in IGNORED_TOP_LEVEL:
             problems.append(f"fixture/{relative} is inside a directory the scorer ignores")
+    if task.concurrent is not None:
+        problems += _concurrent_problems(task)
     return problems
+
+
+def _concurrent_problems(task: Task) -> list[str]:
+    """The other writer's events must apply to the fixture in order, and the expected
+    file must keep what each one wrote."""
+    relative = task.concurrent["file"]
+    if relative not in task.fixture or relative not in task.expected:
+        return [f"{CONCURRENT_SPEC} names {relative}, which must be in fixture/ and expected/"]
+    try:
+        _concurrent_module().apply_all(task.fixture[relative], task.concurrent)
+    except LookupError as error:
+        return [f"{CONCURRENT_SPEC} does not apply to fixture/{relative}: {error}"]
+    return [
+        f"expected/{relative} lacks {change['new']!r} from {CONCURRENT_SPEC}"
+        for event in task.concurrent["events"]
+        for change in event["changes"]
+        if change["new"].encode("utf-8") not in task.expected[relative]
+    ]
 
 
 def discover_tasks(tasks_dir: Path, names: Sequence[str] | None = None) -> list[Task]:
@@ -352,10 +742,39 @@ class ToolCall:
 
 
 @dataclass
+class ApiCall:
+    """One model request. Stream lines that share a message id are one call."""
+
+    id: str
+    parent_tool_use_id: str | None
+    input_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    output_tokens: int = 0
+
+    @property
+    def context(self) -> int:
+        return self.input_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens
+
+    def absorb(self, usage: Mapping[str, Any]) -> None:
+        """Repeated lines repeat (or grow) the same usage: keep the largest value per field."""
+        for key in (
+            "input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "output_tokens",
+        ):
+            value = _number(usage.get(key))
+            if value is not None:
+                setattr(self, key, max(getattr(self, key), int(value)))
+
+
+@dataclass
 class Transcript:
     init: dict[str, Any] | None = None
     result: dict[str, Any] | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
+    api_calls: list[ApiCall] = field(default_factory=list)
     assistant_message_ids: list[str] = field(default_factory=list)
     hook_responses: list[dict[str, Any]] = field(default_factory=list)
     permission_denied_events: list[dict[str, Any]] = field(default_factory=list)
@@ -392,6 +811,7 @@ def parse_stream(lines: Iterable[str]) -> Transcript:
     transcript = Transcript()
     calls: dict[str, ToolCall] = {}
     seen_messages: set[str] = set()
+    api_calls: dict[str, ApiCall] = {}
     for raw in lines:
         raw = raw.strip()
         if not raw:
@@ -425,6 +845,15 @@ def parse_stream(lines: Iterable[str]) -> Transcript:
             if parent is None and isinstance(message_id, str) and message_id not in seen_messages:
                 seen_messages.add(message_id)
                 transcript.assistant_message_ids.append(message_id)
+            if body.get("model") != "<synthetic>":  # locally generated error messages
+                key = message_id if isinstance(message_id, str) else f"line-{transcript.lines}"
+                api_call = api_calls.get(key)
+                if api_call is None:
+                    api_call = api_calls[key] = ApiCall(key, parent)
+                    transcript.api_calls.append(api_call)
+                usage = body.get("usage")
+                if isinstance(usage, dict):
+                    api_call.absorb(usage)
             content = body.get("content")
             for block in content if isinstance(content, list) else []:
                 if not isinstance(block, dict) or block.get("type") != "tool_use":
@@ -540,7 +969,24 @@ _HEREDOC = re.compile(r"(?<!<)<<(?!<)-?[ \t]*(?:'([^'\n]*)'|\"([^\"\n]*)\"|\\?([
 _REDIRECT = re.compile(r"(?<![0-9&<>])>>?(?![>&|(])[ \t]*(?!/dev/(?:null|stdout|stderr|tty)\b)[^\s|;&<>()]")
 _SEGMENT_SPLIT = re.compile(r"\|\||&&|[|;\n]")
 _ECHO = re.compile(r"^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:builtin\s+|command\s+)?(?:echo|printf)\b")
-_IN_PLACE_FLAG = re.compile(r"\s(?:-(?!-)[A-Za-z]*i|--in-place)")
+# A flag cluster holding i (sed -i, perl -pi, perl -0pi), or --in-place.
+_IN_PLACE_FLAG = re.compile(r"\s(?:-(?!-)[A-Za-z0-9]*i|--in-place)")
+_IN_PLACE_EDITOR = re.compile(r"\b(?:g?sed|perl)\b")
+_AWK_IN_PLACE = re.compile(r"\b(?:g?awk|mawk|nawk)\b.*\s(?:-i\s*|--include[=\s]\s*)inplace(?:\.awk)?\b")
+# Edits that do not embed content in the command, so the guard allows them and they
+# are not Bash writes, but they still change files: applying a patch file, and a
+# filter's output redirected into a file (sed ... > f.tmp && mv f.tmp f).
+_ENV_PREFIX = r"^(?:env\s+)?(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"
+_PATCH_APPLY = re.compile(
+    _ENV_PREFIX
+    + r"(?:git(?:\s+-[Cc]\s+\S+|\s+--[A-Za-z-]+=\S+)*\s+apply\b"
+    + r"(?!.*\s--(?:check|stat|numstat|summary)\b)"
+    + r"|patch\b(?!.*\s--(?:dry-run|check)\b))"
+)
+_FILTER = re.compile(
+    _ENV_PREFIX + r"(?:g?sed|g?awk|mawk|nawk|perl|tr|grep|egrep|fgrep|cut|sort|uniq|head|tail|cat|iconv|jq|yq"
+    r"|envsubst|expand|unexpand|dos2unix|unix2dos)\b"
+)
 _TEE = re.compile(r"\btee\b(?:\s+-{1,2}[A-Za-z-]+)*\s+(?!/dev/(?:null|stdout|stderr|tty)\b)[^\s|;&<>()-]")
 _HEREDOC_WRITER = re.compile(r"\btee\b|\bgit\s+apply\b|\bpatch\b")
 _INTERPRETER = re.compile(
@@ -551,6 +997,7 @@ _POWERSHELL = re.compile(r"(?i)\b(?:pwsh|powershell)(?:\.exe)?\b")
 _WRITE_API = re.compile(
     r"\.write_text\(|\.write_bytes\(|(?<!stdout)(?<!stderr)\.write\("
     r"|\bopen\([^)\n]*,\s*['\"][rwa]?[wa]b?\+?['\"]"
+    r"|\bopen\s*\(?\s*(?:my\s+)?[$*]?\w+\s*,\s*['\"](?:\+?>|\+<)"
     r"|writeFileSync|appendFileSync|\bwriteFile\(|\bappendFile\(|\bFile\.write|\bIO\.write|file_put_contents"
 )
 _PS_WRITE = re.compile(
@@ -601,7 +1048,9 @@ def shell_write_kinds(command: Any, tool: str = "Bash") -> list[str]:
             continue
         if _ECHO.match(segment) and _REDIRECT.search(segment):
             kinds.add("echo_redirect")
-        if re.search(r"\b(?:sed|perl)\b", segment) and _IN_PLACE_FLAG.search(segment):
+        if (_IN_PLACE_EDITOR.search(segment) and _IN_PLACE_FLAG.search(segment)) or _AWK_IN_PLACE.search(
+            segment
+        ):
             kinds.add("in_place")
         if _TEE.search(segment):
             kinds.add("tee_write")
@@ -613,6 +1062,217 @@ def shell_write_kinds(command: Any, tool: str = "Bash") -> list[str]:
     ):
         kinds.add("powershell_write")
     return sorted(kinds)
+
+
+def shell_edit_kinds(command: Any) -> list[str]:
+    """Shell file edits that embed no content, so shell_write_kinds misses them:
+    patch_apply (git apply or patch, not a check or stat run) and filter_redirect
+    (sed, awk, perl, grep, ... with stdout redirected into a file). They count as edit
+    calls, so a failed `git apply fix.patch` is a failed edit, but not as Bash writes."""
+    if not isinstance(command, str) or not command.strip():
+        return []
+    kinds: set[str] = set()
+    body_free = _QUOTED.sub("''", _strip_heredoc_bodies(command))
+    for segment in _SEGMENT_SPLIT.split(body_free):
+        segment = segment.strip().lstrip("({ ").strip()
+        if _PATCH_APPLY.match(segment):
+            kinds.add("patch_apply")
+        elif _FILTER.match(segment) and "<<" not in segment and _REDIRECT.search(segment):
+            kinds.add("filter_redirect")
+    return sorted(kinds)
+
+
+# Output that shows a failed edit although the tool reported success. Bash returns the
+# exit status of its last command, so `python3 edit.py; git diff` hides the script's
+# traceback, and git apply or perl print errors from a command that still exits 0.
+_MASKED_SHELL = re.compile(
+    r"Traceback \(most recent call last\)|^\w*Error: |error: patch failed|patch does not apply"
+    r"|^sed: -e expression|^sed: can't read|Can't open .*: No such file|No such file or directory",
+    re.M,
+)
+_MISSING_COMMAND = re.compile(r"(?:^|[\s:])([\w.+-]+): command not found", re.M)
+# Programs whose absence means a shell edit could not run (a missing xxd or od cannot).
+WRITE_PROGRAMS = frozenset(
+    {"python", "python3", "py", "perl", "sed", "gsed", "awk", "gawk", "git", "patch", "node", "tee"}
+)
+
+
+# Programs that change files, by the shell arm method they belong to.
+_METHOD_PROGRAMS = {
+    "sed": "sed",
+    "gsed": "sed",
+    "awk": "sed",
+    "gawk": "sed",
+    "mawk": "sed",
+    "nawk": "sed",
+    "perl": "sed",
+    "node": "other",
+    "nodejs": "other",
+    "deno": "other",
+    "bun": "other",
+    "ruby": "other",
+    "php": "other",
+    "pwsh": "other",
+    "powershell": "other",
+}
+_COMMAND_WRAPPERS = frozenset({"env", "sudo", "command", "builtin", "nohup", "time", "exec", "xargs"})
+# A shell function definition's head: `name() {` or `function name {`.
+_FUNCTION_HEAD = re.compile(r"^(?:function\s+[\w-]+\s*(?:\(\))?|[A-Za-z_][\w-]*\s*\(\))\s*\{?\s*")
+# A redirection or tee into the temporary directory: scratch files, not project files,
+# unless the path is inside a run's work directory, which holds the project.
+_TEMP_TARGET = re.compile(
+    r"(>>?|\btee(?:\s+-a)?)[ \t]*([\"']?)(?:/tmp/|/var/tmp/|\$\{?TMPDIR\}?/?)"
+    rf"(?!{WORK_PREFIX})[^\s;&|<>()\"']*\2"
+)
+# The same with a relative target, which is scratch after a cd into the temporary directory.
+_RELATIVE_TARGET = re.compile(r"(>>?|\btee(?:\s+-a)?)[ \t]*([\"']?)(?![/$~&\"'])[^\s;&|<>()\"']+\2")
+_TEMP_DIR = re.compile(rf"(?:/tmp|/var/tmp|\$\{{?TMPDIR\}}?)(?:/(?!{WORK_PREFIX})\S*|/?)")
+_CD = re.compile(r"\s*\(?\s*cd\s+(?:--\s+)?(\S+)")
+_ASSIGN = re.compile(r"\s*([A-Za-z_]\w*)=(.*)")
+_SHELL_SEPARATOR = re.compile(r"(&&|\|\||[;|])")
+
+
+def _scratch_writes(command: str) -> str:
+    """The command with output that > or tee saves into the temporary directory sent to
+    /dev/null instead: absolute targets there, and relative ones after a cd into it (to
+    a path there, or to a variable set from one or from mktemp)."""
+    temp_vars: set[str] = set()
+    in_temp = False
+    lines: list[str] = []
+    pending: list[str] = []
+    for line in command.split("\n"):
+        if pending:
+            if line.lstrip("\t") == pending[0]:
+                pending.pop(0)
+            lines.append(line)
+            continue
+        pending.extend(
+            next(group for group in match.groups() if group is not None) for match in _HEREDOC.finditer(line)
+        )
+        pieces = _SHELL_SEPARATOR.split(line)
+        for index in range(0, len(pieces), 2):
+            if assign := _ASSIGN.match(pieces[index]):
+                value = assign.group(2).strip().strip("\"'")
+                if value.startswith("$(mktemp") or _TEMP_DIR.fullmatch(value):
+                    temp_vars.add(assign.group(1))
+            elif cd := _CD.match(pieces[index]):
+                target = cd.group(1).strip("\"')")
+                variable = re.match(r"\$\{?([A-Za-z_]\w*)", target)
+                if target.startswith("/") or variable:
+                    in_temp = bool(_TEMP_DIR.fullmatch(target)) or bool(variable and variable.group(1) in temp_vars)
+                elif target in ("-", "~") or target.startswith("~"):
+                    in_temp = False
+            piece = _TEMP_TARGET.sub(lambda match: f"{match.group(1)} /dev/null", pieces[index])
+            if in_temp:
+                piece = _RELATIVE_TARGET.sub(lambda match: f"{match.group(1)} /dev/null", piece)
+            pieces[index] = piece
+        lines.append("".join(pieces))
+    return "\n".join(lines)
+
+
+def shell_methods(command: Any) -> set[str]:
+    """The shell edit methods a command writes files with: sed (sed, awk, or perl run in
+    place or redirected into a file), python and other (node, ruby, ...) when the command
+    holds a file-write call, and patch (git apply, patch). Reads such as `sed -n` do not
+    count. Heredoc bodies and quoted text do not name programs, so inline code that
+    mentions sed is not a sed run."""
+    if not isinstance(command, str):
+        return set()
+    found: set[str] = set()
+    code_writes = bool(_WRITE_API.search(command))
+    body_free = _QUOTED.sub("''", _strip_heredoc_bodies(command))
+    for segment in _SEGMENT_SPLIT.split(body_free):
+        segment = _FUNCTION_HEAD.sub("", segment.strip().lstrip("({ ").strip())
+        words = segment.split()
+        while words and (
+            "=" in words[0].split("/")[0] or words[0] in _COMMAND_WRAPPERS or words[0].startswith("-")
+        ):
+            words.pop(0)
+        if words and words[0] == "timeout" and len(words) > 1:
+            words = words[2:]
+        if not words:
+            continue
+        program = words[0].replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
+        method = _METHOD_PROGRAMS.get(program)
+        if program == "git" or program == "patch":
+            if _PATCH_APPLY.match(" ".join(words)):
+                found.add("patch")
+        elif re.fullmatch(r"python[0-9.]*|py", program):
+            if code_writes:
+                found.add("python")
+        elif method == "sed":
+            in_place = (_IN_PLACE_FLAG.search(segment) and program != "awk") or _AWK_IN_PLACE.search(segment)
+            if in_place or _REDIRECT.search(segment) or (program == "perl" and code_writes):
+                found.add("sed")
+        elif method == "other" and code_writes:
+            found.add("other")
+    return found
+
+
+def method_command(tool_input: Any) -> str | None:
+    """The shell text a method tool runs: Bash's command, or a process tool's command or
+    input (Desktop Commander's start_process and interact_with_process)."""
+    if not isinstance(tool_input, dict):
+        return None
+    for key in ("command", "input"):
+        if isinstance(tool_input.get(key), str):
+            return tool_input[key]
+    return None
+
+
+def off_method_write(command: Any, method: str) -> bool:
+    """Whether a command writes files other than by `method`: it writes with another
+    method's program, or writes (by the write and edit heuristics) without its own.
+    Output that > or tee saves into the temporary directory, such as a patch built from
+    `sed -n` slices, does not count; another program writing even a scratch file does."""
+    if not isinstance(command, str):
+        return False
+    project = _scratch_writes(command)
+    used = shell_methods(project)
+    if not (used or shell_write_kinds(project) or shell_edit_kinds(project)):
+        return False
+    return method not in used or bool(used - {method})
+
+
+def mcp_reported_error(text: str) -> str | None:
+    """The reason in a {"result": "error", "reason": ...} that an MCP server returned as a
+    successful result (mcp-text-editor does this), else None."""
+    data = _json_object(text)
+    nested = data.get("result") if isinstance(data, dict) else None
+    if isinstance(nested, list):
+        for block in nested:
+            inner = _json_object(block.get("text")) if isinstance(block, dict) else None
+            if inner is not None:
+                data = inner
+                break
+    if not isinstance(data, dict):
+        return None
+    for candidate in [data, *(value for value in data.values() if isinstance(value, dict))]:
+        if candidate.get("result") == "error":
+            return str(candidate.get("reason") or "error")
+    return None
+
+
+def edit_call_failed(call: ToolCall, result: ToolResult | None) -> tuple[bool, bool]:
+    """(failed, masked) for an edit call that is not Ultra Edit's.
+
+    masked: the tool reported success but its output shows the edit failed. A shell edit
+    whose only error is a missing viewer (`sed -i ... && xxd f` without xxd) did write,
+    so it is not a failed edit although the tool reported an error."""
+    if result is None:
+        return (False, False)
+    text = result.text or ""
+    shell = call.name in SHELL_TOOLS
+    if result.is_error:
+        missing = set(_MISSING_COMMAND.findall(text))
+        if shell and text.startswith("Exit code 127") and missing and not (missing & WRITE_PROGRAMS):
+            return (False, False)
+        return (True, False)
+    if shell and _MASKED_SHELL.search(text):
+        return (True, True)
+    if call.name.startswith("mcp__") and mcp_reported_error(text) is not None:
+        return (True, True)
+    return (False, False)
 
 
 def hook_denied(event: Mapping[str, Any]) -> bool:
@@ -667,21 +1327,101 @@ def token_usage(result: Mapping[str, Any] | None) -> dict[str, Any]:
     return usage
 
 
-def compute_metrics(transcript: Transcript) -> dict[str, Any]:
+_DRIVE = re.compile(r"^[A-Za-z]:/")
+
+
+def _read_target(call: ToolCall, cwd: str | None) -> str | None:
+    """The normalized path a Read or Ultra Edit snapshot call reads, else None."""
+    if not isinstance(call.input, dict):
+        return None
+    if call.name == "Read":
+        path = call.input.get("file_path")
+    elif ultra_tool(call.name) == "ultra_edit_snapshot":
+        path = call.input.get("path")
+    else:
+        return None
+    if not isinstance(path, str) or not path:
+        return None
+    text = path.replace("\\", "/")
+    if cwd and not (text.startswith("/") or _DRIVE.match(text)):
+        text = cwd.replace("\\", "/").rstrip("/") + "/" + text
+    text = posixpath.normpath(text)
+    return text.lower() if _DRIVE.match(text) else text
+
+
+def _utf8_len(text: str) -> int:
+    return len(text.encode("utf-8", errors="replace"))
+
+
+def _input_bytes(value: Any) -> int:
+    return _utf8_len(json.dumps(value, separators=(",", ":"), ensure_ascii=False))
+
+
+def api_call_metrics(transcript: Transcript) -> dict[str, Any]:
+    """Per-request context and output, from assistant messages deduplicated by id."""
+    calls = transcript.api_calls
+    main = [call for call in calls if not call.parent_tool_use_id]
+    return {
+        "api_calls": len(calls),
+        "subagent_api_calls": len(calls) - len(main),
+        "first_call_context_tokens": main[0].context if main else None,
+        # 0 means a cold start: the shared system-and-tools prefix was not cached yet.
+        "first_call_cache_read_tokens": main[0].cache_read_input_tokens if main else None,
+        "peak_context_tokens": max((call.context for call in calls), default=None),
+        "context_tokens_total": sum(call.context for call in calls) if calls else None,
+        "output_tokens_calls": sum(call.output_tokens for call in calls) if calls else None,
+        "context_series": [[call.context, call.output_tokens] for call in main],
+    }
+
+
+def compute_metrics(
+    transcript: Transcript,
+    edit_tools: Collection[str] = (),
+    method: str | None = None,
+    method_tools: Collection[str] = ("Bash",),
+) -> dict[str, Any]:
+    """Run metrics. edit_tools adds full tool names (third-party MCP edit tools) to the
+    edit calls; native writes, content-writing shell commands, and Ultra Edit commits
+    always count. An arm's method adds counts of method_tools commands (Bash, or a
+    server's process tool) that write files another way: attempted, and run without an
+    error (past the method hook)."""
     by_name: Counter[str] = Counter()
     ultra_statuses: Counter[str] = Counter()
     write_kinds: Counter[str] = Counter()
+    edit_kinds: Counter[str] = Counter()
     counts: Counter[str] = Counter()
+    input_bytes: Counter[str] = Counter()
+    result_bytes: Counter[str] = Counter()
+    cwd = (transcript.init or {}).get("cwd")
+    read_paths: set[str] = set()
     for call in transcript.tool_calls:
         by_name[call.name] += 1
         result = call.result
+        input_bytes[call.name] += _input_bytes(call.input)
+        if result is not None:
+            result_bytes[call.name] += _utf8_len(result.text)
         if call.parent_tool_use_id:
             counts["subagent_tool_calls"] += 1
         if result is None:
             counts["unanswered_tool_calls"] += 1
         failed = result is not None and result.is_error
+        if method and call.name in method_tools and off_method_write(method_command(call.input), method):
+            counts["off_method_attempts"] += 1
+            if result is not None and not result.is_error:
+                counts["off_method_writes"] += 1
         is_edit = False
         ultra = ultra_tool(call.name)
+        target = _read_target(call, cwd if isinstance(cwd, str) else None)
+        if call.name == "Read" or ultra == "ultra_edit_snapshot":
+            counts["read_calls"] += 1
+            if target is not None and target in read_paths:
+                counts["reread_calls"] += 1
+        if target is not None:
+            read_paths.add(target)
+        if call.name == "ToolSearch":
+            counts["toolsearch_calls"] += 1
+        elif call.name == "Skill":
+            counts["skill_calls"] += 1
         if ultra:
             status = ultra_result_status(ultra, result)
             ultra_statuses[status] += 1
@@ -692,13 +1432,18 @@ def compute_metrics(transcript: Transcript) -> dict[str, Any]:
             if ultra in ULTRA_RECOVERY_TOOLS:
                 counts["ultra_recovery_calls"] += 1
             is_edit = ultra in ULTRA_WRITE_TOOLS
-        elif call.name in NATIVE_WRITE_TOOLS:
+        elif call.name in NATIVE_WRITE_TOOLS or call.name in edit_tools:
             is_edit = True
         elif call.name in SHELL_TOOLS:
+            counts["shell_calls"] += 1
+            if result is not None and result.is_error:
+                counts["shell_errors"] += 1
             command = call.input.get("command") if isinstance(call.input, dict) else None
             kinds = shell_write_kinds(command, call.name)
+            other_edits = shell_edit_kinds(command) if call.name == "Bash" else []
+            edit_kinds.update(other_edits)
+            is_edit = bool(kinds or other_edits)
             if kinds:
-                is_edit = True
                 counts["bash_write_attempts"] += 1
                 write_kinds.update(kinds)
                 if result is not None and not result.is_error:
@@ -709,21 +1454,27 @@ def compute_metrics(transcript: Transcript) -> dict[str, Any]:
             counts["tool_errors"] += 1
         if is_edit:
             counts["edit_calls"] += 1
+            if not ultra:
+                failed, masked = edit_call_failed(call, result)
+                counts["masked_edit_failures"] += masked
             if failed:
                 counts["edit_failures"] += 1
     final = transcript.result or {}
     turns = final.get("num_turns")
     denials = final.get("permission_denials")
+    final_text = final.get("result")
     metrics: dict[str, Any] = {
         "tool_calls": len(transcript.tool_calls),
         "tool_calls_by_name": dict(sorted(by_name.items())),
         "tool_errors": counts["tool_errors"],
         "edit_calls": counts["edit_calls"],
         "edit_failures": counts["edit_failures"],
+        "masked_edit_failures": counts["masked_edit_failures"],
         "bash_write_attempts": counts["bash_write_attempts"],
         "bash_writes": counts["bash_writes"],
         "bash_writes_blocked": counts["bash_writes_blocked"],
         "bash_write_kinds": dict(sorted(write_kinds.items())),
+        "shell_edit_kinds": dict(sorted(edit_kinds.items())),
         "ultra_edit_statuses": dict(sorted(ultra_statuses.items())),
         "ultra_rejections": counts["ultra_rejections"],
         "ultra_recovery_calls": counts["ultra_recovery_calls"],
@@ -735,6 +1486,17 @@ def compute_metrics(transcript: Transcript) -> dict[str, Any]:
         "permission_denials": len(denials) if isinstance(denials, list) else 0,
         "subagent_tool_calls": counts["subagent_tool_calls"],
         "unanswered_tool_calls": counts["unanswered_tool_calls"],
+        "shell_calls": counts["shell_calls"],
+        "shell_errors": counts["shell_errors"],
+        "toolsearch_calls": counts["toolsearch_calls"],
+        "read_calls": counts["read_calls"],
+        "reread_calls": counts["reread_calls"],
+        "skill_calls": counts["skill_calls"],
+        "tool_input_bytes": sum(input_bytes.values()),
+        "tool_result_bytes": sum(result_bytes.values()),
+        "tool_input_bytes_by_tool": dict(sorted(input_bytes.items())),
+        "tool_result_bytes_by_tool": dict(sorted(result_bytes.items())),
+        "final_text_bytes": _utf8_len(final_text) if isinstance(final_text, str) else None,
         "turns": turns if isinstance(turns, int) else len(transcript.assistant_message_ids),
         "result_subtype": final.get("subtype"),
         "result_is_error": final.get("is_error"),
@@ -747,6 +1509,10 @@ def compute_metrics(transcript: Transcript) -> dict[str, Any]:
         "stream_lines": transcript.lines,
         "stream_parse_errors": transcript.parse_errors,
     }
+    if method:
+        metrics["off_method_attempts"] = counts["off_method_attempts"]
+        metrics["off_method_writes"] = counts["off_method_writes"]
+    metrics.update(api_call_metrics(transcript))
     metrics.update(token_usage(transcript.result))
     return metrics
 
@@ -764,14 +1530,56 @@ def guarded_tools(matcher: str) -> frozenset[str]:
     return frozenset(matcher.split("|")) & SHELL_TOOLS
 
 
+def arm_spec(arm: str | ArmSpec) -> ArmSpec:
+    if isinstance(arm, ArmSpec):
+        return arm
+    if arm not in BUILTIN_ARMS:
+        raise EvalError(f"unknown arm {arm!r}")
+    return BUILTIN_ARMS[arm]
+
+
+def _server_named(name: Any, servers: Collection[str]) -> str | None:
+    text = str(name or "")
+    return text if text in servers else None
+
+
+def _tool_server(tool: str, servers: Collection[str]) -> str | None:
+    parts = mcp_parts(tool)
+    return parts[0] if parts and parts[0] in servers else None
+
+
+def _third_party_errors(
+    spec: ArmSpec, transcript: Transcript, servers: list[dict[str, Any]], tools: list[str]
+) -> list[str]:
+    """A third-party arm needs its server connected and its required tools listed."""
+    errors = []
+    own = [entry for entry in servers if str(entry.get("name")) == spec.server_name]
+    statuses = sorted({str(entry.get("status")) for entry in own})
+    if not own:
+        errors.append(f"{spec.server_name} MCP server missing from init")
+    elif "connected" not in statuses:
+        errors.append(f"{spec.server_name} MCP server status: {', '.join(statuses)}")
+    missing = [tool for tool in spec.required_tools if tool not in tools]
+    if missing:
+        errors.append(f"required {spec.server_name} tools missing at init: {', '.join(missing)}")
+    elif not any(_tool_server(tool, {str(spec.server_name)}) for tool in tools):
+        # A connected server with no tools leaves only native tools: not this arm.
+        errors.append(f"no {spec.server_name} tools listed at init")
+    return errors
+
+
 def check_integrity(
-    arm: str,
+    arm: str | ArmSpec,
     transcript: Transcript,
     staged_plugin_dir: Path | None = None,
     hook_events_expected: bool = True,
     guard_matcher: str = DEFAULT_GUARD_MATCHER,
+    third_party_servers: Collection[str] = (),
 ) -> tuple[list[str], list[str]]:
-    """Errors mean the run did not test its arm (leaked or missing plugin/hook)."""
+    """Errors mean the run did not test its arm (leaked or missing plugin, hook, or server,
+    or a disallowed tool that was still offered)."""
+    spec = arm_spec(arm)
+    name = spec.name
     errors: list[str] = []
     warnings: list[str] = []
     init = transcript.init
@@ -782,11 +1590,11 @@ def check_integrity(
     other_plugins = sorted(str(entry.get("name")) for entry in plugins if entry not in ultra_plugins)
     servers = [entry for entry in init.get("mcp_servers") or [] if isinstance(entry, dict)]
     ultra_servers = [entry for entry in servers if is_ultra_name(entry.get("name"))]
-    other_servers = sorted(str(entry.get("name")) for entry in servers if entry not in ultra_servers)
-    listed_ultra_tools = [str(name) for name in init.get("tools") or [] if ultra_tool(str(name))]
+    tools = [str(tool) for tool in init.get("tools") or []]
+    listed_ultra_tools = [tool for tool in tools if ultra_tool(tool)]
     ultra_calls = [call for call in transcript.tool_calls if ultra_tool(call.name)]
     hooks = transcript.hook_responses
-    if arm == "ultra-edit":
+    if spec.plugin:
         if not ultra_plugins:
             errors.append("Ultra Edit plugin did not load")
         elif len(ultra_plugins) > 1:
@@ -819,26 +1627,59 @@ def check_integrity(
             warnings.append("no SessionStart hook event; routing context unverified")
     else:
         if ultra_plugins:
-            errors.append(f"Ultra Edit plugin loaded in the {arm} arm")
+            errors.append(f"Ultra Edit plugin loaded in the {name} arm")
         if ultra_servers or listed_ultra_tools:
-            errors.append(f"Ultra Edit MCP tools present in the {arm} arm")
+            errors.append(f"Ultra Edit MCP tools present in the {name} arm")
         if ultra_calls:
-            errors.append(f"Ultra Edit tools called in the {arm} arm")
+            errors.append(f"Ultra Edit tools called in the {name} arm")
+    foreign = set(third_party_servers) - {spec.server_name}
+    if spec.third_party:
+        errors += _third_party_errors(spec, transcript, servers, tools)
+    leaked_servers = sorted(
+        {str(entry.get("name")) for entry in servers if _server_named(entry.get("name"), foreign)}
+        | {server for tool in tools if (server := _tool_server(tool, foreign))}
+    )
+    if leaked_servers:
+        errors.append(f"third-party MCP server(s) present in the {name} arm: {', '.join(leaked_servers)}")
+    leaked_calls = sorted({call.name for call in transcript.tool_calls if _tool_server(call.name, foreign)})
+    if leaked_calls:
+        errors.append(f"third-party tools called in the {name} arm: {', '.join(leaked_calls)}")
+    offered = [tool for tool in spec.disallowed_tools if tool in tools]
+    if offered:
+        errors.append(f"disallowed tool(s) listed at init: {', '.join(offered)}")
     pre_tool = [event for event in hooks if event.get("hook_event") == "PreToolUse"]
-    if arm == "native-guard":
+    if spec.guard_hook or spec.method:
         failed = [event for event in pre_tool if event.get("outcome") == "error"]
+        hook = "guard" if spec.guard_hook else "method"
         if failed:
-            errors.append(f"guard hook failed {len(failed)} time(s)")
-        guarded = guarded_tools(guard_matcher)
+            errors.append(f"{hook} hook failed {len(failed)} time(s)")
+        guarded = guarded_tools(guard_matcher) if spec.guard_hook else frozenset(spec.method_tools)
         shell_calls = sorted({call.name for call in transcript.tool_calls if call.name in guarded})
         if hook_events_expected and shell_calls and not pre_tool:
             errors.append(
                 f"{' and '.join(shell_calls)} called but no PreToolUse hook event was reported; "
-                "the guard did not run "
+                f"the {hook} hook did not run "
                 "(use --no-hook-check if this Claude Code omits PreToolUse hook events)"
             )
-    elif arm == "native" and pre_tool:
-        warnings.append("PreToolUse hooks ran in the native arm (managed hooks?)")
+    elif not spec.plugin and pre_tool:
+        warnings.append(f"PreToolUse hooks ran in the {name} arm (managed hooks?)")
+    if spec.method:
+        through = sum(
+            1
+            for call in transcript.tool_calls
+            if call.name in spec.method_tools
+            and off_method_write(method_command(call.input), spec.method)
+            and call.result is not None
+            and not call.result.is_error
+        )
+        if through:
+            warnings.append(f"{through} shell command(s) wrote files other than by {spec.method}, unblocked")
+    expected_servers = {spec.server_name} | set(third_party_servers)
+    other_servers = sorted(
+        str(entry.get("name"))
+        for entry in servers
+        if entry not in ultra_servers and str(entry.get("name")) not in expected_servers
+    )
     if other_servers:
         warnings.append("other MCP servers: " + ", ".join(other_servers))
     if other_plugins:
@@ -894,7 +1735,7 @@ def parse_version(text: str) -> tuple[int, int, int] | None:
 
 
 def flags_from_help(text: str) -> frozenset[str]:
-    return frozenset(re.findall(r"(?<![\w-])(--[a-z][a-z0-9-]*)", text or ""))
+    return frozenset(re.findall(r"(?<![\w-])(--[a-z][A-Za-z0-9-]*)", text or ""))
 
 
 def run_text(argv: Sequence[str], **options: Any) -> subprocess.CompletedProcess:
@@ -953,24 +1794,25 @@ def deep_merge(base: Mapping[str, Any], extra: Mapping[str, Any]) -> dict[str, A
 
 
 def build_settings(
-    arm: str,
+    arm: str | ArmSpec,
     guard_executable: str | None = None,
     guard_matcher: str = DEFAULT_GUARD_MATCHER,
     extra: Mapping[str, Any] | None = None,
+    disabled_plugins: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """The per-run --settings document. Only native-guard adds a hook."""
-    if arm not in ARMS:
-        raise EvalError(f"unknown arm {arm!r}")
+    """The per-run --settings document. The guard arm adds the guard hook; shell arms add
+    the method hook that denies writes made any other way."""
+    spec = arm_spec(arm)
     settings: dict[str, Any] = {
         "disableClaudeAiConnectors": True,
         "syncClaudeAiPlugins": False,
         "syncClaudeAiSkills": False,
         "autoMemoryEnabled": False,
-        "enabledPlugins": {plugin_id: False for plugin_id in KNOWN_PLUGIN_IDS},
+        "enabledPlugins": {plugin_id: False for plugin_id in (*KNOWN_PLUGIN_IDS, *disabled_plugins)},
     }
-    if arm == "native-guard":
+    if spec.guard_hook:
         if not guard_executable:
-            raise EvalError("the native-guard arm needs the staged ultra-edit-mcp executable")
+            raise EvalError(f"the {spec.name} arm needs the staged ultra-edit-mcp executable")
         settings["hooks"] = {
             "PreToolUse": [
                 {
@@ -986,15 +1828,33 @@ def build_settings(
                 }
             ]
         }
+    if spec.method:
+        how = ["--how", spec.method_how] if spec.method_how else []
+        settings["hooks"] = {
+            "PreToolUse": [
+                {
+                    "matcher": "|".join(spec.method_tools),
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": sys.executable,
+                            "args": [str(METHOD_HOOK), "--method", spec.method, *how],
+                            "timeout": METHOD_HOOK_TIMEOUT_S,
+                        }
+                    ],
+                }
+            ]
+        }
     return deep_merge(settings, extra) if extra else settings
 
 
 def build_command(
     claude_argv: Sequence[str],
     *,
-    arm: str,
+    arm: str | ArmSpec,
     settings_path: Any,
     plugin_dir: Any = None,
+    mcp_config_path: Any = None,
     permission_mode: str = "bypassPermissions",
     max_turns: int = 50,
     model: str | None = None,
@@ -1006,6 +1866,7 @@ def build_command(
     claude: ClaudeInfo | None = None,
 ) -> list[str]:
     """argv for one run. With prompt=None the prompt is sent on stdin."""
+    spec = arm_spec(arm)
     supports = claude.supports if claude else (lambda flag: True)
     argv = [*claude_argv, "-p"]
     if prompt is not None:
@@ -1026,11 +1887,22 @@ def build_command(
         argv += ["--model", model]
     if effort and supports("--effort"):
         argv += ["--effort", effort]
-    if permission_mode != "bypassPermissions" and allowed_tools:
-        argv += ["--allowedTools", ",".join(allowed_tools)]
-    if arm == "ultra-edit":
+    rules = [tool for tool in allowed_tools if tool not in spec.disallowed_tools]
+    if spec.permission_rule and spec.permission_rule not in rules:
+        rules.append(spec.permission_rule)
+    if permission_mode != "bypassPermissions" and rules:
+        argv += ["--allowedTools", ",".join(rules)]
+    if spec.disallowed_tools:
+        argv += ["--disallowedTools", ",".join(spec.disallowed_tools)]
+    if spec.append_system_prompt:
+        argv += ["--append-system-prompt", spec.append_system_prompt]
+    if spec.mcp_server is not None:
+        if mcp_config_path is None:
+            raise EvalError(f"the {spec.name} arm needs an --mcp-config file")
+        argv += ["--mcp-config", str(mcp_config_path)]
+    if spec.plugin:
         if plugin_dir is None:
-            raise EvalError("the ultra-edit arm needs a staged plugin directory")
+            raise EvalError(f"the {spec.name} arm needs a staged plugin directory")
         argv += ["--plugin-dir", str(plugin_dir)]
     return argv
 
@@ -1049,6 +1921,10 @@ def build_env(base: Mapping[str, str], config_dir: Any = None) -> tuple[dict[str
         if actual is not None:
             env.pop(actual)
             removed.append(name)
+    for upper_name, actual in sorted(upper.items()):
+        if upper_name.startswith(STRIPPED_ENV_PREFIXES) and actual in env:
+            env.pop(actual)
+            removed.append(upper_name)
     env.update(CHILD_ENV)
     if config_dir is not None:
         env["CLAUDE_CONFIG_DIR"] = str(config_dir)
@@ -1065,6 +1941,7 @@ class StagedPlugin:
     mcp_executable: Path
     runtime_files: list[str]
     plugin_version: str | None
+    runtime_sha256: str | None = None
 
 
 def mcp_executable_name(windows: bool) -> str:
@@ -1122,7 +1999,8 @@ def stage_plugin(
             path = runtime / name
             if path.is_file():
                 path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    return StagedPlugin(destination.resolve(), executable.resolve(), copied, plugin_version(source))
+    digest = hashlib.sha256(executable.read_bytes()).hexdigest() if executable.is_file() else None
+    return StagedPlugin(destination.resolve(), executable.resolve(), copied, plugin_version(source), digest)
 
 
 def hook_output_denies(returncode: int, stdout: bytes | str) -> bool:
@@ -1229,6 +2107,17 @@ class Config:
     staged: StagedPlugin | None = None
     base_env: Mapping[str, str] | None = None
     hook_check: bool = True
+    arm_specs: dict[str, ArmSpec] = field(default_factory=lambda: dict(BUILTIN_ARMS))
+    third_party_servers: frozenset[str] = frozenset()
+    third_party_dir: Path = DEFAULT_THIRD_PARTY_INSTALL
+    disabled_plugins: tuple[str, ...] = ()
+    transient_retries: int = 0
+    retry_delay_s: float = RETRY_BASE_DELAY_S
+
+    def spec(self, arm: str) -> ArmSpec:
+        if arm not in self.arm_specs:
+            raise EvalError(f"unknown arm {arm!r}")
+        return self.arm_specs[arm]
 
 
 def plan_runs(tasks: Sequence[Task], arms: Sequence[str], reps: int, seed: int | None = 0) -> list[RunSpec]:
@@ -1298,6 +2187,21 @@ def kill_process_tree(process: subprocess.Popen) -> None:
             os.killpg(process.pid, signal.SIGKILL)
 
 
+_ACTIVE: set[subprocess.Popen] = set()
+_ACTIVE_LOCK = threading.Lock()
+_STOPPING = threading.Event()
+
+
+def stop_active_processes() -> None:
+    """Kill every running session and refuse new ones (parallel runs on Ctrl+C: each
+    session has its own process group, so the terminal's SIGINT never reaches it)."""
+    with _ACTIVE_LOCK:
+        _STOPPING.set()
+        processes = list(_ACTIVE)
+    for process in processes:
+        kill_process_tree(process)
+
+
 def run_process(
     argv: Sequence[str],
     *,
@@ -1317,15 +2221,19 @@ def run_process(
     start = time.monotonic()
     timed_out = False
     with open(stdout_path, "wb") as stdout, open(stderr_path, "wb") as stderr:
-        process = subprocess.Popen(
-            list(argv),
-            cwd=str(cwd),
-            env=dict(env),
-            stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
-            stdout=stdout,
-            stderr=stderr,
-            **options,
-        )
+        with _ACTIVE_LOCK:
+            if _STOPPING.is_set():
+                raise EvalError("evaluation interrupted before this run started")
+            process = subprocess.Popen(
+                list(argv),
+                cwd=str(cwd),
+                env=dict(env),
+                stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
+                stdout=stdout,
+                stderr=stderr,
+                **options,
+            )
+            _ACTIVE.add(process)
         try:
             process.communicate(input=stdin_bytes, timeout=timeout_s)
         except subprocess.TimeoutExpired:
@@ -1336,6 +2244,9 @@ def run_process(
             kill_process_tree(process)
             process.communicate()
             raise
+        finally:
+            with _ACTIVE_LOCK:
+                _ACTIVE.discard(process)
     if os.name != "nt":
         # Reap anything the session left behind in its process group.
         with contextlib.suppress(ProcessLookupError, PermissionError):
@@ -1386,14 +2297,20 @@ def _write_json(path: Path, value: Any) -> None:
 def run_one(config: Config, spec: RunSpec) -> dict[str, Any]:
     run_dir = config.out_dir / "runs" / spec.run_id
     run_dir.mkdir(parents=True)
+    arm = config.spec(spec.arm)
     guard = str(config.staged.mcp_executable) if config.staged else None
-    settings = build_settings(spec.arm, guard, config.guard_matcher, config.extra_settings)
-    settings_path = run_dir / "settings.json"
-    _write_json(settings_path, settings)
+    settings = build_settings(
+        arm, guard, config.guard_matcher, config.extra_settings, config.disabled_plugins
+    )
     temp_root = Path(
-        tempfile.mkdtemp(prefix="ue-eval-", dir=str(config.work_dir) if config.work_dir else None)
+        tempfile.mkdtemp(prefix=WORK_PREFIX, dir=str(config.work_dir) if config.work_dir else None)
     )
     repo = temp_root / "repo"
+    if spec.task.concurrent is not None:
+        write_concurrent_state(spec.task, run_dir)
+        add_concurrent_hooks(settings, spec.task, repo.resolve(), run_dir.resolve())
+    settings_path = run_dir / "settings.json"
+    _write_json(settings_path, settings)
     base_env = os.environ if config.base_env is None else config.base_env
     exit_code: int | None = None
     timed_out = False
@@ -1408,11 +2325,16 @@ def run_one(config: Config, spec: RunSpec) -> dict[str, Any]:
             config_dir.mkdir()
         env, removed = build_env(base_env, config_dir)
         use_arg = config.prompt_via == "arg"
+        mcp_path = None
+        if arm.mcp_server is not None:
+            mcp_path = (run_dir / "mcp.json").resolve()
+            _write_json(mcp_path, mcp_config(arm, repo.resolve(), Path(config.third_party_dir).resolve()))
         argv = build_command(
             config.claude.argv,
-            arm=spec.arm,
+            arm=arm,
             settings_path=settings_path.resolve(),
             plugin_dir=config.staged.root if config.staged else None,
+            mcp_config_path=mcp_path,
             permission_mode=config.permission_mode,
             max_turns=config.max_turns,
             model=config.model,
@@ -1457,14 +2379,25 @@ def run_one(config: Config, spec: RunSpec) -> dict[str, Any]:
         (run_dir / "diff.txt").write_text(
             describe_differences(expected, actual, comparison), encoding="utf-8"
         )
-    metrics = compute_metrics(transcript)
+    metrics = compute_metrics(transcript, arm.edit_tools, arm.method, arm.method_tools)
     errors, warnings = check_integrity(
-        spec.arm,
+        arm,
         transcript,
-        config.staged.root if config.staged and spec.arm == "ultra-edit" else None,
+        config.staged.root if config.staged and arm.plugin else None,
         hook_events_expected=config.hook_check and config.claude.supports("--include-hook-events"),
         guard_matcher=config.guard_matcher,
+        third_party_servers=config.third_party_servers,
     )
+    concurrent = None
+    if spec.task.concurrent is not None:
+        concurrent = concurrent_report(spec.task, run_dir, actual, len(transcript.tool_calls))
+        errors += concurrent.pop("errors")
+        warnings += concurrent.pop("warnings")
+        metrics.update(
+            concurrent_applied=concurrent["applied"],
+            concurrent_triggers=",".join(concurrent["triggers"]),
+            concurrent_kept=concurrent["kept"],
+        )
     outcome = classify(transcript, comparison, errors, timed_out)
     if setup_error is not None:
         outcome = "infra_error"
@@ -1506,18 +2439,162 @@ def run_one(config: Config, spec: RunSpec) -> dict[str, Any]:
             "tools": init.get("tools"),
         },
         "files": {"dir": f"runs/{spec.run_id}"},
+        "environment": run_environment(config, arm),
     }
+    if concurrent is not None:
+        record["concurrent"] = concurrent
     _write_json(run_dir / "result.json", record)
     return record
+
+
+def write_concurrent_state(task: Task, run_dir: Path) -> None:
+    """The hook's starting state: no event applied, the file as the fixture has it."""
+    fixture = task.fixture[task.concurrent["file"]]
+    _write_json(
+        run_dir / "concurrent-state.json",
+        {"next": 0, "sha256": hashlib.sha256(fixture).hexdigest(), "calls": 0},
+    )
+
+
+def add_concurrent_hooks(settings: dict[str, Any], task: Task, repo: Any, run_dir: Path) -> None:
+    """Hooks that apply the task's concurrent events: after any tool call (PostToolUse,
+    every tool) and, for events still pending, when the session stops."""
+    state = run_dir / "concurrent-state.json"
+    args = [
+        str(CONCURRENT_HOOK),
+        "--spec", str((task.path / CONCURRENT_SPEC).resolve()),
+        "--repo", str(repo),
+        "--state", str(state),
+        "--log", str(run_dir / "concurrent.jsonl"),
+    ]  # fmt: skip
+
+    def entry(extra: Sequence[str] = (), matcher: str | None = None) -> dict[str, Any]:
+        hook = {
+            "type": "command",
+            "command": sys.executable,
+            "args": [*args, *extra],
+            "timeout": CONCURRENT_HOOK_TIMEOUT_S,
+        }
+        return {"hooks": [hook], **({"matcher": matcher} if matcher is not None else {})}
+
+    hooks = settings.setdefault("hooks", {})
+    hooks.setdefault("PostToolUse", []).append(entry(matcher="*"))
+    hooks.setdefault("Stop", []).append(entry(["--at-stop"]))
+
+
+def concurrent_report(
+    task: Task, run_dir: Path, actual: Mapping[str, bytes], tool_calls: int
+) -> dict[str, Any]:
+    """What the other writer did in a run, and whether the final file kept it. A hook
+    that failed, or never ran although tools were called, makes the run invalid; an
+    event whose text the model had already changed is only a warning, since the bytes
+    then fail on their own."""
+    entries: list[dict[str, Any]] = []
+    log = run_dir / "concurrent.jsonl"
+    if log.exists():
+        for line in log.read_text(encoding="utf-8").splitlines():
+            try:
+                entries.append(json.loads(line))
+            except ValueError:
+                entries.append({"error": f"hook_error: unreadable log line {line[:80]!r}"})
+    try:
+        calls = json.loads((run_dir / "concurrent-state.json").read_text(encoding="utf-8"))["calls"]
+    except (OSError, ValueError, KeyError, TypeError):
+        calls = 0
+    errors, warnings = [], []
+    for entry in entries:
+        error = str(entry.get("error", ""))
+        if error.startswith("apply_failed"):
+            warnings.append(f"concurrent change not applied: {error}")
+        elif error:
+            errors.append(f"concurrent hook: {error}")
+    events = task.concurrent["events"]
+    applied = [entry for entry in entries if entry.get("applied")]
+    if tool_calls and not calls and not entries:
+        errors.append("concurrent hook never ran")
+    elif len(applied) < len(events) and not warnings:
+        warnings.append(f"{len(events) - len(applied)} concurrent event(s) never fired")
+    final = actual.get(task.concurrent["file"], b"")
+    kept = bool(final) and all(
+        change["new"].encode("utf-8") in final for event in events for change in event["changes"]
+    )
+    return {
+        "events": entries,
+        "applied": len(applied),
+        "triggers": [str(e.get("trigger")) for e in applied],
+        "kept": kept,
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
+def run_environment(config: Config, arm: ArmSpec) -> dict[str, Any]:
+    """What a run's measurement depends on outside the task: the Claude Code build and, for
+    arms that start the Ultra Edit executable (plugin or guard hook), that executable."""
+    return _environment(config.claude, config.staged, arm)
+
+
+def _environment(claude: ClaudeInfo, staged: StagedPlugin | None, arm: ArmSpec) -> dict[str, Any]:
+    uses_runtime = arm.plugin or arm.guard_hook
+    return {
+        "claude": claude.version_text,
+        "runtime_sha256": staged.runtime_sha256 if staged and uses_runtime else None,
+    }
+
+
+def environment_drift(
+    kept: Iterable[Mapping[str, Any]], current: Mapping[str, Mapping[str, Any]]
+) -> list[str]:
+    """Kept runs measured under a different Claude Code build or Ultra Edit executable than
+    the runs about to start; mixing them would compare different software. `current` maps
+    each arm in this plan to its run_environment."""
+    problems = []
+    claude = next(iter(current.values()), {}).get("claude")
+    for record in kept:
+        env = record.get("environment")
+        if not isinstance(env, dict):
+            continue
+        if claude and env.get("claude") and env["claude"] != claude:
+            problems.append(f"{record['run_id']}: Claude Code {env['claude']}, now {claude}")
+        arm_env = current.get(record.get("arm"))
+        recorded = env.get("runtime_sha256")
+        if arm_env and recorded and arm_env.get("runtime_sha256") and recorded != arm_env["runtime_sha256"]:
+            problems.append(
+                f"{record['run_id']}: Ultra Edit executable {recorded[:12]}, now {arm_env['runtime_sha256'][:12]}"
+            )
+    return problems
 
 
 # ---------------------------------------------------------------------------
 # Summary
 
 
+def _numbers(values: Iterable[Any]) -> list[float]:
+    return [float(value) for value in values if _number(value) is not None]
+
+
 def _mean(values: Iterable[Any]) -> float | None:
-    numbers = [value for value in values if _number(value) is not None]
+    numbers = _numbers(values)
     return sum(numbers) / len(numbers) if numbers else None
+
+
+def _stdev(values: Iterable[Any]) -> float | None:
+    """Sample standard deviation; None below two values."""
+    numbers = _numbers(values)
+    return statistics.stdev(numbers) if len(numbers) >= 2 else None
+
+
+def _median(values: Iterable[Any]) -> float | None:
+    numbers = _numbers(values)
+    return statistics.median(numbers) if numbers else None
+
+
+def _cv(values: Iterable[Any]) -> float | None:
+    """Coefficient of variation (sd / mean); None below two values or at a zero mean."""
+    numbers = _numbers(values)
+    mean = _mean(numbers)
+    deviation = _stdev(numbers)
+    return deviation / mean if deviation is not None and mean else None
 
 
 def _fmt(value: float | None, digits: int = 1) -> str:
@@ -1532,34 +2609,80 @@ def _rate(count: int, total: int) -> str:
     return f"{count}/{total} ({100 * count / total:.0f}%)" if total else "-"
 
 
+# Reported as mean, standard deviation, and median; the rest as means.
+SPREAD_METRICS = ("cost_usd", "context_tokens_total", "output_tokens", "turns", "tool_calls")
+MEAN_METRICS = (
+    "tool_errors",
+    "shell_errors",
+    "edit_calls",
+    "tool_input_bytes",
+    "tool_result_bytes",
+    "first_call_context_tokens",
+    "total_input_tokens",
+)
+
+
+def scored_records(records: Iterable[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+    return [record for record in records if record.get("outcome") in SCORED_OUTCOMES]
+
+
+def _metric(records: Iterable[Mapping[str, Any]], key: str) -> list[Any]:
+    return [(record.get("metrics") or {}).get(key) for record in records]
+
+
 def aggregate(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    scored = [record for record in records if record.get("outcome") in SCORED_OUTCOMES]
-    metric = lambda key: [record["metrics"].get(key) for record in scored]  # noqa: E731
+    scored = scored_records(records)
     outcomes = Counter(record.get("outcome") for record in records)
-    return {
+    correct = sum(1 for record in scored if record.get("correct"))
+    costs = _numbers(_metric(scored, "cost_usd"))
+    stats: dict[str, Any] = {
         "runs": len(records),
         "scored": len(scored),
-        "correct": sum(1 for record in scored if record.get("correct")),
+        "correct": correct,
         "first_attempt": sum(1 for record in scored if record.get("first_attempt")),
-        "tool_calls": _mean(metric("tool_calls")),
-        "edit_calls": _mean(metric("edit_calls")),
-        "tool_errors": _mean(metric("tool_errors")),
-        "bash_write_attempts": sum(value or 0 for value in metric("bash_write_attempts")),
-        "bash_writes": sum(value or 0 for value in metric("bash_writes")),
-        "turns": _mean(metric("turns")),
-        "total_input_tokens": _mean(metric("total_input_tokens")),
-        "output_tokens": _mean(metric("output_tokens")),
-        "cost_usd": _mean(metric("cost_usd")),
+        "bash_write_attempts": sum(value or 0 for value in _metric(scored, "bash_write_attempts")),
+        "bash_writes": sum(value or 0 for value in _metric(scored, "bash_writes")),
         "wall_s": _mean(record.get("wall_s") for record in scored),
+        "cost_total_usd": sum(costs) if costs else None,
+        "cost_per_correct": sum(costs) / correct if costs and correct else None,
         "invalid": outcomes["invalid"],
         "infra_error": outcomes["infra_error"],
         "timeout": outcomes["timeout"],
+    }
+    for key in SPREAD_METRICS:
+        values = _metric(scored, key)
+        stats[key] = _mean(values)
+        stats[f"{key}_sd"] = _stdev(values)
+        stats[f"{key}_median"] = _median(values)
+    for key in MEAN_METRICS:
+        stats[key] = _mean(_metric(scored, key))
+    return stats
+
+
+def variance_by_task(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Mean over tasks of the per-task coefficient of variation across repetitions."""
+    by_task: dict[str, list[Mapping[str, Any]]] = {}
+    for record in scored_records(records):
+        by_task.setdefault(str(record.get("task")), []).append(record)
+    repeated = [runs for runs in by_task.values() if len(runs) >= 2]
+    return {
+        "tasks": len(repeated),
+        "cost_cv": _mean(_cv(_metric(runs, "cost_usd")) for runs in repeated),
+        "context_cv": _mean(_cv(_metric(runs, "context_tokens_total")) for runs in repeated),
     }
 
 
 _TABLE_HEADER = (
     "| {first} | Scored | Correct | First try | Tool calls | Edit calls | Tool errors "
     "| Bash writes | Turns | Input tok | Output tok | Cost USD | Wall s |"
+)
+_SPREAD_HEADER = (
+    "| {first} | n | Correct | First try | Cost USD | USD per correct | Context tok "
+    "| Output tok | Turns | Tool calls |"
+)
+_MEANS_HEADER = (
+    "| {first} | n | Tool errors | Shell errors | Edit calls | Tool input bytes "
+    "| Tool result bytes | First-call context |"
 )
 
 
@@ -1574,6 +2697,33 @@ def _table_row(label: str, stats: Mapping[str, Any]) -> str:
     )
 
 
+def _spread(stats: Mapping[str, Any], key: str, digits: int) -> str:
+    """mean ± sd (median); the sd is omitted below two runs."""
+    if stats[key] is None:
+        return "-"
+    deviation = stats[f"{key}_sd"]
+    spread = f" ± {_fmt(deviation, digits)}" if deviation is not None else ""
+    return f"{_fmt(stats[key], digits)}{spread} ({_fmt(stats[f'{key}_median'], digits)})"
+
+
+def _spread_row(label: str, stats: Mapping[str, Any]) -> str:
+    return (
+        f"| {label} | {stats['scored']} | {_rate(stats['correct'], stats['scored'])} "
+        f"| {_rate(stats['first_attempt'], stats['scored'])} | {_spread(stats, 'cost_usd', 4)} "
+        f"| {_fmt(stats['cost_per_correct'], 4)} | {_spread(stats, 'context_tokens_total', 0)} "
+        f"| {_spread(stats, 'output_tokens', 0)} | {_spread(stats, 'turns', 1)} "
+        f"| {_spread(stats, 'tool_calls', 1)} |"
+    )
+
+
+def _means_row(label: str, stats: Mapping[str, Any]) -> str:
+    return (
+        f"| {label} | {stats['scored']} | {_fmt(stats['tool_errors'], 2)} | {_fmt(stats['shell_errors'], 2)} "
+        f"| {_fmt(stats['edit_calls'], 1)} | {_fmt(stats['tool_input_bytes'], 0)} "
+        f"| {_fmt(stats['tool_result_bytes'], 0)} | {_fmt(stats['first_call_context_tokens'], 0)} |"
+    )
+
+
 def _ordered(values: Iterable[str], preferred: Sequence[str] = ()) -> list[str]:
     unique = list(dict.fromkeys(values))
     return [item for item in preferred if item in unique] + sorted(
@@ -1581,18 +2731,45 @@ def _ordered(values: Iterable[str], preferred: Sequence[str] = ()) -> list[str]:
     )
 
 
+def _record_key(record: Mapping[str, Any]) -> tuple[str, str, int, str]:
+    """Canonical record order, so summaries never depend on completion order."""
+    rep = record.get("rep")
+    rep = rep if isinstance(rep, int) else 0
+    return (str(record.get("task")), str(record.get("arm")), rep, str(record.get("run_id")))
+
+
+def _separator(header: str) -> str:
+    return "|" + " --- |" * (header.count("|") - 1)
+
+
+def _tables(groups: Sequence[tuple[str, Sequence[Mapping[str, Any]]]], first: str, heading: str) -> list[str]:
+    """The three per-group tables: rates and means, spread, and error and byte means."""
+    stats = [(label, aggregate(subset)) for label, subset in groups]
+    lines = ["", f"## {heading}", "", _TABLE_HEADER.format(first=first), _separator(_TABLE_HEADER)]
+    lines += [_table_row(label, item) for label, item in stats]
+    lines += ["", f"### Spread {heading[0].lower() + heading[1:]}", "", "Cells are mean ± sd (median).", ""]
+    lines += [_SPREAD_HEADER.format(first=first), _separator(_SPREAD_HEADER)]
+    lines += [_spread_row(label, item) for label, item in stats]
+    lines += ["", f"### Errors and bytes {heading[0].lower() + heading[1:]}", ""]
+    lines += [_MEANS_HEADER.format(first=first), _separator(_MEANS_HEADER)]
+    lines += [_means_row(label, item) for label, item in stats]
+    return lines
+
+
 def summarize(records: Sequence[Mapping[str, Any]], title: str = "Ultra Edit evaluation") -> str:
-    arms = _ordered((record["arm"] for record in records), ARMS)
+    records = sorted(records, key=_record_key)
+    arms = _ordered((record["arm"] for record in records), list(BUILTIN_ARMS))
     tasks = _ordered(record["task"] for record in records)
     total = aggregate(records)
     versions = sorted(
         {
             str(record["init"].get("claude_code_version"))
             for record in records
-            if record.get("init", {}).get("claude_code_version")
+            if (record.get("init") or {}).get("claude_code_version")
         }
     )
     models = sorted({model for record in records for model in record["metrics"].get("models") or []})
+    by_arm = {arm: [record for record in records if record["arm"] == arm] for arm in arms}
     lines = [
         f"# {title}",
         "",
@@ -1604,30 +2781,57 @@ def summarize(records: Sequence[Mapping[str, Any]], title: str = "Ultra Edit eva
         "Correct means exact final bytes with no extra or missing files. First try means correct with no "
         "failed edit call, rejected Ultra Edit plan, or Ultra Edit recovery call. Bash writes are "
         "succeeded/attempted content-writing shell commands (heuristic), summed over runs. Other columns "
-        "are means per scored run; Input tok includes cache reads and writes.",
+        "are means per scored run; Input tok includes cache reads and writes. Context tok is the input "
+        "processed over all API calls (uncached + cache reads + cache writes, summed per call), which "
+        "does not depend on cache state. USD per correct is total scored cost over correct runs.",
+    ]
+    lines += _tables([(arm, by_arm[arm]) for arm in arms], "Arm", "By arm")
+    lines += [
         "",
-        "## By arm",
+        "## Variance",
         "",
-        _TABLE_HEADER.format(first="Arm"),
-        "|" + " --- |" * 13,
+        "Per arm, the mean over tasks of the coefficient of variation (sd / mean) across that task's "
+        "repetitions; only tasks with at least two scored runs count. Lower is more predictable.",
+        "",
+        "| Arm | Tasks | Cost CV | Context tok CV |",
+        "| --- | --- | --- | --- |",
     ]
     for arm in arms:
-        lines.append(_table_row(arm, aggregate([record for record in records if record["arm"] == arm])))
-    lines += ["", "## By task and arm", "", _TABLE_HEADER.format(first="Task / arm"), "|" + " --- |" * 13]
-    for task in tasks:
-        for arm in arms:
-            subset = [record for record in records if record["task"] == task and record["arm"] == arm]
-            if subset:
-                lines.append(_table_row(f"{task} / {arm}", aggregate(subset)))
+        variance = variance_by_task(by_arm[arm])
+        lines.append(
+            f"| {arm} | {variance['tasks']} | {_fmt(variance['cost_cv'], 2)} | {_fmt(variance['context_cv'], 2)} |"
+        )
+    lines += [
+        "",
+        "## Fixed context overhead",
+        "",
+        "Median context tokens of the first API call: system prompt, tool definitions, and the task "
+        "prompt before any work. Every later request pays it again, mostly as cache reads. Cold starts "
+        "are runs whose first call read nothing from the prompt cache and so paid to write the shared "
+        "prefix; they inflate cost but not context tokens.",
+        "",
+        "| Arm | Runs | First-call context tok | Cold starts |",
+        "| --- | --- | --- | --- |",
+    ]
+    for arm in arms:
+        scored = scored_records(by_arm[arm])
+        first_calls = _numbers(_metric(scored, "first_call_context_tokens"))
+        cold = sum(1 for value in _metric(scored, "first_call_cache_read_tokens") if value == 0)
+        lines.append(f"| {arm} | {len(first_calls)} | {_fmt(_median(first_calls), 0)} | {cold} |")
+    groups = [
+        (f"{task} / {arm}", subset)
+        for task in tasks
+        for arm in arms
+        if (subset := [record for record in by_arm[arm] if record["task"] == task])
+    ]
+    lines += _tables(groups, "Task / arm", "By task and arm")
     tool_counts: dict[str, dict[str, int]] = {}
-    for record in records:
-        if record.get("outcome") not in SCORED_OUTCOMES:
-            continue
+    for record in scored_records(records):
         for name, count in (record["metrics"].get("tool_calls_by_name") or {}).items():
             per_arm = tool_counts.setdefault(short_tool_name(name), {})
             per_arm[record["arm"]] = per_arm.get(record["arm"], 0) + count
     if tool_counts:
-        scored_by_arm = {arm: aggregate([r for r in records if r["arm"] == arm])["scored"] for arm in arms}
+        scored_by_arm = {arm: len(scored_records(by_arm[arm])) for arm in arms}
         lines += [
             "",
             "## Tool calls per scored run",
@@ -1641,6 +2845,28 @@ def summarize(records: Sequence[Mapping[str, Any]], title: str = "Ultra Edit eva
                 for arm in arms
             ]
             lines.append(f"| {name} | " + " | ".join(cells) + " |")
+    concurrent = [record for record in scored_records(records) if record.get("concurrent")]
+    if concurrent:
+        lines += [
+            "",
+            "## Concurrent changes",
+            "",
+            "Tasks with a concurrent.json, where another writer changes a file during the session. "
+            "Stale view counts runs whose first change landed after the model was shown the file "
+            "and before it wrote it; kept counts runs whose final file holds every change the other "
+            "writer made.",
+            "",
+            "| Arm | Runs | Stale view | Kept | Correct |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+        for arm in arms:
+            subset = [record for record in concurrent if record["arm"] == arm]
+            if not subset:
+                continue
+            stale = sum(1 for record in subset if record["concurrent"]["triggers"][:1] == ["seen"])
+            kept = sum(1 for record in subset if record["concurrent"]["kept"])
+            correct = sum(1 for record in subset if record["correct"])
+            lines.append(f"| {arm} | {len(subset)} | {stale} | {kept} | {correct} |")
     failures = [record for record in records if record.get("outcome") in ("fail", "timeout")]
     if failures:
         lines += ["", "## Failed runs", ""]
@@ -1666,6 +2892,104 @@ def summarize(records: Sequence[Mapping[str, Any]], title: str = "Ultra Edit eva
         lines += ["", "## Warnings", ""]
         lines += [f"- {warning} ({count} run(s))" for warning, count in sorted(warnings.items())]
     return "\n".join(lines) + "\n"
+
+
+RECORD_COLUMNS = (
+    "run_id",
+    "task",
+    "arm",
+    "rep",
+    "outcome",
+    "correct",
+    "first_attempt",
+    "timed_out",
+    "exit_code",
+    "wall_s",
+)
+# Scalar metrics in a fixed order; other scalar metrics follow alphabetically.
+METRIC_COLUMNS = (
+    "cost_usd",
+    "turns",
+    "api_calls",
+    "subagent_api_calls",
+    "first_call_context_tokens",
+    "first_call_cache_read_tokens",
+    "peak_context_tokens",
+    "context_tokens_total",
+    "output_tokens",
+    "output_tokens_calls",
+    "input_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "total_input_tokens",
+    "tool_calls",
+    "tool_errors",
+    "edit_calls",
+    "edit_failures",
+    "masked_edit_failures",
+    "shell_calls",
+    "shell_errors",
+    "bash_write_attempts",
+    "bash_writes",
+    "bash_writes_blocked",
+    "read_calls",
+    "reread_calls",
+    "toolsearch_calls",
+    "skill_calls",
+    "tool_input_bytes",
+    "tool_result_bytes",
+    "final_text_bytes",
+    "ultra_rejections",
+    "ultra_recovery_calls",
+    "hook_denials",
+    "permission_denials",
+    "subagent_tool_calls",
+    "unanswered_tool_calls",
+    "duration_ms",
+    "duration_api_ms",
+    "api_retries",
+    "result_subtype",
+    "result_is_error",
+    "stop_reason",
+    "terminal_reason",
+    "token_source",
+    "stream_lines",
+    "stream_parse_errors",
+)
+
+
+def _scalar(value: Any) -> bool:
+    return value is None or isinstance(value, (str, int, float, bool))
+
+
+def csv_rows(records: Sequence[Mapping[str, Any]]) -> tuple[list[str], list[dict[str, Any]]]:
+    """Columns and rows for runs.csv: one row per run, scalar values only, stable order."""
+    ordered = sorted(records, key=_record_key)
+    present = {
+        key
+        for record in ordered
+        for key, value in (record.get("metrics") or {}).items()
+        if _scalar(value) and value is not None
+    }
+    metric_columns = [*METRIC_COLUMNS, *sorted(present - set(METRIC_COLUMNS) - set(RECORD_COLUMNS))]
+    columns = [*RECORD_COLUMNS, *metric_columns, "reason"]
+    rows = []
+    for record in ordered:
+        metrics = record.get("metrics") or {}
+        row = {key: record.get(key) for key in RECORD_COLUMNS}
+        row.update({key: metrics.get(key) if _scalar(metrics.get(key)) else None for key in metric_columns})
+        row["reason"] = record.get("reason", "")
+        rows.append(row)
+    return columns, rows
+
+
+def write_runs_csv(records: Sequence[Mapping[str, Any]], path: Path) -> None:
+    columns, rows = csv_rows(records)
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: "" if value is None else value for key, value in row.items()})
 
 
 def load_records(results_dir: Path) -> list[dict[str, Any]]:
@@ -1695,10 +3019,70 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     mode.add_argument(
         "--summarize", type=Path, metavar="RESULTS_DIR", help="rebuild summary.md from runs.jsonl"
     )
+    mode.add_argument(
+        "--rescore",
+        type=Path,
+        metavar="RESULTS_DIR",
+        help="recompute metrics from saved transcripts (keeps runs.jsonl.bak), then rebuild summary.md",
+    )
     parser.add_argument(
         "--task", action="append", dest="tasks", metavar="NAME", help="repeatable; default all"
     )
-    parser.add_argument("--arm", action="append", dest="arms", choices=ARMS, help="repeatable; default all")
+    parser.add_argument(
+        "--arm",
+        action="append",
+        dest="arms",
+        metavar="NAME",
+        help="repeatable; default: " + ", ".join(DEFAULT_ARMS) + "; `all` adds every built-in and "
+        "third-party arm. Built-in: " + ", ".join(BUILTIN_ARMS),
+    )
+    parser.add_argument(
+        "--third-party-arms",
+        type=Path,
+        default=DEFAULT_THIRD_PARTY_ARMS,
+        metavar="FILE",
+        help=f"third-party MCP arm definitions (see {THIRD_PARTY_README})",
+    )
+    parser.add_argument(
+        "--third-party-dir",
+        type=Path,
+        default=DEFAULT_THIRD_PARTY_INSTALL,
+        metavar="DIR",
+        help="install directory substituted for {third_party_dir} in arms.json",
+    )
+    parser.add_argument(
+        "--disable-plugin",
+        action="append",
+        dest="disable_plugins",
+        default=[],
+        metavar="ID",
+        help="repeatable; adds enabledPlugins {ID: false} to every run's settings",
+    )
+    parser.add_argument("--jobs", type=int, default=1, help="runs in parallel")
+    parser.add_argument(
+        "--transient-retries",
+        type=int,
+        default=3,
+        help="restart a run that failed on a rate limit or overload, after a pause that doubles each time",
+    )
+    parser.add_argument(
+        "--retry-delay", type=float, default=RETRY_BASE_DELAY_S, help="first pause, in seconds"
+    )
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        metavar="RESULTS_DIR",
+        help="continue an evaluation in RESULTS_DIR: run the planned runs that have no record "
+        "or an infrastructure error, keep the rest",
+    )
+    parser.add_argument(
+        "--rerun-arm",
+        action="append",
+        dest="rerun_arms",
+        default=[],
+        metavar="NAME",
+        help="with --resume, also rerun every recorded run of this arm (repeatable)",
+    )
     parser.add_argument("--reps", type=int, default=1, help="repetitions per task and arm")
     parser.add_argument("--model", help="model alias or full name; recorded from init either way")
     parser.add_argument("--effort", choices=EFFORT_LEVELS, help="passed to claude --effort")
@@ -1742,11 +3126,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0, help="arm-order shuffle seed")
     parser.add_argument("--no-shuffle", action="store_true", help="run arms in the listed order")
     parser.add_argument("--yes", action="store_true", help="start paid runs without the confirmation prompt")
+    parser.add_argument(
+        "--no-warmup",
+        dest="warmup",
+        action="store_false",
+        help="skip the one-call warm-up per arm that caches the shared prompt prefix before the runs",
+    )
+    parser.add_argument(
+        "--allow-drift",
+        action="store_true",
+        help="with --resume, keep runs recorded under a different Claude Code build or Ultra Edit executable",
+    )
     args = parser.parse_args(argv)
     if args.reps < 1:
         parser.error("--reps must be at least 1")
     if args.max_turns < 1:
         parser.error("--max-turns must be at least 1")
+    if args.jobs < 1:
+        parser.error("--jobs must be at least 1")
     return args
 
 
@@ -1766,10 +3163,14 @@ def _print(text: str = "") -> None:
     print(text, flush=True)
 
 
+def _needs_staging(specs: Sequence[ArmSpec]) -> bool:
+    return any(spec.plugin or spec.guard_hook for spec in specs)
+
+
 def _dry_run(
     args: argparse.Namespace,
     tasks: Sequence[Task],
-    arms: Sequence[str],
+    specs: Sequence[ArmSpec],
     plan: Sequence[RunSpec],
     out_dir: Path,
 ) -> int:
@@ -1779,29 +3180,36 @@ def _dry_run(
     guard = staged_root / "runtime" / mcp_executable_name(windows)
     runtime_ok = (Path(args.runtime_dir) / mcp_executable_name(windows)).is_file()
     extra = _load_extra_settings(args.extra_settings)
-    counts = f"{len(tasks)} task(s) x {len(arms)} arm(s) x {args.reps} rep(s) = {len(plan)} run(s)"
-    _print(f"Dry run: {counts}. Nothing is started.")
+    third_party_dir = Path(args.third_party_dir).resolve()
+    counts = f"{len(tasks)} task(s) x {len(specs)} arm(s) x {args.reps} rep(s) = {len(plan)} run(s)"
+    _print(f"Dry run: {counts}, {args.jobs} at a time. Nothing is started.")
     _print(f"claude: {format_command(claude_argv)} (flags not probed; --preflight checks them)")
-    if any(arm != "native" for arm in arms):
+    if _needs_staging(specs):
         _print(
             f"stage: {args.plugin_source} -> {staged_root}, runtime from {args.runtime_dir} "
             f"({mcp_executable_name(windows)} {'found' if runtime_ok else 'MISSING'})"
         )
+    for spec in specs:
+        for problem in third_party_problems(spec, third_party_dir):
+            _print(f"WARNING: {problem}")
     _print(f"results: {out_dir}")
     _print("each run: fresh temporary Git repository with the fixture committed; cwd = <temp>/repo")
     env, removed = build_env(os.environ)
     _print(f"child environment sets: {', '.join(f'{k}={v}' for k, v in CHILD_ENV.items())}")
     if removed:
         _print(f"child environment removes: {', '.join(removed)}")
-    for arm in arms:
-        spec = next(item for item in plan if item.arm == arm)
-        settings_path = out_dir / "runs" / spec.run_id / "settings.json"
-        settings = build_settings(arm, str(guard), args.guard_matcher, extra)
+    for arm in specs:
+        spec = next(item for item in plan if item.arm == arm.name)
+        run_dir = out_dir / "runs" / spec.run_id
+        settings = build_settings(arm, str(guard), args.guard_matcher, extra, args.disable_plugins)
+        if spec.task.concurrent is not None:
+            add_concurrent_hooks(settings, spec.task, "<temp>/repo", run_dir)
         argv = build_command(
             claude_argv,
             arm=arm,
-            settings_path=settings_path,
+            settings_path=run_dir / "settings.json",
             plugin_dir=staged_root,
+            mcp_config_path=run_dir / "mcp.json",
             permission_mode=args.permission_mode,
             max_turns=args.max_turns,
             model=args.model,
@@ -1812,9 +3220,13 @@ def _dry_run(
             prompt="<contents of prompt.md>" if args.prompt_via == "arg" else None,
         )
         _print("")
-        _print(f"== {arm} (example: {spec.run_id}) ==")
-        _print(f"settings file {settings_path}:")
+        _print(f"== {arm.name} (example: {spec.run_id}) ==")
+        _print(arm.description)
+        _print(f"settings file {run_dir / 'settings.json'}:")
         _print(json.dumps(settings, indent=2))
+        if arm.mcp_server is not None:
+            _print(f"MCP config file {run_dir / 'mcp.json'}:")
+            _print(json.dumps(mcp_config(arm, "<temp>/repo", third_party_dir), indent=2))
         _print("command:")
         _print(format_command(argv))
         if args.prompt_via == "stdin":
@@ -1827,7 +3239,7 @@ def _dry_run(
 
 
 def _preflight(
-    args: argparse.Namespace, arms: Sequence[str], out_dir: Path, extra: dict[str, Any] | None
+    args: argparse.Namespace, specs: Sequence[ArmSpec], out_dir: Path, extra: dict[str, Any] | None
 ) -> tuple[ClaudeInfo | None, StagedPlugin | None, list[str], list[str]]:
     problems: list[str] = []
     notes: list[str] = []
@@ -1855,6 +3267,10 @@ def _preflight(
             unsupported = [flag for flag in OPTIONAL_FLAGS if not info.supports(flag)]
             if unsupported:
                 notes.append("optional flags unavailable and skipped: " + ", ".join(unsupported))
+            for spec in specs:
+                missing = [flag for flag in spec.needs_flags() if not info.supports(flag)]
+                if missing:
+                    problems.append(f"arm {spec.name} needs claude flags: {', '.join(missing)}")
     if (
         args.permission_mode == "bypassPermissions"
         and os.name != "nt"
@@ -1870,8 +3286,14 @@ def _preflight(
             "--isolate-config starts logged out: set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN "
             "(from `claude setup-token`), or provide apiKeyHelper via --extra-settings"
         )
+    for spec in specs:
+        if spec.third_party:
+            found = third_party_problems(spec, Path(args.third_party_dir))
+            problems += found
+            if not found:
+                notes.append(f"arm {spec.name}: MCP server command found")
     staged = None
-    if any(arm != "native" for arm in arms):
+    if _needs_staging(specs):
         try:
             staged = stage_plugin(args.plugin_source, args.runtime_dir, out_dir / "plugin")
         except (EvalError, OSError) as error:
@@ -1884,7 +3306,7 @@ def _preflight(
                 problems.append(f"staged {staged.mcp_executable.name} cannot run: {error}")
             else:
                 notes.append(f"runtime: {(version.stdout or version.stderr).strip()}")
-            if "native-guard" in arms:
+            if any(spec.guard_hook for spec in specs):
                 scratch = Path(tempfile.mkdtemp(prefix="ue-eval-hook-"))
                 try:
                     hook_problems = check_guard_hook(
@@ -1895,7 +3317,7 @@ def _preflight(
                 problems += hook_problems
                 if not hook_problems:
                     notes.append("guard hook denies a heredoc write and allows a read")
-            if info is not None:
+            if info is not None and any(spec.plugin for spec in specs):
                 # Local manifest validation; no model call.
                 validate = run_text(
                     [*info.argv, "plugin", "validate", str(staged.root)], timeout=120, env=env
@@ -1925,7 +3347,7 @@ def _confirm(count: int, assume_yes: bool) -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
-def _progress_line(record: Mapping[str, Any]) -> str:
+def _progress_line(record: Mapping[str, Any], prefix: str = "          ") -> str:
     metrics = record["metrics"]
     fields = (
         f"tools={metrics['tool_calls']}",
@@ -1933,10 +3355,12 @@ def _progress_line(record: Mapping[str, Any]) -> str:
         f"errors={metrics['tool_errors']}",
         f"bash-writes={metrics['bash_writes']}/{metrics['bash_write_attempts']}",
         f"turns={metrics['turns']}",
+        f"context={metrics.get('context_tokens_total') or 0}",
         f"cost=${metrics.get('cost_usd') or 0:.4f}",
         f"wall={record['wall_s']:.1f}s",
     )
-    return f"          {record['outcome'].upper():11} " + " ".join(fields)
+    cold = " cold-start" if metrics.get("first_call_cache_read_tokens") == 0 else ""
+    return f"{prefix}{record['outcome'].upper():11} " + " ".join(fields) + cold
 
 
 def _harness_commit() -> str | None:
@@ -1947,6 +3371,55 @@ def _harness_commit() -> str | None:
     return (completed.stdout.strip() or None) if completed.returncode == 0 else None
 
 
+def rescore_records(results_dir: Path, registry: ArmRegistry) -> list[dict[str, Any]]:
+    """Recompute each run's metrics from its saved stream.jsonl with the current code.
+
+    Outcomes, byte comparisons, and integrity results are kept: the temporary
+    repositories are gone, so only transcript-derived values can be recomputed.
+    """
+    results_dir = Path(results_dir)
+    records = load_records(results_dir)
+    manifest_path = results_dir / "manifest.json"
+    recorded_specs: dict[str, Any] = {}
+    if manifest_path.exists():
+        recorded_specs = json.loads(manifest_path.read_text(encoding="utf-8")).get("arm_specs") or {}
+    rescored = []
+    for record in records:
+        arm = record.get("arm")
+        recorded = recorded_specs.get(arm) if isinstance(recorded_specs.get(arm), dict) else {}
+        if "edit_tools" in recorded:
+            edit_tools = tuple(recorded["edit_tools"])
+        elif arm in registry.arms:
+            edit_tools = registry.arms[arm].edit_tools
+        else:
+            edit_tools = NATIVE_EDIT_TOOL_NAMES
+        # Runs recorded before arms had methods were not held to one.
+        method = recorded.get("method") if "method" in recorded else None
+        method_tools = tuple(recorded.get("method_tools") or ("Bash",))
+        stream = results_dir / "runs" / str(record.get("run_id")) / "stream.jsonl"
+        updated = dict(record)
+        if stream.exists():
+            metrics = compute_metrics(parse_stream_file(stream), edit_tools, method, method_tools)
+            updated["metrics"] = metrics
+            updated["first_attempt"] = first_attempt(metrics, bool(record.get("correct")))
+        rescored.append(updated)
+    backup = results_dir / "runs.jsonl.bak"
+    if not backup.exists():
+        shutil.copyfile(results_dir / "runs.jsonl", backup)
+    with open(results_dir / "runs.jsonl", "w", encoding="utf-8") as handle:
+        for record in rescored:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return rescored
+
+
+def write_results(records: Sequence[Mapping[str, Any]], results_dir: Path) -> str:
+    """summary.md and runs.csv from the records; returns the summary text."""
+    summary = summarize(records) if records else "# Ultra Edit evaluation\n\nNo runs completed.\n"
+    (Path(results_dir) / "summary.md").write_text(summary, encoding="utf-8")
+    write_runs_csv(records, Path(results_dir) / "runs.csv")
+    return summary
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -1954,34 +3427,70 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         if args.summarize:
-            summary = summarize(load_records(args.summarize))
-            (Path(args.summarize) / "summary.md").write_text(summary, encoding="utf-8")
+            summary = write_results(load_records(args.summarize), args.summarize)
             _print(summary)
             return 0
+        if args.rescore:
+            records = rescore_records(args.rescore, load_arm_registry(args.third_party_arms))
+            _print(write_results(records, args.rescore))
+            return 0
+        registry = load_arm_registry(args.third_party_arms)
+        specs = registry.resolve(args.arms)
+        arms = tuple(spec.name for spec in specs)
         tasks = discover_tasks(args.tasks_dir, args.tasks)
-        arms = tuple(dict.fromkeys(args.arms or ARMS))
         plan = plan_runs(tasks, arms, args.reps, None if args.no_shuffle else args.seed)
-        out_dir = Path(args.out) if args.out else DEFAULT_RESULTS_DIR / _timestamp()
+        if args.resume and args.out:
+            raise EvalError("use either --resume RESULTS_DIR or --out, not both")
+        if args.rerun_arms and not args.resume:
+            raise EvalError("--rerun-arm needs --resume")
+        out_dir = Path(args.resume or args.out or DEFAULT_RESULTS_DIR / _timestamp())
         if args.dry_run:
-            return _dry_run(args, tasks, arms, plan, out_dir)
+            return _dry_run(args, tasks, specs, plan, out_dir)
         extra = _load_extra_settings(args.extra_settings)
         if args.preflight:
             scratch = Path(tempfile.mkdtemp(prefix="ue-eval-preflight-"))
             try:
-                _, _, problems, notes = _preflight(args, arms, scratch, extra)
+                _, _, problems, notes = _preflight(args, specs, scratch, extra)
             finally:
                 remove_tree(scratch)
             _report(notes, problems)
             _print("preflight passed" if not problems else "preflight failed")
             return 0 if not problems else 1
-        if out_dir.exists() and any(out_dir.iterdir()):
-            raise EvalError(f"results directory is not empty: {out_dir}")
+        if args.resume:
+            if not (out_dir / "runs.jsonl").exists():
+                raise EvalError(f"nothing to resume: no runs.jsonl in {out_dir}")
+        elif out_dir.exists() and any(out_dir.iterdir()):
+            raise EvalError(f"results directory is not empty: {out_dir} (use --resume to continue it)")
         out_dir.mkdir(parents=True, exist_ok=True)
-        info, staged, problems, notes = _preflight(args, arms, out_dir, extra)
+        info, staged, problems, notes = _preflight(args, specs, out_dir, extra)
         _report(notes, problems)
         if problems or info is None:
             return 1
-        if not _confirm(len(plan), args.yes):
+        kept: list[dict[str, Any]] = []
+        if args.resume:
+            unknown = sorted(set(args.rerun_arms) - set(arms))
+            if unknown:
+                raise EvalError(f"--rerun-arm names arms outside this plan: {', '.join(unknown)}")
+            kept, todo = resume_plan(out_dir, plan, args.rerun_arms, apply=False)
+            current = {spec.name: _environment(info, staged, spec) for spec in specs}
+            drift = environment_drift(kept, current)
+            if drift and not args.allow_drift:
+                shown = "\n  ".join(drift[:10]) + (
+                    f"\n  ... {len(drift) - 10} more" if len(drift) > 10 else ""
+                )
+                raise EvalError(
+                    "kept runs were measured with different software:\n  "
+                    + shown
+                    + "\nrerun their arms with --rerun-arm, or pass --allow-drift to mix them"
+                )
+            if todo and not _confirm(len(todo), args.yes):
+                return 1
+            kept, plan = resume_plan(out_dir, plan, args.rerun_arms)
+            _print(f"resuming {out_dir}: keeping {len(kept)} recorded run(s), starting {len(plan)}")
+            if not plan:
+                _print(write_results(kept, out_dir))
+                return 0
+        elif not _confirm(len(plan), args.yes):
             return 1
         config = Config(
             claude=info,
@@ -2002,11 +3511,240 @@ def main(argv: Sequence[str] | None = None) -> int:
             keep_workdirs=args.keep_workdirs,
             staged=staged,
             hook_check=not args.no_hook_check,
+            arm_specs={spec.name: spec for spec in specs},
+            third_party_servers=registry.third_party_servers,
+            third_party_dir=Path(args.third_party_dir),
+            disabled_plugins=tuple(args.disable_plugins),
+            transient_retries=max(0, args.transient_retries),
+            retry_delay_s=max(0.0, args.retry_delay),
         )
-        return execute(config, plan, args, arms, tasks)
+        return execute(config, plan, args, arms, tasks, kept)
     except EvalError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
+
+
+class RunLog:
+    """Appends finished runs to runs.jsonl under a lock and tracks recorded spend."""
+
+    def __init__(self, path: Path, kept: Sequence[dict[str, Any]] = ()) -> None:
+        self.path = path
+        self.lock = threading.Lock()
+        self.records: list[dict[str, Any]] = list(kept)
+        self.spent = 0.0
+
+    def add(self, record: dict[str, Any]) -> None:
+        with self.lock:
+            with open(self.path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record) + "\n")
+            self.records.append(record)
+            self.spent += record["metrics"].get("cost_usd") or 0.0
+
+
+def transient_failure(record: Mapping[str, Any]) -> bool:
+    """An infrastructure failure caused by API load, such as a rate limit."""
+    if record.get("outcome") != "infra_error":
+        return False
+    errors = record.get("metrics", {}).get("api_errors") or []
+    return any(error in TRANSIENT_ERRORS for error in errors)
+
+
+def archive_run_dir(out_dir: Path, run_id: str) -> Path | None:
+    """Move a run's directory aside (runs/<id>.attempt-N) so the run can start again."""
+    run_dir = Path(out_dir) / "runs" / run_id
+    if not run_dir.exists():
+        return None
+    attempt = 1
+    while (target := run_dir.with_name(f"{run_id}.attempt-{attempt}")).exists():
+        attempt += 1
+    run_dir.rename(target)
+    return target
+
+
+def run_with_retries(config: Config, spec: RunSpec) -> dict[str, Any]:
+    """run_one, repeated after an exponential pause while it fails on a transient API error.
+
+    Earlier attempts stay in runs/<id>.attempt-N; the record counts them and their cost."""
+    record = run_one(config, spec)
+    retries = 0
+    earlier_cost = 0.0
+    while transient_failure(record) and retries < config.transient_retries and not _STOPPING.is_set():
+        earlier_cost += record["metrics"].get("cost_usd") or 0.0
+        delay = config.retry_delay_s * (2**retries)
+        if _STOPPING.wait(delay):
+            break
+        archive_run_dir(config.out_dir, spec.run_id)
+        retries += 1
+        record = run_one(config, spec)
+    if retries:
+        record["transient_retries"] = retries
+        record["transient_retry_cost_usd"] = round(earlier_cost, 6)
+        _write_json(config.out_dir / "runs" / spec.run_id / "result.json", record)
+    return record
+
+
+def run_plan(
+    config: Config,
+    plan: Sequence[RunSpec],
+    log: RunLog,
+    jobs: int = 1,
+    max_total_usd: float | None = None,
+) -> int:
+    """Run the plan with up to `jobs` sessions at once. Returns how many runs were skipped
+    because recorded spend reached max_total_usd; in-flight runs always finish."""
+    width = max(len(f"{spec.task.name} / {spec.arm} / r{spec.rep}") for spec in plan)
+    queue = list(enumerate(plan, 1))
+    in_flight: dict[Future, tuple[int, str]] = {}
+    skipped = 0
+    _STOPPING.clear()
+
+    def label(index: int, spec: RunSpec) -> str:
+        text = f"{spec.task.name} / {spec.arm} / r{spec.rep}"
+        return f"[{index:3d}/{len(plan)}] {text.ljust(width)}"
+
+    def finish(future: Future, text: str) -> None:
+        try:
+            record = future.result()
+        except Exception as error:  # a harness bug in one run must not kill the in-flight ones
+            _print(f"{text} HARNESS ERROR (not recorded): {type(error).__name__}: {error}")
+            traceback.print_exception(type(error), error, error.__traceback__, file=sys.stderr)
+            return
+        log.add(record)
+        if jobs == 1:
+            _print(_progress_line(record))
+        else:
+            _print(_progress_line(record, prefix=f"{text} "))
+        if record["reason"]:
+            _print(f"          {record['reason'][:200]}")
+
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        try:
+            while queue or in_flight:
+                while queue and len(in_flight) < jobs:
+                    if max_total_usd is not None and log.spent >= max_total_usd:
+                        skipped = len(queue)
+                        queue.clear()
+                        _print(
+                            f"stopping: recorded spend ${log.spent:.4f} reached --max-total-usd "
+                            f"{max_total_usd:g}; {skipped} planned run(s) skipped"
+                        )
+                        break
+                    index, spec = queue.pop(0)
+                    text = label(index, spec)
+                    if jobs == 1:
+                        _print(f"{text} ...")
+                    in_flight[pool.submit(run_with_retries, config, spec)] = (index, text)
+                if not in_flight:
+                    break
+                # A timeout keeps Ctrl+C responsive where untimed waits block it (Windows).
+                done, _ = wait(list(in_flight), timeout=1.0, return_when=FIRST_COMPLETED)
+                for future in sorted(done, key=lambda item: in_flight[item][0]):
+                    _, text = in_flight.pop(future)
+                    finish(future, text)
+        except BaseException:
+            for future in in_flight:
+                future.cancel()
+            stop_active_processes()
+            raise
+    return skipped
+
+
+WARMUP_PROMPT = "This is a prompt-cache warm-up. Reply with the single word OK. Do not call any tools.\n"
+
+
+def warm_up(config: Config, arms: Sequence[str], log: RunLog, jobs: int = 1) -> None:
+    """One short session per arm before the measured runs, so each arm's shared prefix (system
+    prompt and tool definitions) is already in the prompt cache when its first runs start.
+
+    Without it an arm's first wave of runs pays to write that prefix and later ones do not, so
+    an arm run alone after a pause looks dearer than one that ran while its prefix was cached.
+    The sessions are recorded in warmup.jsonl and count toward --max-total-usd."""
+    task = Task("warmup", config.out_dir, WARMUP_PROMPT, {"README.md": b"warm-up\n"}, {})
+    warm = dataclasses.replace(config, out_dir=config.out_dir / "warmup", max_turns=1)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    def one(arm: str) -> dict[str, Any]:
+        spec = RunSpec(dataclasses.replace(task, name=f"warmup-{stamp}"), arm, 1)
+        record = run_one(warm, spec)
+        metrics = record["metrics"]
+        return {
+            "arm": arm,
+            "run_dir": f"warmup/runs/{spec.run_id}",
+            "outcome": record["outcome"],
+            "cost_usd": metrics.get("cost_usd"),
+            "first_call_cache_read_tokens": metrics.get("first_call_cache_read_tokens"),
+            "cache_creation_input_tokens": metrics.get("cache_creation_input_tokens"),
+            "api_errors": metrics.get("api_errors"),
+        }
+
+    with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+        results = list(pool.map(one, arms))
+    with open(config.out_dir / "warmup.jsonl", "a", encoding="utf-8") as handle:
+        for result in results:
+            handle.write(json.dumps(result) + "\n")
+    for result in results:
+        with log.lock:
+            log.spent += result["cost_usd"] or 0.0
+        state = "already cached" if result["first_call_cache_read_tokens"] else "written"
+        _print(
+            f"warm-up {result['arm']}: prefix {state}, cost ${result['cost_usd'] or 0:.4f}"
+            + (f", errors: {', '.join(result['api_errors'])}" if result["api_errors"] else "")
+        )
+
+
+def resume_plan(
+    out_dir: Path, plan: Sequence[RunSpec], rerun_arms: Collection[str] = (), apply: bool = True
+) -> tuple[list[dict[str, Any]], list[RunSpec]]:
+    """Split a planned evaluation into recorded runs to keep and runs to (re)start.
+
+    A run is started again when it has no record, its record is an infrastructure
+    error, or its arm is in rerun_arms. With apply, their old directories are moved
+    aside and runs.jsonl keeps only the kept records."""
+    records = (
+        {record["run_id"]: record for record in load_records(out_dir)}
+        if (Path(out_dir) / "runs.jsonl").exists()
+        else {}
+    )
+    planned = {spec.run_id for spec in plan}
+    kept, todo = [], []
+    for spec in plan:
+        record = records.get(spec.run_id)
+        if record is not None and record.get("outcome") != "infra_error" and spec.arm not in rerun_arms:
+            kept.append(record)
+        else:
+            todo.append(spec)
+    for run_id, record in records.items():
+        if run_id not in planned:
+            kept.append(record)  # runs outside this plan's selection stay as recorded
+    if not apply:
+        return kept, todo
+    for spec in todo:
+        archive_run_dir(out_dir, spec.run_id)
+    with open(Path(out_dir) / "runs.jsonl", "w", encoding="utf-8") as handle:
+        for record in kept:
+            handle.write(json.dumps(record) + "\n")
+    return kept, todo
+
+
+INVOCATION_KEYS = ("created", "harness_commit", "claude", "plugin", "arms", "reps", "options", "environment")
+
+
+def merge_manifest(previous: Mapping[str, Any], current: Mapping[str, Any]) -> dict[str, Any]:
+    """The manifest of a resumed evaluation: the current invocation's fields, arms and arm specs
+    accumulated over every invocation, and each earlier invocation kept in `history`."""
+    history = list(previous.get("history") or [])
+    if not history:
+        legacy = previous.get("resumed_from")
+        if isinstance(legacy, dict):
+            history.append(dict(legacy))
+        history.append({key: previous.get(key) for key in INVOCATION_KEYS if key in previous})
+    merged = dict(current)
+    merged["arms"] = list(dict.fromkeys([*(previous.get("arms") or []), *current.get("arms", [])]))
+    merged["arm_specs"] = {**(previous.get("arm_specs") or {}), **current.get("arm_specs", {})}
+    merged["environment"] = {**(previous.get("environment") or {}), **current.get("environment", {})}
+    merged["tasks"] = list(dict.fromkeys([*(previous.get("tasks") or []), *current.get("tasks", [])]))
+    merged["history"] = [*history, {key: current.get(key) for key in INVOCATION_KEYS if key in current}]
+    return merged
 
 
 def execute(
@@ -2015,6 +3753,7 @@ def execute(
     args: argparse.Namespace,
     arms: Sequence[str],
     tasks: Sequence[Task],
+    kept: Sequence[dict[str, Any]] = (),
 ) -> int:
     manifest = {
         "created": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
@@ -2029,6 +3768,7 @@ def execute(
         },
         "tasks": [task.name for task in tasks],
         "arms": list(arms),
+        "arm_specs": {name: config.spec(name).to_json() for name in arms},
         "reps": args.reps,
         "options": {
             key: (str(value) if isinstance(value, Path) else value)
@@ -2036,29 +3776,19 @@ def execute(
             if key not in ("dry_run", "preflight", "summarize", "yes")
         },
     }
-    _write_json(config.out_dir / "manifest.json", manifest)
-    records: list[dict[str, Any]] = []
-    spent = 0.0
-    width = max(len(f"{spec.task.name} / {spec.arm} / r{spec.rep}") for spec in plan)
+    manifest["environment"] = {name: run_environment(config, config.spec(name)) for name in arms}
+    manifest_path = config.out_dir / "manifest.json"
+    if kept and manifest_path.exists():
+        manifest = merge_manifest(json.loads(manifest_path.read_text(encoding="utf-8")), manifest)
+    _write_json(manifest_path, manifest)
+    log = RunLog(config.out_dir / "runs.jsonl", kept)
     try:
-        for index, spec in enumerate(plan, 1):
-            if args.max_total_usd is not None and spent >= args.max_total_usd:
-                _print(f"stopping: recorded spend ${spent:.4f} reached --max-total-usd {args.max_total_usd}")
-                break
-            label = f"{spec.task.name} / {spec.arm} / r{spec.rep}"
-            _print(f"[{index:3d}/{len(plan)}] {label.ljust(width)} ...")
-            record = run_one(config, spec)
-            records.append(record)
-            with open(config.out_dir / "runs.jsonl", "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record) + "\n")
-            spent += record["metrics"].get("cost_usd") or 0.0
-            _print(_progress_line(record))
-            if record["reason"]:
-                _print(f"          {record['reason'][:200]}")
+        if plan and getattr(args, "warmup", True):
+            warm_up(config, list(dict.fromkeys(spec.arm for spec in plan)), log, args.jobs)
+        run_plan(config, plan, log, args.jobs, args.max_total_usd)
     except KeyboardInterrupt:
         _print("interrupted; summarizing completed runs")
-    summary = summarize(records) if records else "# Ultra Edit evaluation\n\nNo runs completed.\n"
-    (config.out_dir / "summary.md").write_text(summary, encoding="utf-8")
+    summary = write_results(log.records, config.out_dir)
     _print("")
     _print(summary)
     _print(f"results: {config.out_dir}")

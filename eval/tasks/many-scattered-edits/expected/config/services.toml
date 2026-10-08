@@ -1,0 +1,2646 @@
+# Service registry for the shop platform.
+#
+# One [services.<name>] table per deployable service. Keys that are left out
+# fall back to config/defaults.toml. Keep tables grouped by owning team.
+
+schema_version = 3
+
+[services.auth-api]
+description = "Auth api service"
+port = 8080
+protocol = "http"
+replicas = 3
+enabled = true
+timeout_ms = 5000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-auth"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "512Mi"
+tags = ["public", "http"]
+
+[services.auth-admin]
+description = "Auth admin service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 10000
+retries = 2
+region = "us-east-1"
+owner = "team-auth"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "256Mi"
+tags = ["internal", "http"]
+
+[services.auth-cache]
+description = "Auth cache service"
+port = 6379
+protocol = "tcp"
+replicas = 3
+enabled = false
+timeout_ms = 3000
+retries = 3
+region = "eu-west-1"
+owner = "team-auth"
+log_level = "info"
+health_check = "/livez"
+cpu = "250m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.auth-export]
+description = "Auth export service"
+port = 9090
+protocol = "grpc"
+replicas = 3
+enabled = true
+timeout_ms = 3000
+retries = 3
+region = "eu-west-1"
+owner = "team-auth"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "250m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.auth-gateway]
+description = "Auth gateway service"
+port = 8081
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-auth"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "1Gi"
+tags = ["public", "http"]
+
+[services.auth-indexer]
+description = "Auth indexer service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-auth"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.auth-scheduler]
+description = "Auth scheduler service"
+port = 9090
+protocol = "grpc"
+replicas = 4
+enabled = true
+timeout_ms = 5000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-auth"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.auth-stream]
+description = "Auth stream service"
+port = 9092
+protocol = "tcp"
+replicas = 2
+enabled = false
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-auth"
+log_level = "info"
+health_check = "/livez"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.auth-sync]
+description = "Auth sync service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-auth"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.auth-webhooks]
+description = "Auth webhooks service"
+port = 8080
+protocol = "http"
+replicas = 3
+enabled = true
+timeout_ms = 10000
+retries = 3
+region = "eu-west-1"
+owner = "team-auth"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["public", "http"]
+
+[services.auth-worker]
+description = "Auth worker service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-auth"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.billing-api]
+description = "Billing api service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-billing"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "1Gi"
+tags = ["public", "http"]
+
+[services.billing-admin]
+description = "Billing admin service"
+port = 8080
+protocol = "http"
+replicas = 3
+enabled = false
+timeout_ms = 3000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-billing"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "http"]
+
+[services.billing-cache]
+description = "Billing cache service"
+port = 6379
+protocol = "tcp"
+replicas = 3
+enabled = true
+timeout_ms = 3000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-billing"
+log_level = "info"
+health_check = "/livez"
+cpu = "500m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.billing-export]
+description = "Billing export service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-billing"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.billing-gateway]
+description = "Billing gateway service"
+port = 8080
+protocol = "http"
+replicas = 4
+enabled = true
+timeout_ms = 5000
+retries = 3
+region = "eu-west-1"
+owner = "team-billing"
+log_level = "info"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "256Mi"
+tags = ["public", "http"]
+
+[services.billing-indexer]
+description = "Billing indexer service"
+port = 9090
+protocol = "grpc"
+replicas = 4
+enabled = true
+timeout_ms = 5000
+retries = 3
+region = "eu-west-1"
+owner = "team-billing"
+log_level = "info"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.billing-scheduler]
+description = "Billing scheduler service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = false
+timeout_ms = 7500
+retries = 2
+region = "us-east-1"
+owner = "team-billing"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.billing-stream]
+description = "Billing stream service"
+port = 9092
+protocol = "tcp"
+replicas = 3
+enabled = false
+timeout_ms = 3000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-billing"
+log_level = "info"
+health_check = "/livez"
+cpu = "1000m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.billing-sync]
+description = "Billing sync service"
+port = 9090
+protocol = "grpc"
+replicas = 3
+enabled = true
+timeout_ms = 3000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-billing"
+log_level = "info"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.billing-webhooks]
+description = "Billing webhooks service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-billing"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "250m"
+memory = "256Mi"
+tags = ["public", "http"]
+
+[services.billing-worker]
+description = "Billing worker service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-billing"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.catalog-api]
+description = "Catalog api service"
+port = 8080
+protocol = "http"
+replicas = 3
+enabled = false
+timeout_ms = 5000
+retries = 3
+region = "eu-west-1"
+owner = "team-catalog"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "256Mi"
+tags = ["public", "http"]
+
+[services.catalog-admin]
+description = "Catalog admin service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-catalog"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "1Gi"
+tags = ["internal", "http"]
+
+[services.catalog-cache]
+description = "Catalog cache service"
+port = 6379
+protocol = "tcp"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-catalog"
+log_level = "warn"
+health_check = "/livez"
+cpu = "250m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.catalog-export]
+description = "Catalog export service"
+port = 9090
+protocol = "grpc"
+replicas = 4
+enabled = true
+timeout_ms = 10000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-catalog"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.catalog-gateway]
+description = "Catalog gateway service"
+port = 8080
+protocol = "http"
+replicas = 4
+enabled = true
+timeout_ms = 10000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-catalog"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["public", "http"]
+
+[services.catalog-indexer]
+description = "Catalog indexer service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = false
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-catalog"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "500m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.catalog-scheduler]
+description = "Catalog scheduler service"
+port = 9090
+protocol = "grpc"
+replicas = 3
+enabled = true
+timeout_ms = 3000
+retries = 3
+region = "eu-west-1"
+owner = "team-catalog"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.catalog-stream]
+description = "Catalog stream service"
+port = 9092
+protocol = "tcp"
+replicas = 3
+enabled = true
+timeout_ms = 3000
+retries = 3
+region = "eu-west-1"
+owner = "team-catalog"
+log_level = "info"
+health_check = "/livez"
+cpu = "500m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.catalog-sync]
+description = "Catalog sync service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-catalog"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.catalog-webhooks]
+description = "Catalog webhooks service"
+port = 8080
+protocol = "http"
+replicas = 3
+enabled = true
+timeout_ms = 5000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-catalog"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["public", "http"]
+
+[services.catalog-worker]
+description = "Catalog worker service"
+port = 9090
+protocol = "grpc"
+replicas = 3
+enabled = false
+timeout_ms = 5000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-catalog"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.checkout-api]
+description = "Checkout api service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 10000
+retries = 2
+region = "us-east-1"
+owner = "team-checkout"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["public", "http", "pci"]
+
+[services.checkout-admin]
+description = "Checkout admin service"
+port = 8080
+protocol = "http"
+replicas = 1
+enabled = true
+timeout_ms = 10000
+retries = 2
+region = "us-east-1"
+owner = "team-checkout"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "500m"
+memory = "256Mi"
+tags = ["internal", "http"]
+
+[services.checkout-cache]
+description = "Checkout cache service"
+port = 6379
+protocol = "tcp"
+replicas = 4
+enabled = true
+timeout_ms = 3000
+retries = 3
+region = "eu-west-1"
+owner = "team-checkout"
+log_level = "info"
+health_check = "/livez"
+cpu = "1000m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.checkout-export]
+description = "Checkout export service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-checkout"
+log_level = "info"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.checkout-gateway]
+description = "Checkout gateway service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = false
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-checkout"
+log_level = "info"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "1Gi"
+tags = ["public", "http"]
+
+[services.checkout-indexer]
+description = "Checkout indexer service"
+port = 9090
+protocol = "grpc"
+replicas = 3
+enabled = true
+timeout_ms = 5000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-checkout"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.checkout-scheduler]
+description = "Checkout scheduler service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-checkout"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.checkout-stream]
+description = "Checkout stream service"
+port = 9092
+protocol = "tcp"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-checkout"
+log_level = "info"
+health_check = "/livez"
+cpu = "250m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.checkout-sync]
+description = "Checkout sync service"
+port = 9090
+protocol = "grpc"
+replicas = 3
+enabled = true
+timeout_ms = 10000
+retries = 3
+region = "eu-west-1"
+owner = "team-checkout"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "250m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.checkout-webhooks]
+description = "Checkout webhooks service"
+port = 8080
+protocol = "http"
+replicas = 3
+enabled = false
+timeout_ms = 10000
+retries = 3
+region = "eu-west-1"
+owner = "team-checkout"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "512Mi"
+tags = ["public", "http"]
+
+[services.checkout-worker]
+description = "Checkout worker service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-checkout"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.inventory-api]
+description = "Inventory api service"
+port = 8080
+protocol = "http"
+replicas = 4
+enabled = true
+timeout_ms = 3000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-inventory"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "1Gi"
+tags = ["public", "http"]
+
+[services.inventory-admin]
+description = "Inventory admin service"
+port = 8080
+protocol = "http"
+replicas = 4
+enabled = true
+timeout_ms = 3000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-inventory"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "http"]
+
+[services.inventory-cache]
+description = "Inventory cache service"
+port = 6379
+protocol = "tcp"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-inventory"
+log_level = "info"
+health_check = "/livez"
+cpu = "500m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.inventory-export]
+description = "Inventory export service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = false
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-inventory"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.inventory-gateway]
+description = "Inventory gateway service"
+port = 8080
+protocol = "http"
+replicas = 3
+enabled = true
+timeout_ms = 5000
+retries = 3
+region = "eu-west-1"
+owner = "team-inventory"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "500m"
+memory = "256Mi"
+tags = ["public", "http"]
+
+[services.inventory-indexer]
+description = "Inventory indexer service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 10000
+retries = 2
+region = "us-east-1"
+owner = "team-inventory"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.inventory-scheduler]
+description = "Inventory scheduler service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 10000
+retries = 2
+region = "us-east-1"
+owner = "team-inventory"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.inventory-stream]
+description = "Inventory stream service"
+port = 9092
+protocol = "tcp"
+replicas = 3
+enabled = true
+timeout_ms = 3000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-inventory"
+log_level = "info"
+health_check = "/livez"
+cpu = "500m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.inventory-sync]
+description = "Inventory sync service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+connect_timeout_ms = 750
+retries = 2
+region = "us-east-1"
+owner = "team-inventory"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.inventory-webhooks]
+description = "Inventory webhooks service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-inventory"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "256Mi"
+tags = ["public", "http"]
+
+[services.inventory-worker]
+description = "Inventory worker service"
+port = 9090
+protocol = "grpc"
+replicas = 4
+enabled = true
+timeout_ms = 5000
+retries = 3
+region = "eu-west-1"
+owner = "team-inventory"
+log_level = "info"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.ledger-api]
+description = "Ledger api service"
+port = 8080
+protocol = "http"
+replicas = 4
+enabled = true
+timeout_ms = 5000
+retries = 3
+region = "eu-west-1"
+owner = "team-ledger"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "256Mi"
+tags = ["public", "http"]
+
+[services.ledger-admin]
+description = "Ledger admin service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-ledger"
+log_level = "info"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "1Gi"
+tags = ["internal", "http"]
+
+[services.ledger-cache]
+description = "Ledger cache service"
+port = 6379
+protocol = "tcp"
+replicas = 3
+enabled = true
+timeout_ms = 10000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-ledger"
+log_level = "info"
+health_check = "/livez"
+cpu = "1000m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.ledger-export]
+description = "Ledger export service"
+port = 9090
+protocol = "grpc"
+replicas = 3
+enabled = true
+timeout_ms = 10000
+retries = 1
+region = "us-west-2"
+owner = "team-ledger"
+log_level = "info"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.ledger-gateway]
+description = "Ledger gateway service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-ledger"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "512Mi"
+tags = ["public", "http"]
+
+[services.ledger-indexer]
+description = "Ledger indexer service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-ledger"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.ledger-scheduler]
+description = "Ledger scheduler service"
+port = 9090
+protocol = "grpc"
+replicas = 3
+enabled = true
+timeout_ms = 3000
+retries = 3
+region = "eu-west-1"
+owner = "team-ledger"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.ledger-stream]
+description = "Ledger stream service"
+port = 9092
+protocol = "tcp"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-ledger"
+log_level = "warn"
+health_check = "/livez"
+cpu = "250m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.ledger-sync]
+description = "Ledger sync service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-ledger"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.ledger-webhooks]
+description = "Ledger webhooks service"
+port = 8080
+protocol = "http"
+replicas = 4
+enabled = true
+timeout_ms = 5000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-ledger"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["public", "http"]
+
+[services.ledger-worker]
+description = "Ledger worker service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 10000
+retries = 2
+region = "us-east-1"
+owner = "team-ledger"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "500m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.notify-api]
+description = "Notify api service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 10000
+retries = 2
+region = "us-east-1"
+owner = "team-notify"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["public", "http"]
+
+[services.notify-admin]
+description = "Notify admin service"
+port = 8080
+protocol = "http"
+replicas = 3
+enabled = true
+timeout_ms = 3000
+retries = 3
+region = "eu-west-1"
+owner = "team-notify"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "256Mi"
+tags = ["internal", "http"]
+
+[services.notify-cache]
+description = "Notify cache service"
+port = 6379
+protocol = "tcp"
+replicas = 3
+enabled = true
+timeout_ms = 3000
+retries = 3
+region = "eu-west-1"
+owner = "team-notify"
+log_level = "info"
+health_check = "/livez"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.notify-export]
+description = "Notify export service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-notify"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.notify-gateway]
+description = "Notify gateway service"
+port = 8080
+protocol = "http"
+replicas = 3
+enabled = true
+timeout_ms = 5000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-notify"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "1Gi"
+tags = ["public", "http"]
+
+[services.notify-indexer]
+description = "Notify indexer service"
+port = 9090
+protocol = "grpc"
+replicas = 3
+enabled = true
+timeout_ms = 5000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-notify"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.notify-scheduler]
+description = "Notify scheduler service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-notify"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "500m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.notify-stream]
+description = "Notify stream service"
+port = 9092
+protocol = "tcp"
+replicas = 4
+enabled = true
+timeout_ms = 10000
+retries = 3
+region = "eu-west-1"
+owner = "team-notify"
+log_level = "info"
+health_check = "/livez"
+cpu = "1000m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.notify-sync]
+description = "Notify sync service"
+port = 9090
+protocol = "grpc"
+replicas = 4
+enabled = true
+timeout_ms = 10000
+retries = 3
+region = "eu-west-1"
+owner = "team-notify"
+log_level = "info"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.notify-webhooks]
+description = "Notify webhooks service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-notify"
+log_level = "info"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "1Gi"
+tags = ["public", "http"]
+
+[services.notify-worker]
+description = "Notify worker service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-notify"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.orders-api]
+description = "Orders api service"
+port = 8080
+protocol = "http"
+replicas = 3
+enabled = true
+timeout_ms = 3000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-orders"
+log_level = "info"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "1Gi"
+tags = ["public", "http"]
+
+[services.orders-admin]
+description = "Orders admin service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-orders"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "512Mi"
+tags = ["internal", "http"]
+
+[services.orders-cache]
+description = "Orders cache service"
+port = 6379
+protocol = "tcp"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-orders"
+log_level = "warn"
+health_check = "/livez"
+cpu = "250m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.orders-export]
+description = "Orders export service"
+port = 9090
+protocol = "grpc"
+replicas = 3
+enabled = true
+timeout_ms = 5000
+retries = 3
+region = "eu-west-1"
+owner = "team-orders"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.orders-gateway]
+description = "Orders gateway service"
+port = 8080
+protocol = "http"
+replicas = 3
+enabled = true
+timeout_ms = 5000
+retries = 3
+region = "eu-west-1"
+owner = "team-orders"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "256Mi"
+tags = ["public", "http"]
+
+[services.orders-indexer]
+description = "Orders indexer service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 10000
+retries = 2
+region = "us-east-1"
+owner = "team-orders"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.orders-scheduler]
+description = "Orders scheduler service"
+port = 9090
+protocol = "grpc"
+replicas = 4
+enabled = true
+timeout_ms = 3000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-orders"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.orders-stream]
+description = "Orders stream service"
+port = 9092
+protocol = "tcp"
+replicas = 4
+enabled = true
+timeout_ms = 3000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-orders"
+log_level = "info"
+health_check = "/livez"
+cpu = "500m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.orders-sync]
+description = "Orders sync service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-orders"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.orders-webhooks]
+description = "Orders webhooks service"
+port = 8080
+protocol = "http"
+replicas = 3
+enabled = true
+timeout_ms = 5000
+retries = 3
+region = "eu-west-1"
+owner = "team-orders"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "500m"
+memory = "256Mi"
+tags = ["public", "http"]
+
+[services.orders-worker]
+description = "Orders worker service"
+port = 9090
+protocol = "grpc"
+replicas = 3
+enabled = true
+timeout_ms = 12000
+retries = 3
+region = "eu-west-1"
+owner = "team-orders"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.payments-api]
+description = "Payments api service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-payments"
+log_level = "info"
+health_check = "/readyz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["public", "http"]
+
+[services.payments-admin]
+description = "Payments admin service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-payments"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "1Gi"
+tags = ["internal", "http"]
+
+[services.payments-cache]
+description = "Payments cache service"
+port = 6379
+protocol = "tcp"
+replicas = 3
+enabled = true
+timeout_ms = 10000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-payments"
+log_level = "warn"
+health_check = "/livez"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.payments-export]
+description = "Payments export service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-payments"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.payments-gateway]
+description = "Payments gateway service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-payments"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["public", "http"]
+
+[services.payments-indexer]
+description = "Payments indexer service"
+port = 9090
+protocol = "grpc"
+replicas = 4
+enabled = true
+timeout_ms = 3000
+retries = 3
+region = "eu-west-1"
+owner = "team-payments"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.payments-scheduler]
+description = "Payments scheduler service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = false
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-payments"
+log_level = "info"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.payments-stream]
+description = "Payments stream service"
+port = 9092
+protocol = "tcp"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-payments"
+log_level = "info"
+health_check = "/livez"
+cpu = "1000m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.payments-sync]
+description = "Payments sync service"
+port = 9090
+protocol = "grpc"
+replicas = 3
+enabled = true
+timeout_ms = 5000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-payments"
+log_level = "info"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.payments-webhooks]
+description = "Payments webhooks service"
+port = 8080
+protocol = "http"
+replicas = 3
+enabled = true
+timeout_ms = 5000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-payments"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "512Mi"
+tags = ["public", "http"]
+
+[services.payments-worker]
+description = "Payments worker service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 10000
+retries = 2
+region = "us-east-1"
+owner = "team-payments"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.pricing-api]
+description = "Pricing api service"
+port = 8080
+protocol = "http"
+replicas = 3
+enabled = true
+timeout_ms = 3000
+retries = 3
+region = "eu-west-1"
+owner = "team-pricing"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "512Mi"
+tags = ["public", "http"]
+
+[services.pricing-admin]
+description = "Pricing admin service"
+port = 8080
+protocol = "http"
+replicas = 3
+enabled = true
+timeout_ms = 3000
+retries = 3
+region = "eu-west-1"
+owner = "team-pricing"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "250m"
+memory = "256Mi"
+tags = ["internal", "http"]
+
+[services.pricing-cache]
+description = "Pricing cache service"
+port = 6379
+protocol = "tcp"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-pricing"
+health_check = "/livez"
+cpu = "250m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.pricing-export]
+description = "Pricing export service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-pricing"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.pricing-gateway]
+description = "Pricing gateway service"
+port = 8080
+protocol = "http"
+replicas = 4
+enabled = true
+timeout_ms = 5000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-pricing"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "1Gi"
+tags = ["public", "http"]
+
+[services.pricing-indexer]
+description = "Pricing indexer service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = false
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-pricing"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.pricing-scheduler]
+description = "Pricing scheduler service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-pricing"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.pricing-stream]
+description = "Pricing stream service"
+port = 9092
+protocol = "tcp"
+replicas = 3
+enabled = true
+timeout_ms = 10000
+retries = 3
+region = "eu-west-1"
+owner = "team-pricing"
+log_level = "info"
+health_check = "/livez"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.pricing-sync]
+description = "Pricing sync service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-pricing"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.pricing-webhooks]
+description = "Pricing webhooks service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-pricing"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "1Gi"
+tags = ["public", "http"]
+
+[services.pricing-worker]
+description = "Pricing worker service"
+port = 9090
+protocol = "grpc"
+replicas = 3
+enabled = false
+timeout_ms = 3000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-pricing"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.profile-api]
+description = "Profile api service"
+port = 8080
+protocol = "http"
+replicas = 3
+enabled = true
+timeout_ms = 3000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-profile"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "1Gi"
+tags = ["public", "http"]
+
+[services.profile-admin]
+description = "Profile admin service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-profile"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "http"]
+
+[services.profile-cache]
+description = "Profile cache service"
+port = 6379
+protocol = "tcp"
+replicas = 4
+enabled = true
+timeout_ms = 5000
+retries = 3
+region = "eu-west-1"
+owner = "team-profile"
+log_level = "info"
+health_check = "/livez"
+cpu = "1000m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.profile-export]
+description = "Profile export service"
+port = 9090
+protocol = "grpc"
+replicas = 4
+enabled = true
+timeout_ms = 5000
+retries = 3
+region = "eu-west-1"
+owner = "team-profile"
+log_level = "info"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.profile-gateway]
+description = "Profile gateway service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = false
+timeout_ms = 10000
+retries = 2
+region = "us-east-1"
+owner = "team-profile"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "2000m"
+memory = "512Mi"
+tags = ["public", "http"]
+
+[services.profile-indexer]
+description = "Profile indexer service"
+port = 9090
+protocol = "grpc"
+replicas = 3
+enabled = true
+timeout_ms = 3000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-profile"
+log_level = "info"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.profile-scheduler]
+description = "Profile scheduler service"
+port = 9090
+protocol = "grpc"
+replicas = 3
+enabled = true
+timeout_ms = 3000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-profile"
+log_level = "info"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.profile-stream]
+description = "Profile stream service"
+port = 9092
+protocol = "tcp"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-profile"
+log_level = "warn"
+health_check = "/livez"
+cpu = "250m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.profile-sync]
+description = "Profile sync service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-profile"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.profile-webhooks]
+description = "Profile webhooks service"
+port = 8080
+protocol = "http"
+replicas = 3
+enabled = false
+timeout_ms = 5000
+retries = 3
+region = "eu-west-1"
+owner = "team-profile"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "256Mi"
+tags = ["public", "http"]
+
+[services.profile-worker]
+description = "Profile worker service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-profile"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.reports-api]
+description = "Reports api service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-reports"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "250m"
+memory = "512Mi"
+tags = ["public", "http"]
+
+[services.reports-admin]
+description = "Reports admin service"
+port = 8080
+protocol = "http"
+replicas = 4
+enabled = true
+timeout_ms = 10000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-reports"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "1Gi"
+tags = ["internal", "http"]
+
+[services.reports-cache]
+description = "Reports cache service"
+port = 6379
+protocol = "tcp"
+replicas = 4
+enabled = true
+timeout_ms = 10000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-reports"
+log_level = "info"
+health_check = "/livez"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.reports-export]
+description = "Reports export service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = false
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-reports"
+log_level = "debug"
+health_check = "/healthz"
+cpu = "500m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.reports-gateway]
+description = "Reports gateway service"
+port = 8080
+protocol = "http"
+replicas = 3
+enabled = true
+timeout_ms = 3000
+retries = 3
+region = "eu-west-1"
+owner = "team-reports"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["public", "http"]
+
+[services.reports-indexer]
+description = "Reports indexer service"
+port = 9090
+protocol = "grpc"
+replicas = 3
+enabled = true
+timeout_ms = 3000
+retries = 3
+region = "eu-west-1"
+owner = "team-reports"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.reports-scheduler]
+description = "Reports scheduler service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-reports"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.reports-stream]
+description = "Reports stream service"
+port = 9092
+protocol = "tcp"
+replicas = 3
+enabled = true
+timeout_ms = 5000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-reports"
+log_level = "warn"
+health_check = "/livez"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.reports-sync]
+description = "Reports sync service"
+port = 9090
+protocol = "grpc"
+replicas = 3
+enabled = false
+timeout_ms = 5000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-reports"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.reports-webhooks]
+description = "Reports webhooks service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 10000
+retries = 2
+region = "us-east-1"
+owner = "team-reports"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["public", "http"]
+
+[services.reports-worker]
+description = "Reports worker service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 10000
+retries = 2
+region = "us-east-1"
+owner = "team-reports"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "500m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.search-api]
+description = "Search api service"
+port = 8080
+protocol = "http"
+replicas = 4
+enabled = true
+timeout_ms = 3000
+retries = 3
+region = "eu-west-1"
+owner = "team-search"
+log_level = "info"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "512Mi"
+tags = ["public", "http"]
+
+[services.search-admin]
+description = "Search admin service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-search"
+log_level = "info"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "512Mi"
+tags = ["internal", "http"]
+
+[services.search-cache]
+description = "Search cache service"
+port = 6379
+protocol = "tcp"
+replicas = 2
+enabled = false
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-search"
+log_level = "info"
+health_check = "/livez"
+cpu = "1000m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.search-export]
+description = "Search export service"
+port = 9090
+protocol = "grpc"
+replicas = 3
+enabled = true
+timeout_ms = 5000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-search"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.search-gateway]
+description = "Search gateway service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-search"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "256Mi"
+tags = ["public", "http"]
+
+[services.search-indexer]
+description = "Search indexer service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-discovery"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.search-scheduler]
+description = "Search scheduler service"
+port = 9090
+protocol = "grpc"
+replicas = 3
+enabled = true
+timeout_ms = 10000
+retries = 3
+region = "eu-west-1"
+owner = "team-search"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "250m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.search-stream]
+description = "Search stream service"
+port = 9092
+protocol = "tcp"
+replicas = 3
+enabled = false
+timeout_ms = 10000
+retries = 3
+region = "eu-west-1"
+owner = "team-search"
+log_level = "info"
+health_check = "/livez"
+cpu = "250m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.search-sync]
+description = "Search sync service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-search"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.search-webhooks]
+description = "Search webhooks service"
+port = 8080
+protocol = "http"
+replicas = 4
+enabled = true
+timeout_ms = 3000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-search"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "1Gi"
+tags = ["public", "http"]
+
+[services.search-worker]
+description = "Search worker service"
+port = 9090
+protocol = "grpc"
+replicas = 4
+enabled = true
+timeout_ms = 3000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-search"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.shipping-api]
+description = "Shipping api service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-shipping"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "256Mi"
+tags = ["public", "http"]
+
+[services.shipping-admin]
+description = "Shipping admin service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = false
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-shipping"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "http"]
+
+[services.shipping-cache]
+description = "Shipping cache service"
+port = 6379
+protocol = "tcp"
+replicas = 3
+enabled = true
+timeout_ms = 5000
+retries = 3
+region = "eu-west-1"
+owner = "team-shipping"
+log_level = "warn"
+health_check = "/livez"
+cpu = "500m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.shipping-export]
+description = "Shipping export service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 10000
+retries = 2
+region = "us-east-1"
+owner = "team-shipping"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.shipping-gateway]
+description = "Shipping gateway service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 10000
+retries = 2
+region = "us-east-1"
+owner = "team-shipping"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["public", "http"]
+
+[services.shipping-indexer]
+description = "Shipping indexer service"
+port = 9090
+protocol = "grpc"
+replicas = 3
+enabled = true
+timeout_ms = 3000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-shipping"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.shipping-scheduler]
+description = "Shipping scheduler service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-shipping"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.shipping-stream]
+description = "Shipping stream service"
+port = 9092
+protocol = "tcp"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-shipping"
+log_level = "info"
+health_check = "/livez"
+cpu = "500m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.shipping-sync]
+description = "Shipping sync service"
+port = 9090
+protocol = "grpc"
+replicas = 4
+enabled = true
+timeout_ms = 5000
+retries = 3
+region = "eu-west-1"
+owner = "team-shipping"
+log_level = "info"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.shipping-webhooks]
+description = "Shipping webhooks service"
+port = 8080
+protocol = "http"
+replicas = 4
+enabled = true
+timeout_ms = 5000
+retries = 3
+region = "eu-west-1"
+owner = "team-shipping"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "256Mi"
+tags = ["public", "http"]
+
+[services.shipping-worker]
+description = "Shipping worker service"
+port = 9190
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-shipping"
+log_level = "info"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.tax-api]
+description = "Tax api service"
+port = 8080
+protocol = "http"
+replicas = 3
+enabled = true
+timeout_ms = 10000
+retries = 4
+region = "ap-southeast-2"
+owner = "team-tax"
+log_level = "info"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "512Mi"
+tags = ["public", "http"]
+
+[services.tax-admin]
+description = "Tax admin service"
+port = 8080
+protocol = "http"
+replicas = 3
+enabled = true
+timeout_ms = 10000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-tax"
+log_level = "info"
+health_check = "/healthz"
+cpu = "1000m"
+memory = "1Gi"
+tags = ["internal", "http"]
+
+[services.tax-cache]
+description = "Tax cache service"
+port = 6379
+protocol = "tcp"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-tax"
+log_level = "info"
+health_check = "/livez"
+cpu = "250m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.tax-export]
+description = "Tax export service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+owner = "team-tax"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.tax-gateway]
+description = "Tax gateway service"
+port = 8080
+protocol = "http"
+replicas = 3
+enabled = true
+timeout_ms = 3000
+retries = 3
+region = "eu-west-1"
+owner = "team-tax"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "512Mi"
+tags = ["public", "http"]
+
+[services.tax-indexer]
+description = "Tax indexer service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-tax"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "250m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.tax-scheduler]
+description = "Tax scheduler service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 5000
+retries = 2
+region = "us-east-1"
+owner = "team-tax"
+log_level = "info"
+health_check = "/healthz"
+cpu = "250m"
+memory = "1Gi"
+tags = ["internal", "batch"]
+
+[services.tax-stream]
+description = "Tax stream service"
+port = 9092
+protocol = "tcp"
+replicas = 4
+enabled = true
+timeout_ms = 5000
+retries = 1
+region = "ap-southeast-2"
+owner = "team-tax"
+log_level = "info"
+health_check = "/livez"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[services.tax-sync]
+description = "Tax sync service"
+port = 9090
+protocol = "grpc"
+replicas = 2
+enabled = true
+timeout_ms = 10000
+retries = 2
+region = "us-east-1"
+owner = "team-tax"
+log_level = "warn"
+health_check = "/healthz"
+cpu = "500m"
+memory = "256Mi"
+tags = ["internal", "batch"]
+
+[services.tax-webhooks]
+description = "Tax webhooks service"
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 10000
+retries = 2
+region = "us-east-1"
+owner = "team-tax"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["public", "http"]
+
+[services.tax-worker]
+description = "Tax worker service"
+port = 9090
+protocol = "grpc"
+replicas = 3
+enabled = true
+timeout_ms = 3000
+retries = 3
+region = "eu-west-1"
+owner = "team-tax"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "256Mi"
+tags = ["internal", "batch"]

@@ -1,0 +1,21 @@
+# Production overrides, merged on top of config/base.yaml.
+
+service:
+  workers: 8
+
+database:
+  url: postgresql://parcelhub@db-primary.prod.internal:5432/parcelhub
+  # During an incident, APP_DB_POOL_SIZE shrinks the pool without a redeploy.
+  max_connections: 25  # 8 workers x 25 = 200 of the 240 we may use
+  pool_timeout: 2.0
+
+cache:
+  url: redis://cache.prod.internal:6379/0
+  pool_size: 8
+
+http:
+  pool_size: 50
+  timeout: 5.0
+
+logging:
+  level: WARNING

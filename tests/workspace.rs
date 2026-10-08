@@ -26,6 +26,7 @@ fn change(id: &str, old: &str, new: &str) -> Change {
         target: Target::Exact {
             old: old.into(),
             scope: None,
+            lines: None,
         },
         text: new.into(),
     }
@@ -35,6 +36,7 @@ fn request(id: &str, snapshot: &Snapshot, changes: Vec<Change>) -> EditRequest {
     EditRequest {
         request_id: id.into(),
         files: vec![FileRequest {
+            path: None,
             base: snapshot.id.clone(),
             changes,
         }],
@@ -157,6 +159,7 @@ fn preflight_retry_preserves_history_candidates_and_request_identity_after_resta
     let second = workspace.read("second.txt").unwrap();
     let mut original_request = request("original", &snapshot, vec![change("first", "one", "two")]);
     original_request.files.push(FileRequest {
+        path: None,
         base: second.id,
         changes: vec![change("second", "one", "two")],
     });
@@ -299,6 +302,7 @@ fn failed_batch_keeps_every_target_unchanged_and_repair_retains_positions() {
         ],
     );
     request.files.push(FileRequest {
+        path: None,
         base: second.id,
         changes: vec![change("third", "also missing", "FOUR")],
     });
@@ -480,6 +484,7 @@ fn aliases_cannot_overwrite_separate_candidates() {
     let alias = workspace.read("./file.txt").unwrap();
     let mut request = request("aliases", &first, vec![change("a", "one", "ONE")]);
     request.files.push(FileRequest {
+        path: None,
         base: alias.id,
         changes: vec![change("b", "two", "TWO")],
     });
@@ -488,6 +493,7 @@ fn aliases_cannot_overwrite_separate_candidates() {
     let hardlink = workspace.read("link.txt").unwrap();
     let mut request = self::request("hardlinks", &first, vec![change("a", "one", "ONE")]);
     request.files.push(FileRequest {
+        path: None,
         base: hardlink.id,
         changes: vec![change("b", "two", "TWO")],
     });
@@ -529,6 +535,7 @@ fn invalid_snapshot_references_are_not_misreported_as_file_paths() {
         .prepare(EditRequest {
             request_id: "invalid-reference".into(),
             files: vec![FileRequest {
+                path: None,
                 base: reference.into(),
                 changes: vec![change("unused", "one", "two")],
             }],
@@ -567,10 +574,12 @@ fn invalid_snapshot_references_are_not_misreported_as_file_paths() {
             request_id: "two-invalid-references".into(),
             files: vec![
                 FileRequest {
+                    path: None,
                     base: "sdoesnotexist000".into(),
                     changes: vec![change("first", "one", "two")],
                 },
                 FileRequest {
+                    path: None,
                     base: reference.into(),
                     changes: vec![change("second", "one", "two")],
                 },
@@ -765,6 +774,7 @@ fn pruning_removes_unreferenced_and_orphaned_blobs_and_keeps_referenced_ones() {
         .prepare(EditRequest {
             request_id: "planned".into(),
             files: vec![FileRequest {
+                path: None,
                 base: planned.snapshot.clone(),
                 changes: vec![Change {
                     id: "c".into(),
@@ -906,6 +916,7 @@ fn an_omitted_request_id_is_stable_and_every_argument_changes_it() {
     scoped.files[0].changes[0].target = Target::Exact {
         old: "one".into(),
         scope: Some("r1".into()),
+        lines: None,
     };
     let variants = [
         request("", &other_base, vec![change("a", "one", "ONE")]),
@@ -1014,7 +1025,7 @@ fn different_automatic_requests_never_reuse_a_request_id() {
 #[test]
 fn omitted_change_ids_become_their_one_based_positions() {
     let (dir, workspace, first) = setup("one two");
-    fs::write(dir.path().join("second.txt"), "three").unwrap();
+    fs::write(dir.path().join("second.txt"), "three four").unwrap();
     let second = workspace.read("second.txt").unwrap();
     let mut automatic = request(
         "",
@@ -1022,6 +1033,7 @@ fn omitted_change_ids_become_their_one_based_positions() {
         vec![change("", "one", "ONE"), change("", "two", "TWO")],
     );
     automatic.files.push(FileRequest {
+        path: None,
         base: second.id.clone(),
         changes: vec![change("", "three", "THREE")],
     });
@@ -1038,7 +1050,7 @@ fn omitted_change_ids_become_their_one_based_positions() {
         .prepare(request(
             "",
             &second,
-            vec![change("mine", "th", "TH"), change("", "ree", "REE")],
+            vec![change("mine", "three", "3"), change("", "four", "4")],
         ))
         .unwrap();
     assert!(mixed.ready);
@@ -1219,4 +1231,181 @@ fn a_replay_notice_counts_against_the_report_bounds() {
     }
     assert_eq!(replayed.lines().next(), Some(REPLAY_NOTICE));
     assert_eq!(replayed.lines().nth(1), fresh.lines().next());
+}
+
+/// Derived request IDs are persisted as binding keys, so the IDs 0.3.0 derived for
+/// these requests must never change: a different ID would re-attempt an edit whose
+/// output was lost instead of replaying its receipt.
+#[test]
+fn derived_request_ids_match_0_3_0() {
+    let file = |base: &str, target: Target, text: &str| EditRequest {
+        request_id: String::new(),
+        files: vec![FileRequest {
+            path: None,
+            base: base.into(),
+            changes: vec![Change {
+                id: String::new(),
+                target,
+                text: text.into(),
+            }],
+        }],
+    };
+    let golden = [
+        (
+            file(
+                "s00000000000000000000000000000001",
+                Target::Exact {
+                    old: "alpha = 1".into(),
+                    scope: None,
+                    lines: None,
+                },
+                "alpha = 2",
+            ),
+            "auto-5449ca50c1835a6f1d12d9ffa2b1e0b7",
+        ),
+        (
+            file(
+                "s00000000000000000000000000000002",
+                Target::All {
+                    old: "old_name".into(),
+                    scope: Some("r0".into()),
+                    expected: 3,
+                    lines: None,
+                },
+                "new_name",
+            ),
+            "auto-f0a764ec9036620a82f665c4348a55dc",
+        ),
+        (
+            file(
+                "s00000000000000000000000000000003",
+                Target::Span {
+                    span: "r12".into(),
+                    expect: Some("    return x;".into()),
+                },
+                "    return y;",
+            ),
+            "auto-63beb797ae5975a3c95f9cd7f30c8a08",
+        ),
+    ];
+    for (request, id) in golden {
+        assert_eq!(resolve_ids(request).unwrap().request_id, id);
+    }
+    let corrections = [Change {
+        id: "1.1".into(),
+        target: Target::Exact {
+            old: "two".into(),
+            scope: Some("r2".into()),
+            lines: None,
+        },
+        text: "2".into(),
+    }];
+    assert_eq!(
+        repair_request_id("", "d00000000000000000000000000000004", &corrections).unwrap(),
+        "auto-de1755d7e9acadbd0ee7c77d576a350d"
+    );
+    assert_eq!(
+        undo_request_id("", "p00000000000000000000000000000005").unwrap(),
+        "auto-6bef3b0b08e8021d34d1eb63f244f1ac"
+    );
+}
+
+#[test]
+fn shorthand_and_verbose_spellings_derive_one_request_id() {
+    let parse = |value: serde_json::Value| {
+        resolve_ids(serde_json::from_value::<EditRequest>(value).unwrap())
+            .unwrap()
+            .request_id
+    };
+    let base = "s00000000000000000000000000000001";
+    for (shorthand, verbose) in [
+        (
+            json!({"old":"alpha = 1","new":"alpha = 2"}),
+            json!({"target":{"kind":"exact","old":"alpha = 1"},"text":"alpha = 2"}),
+        ),
+        (
+            json!({"old":"x","text":"y","count":3,"in":"r0"}),
+            json!({"target":{"kind":"all","old":"x","scope":"r0","expected":3},"text":"y"}),
+        ),
+        (
+            json!({"span":"r12","new":"    return y;","expect":"    return x;"}),
+            json!({"target":{"kind":"span","span":"r12","expect":"    return x;"},"text":"    return y;"}),
+        ),
+        (
+            json!({"lines":"146-150","new":"","expect":"fn main() {"}),
+            json!({"target":{"kind":"lines","lines":[146,150],"expect":"fn main() {"},"text":""}),
+        ),
+        (
+            json!({"after":0,"new":"use std::fs;"}),
+            json!({"target":{"kind":"insert","after":0},"text":"use std::fs;"}),
+        ),
+    ] {
+        let request = |change| json!({"files":[{"base":base,"changes":[change]}]});
+        assert_eq!(
+            parse(request(shorthand.clone())),
+            parse(request(verbose)),
+            "{shorthand}"
+        );
+    }
+    // The shorthand reaches the 0.3.0 golden ID of the same verbose request.
+    assert_eq!(
+        parse(json!({"files":[{"base":base,"changes":[{"old":"alpha = 1","new":"alpha = 2"}]}]})),
+        "auto-5449ca50c1835a6f1d12d9ffa2b1e0b7"
+    );
+}
+
+#[test]
+fn a_lines_edit_commits_and_undo_restores_the_bytes() {
+    let original = "x\r\ny\r\nz\r\n";
+    let (dir, workspace, snapshot) = setup(original);
+    let edit = Change {
+        id: "y".into(),
+        target: Target::Lines {
+            lines: [2, 3],
+            expect: None,
+            expect_last: None,
+        },
+        text: "Y\nZ".into(),
+    };
+    let receipt = completed(
+        workspace
+            .edit(request("lines", &snapshot, vec![edit]))
+            .unwrap(),
+    );
+    assert_eq!(receipt.commit, CommitStatus::Committed);
+    assert_eq!(receipt.warnings[0].code, "EOL_ADAPTED");
+    let path = dir.path().join("file.txt");
+    assert_eq!(fs::read(&path).unwrap(), b"x\r\nY\r\nZ\r\n");
+    let undone = completed(workspace.undo(&receipt.plan_id, "").unwrap());
+    assert_eq!(undone.commit, CommitStatus::Committed);
+    assert_eq!(fs::read(&path).unwrap(), original.as_bytes());
+}
+
+#[test]
+fn undo_restores_lf_bytes_into_an_all_crlf_file_literally() {
+    // The edit turns an LF file into an all-CRLF one; undoing it must write the
+    // recorded LF bytes, not adapt them to the file's current line endings.
+    let (dir, workspace, snapshot) = setup("a\nb\n");
+    let receipt = completed(
+        workspace
+            .edit(request(
+                "to-crlf",
+                &snapshot,
+                vec![Change {
+                    id: "all".into(),
+                    target: Target::Span {
+                        span: "r0".into(),
+                        expect: None,
+                    },
+                    text: "a\r\nb\r\n".into(),
+                }],
+            ))
+            .unwrap(),
+    );
+    let path = dir.path().join("file.txt");
+    assert_eq!(fs::read(&path).unwrap(), b"a\r\nb\r\n");
+    let undone = completed(workspace.undo(&receipt.plan_id, "").unwrap());
+    assert_eq!(undone.commit, CommitStatus::Committed);
+    assert!(undone.warnings.is_empty(), "{:?}", undone.warnings);
+    assert_eq!(fs::read(&path).unwrap(), b"a\nb\n");
 }

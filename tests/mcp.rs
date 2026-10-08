@@ -33,6 +33,8 @@ impl Client {
     }
 
     fn connect_after_prefix(command: &mut Command, malformed_prefix: bool) -> Self {
+        // The plugin's server leaves routing to its session card.
+        let instructed = !command.get_args().any(|arg| arg == "--no-instructions");
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -76,12 +78,20 @@ impl Client {
         );
         assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
         assert!(initialized["result"]["capabilities"]["tools"].is_object());
-        let instructions = initialized["result"]["instructions"].as_str().unwrap();
-        assert!(instructions.starts_with("ALWAYS use these direct MCP tools"));
-        assert!(
-            instructions.len() <= 2_000,
-            "Claude truncates server instructions"
-        );
+        if instructed {
+            let instructions = initialized["result"]["instructions"].as_str().unwrap();
+            assert!(
+                instructions.starts_with(
+                    "Edit existing UTF-8 files in the launch workspace with ultra_edit"
+                )
+            );
+            assert!(
+                instructions.len() <= 2_000,
+                "Claude truncates server instructions"
+            );
+        } else {
+            assert!(initialized["result"].get("instructions").is_none());
+        }
         client.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
         client
     }
@@ -190,6 +200,8 @@ fn startup_requires_explicit_root_and_keeps_protocol_stdout_clean() {
         vec![],
         vec!["--root"],
         vec!["--root", "missing-workspace"],
+        vec!["--root", ".", "--no-instruction"],
+        vec!["--root", ".", "--no-instructions", "extra"],
         vec!["--help", "extra"],
         vec!["--claude-context"],
         vec!["--claude-context", "Bash"],
@@ -240,6 +252,13 @@ fn startup_requires_explicit_root_and_keeps_protocol_stdout_clean() {
             );
         }
         assert!(!tool["description"].as_str().unwrap().is_empty());
+        // Only the edit tool skips Claude Code's ToolSearch round trip.
+        let always = name == "ultra_edit";
+        assert_eq!(
+            tool["_meta"]["anthropic/alwaysLoad"],
+            if always { json!(true) } else { json!(null) },
+            "{name}"
+        );
     }
     assert_eq!(client.rpc("ping", json!({}))["result"], json!({}));
     assert!(client.rpc("unsupported/method", json!({}))["error"].is_object());
@@ -394,9 +413,8 @@ fn broken_stdout_exits_without_panic_while_stdin_stays_open() {
                 .map(|id| format!("{}\n", json!({"jsonrpc":"2.0","id":id,"method":"ping"})))
                 .collect::<String>()
         };
-        let _ = input.write_all(payload.as_bytes());
-        let _ = input.flush();
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut sent = None::<Instant>;
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
@@ -405,6 +423,14 @@ fn broken_stdout_exits_without_panic_while_stdin_stays_open() {
                 let _ = child.kill();
                 let _ = child.wait();
                 panic!("Broken stdout did not terminate the server while stdin remained open");
+            }
+            // A child another test forks while the reader is dropped holds the
+            // pipe's read end until it execs, so replies written then succeed;
+            // more input makes the server write again once the pipe is closed.
+            if sent.is_none_or(|sent| sent.elapsed() >= Duration::from_millis(100)) {
+                let _ = input.write_all(payload.as_bytes());
+                let _ = input.flush();
+                sent = Some(Instant::now());
             }
             std::thread::sleep(Duration::from_millis(10));
         };
@@ -689,6 +715,72 @@ fn continued_ranges_and_searches_edit_distant_lines_under_one_base_over_mcp() {
     client.close();
 }
 
+/// The benchmark's large-file-two-regions run guessed span ranges from the
+/// `spans` summary; they now resolve, and other guesses learn what is disclosed.
+#[test]
+fn span_ranges_from_the_spans_summary_edit_two_regions_in_one_call_over_mcp() {
+    let root = TempDir::new().unwrap();
+    let line = |number: usize| format!("    value_{number} = compute({number})\n");
+    let original: String = (1..=2_000).map(line).collect();
+    fs::write(root.path().join("routes.py"), &original).unwrap();
+    let mut client = Client::start(root.path());
+    let first = client.range("routes.py", 146, 150);
+    let both = client.call(
+        "ultra_edit_snapshot",
+        json!({"path":"routes.py","selection":{
+            "kind":"range","first":1875,"last":1879,"snapshot":first["snapshot"]
+        }}),
+        false,
+    );
+    assert_eq!(
+        both["spans"],
+        json!(["r146..r150", "r1875..r1879", "selection"])
+    );
+    let body = |first: usize, last: usize| {
+        (first..=last)
+            .map(|number| line(number).trim_end().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let guessed = client.call(
+        "ultra_edit",
+        json!({"files":[{"base":both["snapshot"],"changes":[
+            {"target":{"kind":"span","span":"146-150"},"text":"x"}
+        ]}]}),
+        true,
+    );
+    let diagnostic = &guessed["diagnostics"][0];
+    assert_eq!(diagnostic["code"], "UNKNOWN_SPAN");
+    assert_eq!(
+        diagnostic["message"],
+        "\"146-150\" is not a span ID; use r146, r146..r150, selection, m1, or \"lines\":[146,150]. This base discloses lines 146-150, 1875-1879; selection = lines 1875-1879"
+    );
+    let committed = client.call(
+        "ultra_edit",
+        json!({"files":[{"base":both["snapshot"],"changes":[
+            {"target":{"kind":"span","span":"r146..r150","expect":body(146, 150)},
+             "text":"    first_region = True"},
+            {"target":{"kind":"exact","old":"compute(1877)","scope":"r1875..r1879"},
+             "text":"compute(1877, cached=True)"}
+        ]}]}),
+        false,
+    );
+    assert_eq!(committed["commit"], "committed");
+    let expected: String = (1..=2_000)
+        .map(|number| match number {
+            146 => "    first_region = True\n".into(),
+            147..=150 => String::new(),
+            1877 => "    value_1877 = compute(1877, cached=True)\n".into(),
+            _ => line(number),
+        })
+        .collect();
+    assert_eq!(
+        fs::read(root.path().join("routes.py")).unwrap(),
+        expected.as_bytes()
+    );
+    client.close();
+}
+
 #[test]
 fn declared_schema_minimums_agree_with_the_runtime_line_and_count_rules() {
     let root = TempDir::new().unwrap();
@@ -725,8 +817,13 @@ fn declared_schema_minimums_agree_with_the_runtime_line_and_count_rules() {
     let range = variant(&snapshot, "Selection", "range");
     assert_eq!(range["properties"]["first"]["minimum"], 1);
     assert_eq!(range["properties"]["last"]["minimum"], 1);
-    let all = variant(&schema("ultra_edit"), "Target", "all");
-    assert_eq!(all["properties"]["expected"]["minimum"], 1);
+    // Shorthand fields carry the runtime minimums; the verbose form, still accepted,
+    // is not advertised.
+    let change = schema("ultra_edit")["$defs"]["Change"].clone();
+    assert_eq!(change["properties"]["count"]["minimum"], 1);
+    assert_eq!(change["properties"]["lines"]["items"]["minimum"], 1);
+    assert_eq!(change["properties"]["after"]["minimum"], 0);
+    assert!(change["properties"].get("target").is_none(), "{change}");
 
     let rejected = client.call(
         "ultra_edit_snapshot",
@@ -748,16 +845,30 @@ fn declared_schema_minimums_agree_with_the_runtime_line_and_count_rules() {
 #[test]
 fn diff_and_byte_warnings_are_available_before_and_after_commit() {
     let root = TempDir::new().unwrap();
-    let before: String = (1..=44).map(|line| format!("line {line}\r\n")).collect();
+    // A final LF line makes the file mixed, so LF-only text stays literal.
+    let mut before: String = (1..=44).map(|line| format!("line {line}\r\n")).collect();
+    before.push_str("tail\n");
     fs::write(root.path().join("file.txt"), &before).unwrap();
     let mut client = Client::start(root.path());
     let snapshot = client.full("file.txt");
     let request = json!({"request_id":"review","files":[{"base":snapshot["snapshot"],"changes":[
         {"id":"one","target":{"kind":"exact","old":"line 10\r\n"},"text":"changed 10\n"},
-        {"id":"two","target":{"kind":"exact","old":"line 35"},"text":"changed\u{0000}35"}
+        {"id":"two","target":{"kind":"exact","old":"line 35"},"text":"changed\u{0000}35"},
+        {"id":"three","target":{"kind":"exact","old":"line 20\r\n"},"text":"line 20"}
     ]}]});
     let prepared = client.call("ultra_edit_prepare", request.clone(), false);
-    assert_eq!(prepared["warning_count"], 2);
+    assert_eq!(prepared["warning_count"], 3);
+    // Byte warnings come first; the edge lint follows them.
+    assert_eq!(prepared["warnings"][0]["code"], "NUL_BYTE");
+    assert_eq!(prepared["warnings"][1]["code"], "MIXED_LINE_ENDINGS");
+    assert_eq!(
+        prepared["warnings"][2],
+        json!({
+            "code": "WHITESPACE_EDGE",
+            "file": prepared["warnings"][0]["file"],
+            "message": "Change three: `old` ends in whitespace `new` drops, joining what follows; line 20 now reads \"line 20line 21\"",
+        })
+    );
     let diff = client.call(
         "ultra_edit_diff",
         json!({"plan":prepared["reference"]}),
@@ -765,10 +876,10 @@ fn diff_and_byte_warnings_are_available_before_and_after_commit() {
     );
     let text = diff["diff"].as_str().unwrap();
     assert!(text.contains("-line 10\r\n+changed 10\n"), "{text}");
-    assert!(!text.contains("line 22"), "{text}");
+    assert!(!text.contains("line 27"), "{text}");
     assert!(diff["next_offset"].is_null());
     let committed = client.call("ultra_edit", request, false);
-    assert_eq!(committed["warning_count"], 2);
+    assert_eq!(committed["warning_count"], 3);
     assert_eq!(committed["warnings"], prepared["warnings"]);
     client.close();
     let mut client = Client::start(root.path());
@@ -783,6 +894,7 @@ fn diff_and_byte_warnings_are_available_before_and_after_commit() {
         before
             .replace("line 10\r\n", "changed 10\n")
             .replace("line 35", "changed\u{0}35")
+            .replace("line 20\r\n", "line 20")
     );
     client.close();
 }
@@ -931,14 +1043,21 @@ fn bundled_plugin_launches_hooks_and_mcp_without_path_lookup() {
         .tempdir()
         .unwrap();
     fs::create_dir(package.path().join("runtime")).unwrap();
-    fs::copy(
-        env!("CARGO_BIN_EXE_ultra-edit-mcp"),
-        package.path().join(format!(
-            "runtime/ultra-edit-mcp{}",
-            std::env::consts::EXE_SUFFIX
-        )),
-    )
-    .unwrap();
+    let copied = package.path().join(format!(
+        "runtime/ultra-edit-mcp{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::copy(env!("CARGO_BIN_EXE_ultra-edit-mcp"), &copied).unwrap();
+    // A child another test forks while the copy is open for writing holds it
+    // open until that child execs, and running the copy meanwhile is refused.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while let Err(error) = Command::new(&copied).arg("--version").output() {
+        assert!(
+            error.kind() == std::io::ErrorKind::ExecutableFileBusy && Instant::now() < deadline,
+            "{error}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let executable = |configuration: &Value| {
         let path = configuration["command"].as_str().unwrap();
         assert!(path.starts_with("${CLAUDE_PLUGIN_ROOT}/runtime/"));
@@ -984,8 +1103,9 @@ fn bundled_plugin_launches_hooks_and_mcp_without_path_lookup() {
     }
     let guards = configuration["hooks"]["PreToolUse"].as_array().unwrap();
     assert_eq!(guards.len(), 1);
-    // Exact tool names: the guard only understands Bash and PowerShell commands.
-    assert_eq!(guards[0]["matcher"], "Bash|PowerShell");
+    // Exact tool names: the guard understands Bash and PowerShell commands and
+    // scripts that Write saves.
+    assert_eq!(guards[0]["matcher"], "Bash|PowerShell|Write");
     let handler = &guards[0]["hooks"][0];
     assert_eq!(handler["type"], "command");
     assert_ne!(handler["async"], true);
@@ -1868,8 +1988,9 @@ fn request_and_change_ids_are_optional_except_for_retry() {
         let schema = schema(name);
         assert_eq!(required(&schema), ["files"], "{name}");
         assert_eq!(schema["properties"]["request_id"]["type"], "string");
+        // Every change field is optional in the schema; parsing enforces the forms.
         let change = &schema["$defs"]["Change"];
-        assert_eq!(required(change), ["target", "text"], "{name}");
+        assert!(change.get("required").is_none(), "{name}: {change}");
         assert_eq!(change["properties"]["id"]["type"], "string");
     }
     assert_eq!(
@@ -2017,5 +2138,109 @@ fn rejections_repairs_and_undos_replay_under_derived_ids() {
         replay_of(&undone)
     );
     assert_eq!(fs::read_to_string(&path).unwrap(), "y y\n");
+    client.close();
+}
+
+#[test]
+fn the_routing_cards_example_commits_through_the_server_by_path() {
+    let card = include_str!("../plugin/claude-code/instructions.md");
+    assert!(card.len() <= 2_048, "the card is {} bytes", card.len());
+    let start = card.find("{\"files\"").unwrap();
+    let end = card[start..].find("]}]}").unwrap() + start + 4;
+    let root = TempDir::new().unwrap();
+    fs::create_dir(root.path().join("src")).unwrap();
+    let file = root.path().join("src").join("app.py");
+    fs::write(
+        &file,
+        "import os\n\nretries = 2\ncfg = load(cfg)\n\n\ndef main():\n    run()\n",
+    )
+    .unwrap();
+    let mut example: Value = serde_json::from_str(&card[start..end]).unwrap();
+    example["files"][0]["path"] = json!(file.to_str().unwrap());
+    let mut client = Client::start(root.path());
+    let done = client.call("ultra_edit", example.clone(), false);
+    assert_eq!(done["commit"], "committed", "{done}");
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "import os\nimport re\n\nretries = 3\nconfig = load(config)\n\n\ndef main(argv):\n    run(argv)\n"
+    );
+    // Resending the identical call replays the recorded result and writes nothing.
+    let again = client.call("ultra_edit", example, false);
+    assert_eq!(again["commit"], "committed");
+    assert_eq!(again["replayed"], true, "{again}");
+    client.close();
+}
+
+#[test]
+fn shorthand_changes_commit_and_their_verbose_spelling_replays() {
+    let root = TempDir::new().unwrap();
+    fs::write(
+        root.path().join("app.py"),
+        "timeout_ms = 1500\nretries = 3\n",
+    )
+    .unwrap();
+    let mut client = Client::start(root.path());
+    let base = client.full("app.py");
+    let shorthand = json!({"files":[{"base":base["snapshot"],"changes":[
+        {"old":"timeout_ms = 1500","new":"timeout_ms = 2500"},
+        {"lines":[2,2],"new":"retries = 5"}
+    ]}]});
+    let committed = client.call("ultra_edit", shorthand, false);
+    assert_eq!(committed["commit"], "committed");
+    assert_eq!(
+        fs::read_to_string(root.path().join("app.py")).unwrap(),
+        "timeout_ms = 2500\nretries = 5\n"
+    );
+    let verbose = json!({"files":[{"base":base["snapshot"],"changes":[
+        {"target":{"kind":"exact","old":"timeout_ms = 1500","scope":null},"text":"timeout_ms = 2500"},
+        {"id":"1.2","target":{"kind":"lines","lines":[2,2]},"text":"retries = 5"}
+    ]}]});
+    assert_eq!(
+        client.call("ultra_edit", verbose, false),
+        replay_of(&committed)
+    );
+    // A malformed change is refused while parsing, with the accepted form.
+    let refused = client.rpc(
+        "tools/call",
+        json!({"name":"ultra_edit","arguments":{"files":[{"base":base["snapshot"],"changes":[
+            {"lines":"r1..r2","new":"x"}
+        ]}]}}),
+    );
+    let text = refused.to_string();
+    assert!(
+        text.contains(
+            "file 1, change 1: lines takes numbers like [146,150]; span IDs such as r146..r150 go in `span`"
+        ),
+        "{refused}"
+    );
+    client.close();
+}
+
+#[test]
+fn lines_delete_and_lf_text_keep_a_crlf_file_crlf_on_disk() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("Rotate-Logs.ps1");
+    fs::write(
+        &path,
+        "param()\r\n# Deprecated: remove in 3.0\r\nWrite-Host 1\r\nif ($x) {\r\n    Write-Host 2\r\n}\r\n",
+    )
+    .unwrap();
+    let mut client = Client::start(root.path());
+    let base = client.full("Rotate-Logs.ps1");
+    let committed = client.call(
+        "ultra_edit",
+        json!({"files":[{"base":base["snapshot"],"changes":[
+            {"lines":[2,2],"new":""},
+            // Copied from a view that hides \r: LF is matched and written as CRLF.
+            {"old":"if ($x) {\n    Write-Host 2\n}","new":"if ($y) {\n    Write-Host 3\n}"}
+        ]}]}),
+        false,
+    );
+    assert_eq!(committed["commit"], "committed");
+    assert_eq!(committed["warnings"][0]["code"], "EOL_ADAPTED");
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"param()\r\nWrite-Host 1\r\nif ($y) {\r\n    Write-Host 3\r\n}\r\n"
+    );
     client.close();
 }

@@ -15,12 +15,14 @@ fn prepare(workspace: &Workspace, paths: &[&str], request_id: &str) -> PreparedP
         .iter()
         .enumerate()
         .map(|(index, path)| FileRequest {
+            path: None,
             base: workspace.read(path).unwrap().id,
             changes: vec![Change {
                 id: format!("change-{index}"),
                 target: Target::Exact {
                     old: "before".into(),
                     scope: None,
+                    lines: None,
                 },
                 text: "after".into(),
             }],

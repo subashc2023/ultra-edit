@@ -30,8 +30,8 @@ reference and corrections when omitted:
   "reference": "REPLACE_WITH_RETURNED_DRAFT_OR_PLAN",
   "changes": [{
     "id": "1.1",
-    "target": { "kind": "exact", "old": "const RETRIES: usize = 1;" },
-    "text": "const RETRIES: usize = 3;"
+    "old": "const RETRIES: usize = 1;",
+    "new": "const RETRIES: usize = 3;"
   }]
 }
 ```
@@ -41,14 +41,13 @@ Each correction's `id` is required: the diagnostic's `change_id`, derived as
 corrections. When the diagnostic lists `candidates`, copy an `exact` or
 `whitespace` candidate's `text` into `old`, and confirm a `similar` one first
 (see [Targets](targets.md#when-a-target-is-not-found)). For `TARGET_AMBIGUOUS`,
-`actual` is the overlapping-start count; the message's parenthesized
-non-overlapping count is the `expected` value only when changing the same `old`
-and disclosed scope to `{"kind":"all"}`. If the original `exact` was unscoped
-and its focused snapshot has no covering span, take a suitable snapshot and
-start a new request. For
-`EMPTY_TARGET`, use a returned zero-width span if available. Otherwise, to insert
-a line, replace the preceding line body with original + line ending + insertion,
-or the following body with insertion + line ending + original.
+`actual` is the overlapping-start count; restrict `old` with
+`"in":[first,last]` using the lines the message names, or, to replace them all,
+use the parenthesized non-overlapping count as `count`. For `EMPTY_TARGET`,
+insert with `{"after":n,"expect":…,"new":…}`. For `LINE_GUARD_REQUIRED`,
+`LINE_GUARD_WEAK`, or a line-target `EXPECTED_TEXT_MISMATCH`, add or extend
+`expect`, or use the current line numbers the message gives. A `path` file's
+draft keeps the bytes it read as its base, so a repair is judged against them.
 Unknown change IDs cannot be added, and a repair cannot replace the base snapshots.
 A successful repair is a preview;
 commit its returned plan separately. Any commit attempt closes repair, including

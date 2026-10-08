@@ -15,6 +15,7 @@ fn request(id: &str, base: &str, span: &str, text: &str) -> EditRequest {
     EditRequest {
         request_id: id.into(),
         files: vec![FileRequest {
+            path: None,
             base: base.into(),
             changes: vec![Change {
                 id: "replace".into(),
@@ -33,6 +34,7 @@ fn span_edits(id: &str, base: &str, changes: &[(&str, &str)]) -> EditRequest {
     EditRequest {
         request_id: id.into(),
         files: vec![FileRequest {
+            path: None,
             base: base.into(),
             changes: changes
                 .iter()
@@ -212,6 +214,7 @@ fn unscoped_exact_targets_still_search_the_complete_original_file() {
     edit.files[0].changes[0].target = Target::Exact {
         old: "same".into(),
         scope: None,
+        lines: None,
     };
     let rejected = workspace.prepare(edit.clone()).unwrap();
     assert!(!rejected.ready);
@@ -221,6 +224,7 @@ fn unscoped_exact_targets_still_search_the_complete_original_file() {
     edit.files[0].changes[0].target = Target::Exact {
         old: "same".into(),
         scope: Some("selection".into()),
+        lines: None,
     };
     assert!(workspace.prepare(edit).unwrap().ready);
 }
@@ -364,11 +368,9 @@ fn invalid_and_extreme_line_ranges_are_rejected() {
         (0, 1, "INVALID_LINE_RANGE"),
         (1, 0, "INVALID_LINE_RANGE"),
         (2, 1, "INVALID_LINE_RANGE"),
-        (1, 3, "INVALID_LINE_RANGE"),
         (3, 3, "INVALID_LINE_RANGE"),
-        (2, 900, "INVALID_LINE_RANGE"),
+        (3, 900, "INVALID_LINE_RANGE"),
         (usize::MAX, usize::MAX, "INVALID_LINE_RANGE"),
-        (1, usize::MAX, "INVALID_LINE_RANGE"),
     ] {
         assert_eq!(
             workspace
@@ -377,6 +379,17 @@ fn invalid_and_extreme_line_ranges_are_rejected() {
                 .code,
             code
         );
+    }
+}
+
+#[test]
+fn a_range_past_the_last_line_reads_through_it() {
+    let (_dir, workspace) = setup("one\ntwo\n");
+    for (first, last) in [(1, 3), (2, 900), (1, usize::MAX)] {
+        let view = workspace.read_range("file.txt", first, last).unwrap();
+        assert_eq!(view.total_lines, 2, "{first}..{last}");
+        assert_eq!(view.lines.last().unwrap(), "r2 | two", "{first}..{last}");
+        assert_eq!(view.text, if first == 1 { "one\ntwo" } else { "two" });
     }
 }
 
@@ -691,8 +704,8 @@ fn continued_ranges_keep_per_read_limits() {
         (
             "file.txt",
             &second.snapshot,
-            999,
             1_001,
+            1_002,
             "INVALID_LINE_RANGE",
         ),
         ("file.txt", &second.snapshot, 0, 1, "INVALID_LINE_RANGE"),

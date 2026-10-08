@@ -35,6 +35,18 @@ const NON_FILE_DRIVES: [&str; 8] = [
 /// Target words longer than this count as inside without being read.
 const MAX_TARGET_BYTES: usize = 4096;
 
+/// Temporary directories on every system, besides `TMPDIR`, `TEMP`, and
+/// `TMP`, where scratch scripts are saved.
+const TEMPORARY_DIRECTORIES: [&str; 7] = [
+    "/tmp",
+    "/var/tmp",
+    "/dev/shm",
+    "/private/tmp",
+    "/private/var/tmp",
+    "/var/folders",
+    "/private/var/folders",
+];
+
 /// The project a command runs in and the environment values its write
 /// targets may expand. The hook builds it from its own environment and the
 /// event; the classifier never reads the environment itself.
@@ -42,6 +54,9 @@ const MAX_TARGET_BYTES: usize = 4096;
 pub struct Scope {
     root: Option<Root>,
     variables: Vec<(&'static str, String)>,
+    /// Variables the Bash script being checked assigns once, with the
+    /// targets their values name.
+    locals: Vec<(String, Target)>,
     /// Whether the script passed through another shell's expansions, such
     /// as `pwsh -c "..."` in Bash, so the variables it names are unknown.
     foreign: bool,
@@ -63,8 +78,37 @@ impl Scope {
         Self {
             root: self.root.clone(),
             variables: Vec::new(),
+            locals: Vec::new(),
             foreign: true,
         }
+    }
+
+    /// This scope for a Bash script that binds `bindings`, in order: each
+    /// variable's name and raw value, or no value where a loop, `read`, or
+    /// one command's environment binds it. A variable assigned once expands
+    /// in later targets; `$(mktemp)` names a new temporary file. The
+    /// enclosing script's variables are dropped.
+    pub(super) fn with_locals(&self, bindings: &[(String, Option<String>)]) -> Self {
+        let mut scope = Self {
+            locals: Vec::new(),
+            ..self.clone()
+        };
+        for (name, value) in bindings {
+            let once = bindings.iter().filter(|(other, _)| other == name).count() == 1;
+            let (Some(value), true) = (value, once) else {
+                continue;
+            };
+            let unquoted = value.trim_matches('"');
+            let target = if unquoted.starts_with("$(mktemp") || unquoted.starts_with("`mktemp") {
+                Target::Scratch
+            } else if value.len() > MAX_TARGET_BYTES {
+                Target::Dynamic
+            } else {
+                bash_target(value, &scope)
+            };
+            scope.locals.push((name.clone(), target));
+        }
+        scope
     }
 
     /// Records the value of one of [`SCOPE_VARIABLES`]. Other names and empty
@@ -87,6 +131,75 @@ impl Scope {
             .map(|(_, value)| value.as_str())
     }
 
+    fn windows(&self) -> bool {
+        self.root.as_ref().is_some_and(|root| root.windows)
+    }
+
+    /// The home directory, when it was passed in.
+    pub(super) fn home(&self) -> Option<&str> {
+        if self.windows() {
+            self.variable("USERPROFILE")
+                .or_else(|| self.variable("HOME"))
+        } else {
+            self.variable("HOME")
+        }
+    }
+
+    /// The temporary directory: `TMPDIR`, `TEMP`, or `TMP`, else `/tmp`
+    /// outside Windows.
+    pub(super) fn temporary(&self) -> Option<&str> {
+        ["TMPDIR", "TEMP", "TMP"]
+            .into_iter()
+            .find_map(|name| self.variable(name))
+            .or_else(|| (self.root.is_some() && !self.windows()).then_some("/tmp"))
+    }
+
+    /// Whether `path` lies in a temporary directory, where scratch scripts
+    /// are saved: `/tmp` and the like, the `TMPDIR`, `TEMP`, and `TMP`
+    /// directories, and on Windows `\Temp`, `\Tmp`, or `\Windows\Temp` on
+    /// any drive.
+    pub(super) fn scratch(&self, path: &str) -> bool {
+        let Some(target) = Root::parse(path) else {
+            return false;
+        };
+        let parts = &target.components;
+        if target.windows
+            && parts.len() > 2
+            && (matches!(parts[1].as_str(), "TEMP" | "TMP")
+                || (parts[1] == "WINDOWS" && parts[2] == "TEMP" && parts.len() > 3))
+        {
+            return true;
+        }
+        TEMPORARY_DIRECTORIES
+            .iter()
+            .copied()
+            .chain(
+                ["TMPDIR", "TEMP", "TMP"]
+                    .into_iter()
+                    .filter_map(|name| self.variable(name)),
+            )
+            .filter_map(Root::parse)
+            .any(|directory| {
+                directory.windows == target.windows
+                    && parts.len() > directory.components.len()
+                    && parts.starts_with(&directory.components)
+            })
+    }
+
+    /// The path the word whose source text is `raw` names, when every part
+    /// of it is known.
+    pub(super) fn path(&self, dialect: Dialect, raw: &str) -> Option<String> {
+        let target = match dialect {
+            _ if raw.len() > MAX_TARGET_BYTES => return None,
+            Dialect::Bash => bash_target(raw, self),
+            Dialect::PowerShell => powershell_target(raw, self, self.windows()),
+        };
+        match target {
+            Target::Path(path) => Some(path),
+            _ => None,
+        }
+    }
+
     /// Whether a write to the word whose source text is `raw` may reach a
     /// project file. Discarded output never does; under a root, runner files
     /// and absolute paths outside the root do not either.
@@ -100,9 +213,43 @@ impl Scope {
         match (target, &self.root) {
             (Target::Device, _) => false,
             (_, None) | (Target::Dynamic, _) => true,
-            (Target::Runner, Some(_)) => false,
+            (Target::Runner | Target::Scratch, Some(_)) => false,
             (Target::Path(path), Some(root)) => !root.excludes(&path, dialect),
+            (Target::Prefix(prefix), Some(root)) => !root.excludes_prefix(&prefix, dialect),
         }
+    }
+}
+
+impl Scope {
+    /// Whether a write to `path`, taken as written rather than as a shell word
+    /// (a string literal in script code, or the Write tool's path), may reach
+    /// a project file: without a root, or unless it is absolute and outside.
+    pub(super) fn literal_inside(&self, path: &str) -> bool {
+        let Some(root) = &self.root else {
+            return true;
+        };
+        let dialect = if root.windows {
+            Dialect::PowerShell
+        } else {
+            Dialect::Bash
+        };
+        path.len() > MAX_TARGET_BYTES || !root.excludes(path, dialect)
+    }
+
+    /// Whether every path that starts with the text `prefix`, as code spells
+    /// a path before an interpolation, lies outside the project: its
+    /// directory part is absolute and outside the root, or leads to the root
+    /// while its partial last name cannot start the root's next name.
+    pub(super) fn prefix_outside(&self, prefix: &str) -> bool {
+        let Some(root) = &self.root else {
+            return false;
+        };
+        let dialect = if root.windows {
+            Dialect::PowerShell
+        } else {
+            Dialect::Bash
+        };
+        prefix.len() <= MAX_TARGET_BYTES && root.excludes_prefix(prefix, dialect)
     }
 }
 
@@ -133,9 +280,10 @@ impl Root {
         })
     }
 
-    /// Whether `path` is absolute and lies outside this root.
-    fn excludes(&self, path: &str, dialect: Dialect) -> bool {
-        let components = if self.windows {
+    /// The folded components of `path` when it is absolute under this
+    /// root's conventions.
+    fn components(&self, path: &str, dialect: Dialect) -> Option<Vec<String>> {
+        if self.windows {
             // Git Bash spells `C:\x` as `/c/x`; PowerShell reads `/c/x` as a
             // folder on the current drive.
             windows(path, dialect == Dialect::Bash)
@@ -144,8 +292,36 @@ impl Root {
             posix(&path.replace('\\', "/"))
         } else {
             posix(path)
+        }
+    }
+
+    /// Whether `path` is absolute and lies outside this root.
+    fn excludes(&self, path: &str, dialect: Dialect) -> bool {
+        self.components(path, dialect)
+            .is_some_and(|components| !components.starts_with(&self.components))
+    }
+
+    /// Whether no path that starts with the text `prefix` lies in this root.
+    fn excludes_prefix(&self, prefix: &str, dialect: Dialect) -> bool {
+        let separators: &[char] = if self.windows || dialect == Dialect::PowerShell {
+            &['/', '\\']
+        } else {
+            &['/']
         };
-        components.is_some_and(|components| !components.starts_with(&self.components))
+        let Some(cut) = prefix.rfind(separators) else {
+            return false;
+        };
+        let Some(directory) = self.components(&prefix[..=cut], dialect) else {
+            return false;
+        };
+        if directory.starts_with(&self.components) {
+            return false;
+        }
+        if !self.components.starts_with(&directory) {
+            return true;
+        }
+        let partial = fold(&prefix[cut + 1..]);
+        !self.components[directory.len()].starts_with(&partial)
     }
 }
 
@@ -233,6 +409,7 @@ fn fold(name: &str) -> String {
 }
 
 /// A write target read from its source text.
+#[derive(Clone, Debug)]
 enum Target {
     /// Output that no file receives, such as `$null` or the `Env:` drive.
     Device,
@@ -240,13 +417,18 @@ enum Target {
     Runner,
     /// A path whose text is fully known.
     Path(String),
+    /// A path whose leading text is known and whose rest is not.
+    Prefix(String),
+    /// A new file or directory that `mktemp` made.
+    Scratch,
     /// A path that depends on anything else only known at run time.
     Dynamic,
 }
 
 /// Reads a Bash word as a path, expanding only a leading `~`, `$HOME`,
-/// `$TMPDIR`, or `$CLAUDE_PROJECT_DIR`. Other expansions, substitutions, and
-/// unquoted glob or brace characters make it dynamic.
+/// `$TMPDIR`, `$CLAUDE_PROJECT_DIR`, or variable the script assigned once.
+/// A later expansion or substitution, or an unquoted glob or brace
+/// character, leaves only the text before it known.
 fn bash_target(raw: &str, scope: &Scope) -> Target {
     let bytes = raw.as_bytes();
     let mut text = Vec::new();
@@ -276,19 +458,16 @@ fn bash_target(raw: &str, scope: &Scope) -> Target {
                 }
                 _ => text.push(byte),
             },
-            b'$' => {
-                let Some((name, length)) = bash_variable(&bytes[at..]) else {
-                    return Target::Dynamic;
-                };
+            b'$' => match bash_variable(&bytes[at..]) {
                 // Only a leading variable expands; a later one is unknown.
-                if lead.is_some() || !text.is_empty() {
-                    return Target::Dynamic;
+                Some((name, length)) if lead.is_none() && text.is_empty() => {
+                    lead = Some(name);
+                    at += length;
                 }
-                lead = Some(name);
-                at += length;
-            }
-            b'`' => return Target::Dynamic,
-            b'*' | b'?' | b'[' | b'{' if !quoted => return Target::Dynamic,
+                _ => return partial(lead, &text, scope),
+            },
+            b'`' => return partial(lead, &text, scope),
+            b'*' | b'?' | b'[' | b'{' if !quoted => return partial(lead, &text, scope),
             _ => text.push(byte),
         }
     }
@@ -298,11 +477,42 @@ fn bash_target(raw: &str, scope: &Scope) -> Target {
     let rest = String::from_utf8_lossy(&text);
     match lead {
         None => Target::Path(rest.into_owned()),
-        Some(name) if RUNNER_FILES.contains(&name) => runner(&rest),
-        Some(name @ ("HOME" | "TMPDIR" | "CLAUDE_PROJECT_DIR")) => {
-            expanded(scope.variable(name), &rest)
-        }
-        Some(_) => Target::Dynamic,
+        Some(name) => expansion(name, &rest, scope),
+    }
+}
+
+/// A word's target when only its leading variable `lead` and the `text`
+/// after it are known: a prefix, unless the variable is unknown.
+fn partial(lead: Option<&str>, text: &[u8], scope: &Scope) -> Target {
+    if scope.foreign && lead.is_some() {
+        return Target::Dynamic;
+    }
+    let text = String::from_utf8_lossy(text);
+    let known = match lead {
+        None => Target::Path(text.into_owned()),
+        Some(name) => expansion(name, &text, scope),
+    };
+    match known {
+        Target::Path(path) if !path.is_empty() => Target::Prefix(path),
+        Target::Prefix(_) | Target::Scratch => known,
+        _ => Target::Dynamic,
+    }
+}
+
+/// The target of `$name` followed by `rest`.
+fn expansion(name: &str, rest: &str, scope: &Scope) -> Target {
+    if let Some((_, target)) = scope.locals.iter().rev().find(|(local, _)| local == name) {
+        return match target {
+            Target::Path(path) => Target::Path(format!("{path}{rest}")),
+            Target::Prefix(_) | Target::Scratch => target.clone(),
+            Target::Device if rest.is_empty() => Target::Device,
+            _ => Target::Dynamic,
+        };
+    }
+    match name {
+        _ if RUNNER_FILES.contains(&name) => runner(rest),
+        "HOME" | "TMPDIR" | "CLAUDE_PROJECT_DIR" => expanded(scope.variable(name), rest),
+        _ => Target::Dynamic,
     }
 }
 

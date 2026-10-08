@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -20,11 +20,15 @@ const REPAIR_DOMAIN: &[u8] = b"ultra-edit:repair:v1\0";
 const UNDO_DOMAIN: &[u8] = b"ultra-edit:undo:v1\0";
 
 /// Leads the report of a replayed result so it cannot pass for a new attempt.
-pub const REPLAY_NOTICE: &str = "Replayed the recorded result; nothing new was attempted. To try again, pass a new explicit request_id, or for an edit, take fresh snapshots.";
+pub const REPLAY_NOTICE: &str = "Replayed the recorded result; nothing new was attempted. To try again, pass a new explicit request_id, or for an edit with snapshot bases, take fresh snapshots.";
 
 /// Filesystem host. Each operation coordinates with other hosts using the same workspace root.
 pub struct Workspace {
     storage: Storage,
+    /// The root as the caller spelled it, made absolute without resolving links. The
+    /// storage root is canonical, so a path the caller spells from this root (through a
+    /// symlink, as macOS temporary directories are) needs it to normalize the same way.
+    spelled_root: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,8 +86,10 @@ pub enum Evidence {
 
 impl Workspace {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, Error> {
+        let root = root.as_ref();
         Ok(Self {
-            storage: Storage::open(root.as_ref())?,
+            storage: Storage::open(root)?,
+            spelled_root: std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf()),
         })
     }
 
@@ -225,9 +231,18 @@ impl Workspace {
         Ok((path, text))
     }
 
-    /// Omitted IDs are resolved first, as by [`resolve_ids`].
+    /// Normalizes file paths, as by [`normalize_paths`], then resolves omitted IDs, as by
+    /// [`resolve_ids`]. Both are pure, so a caller can resolve before taking the lock.
+    pub fn resolve_request(&self, request: EditRequest) -> Result<EditRequest, Error> {
+        resolve_ids(normalize_paths(
+            request,
+            &[self.root(), self.spelled_root.as_path()],
+        ))
+    }
+
+    /// Paths and omitted IDs are resolved first, as by [`Self::resolve_request`].
     pub fn prepare(&self, request: EditRequest) -> Result<Preparation, Error> {
-        let request = resolve_ids(request)?;
+        let request = self.resolve_request(request)?;
         let _lock = self.storage.lock()?;
         let input = Input::Edit {
             request: request.clone(),
@@ -238,10 +253,11 @@ impl Workspace {
         self.prepare_new(input, request)
     }
 
-    /// Omitted IDs are resolved first, as by [`resolve_ids`].
+    /// Paths and omitted IDs are resolved first, as by [`Self::resolve_request`].
     pub fn edit(&self, request: EditRequest) -> Result<EditResult, Error> {
-        let request = resolve_ids(request)?;
+        let request = self.resolve_request(request)?;
         let _lock = self.storage.lock()?;
+        let path_mode = request.files.iter().any(|file| file.path.is_some());
         let input = Input::Edit {
             request: request.clone(),
         };
@@ -249,7 +265,40 @@ impl Workspace {
             Some(reference) => self.preparation(&reference, true)?,
             None => self.prepare_new(input, request)?,
         };
-        self.finish(preparation)
+        let mut result = self.finish(preparation)?;
+        if let EditResult::Completed {
+            receipt,
+            replayed: true,
+            ..
+        } = &mut result
+            && path_mode
+        {
+            receipt.warnings.extend(self.replayed_changes(receipt)?);
+        }
+        Ok(result)
+    }
+
+    /// A replayed path request names files, not snapshots, so its caller may expect the
+    /// edit applied to the files as they are now. Warn for each committed file whose
+    /// bytes changed since: nothing was written to it now.
+    fn replayed_changes(&self, receipt: &Receipt) -> Result<Vec<Diagnostic>, Error> {
+        let plan = self.plan(&receipt.plan_id)?;
+        let mut warnings = Vec::new();
+        for file in &plan.files {
+            let committed = receipt.files.iter().any(|outcome| {
+                outcome.path == file.base.path && outcome.status == FileStatus::Committed
+            });
+            let current = self.storage.read(Path::new(&file.base.path)).ok();
+            if committed && current.as_deref() != Some(file.output.as_str()) {
+                let mut warning = Diagnostic::new(
+                    "REPLAYED_FILE_CHANGED",
+                    "This identical request was already committed and the file has changed since; nothing was written now. To apply the edit to the current file, pass a new request_id.",
+                );
+                warning.file = Some(file.base.path.clone());
+                warnings.push(warning);
+            }
+        }
+        Ok(warnings)
     }
 
     pub fn commit(&self, reference: &str) -> Result<Receipt, Error> {
@@ -321,7 +370,13 @@ impl Workspace {
             let binding: Binding = self.storage.get("requests", &id)?;
             let request_id = match &binding.input {
                 Input::Edit { request } => {
-                    retained.extend(request.files.iter().map(|file| file.base.clone()));
+                    retained.extend(
+                        request
+                            .files
+                            .iter()
+                            .filter(|file| !file.base.is_empty())
+                            .map(|file| file.base.clone()),
+                    );
                     &request.request_id
                 }
                 Input::Repair {
@@ -384,7 +439,14 @@ impl Workspace {
                     "Draft does not match its filename",
                 ));
             }
-            retained.extend(draft.request.files.iter().map(|file| file.base.clone()));
+            retained.extend(
+                draft
+                    .request
+                    .files
+                    .iter()
+                    .filter(|file| !file.base.is_empty())
+                    .map(|file| file.base.clone()),
+            );
         }
         for id in self.storage.object_ids("inspections")? {
             let inspection: Inspection = self.storage.get("inspections", &id)?;
@@ -449,6 +511,31 @@ impl Workspace {
                 ));
             }
         };
+        // An undo restores recorded bytes exactly; a repair would plan new text. A
+        // store written by 0.3.0 may hold repairs of an undo's draft, so follow them.
+        let mut origin = request.request_id.clone();
+        let mut seen = BTreeSet::new();
+        loop {
+            let key = digest(origin.as_bytes());
+            if !seen.insert(key.clone()) || !self.storage.exists("requests", &key)? {
+                break;
+            }
+            let reference = match self.storage.get::<Binding>("requests", &key)?.input {
+                Input::Undo { .. } => {
+                    return Err(Error::new(
+                        "INVALID_REFERENCE",
+                        "An undo restores recorded bytes and cannot be repaired; once the file holds the undone plan's output again, undo that plan with a new request_id",
+                    ));
+                }
+                Input::Repair { reference, .. } | Input::Retry { reference, .. } => reference,
+                Input::Edit { .. } => break,
+            };
+            origin = match self.evidence_unlocked(&reference)? {
+                Evidence::Plan(plan) => plan.request.request_id,
+                Evidence::Draft(draft) => draft.request.request_id,
+                Evidence::Snapshot(_) | Evidence::Inspection(_) => break,
+            };
+        }
         if request_id == request.request_id {
             return Err(Error::new(
                 "REQUEST_ID_REUSED",
@@ -561,6 +648,7 @@ impl Workspace {
             let snapshot = compiler::snapshot(file.base.path.clone(), file.output.clone());
             self.storage.put("snapshots", &snapshot.id, &snapshot)?;
             files.push(FileRequest {
+                path: None,
                 base: snapshot.id,
                 changes: vec![Change {
                     id: format!("undo-{}", files.len() + 1),
@@ -630,17 +718,29 @@ impl Workspace {
                 "A request may address at most 64 files",
             ));
         }
-        let mut snapshots = BTreeMap::new();
         let mut diagnostics = Vec::new();
+        // A derived-ID path request that is rejected is not bound: nothing was written,
+        // so an identical resend after fixing the file is evaluated again, as native Edit
+        // would be. Explicit IDs and snapshot-only requests bind as before.
+        let unbound_draft = matches!(&input, Input::Edit { .. })
+            && request.files.iter().any(|file| file.path.is_some())
+            && derived_id(EDIT_DOMAIN, &request.files)? == request.request_id;
+        let (request, mut fresh) = self.read_paths(request, &mut diagnostics)?;
+        let mut snapshots = BTreeMap::new();
         let mut paths: Vec<PathBuf> = Vec::new();
         let mut examined = BTreeSet::new();
         let mut total_bytes = 0usize;
         for file in &request.files {
-            // An empty base is reported once by the compiler as EMPTY_SNAPSHOT_ID.
+            // An empty base is reported once by the compiler as EMPTY_SNAPSHOT_ID, and an
+            // unreadable path once by read_paths.
             if !examined.insert(&file.base) || file.base.trim().is_empty() {
                 continue;
             }
-            let snapshot: Snapshot = match self.storage.get("snapshots", &file.base) {
+            let read_now = fresh.contains_key(&file.base);
+            let snapshot: Snapshot = match fresh
+                .remove(&file.base)
+                .map_or_else(|| self.storage.get("snapshots", &file.base), Ok)
+            {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     diagnostics.push(Diagnostic::new(
@@ -663,7 +763,7 @@ impl Workspace {
             if total_bytes > 64 * 1024 * 1024 {
                 return Err(Error::new(
                     "RESOURCE_LIMIT",
-                    "Snapshot bytes in a batch exceed 64 MiB",
+                    "File bytes in a batch exceed 64 MiB",
                 ));
             }
             let check = self.storage.resolve(Path::new(&snapshot.path)).and_then(|path| {
@@ -676,7 +776,7 @@ impl Workspace {
                     }
                 }
                 paths.push(path.clone());
-                if self.storage.read(&path)? != snapshot.text {
+                if !read_now && self.storage.read(&path)? != snapshot.text {
                     return Err(Error::new("STALE_SNAPSHOT", if undo {
                         "Undo requires the recorded after-bytes, but the file differs; it may already be undone or contain newer work. Inspect the current file and original plan before choosing an explicit restoration edit"
                     } else {
@@ -692,16 +792,31 @@ impl Workspace {
             }
             snapshots.insert(file.base.clone(), snapshot);
         }
-        let compiled = compiler::compile(&request, &snapshots);
+        // An undo restores recorded bytes, which line-ending adaptation must not touch.
+        let eol = if undo {
+            compiler::Eol::Literal
+        } else {
+            compiler::Eol::Adapt
+        };
+        let compiled = compiler::compile_with(&request, &snapshots, eol);
         let plan = match compiled {
             Ok(plan) => Some(plan),
             Err(errors) => {
-                // The workspace already reported every base absent from the map.
-                diagnostics.extend(
-                    errors
-                        .into_iter()
-                        .filter(|error| error.code != "UNKNOWN_SNAPSHOT"),
-                );
+                // The workspace already reported every base absent from the map, and
+                // every span named in a path file, which discloses only r0.
+                let needs_base: BTreeSet<String> = diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.code == "SPAN_NEEDS_BASE")
+                    .filter_map(|diagnostic| diagnostic.change_id.clone())
+                    .collect();
+                diagnostics.extend(errors.into_iter().filter(|error| {
+                    error.code != "UNKNOWN_SNAPSHOT"
+                        && !(error.code == "UNKNOWN_SPAN"
+                            && error
+                                .change_id
+                                .as_ref()
+                                .is_some_and(|id| needs_base.contains(id)))
+                }));
                 None
             }
         };
@@ -721,6 +836,9 @@ impl Workspace {
                 diagnostics,
             };
             self.storage.put("drafts", &draft.id, &draft)?;
+            if unbound_draft {
+                return self.preparation(&draft.id, false);
+            }
             draft.id
         };
         self.storage.put(
@@ -732,6 +850,90 @@ impl Workspace {
             },
         )?;
         self.preparation(&reference, false)
+    }
+
+    /// Reads each `path` file under the lock into a stored snapshot and returns the
+    /// request with that snapshot as the file's base, so plans and drafts record
+    /// bases exactly as snapshot requests do. A file that cannot be read keeps its
+    /// path and gets a diagnostic. With both `path` and `base`, the base is used and
+    /// must be that file's snapshot.
+    fn read_paths(
+        &self,
+        mut request: EditRequest,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Result<(EditRequest, BTreeMap<String, Snapshot>), Error> {
+        let mut fresh = BTreeMap::new();
+        let mut total_bytes = 0usize;
+        let mut read = BTreeSet::new();
+        for file in &mut request.files {
+            let Some(given) = file.path.clone() else {
+                continue;
+            };
+            let resolved = if file.base.trim().is_empty() {
+                self.read_source(Path::new(&given)).map(Some)
+            } else {
+                self.storage.resolve(Path::new(&given)).and_then(|path| {
+                    // An unavailable base is reported once, as INVALID_SNAPSHOT, by the caller.
+                    let Ok(base) = self.storage.get::<Snapshot>("snapshots", &file.base) else {
+                        return Ok(None);
+                    };
+                    if path != Path::new(&base.path) {
+                        return Err(Error::new(
+                            "SNAPSHOT_PATH_MISMATCH",
+                            format!("The path does not identify snapshot {}'s file", file.base),
+                        ));
+                    }
+                    Ok(None)
+                })
+            };
+            match resolved {
+                Ok(Some((path, _))) if read.contains(&path) => {
+                    // Reported once here; the entry keeps its path, so nothing else plans it.
+                    let mut diagnostic = Diagnostic::new(
+                        "DUPLICATE_TARGET_PATH",
+                        "This file is named by an earlier entry; list each file once, with all its changes in that entry",
+                    );
+                    diagnostic.file = Some(path);
+                    diagnostics.push(diagnostic);
+                }
+                Ok(Some((path, text))) => {
+                    read.insert(path.clone());
+                    // Checked as each file is read, so a batch never holds more than the limit.
+                    total_bytes = total_bytes.saturating_add(text.len());
+                    if total_bytes > 64 * 1024 * 1024 {
+                        return Err(Error::new(
+                            "RESOURCE_LIMIT",
+                            "File bytes in a batch exceed 64 MiB",
+                        ));
+                    }
+                    for change in &file.changes {
+                        if let Some(span) = needs_base(&change.target) {
+                            let mut diagnostic = Diagnostic::new(
+                                "SPAN_NEEDS_BASE",
+                                format!(
+                                    "Span {span} needs a base from ultra_edit_snapshot; with `path`, target text with `old`, or whole lines with `lines` and `expect`."
+                                ),
+                            );
+                            diagnostic.file = Some(path.clone());
+                            diagnostic.change_id = Some(change.id.clone());
+                            diagnostics.push(diagnostic);
+                        }
+                    }
+                    let snapshot = compiler::file_snapshot(path, text);
+                    self.storage.put("snapshots", &snapshot.id, &snapshot)?;
+                    file.base = snapshot.id.clone();
+                    file.path = None;
+                    fresh.insert(snapshot.id.clone(), snapshot);
+                }
+                Ok(None) => file.path = None,
+                Err(error) => {
+                    let mut diagnostic = Diagnostic::new(&error.code, error.message);
+                    diagnostic.file = Some(given);
+                    diagnostics.push(diagnostic);
+                }
+            }
+        }
+        Ok((request, fresh))
     }
 
     fn plan(&self, reference: &str) -> Result<PreparedPlan, Error> {
@@ -834,6 +1036,44 @@ impl Workspace {
             )),
         }
     }
+}
+
+/// Rewrites each file `path` lexically, without touching the filesystem, so spellings of
+/// one file derive one request ID: a leading spelling of the workspace root (`roots`,
+/// such as its canonical and its given form) is stripped, and `.` components and
+/// repeated separators are dropped. `..` is kept, because collapsing it past a
+/// symlinked directory would name a different file.
+pub fn normalize_paths(mut request: EditRequest, roots: &[&Path]) -> EditRequest {
+    for file in &mut request.files {
+        if let Some(path) = &mut file.path {
+            let given = Path::new(path.as_str());
+            let relative = roots
+                .iter()
+                .find_map(|root| given.strip_prefix(root).ok())
+                .unwrap_or(given);
+            let normal: PathBuf = relative
+                .components()
+                .filter(|component| *component != Component::CurDir)
+                .collect();
+            if let Some(normal) = normal.to_str().filter(|normal| !normal.is_empty()) {
+                *path = normal.to_owned();
+            }
+        }
+    }
+    request
+}
+
+/// The span a target in a `path` file names other than `r0`, the whole file: a path
+/// file is read now, so no span of it was ever disclosed.
+fn needs_base(target: &Target) -> Option<&str> {
+    let span = match target {
+        Target::Exact { scope, .. } => scope.as_deref()?,
+        Target::All { scope, .. } => scope.as_deref()?,
+        Target::Span { span, .. } => span.as_str(),
+        Target::Lines { .. } | Target::Insert { .. } => return None,
+    };
+    // An empty ID is reported once, as EMPTY_SPAN_ID.
+    (!span.trim().is_empty() && span != "r0").then_some(span)
 }
 
 /// Fills each empty change ID with its 1-based `"{file}.{change}"` position, then an

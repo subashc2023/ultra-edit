@@ -62,7 +62,11 @@ a custom configuration directory; Claude Code identifies that copy as
 For a session-only source test, use
 `claude --plugin-dir ABSOLUTE_PLUGIN_DIRECTORY`.
 The packaged `.mcp.json` runs `${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp` with
-the argument array `["--root", "${CLAUDE_PROJECT_DIR}"]`. The native launcher
+the argument array `["--root", "${CLAUDE_PROJECT_DIR}", "--no-instructions"]`.
+`--no-instructions` leaves server instructions out of `initialize`, because the
+plugin's session card already gives the model the same routing; measured with
+Claude Code 2.1.293, the duplicate cost about 280 tokens on every model call.
+Other hosts start the server without it and receive the instructions. The native launcher
 resolves `.exe` on Windows. Hook entries point to the same executable with an
 explicit argument array, so they launch directly without a shell. `runtime/`
 keeps the binaries private; a plugin `bin/` directory would be added to Claude's
@@ -111,7 +115,7 @@ The names below are server-side names; the host may add a namespace.
 | Tool | Arguments | Engine operation |
 | --- | --- | --- |
 | `ultra_edit_snapshot` | `{path, selection: {kind: "range", first, last, snapshot?}}`, `{path, selection: {kind: "search", query, offset?, snapshot?}}`, or `{path, selection: {kind: "full", expected_bytes?}}` | Focused range, paged literal search, or bounded full read; `snapshot` continues a prior snapshot |
-| `ultra_edit` | `EditRequest`: `{request_id?, files: [{base, changes: [{id?, target, text}]}]}` | Prepare and commit through `edit` |
+| `ultra_edit` | `EditRequest`: `{request_id?, files: [{path or base, changes: [{old, new, count?, in?} or {lines, expect, new} or {after, expect, new} or {span, expect?, new}]}]}` | Prepare and commit through `edit` |
 | `ultra_edit_status` | `{query: {kind: "receipt", request_id, full?: boolean}}` or `{query: {kind: "evidence", reference}}` | Retrieve a compact outcome (default), full receipt (`full: true`), or explicit evidence |
 | `ultra_edit_prepare` | The same direct `EditRequest` as `ultra_edit` | Persist a preview or rejected draft |
 | `ultra_edit_commit` | `{plan}` | Commit the stored candidate |
@@ -153,8 +157,8 @@ derived ID when the call omitted one. A result returned for an already recorded
 request without a new commit attempt adds `replayed: true` (omitted otherwise),
 and its report begins with a replay notice; a replay never writes target files.
 Each of the first six compact diagnostics can carry up to three `candidates`,
-`{kind, line, end_line, text?, similarity?}`, for a missing `exact`/`all` target
-or a failed span `expect`; full drafts carry them for every diagnostic. Receipt
+`{kind, line, end_line, text?, similarity?}`, for a missing `old` target or a
+failed span or line `expect`; full drafts carry them for every diagnostic. Receipt
 requests with `full: true` return `{kind: "receipt", receipt}`; a recorded
 request without a receipt returns
 `{kind: "receipt_unavailable", request_id, receipt: null}`.
@@ -206,17 +210,18 @@ tools remain available for new files and isolated edits. If required MCP tools
 are unavailable or denied, Claude is instructed to report the blocker. The
 backslash concern comes from a user's 2026-09-05 Bash observation, not a claim
 that this project reproduced it on every host. The context hooks inject
-instructions. The `PreToolUse` hook, matched to `Bash|PowerShell`, denies
-commands that write content embedded in the command into project files and
-leaves other tools and commands alone; it is a guard against common patterns,
-not a sandbox.
+instructions. The `PreToolUse` hook, matched to `Bash|PowerShell|Write`,
+denies commands that write content embedded in the command into project files,
+and scripts saved outside the project that may write project files, and leaves
+other tools and commands alone; it is a guard against common patterns, not a
+sandbox.
 Explicit user instructions and host permissions take precedence over plugin
 guidance. Report conflicting workflow instructions; generic advice to use sed
 or heredocs is not a reason to silently abandon the user's explicit Ultra Edit
 route.
 
-The runtime contract is also carried in server instructions, tool descriptions,
-and schemas. The [thin skill](../plugin/claude-code/skills/edit/SKILL.md) keeps the
+The runtime contract is also carried in tool descriptions and schemas, and, for
+hosts other than the plugin, in server instructions. The [thin skill](../plugin/claude-code/skills/edit/SKILL.md) keeps the
 ordinary flow and non-optional base, literal-text, retry, and outcome rules up
 front. Its task/symptom table links to four focused references: contract, targets,
 recovery, and Claude Code. Those references are inside the plugin, so installation
@@ -231,6 +236,33 @@ automatically. A plugin-root `CLAUDE.md` is not automatically loaded by Claude
 Code, so the package uses context hooks instead of modifying a user's instruction
 files. See the official
 [plugin layout reference](https://code.claude.com/docs/en/plugins-reference#plugin-directory-structure).
+
+## Claude Code tool loading and result visibility
+
+Two probes with a throwaway stdio MCP server and headless Claude Code 2.1.292
+(`claude -p … --output-format stream-json --mcp-config FILE`, and the same server
+in a minimal plugin `.mcp.json` loaded with `--plugin-dir`) settle how the host
+treats what an MCP server sends. They are maintainer measurements, not a host
+contract, so recheck them on major Claude Code upgrades.
+
+- Loading. A tool whose definition carries `_meta: {"anthropic/alwaysLoad":
+  true}` arrives with its full schema, so the model calls it without a
+  `ToolSearch` round trip, both from an `--mcp-config` server and from a plugin
+  server. A server-level `"alwaysLoad": true` key in the MCP server
+  configuration, including a plugin's `.mcp.json`, loads every tool of that
+  server. Tools with neither are deferred behind `ToolSearch`, though the model
+  sometimes calls a deferred tool directly. Ultra Edit marks only `ultra_edit`,
+  the tool every edit uses, so an editing session skips the round trip (about
+  0.9 extra API calls per run in the benchmark). Ordinary edits name files by
+  `path` and need no snapshot, so `ultra_edit_snapshot` stays deferred with the
+  recovery tools. The schema adds about 2 KB to every request, which the prompt
+  cache serves after the first.
+- Results. When a tool result has only text `content`, the model sees that text.
+  When it has both text `content` and `structuredContent`, the model sees only
+  the serialized `structuredContent` JSON and never the text. A results mode
+  meant to show the model plain text must therefore omit `structuredContent`
+  entirely. No Ultra Edit tool declares an `outputSchema`, so omitting it is
+  spec-compliant.
 
 ## Validation
 
@@ -259,7 +291,8 @@ and test stale/retry behavior. Manifest validation alone does not prove that the
 host can locate the
 executable or discover and invoke the tools. The
 [evaluation harness](../eval/README.md) compares native editing, native editing
-with only the shell guard, and the full plugin on six fixture tasks.
+with only the shell guard, the plugin, shell edits, and third-party MCP edit
+servers on 23 fixture tasks.
 
 The initial smoke test passed with Claude Code 2.1.263 on 2026-09-07: the plugin
 server connected, Claude loaded the skill, called snapshot → edit → status,

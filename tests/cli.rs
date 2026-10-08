@@ -308,7 +308,7 @@ fn malformed_focused_read_arguments_are_rejected_without_mutation() {
         vec!["read-range", "source.txt", "one", "1"],
         vec!["read-range", "source.txt", "-1", "1"],
         vec!["read-range", "source.txt", "0", "1"],
-        vec!["read-range", "source.txt", "1", "2"],
+        vec!["read-range", "source.txt", "2", "2"],
         vec![
             "read-range",
             "source.txt",
@@ -370,7 +370,7 @@ fn a_continued_range_edits_distant_lines_under_one_base_across_processes() {
             "INVALID_REFERENCE",
         ),
         (
-            vec!["read-range", "source.txt", "2", "4", continued],
+            vec!["read-range", "source.txt", "4", "5", continued],
             "INVALID_LINE_RANGE",
         ),
     ] {

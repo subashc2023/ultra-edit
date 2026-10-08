@@ -1,7 +1,8 @@
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use same_file::Handle;
@@ -9,10 +10,10 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 use tempfile::NamedTempFile;
 
-use crate::compiler::MAX_TEXT_BYTES;
+use crate::compiler::{self, MAX_TEXT_BYTES};
 use crate::model::{
-    CommitStatus, Error, FileOutcome, FileStatus, PreparedFile, PreparedPlan, Receipt, Snapshot,
-    digest, new_id,
+    Change, CommitStatus, Error, FileOutcome, FileStatus, PreparedFile, PreparedPlan, Receipt,
+    Replacement, Snapshot, Target, digest, new_id,
 };
 
 mod reconciliation;
@@ -215,7 +216,17 @@ impl Storage {
 
     pub fn resolve(&self, path: &Path) -> Result<PathBuf, Error> {
         let requested = self.root.join(path);
-        let path = fs::canonicalize(&requested).map_err(|error| target_error(&requested, error))?;
+        let path = fs::canonicalize(&requested).map_err(|error| {
+            let mut error = target_error(&requested, error);
+            if error.code == "TARGET_MISSING"
+                && let Some(near) = self.ending_like(path)
+            {
+                // The diagnostic's file names the path asked for, so this one fits.
+                let near = crate::report::path_for_display(&near.to_string_lossy()).into_owned();
+                error.message = format!("No file exists there; did you mean {near}?");
+            }
+            error
+        })?;
         if !path.starts_with(&self.root) || path.starts_with(&self.state) {
             return Err(Error::new(
                 "PATH_OUTSIDE_WORKSPACE",
@@ -229,6 +240,31 @@ impl Storage {
             ));
         }
         Ok(path)
+    }
+
+    /// A workspace file whose path ends like `path`, an absolute path outside the
+    /// root that names no file, as when a directory was left out of it. At least a
+    /// directory and the file name must match, so a file that only shares a name
+    /// is never offered. Only paths under the root are probed, and only after a miss.
+    fn ending_like(&self, path: &Path) -> Option<PathBuf> {
+        if self.root.join(path).starts_with(&self.root) {
+            return None;
+        }
+        let parts: Vec<&std::ffi::OsStr> = path
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(part) => Some(part),
+                _ => None,
+            })
+            .collect();
+        (1..parts.len().saturating_sub(1)).find_map(|skip| {
+            let candidate =
+                fs::canonicalize(self.root.join(parts[skip..].iter().collect::<PathBuf>())).ok()?;
+            (candidate.starts_with(&self.root)
+                && !candidate.starts_with(&self.state)
+                && candidate.is_file())
+            .then_some(candidate)
+        })
     }
 
     pub fn read(&self, path: &Path) -> Result<String, Error> {
@@ -1235,28 +1271,48 @@ fn validate_plan(plan: &PreparedPlan) -> Result<(), Error> {
         }
         let mut end = 0;
         let mut output = String::new();
-        let mut previous_start = None;
+        let mut previous: Option<&Replacement> = None;
         let mut seen = std::collections::HashSet::new();
+        let changes: HashMap<&str, &Change> = request
+            .changes
+            .iter()
+            .map(|change| (change.id.as_str(), change))
+            .collect();
+        // Computed only when a replacement needs them.
+        let (lines, crlf) = (OnceCell::new(), OnceCell::new());
         for replacement in &file.replacements {
+            // An insertion may touch another change only beside a deletion, where
+            // either order gives the same text.
+            let insertion = |replacement: &Replacement| replacement.start == replacement.end;
+            let deletion = |replacement: &Replacement| {
+                replacement.start < replacement.end && replacement.text.is_empty()
+            };
+            let touches = previous.is_some_and(|previous| {
+                (previous.start == replacement.start
+                    && !(insertion(previous) && deletion(replacement)))
+                    || (replacement.start == end && insertion(replacement) && !deletion(previous))
+            });
             if replacement.start < end
                 || replacement.end < replacement.start
                 || !file.base.text.is_char_boundary(replacement.start)
                 || !file.base.text.is_char_boundary(replacement.end)
-                || previous_start == Some(replacement.start)
-                || (previous_start.is_some()
-                    && replacement.start == end
-                    && replacement.start == replacement.end)
+                || touches
             {
                 return Err(Error::new(
                     "INVALID_PLAN",
                     "Replacement ranges are invalid or overlap",
                 ));
             }
-            if !request
-                .changes
-                .iter()
-                .any(|change| change.id == replacement.change_id && change.text == replacement.text)
-            {
+            // A line target derives one replacement; recomputing it from the base
+            // catches a plan altered after the compiler wrote it.
+            let derived = changes
+                .get(replacement.change_id.as_str())
+                .is_some_and(|change| {
+                    compiler::derives(&file.base.text, &lines, &crlf, change, replacement)
+                        && (!matches!(change.target, Target::Lines { .. } | Target::Insert { .. })
+                            || !seen.contains(&replacement.change_id))
+                });
+            if !derived {
                 return Err(Error::new(
                     "INVALID_PLAN",
                     "Replacement does not match a requested change",
@@ -1266,7 +1322,7 @@ fn validate_plan(plan: &PreparedPlan) -> Result<(), Error> {
             output.push_str(&file.base.text[end..replacement.start]);
             output.push_str(&replacement.text);
             end = replacement.end;
-            previous_start = Some(replacement.start);
+            previous = Some(replacement);
         }
         output.push_str(&file.base.text[end..]);
         if output != file.output || seen.len() != file.change_ids.len() {
@@ -1574,12 +1630,14 @@ mod tests {
             let snapshot =
                 compiler::snapshot(canonical.to_string_lossy().into_owned(), "before".into());
             files.push(FileRequest {
+                path: None,
                 base: snapshot.id.clone(),
                 changes: vec![Change {
                     id: format!("change-{index}"),
                     target: Target::Exact {
                         old: "before".into(),
                         scope: None,
+                        lines: None,
                     },
                     text: "after".into(),
                 }],
@@ -1612,12 +1670,14 @@ mod tests {
         let request = EditRequest {
             request_id: request_id.into(),
             files: vec![FileRequest {
+                path: None,
                 base: snapshot.id.clone(),
                 changes: vec![Change {
                     id: format!("{request_id}-change"),
                     target: Target::Exact {
                         old: old.into(),
                         scope: None,
+                        lines: None,
                     },
                     text: text.into(),
                 }],

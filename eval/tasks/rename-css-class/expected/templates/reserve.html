@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reserve a copy - Fernhill Library</title>
+  <link rel="stylesheet" href="/static/css/buttons.css">
+  <script type="module" src="/static/js/reserve.js"></script>
+</head>
+<body>
+  <header class="site-header">
+    <a class="site-header__brand" href="/">Fernhill Library</a>
+    <nav class="toolbar" aria-label="Account">
+      <a class="btn btn-primary-outline" href="/account">My account</a>
+    </nav>
+  </header>
+
+  <main id="content">
+    <h1>Reserve a copy</h1>
+    <p class="book-summary"><cite>The Long Way Home</cite> by Ada Merriweather.
+      Three of five copies are on loan.</p>
+
+    <form class="reserve-form" action="/holds" method="post"
+          data-btn-primary-label="Reserve this copy">
+      <label for="branch">Pickup branch</label>
+      <select id="branch" name="branch" required>
+        <option value="">Choose a branch</option>
+        <option value="orchard">Orchard Lane</option>
+        <option value="riverside">Riverside</option>
+        <option value="hilltop">Hilltop</option>
+        <option value="mill">Old Mill</option>
+      </select>
+
+      <label for="notify">Tell me when it is ready by</label>
+      <select id="notify" name="notify">
+        <option value="email">Email</option>
+        <option value="sms">Text message</option>
+      </select>
+
+      <!-- reserve.js enables the primary button once a branch is chosen. -->
+      <div class="form-actions" role="group">
+        <button type="submit" class="btn btn-accent" aria-describedby="btn-primary-help" disabled>Reserve this copy</button>
+        <a class="btn btn-primary-outline" href="/catalog">Back to results</a>
+      </div>
+      <p id="btn-primary-help" class="form-hint" hidden>We hold a reserved copy for three days after it arrives.</p>
+    </form>
+
+    <section class="reserve-done" hidden>
+      <h2>Reserved</h2>
+      <p>We will let you know when your copy is ready at
+        <strong class="reserve-done__branch"></strong>.</p>
+      <a class="btn btn-accent" href="/catalog">Find another book</a>
+    </section>
+  </main>
+</body>
+</html>

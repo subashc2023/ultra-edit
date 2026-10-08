@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shop-config
+  namespace: shop-prod
+data:
+  LOG_FORMAT: json
+  nginx.conf: |
+    upstream shop_api {
+      server 127.0.0.1:8080;
+    }
+    server {
+      listen 80;
+      location /api/ {
+        proxy_pass http://shop_api;
+        proxy_read_timeout 30s;
+      }
+      location /admin/ {
+        proxy_pass http://shop_api;
+        proxy_read_timeout 30s;
+      }
+    }
+  motd.txt: |
+    Welcome to the shop prod cluster.  
+    Maintenance window: Sunday 02:00-04:00 UTC   
+    On-call: #shop-oncall  
+    Runbook: https://runbooks.example.com/shop
+  cron.yaml: |
+    - name: expire-carts
+      schedule: "*/15 * * * *"
+    - name: nightly-report
+      schedule: "0 2 * * *"

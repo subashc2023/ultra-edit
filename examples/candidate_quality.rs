@@ -258,12 +258,14 @@ fn search(file: &File, needle: &str) -> Option<Vec<Candidate>> {
         target: Target::Exact {
             old: needle.into(),
             scope: None,
+            lines: None,
         },
         text: String::new(),
     };
     let request = EditRequest {
         request_id: "quality".into(),
         files: vec![FileRequest {
+            path: None,
             base: file.base.id.clone(),
             changes: vec![change],
         }],

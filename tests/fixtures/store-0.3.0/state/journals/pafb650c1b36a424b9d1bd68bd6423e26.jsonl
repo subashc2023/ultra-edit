@@ -1,0 +1,3 @@
+{"checksum":"f1ddde09abda33ea4751fab626a5fade72ffa7b82401c61df6a1b6caf7e6eca6","payload":{"event":"begin","file_count":1,"plan_digest":"2099fc851a6435c26f8fa4f51a90df4617adf194587c0ab75cbd47fa073c26e0","plan_id":"pafb650c1b36a424b9d1bd68bd6423e26","preflight_failed":true}}
+{"checksum":"182fb6361f55ea80fc3cf69ce58e68614d352cb71e1653940dd17e56c8d380b4","payload":{"error":"STALE_SNAPSHOT: Current bytes differ from the prepared base","event":"outcome","index":0,"status":"not_committed"}}
+{"checksum":"161ae3b3155ec646a1221d474c1579e2ae075e5dd766aa9fdf46fadccbf968f5","payload":{"event":"finished"}}

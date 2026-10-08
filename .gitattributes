@@ -20,8 +20,14 @@ LLVM_COMPILER_RT_LICENSE.txt -text whitespace=-trailing-space
 # Keep the POSIX launcher in LF format on fresh Windows checkouts.
 packaging/launcher.sh text eol=lf
 
+# Keep the routing card's shipped bytes, and its size bound, the same on Windows.
+plugin/claude-code/instructions.md text eol=lf
+
 # Keep the catalog byte-identical to the generated release asset it mirrors.
 .claude-plugin/marketplace.json text eol=lf
 
 # Keep evaluation fixtures and expected files byte-exact (CRLF, BOM, tabs, trailing spaces).
 eval/tasks/** -text
+
+# Keep the 0.3.0 store fixture byte-exact; journals and blobs are digested.
+tests/fixtures/** -text

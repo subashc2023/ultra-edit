@@ -1,0 +1,20 @@
+# Defaults for every [services.<name>] table in services.toml.
+# A service table overrides any key it sets.
+
+[defaults]
+port = 8080
+protocol = "http"
+replicas = 2
+enabled = true
+timeout_ms = 3000
+retries = 2
+region = "us-east-1"
+log_level = "info"
+health_check = "/healthz"
+cpu = "500m"
+memory = "512Mi"
+tags = ["internal", "batch"]
+
+[defaults.rollout]
+max_surge = 1
+max_unavailable = 0

@@ -1,0 +1,33 @@
+# Base settings shared by every environment.
+#
+# The environment's own file (config/production.yaml, config/staging.yaml) is
+# merged on top of this one key by key, so it lists only what differs. See
+# docs/configuration.md for what each key means.
+
+service:
+  name: parcelhub
+  workers: 4
+  listen: 0.0.0.0:8080
+
+database:
+  url: postgresql://parcelhub@localhost:5432/parcelhub
+  # Connections per worker process. The pool size times the number of workers
+  # must stay under the database server's connection limit.
+  pool_size: 10
+  pool_timeout: 5.0  # seconds to wait for a free connection
+  statement_timeout_ms: 15000
+
+cache:
+  url: redis://localhost:6379/0
+  pool_size: 4  # Redis connections per worker
+  default_ttl: 300
+
+http:
+  # Outbound client for the carrier tracking APIs.
+  pool_size: 20
+  timeout: 10.0
+  retries: 3
+
+logging:
+  level: INFO
+  format: json

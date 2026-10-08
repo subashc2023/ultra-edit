@@ -89,9 +89,15 @@ A span edit avoids retransmitting the old block. Focused snapshots return only
 the requested source, and direct MCP arguments avoid shell quoting and generated
 editing code. These are concrete ways to reduce payloads compared with heredoc
 rewrites; actual token and cost savings depend on the task, model, and retries.
-Snapshots and tool instructions also cost context. No model-level token-savings
-percentage or speed advantage over native Edit has been measured yet; the
-[evaluation harness](eval/README.md) exists to measure exactly that.
+Snapshots and tool instructions also cost context. Measured with the
+[evaluation harness](eval/README.md), Ultra Edit cost 1.06x native Claude Code
+(0.67x native editing with shell writes blocked) on tasks that native editing
+often finished with a blind shell substitution. On eight tasks that leave
+finding the edit sites to the model it was correct in every run, at 1.03x and
+1.22x native in two rounds, while native editing with shell writes blocked
+failed 5 of 20 runs and cost more. When another writer changed a file during
+the session, it cost 0.71x native; see
+[the results](docs/performance.md#model-level-results).
 
 ### What you give up
 
@@ -112,40 +118,45 @@ edit tool does not get:
 
 ## How an edit works
 
-Claude reads a focused snapshot, then sends every related change in one request.
-A snapshot is an immutable copy of the file; the response lists editable span IDs
-such as `r12` (line 12) or `m1` (a search match):
-
-```json
-{ "path": "src/retry.rs", "selection": { "kind": "range", "first": 10, "last": 14 } }
-```
-
-The edit names that snapshot as its base. Request and change IDs are optional;
-the engine derives them from the request, so repeating an identical call returns
-the recorded result with `"replayed": true` instead of writing twice.
+Claude reads files with its own Read tool, then sends every related change, across
+files, in one request that names each file by the same absolute path. Request and
+change IDs are optional; the engine derives them from the request, so repeating an
+identical call returns the recorded result with `"replayed": true` instead of
+writing twice.
 
 ```json
 {
   "files": [{
-    "base": "s_RETURNED_SNAPSHOT",
+    "path": "/work/app/src/retry.rs",
     "changes": [
-      { "target": { "kind": "span", "span": "r12", "expect": "const retries = 2;" }, "text": "const retries = 3;" },
-      { "target": { "kind": "exact", "old": "const delayMs = 100;" }, "text": "const delayMs = 250;" }
+      { "old": "const DELAY_MS: u64 = 100;", "new": "const DELAY_MS: u64 = 250;" },
+      { "lines": [12, 12], "expect": "const RETRIES: u32 = 2;", "new": "const RETRIES: u32 = 3;" },
+      { "after": 3, "expect": "use std::time::Duration;", "new": "use std::thread;" }
     ]
   }]
 }
 ```
 
+`old` must occur exactly once, as whole words (or `count` times, which may
+match inside words), and `lines`/`after` address whole lines by Read's numbers,
+guarded by `expect`, so a stale line number is rejected instead of applied. Span targets on an immutable snapshot from
+`ultra_edit_snapshot` (`r12` for line 12, `m1` for a search match) remain for
+files too large to Read.
+
 Every target resolves against the original bytes, and the whole batch is
-rejected if any target is missing, ambiguous, overlapping, or stale. When a
+rejected if any target is missing, ambiguous, overlapping, or stale. Two
+targets that share a few bytes both keep unchanged, such as `old` anchors with
+common context, are applied side by side instead. When a
 target is not found or an `expect` guard fails, the diagnostic lists up to three
 candidates with their exact current text and lines: the text outside a wrong
 scope, a region that differs only in whitespace or line endings, or one at least
 70% similar, so the model can copy text instead of guessing. To edit
 distant parts of one file in one batch, a range read can continue an earlier
 snapshot, keeping its spans. Receipts report `committed`, `partial`,
-`not_committed`, or `outcome_unknown` per file; nothing outside the declared spans
-changes, including line endings, BOMs, and trailing whitespace.
+`not_committed`, or `outcome_unknown` per file; nothing outside the declared
+targets changes, including line endings, BOMs, and trailing whitespace. Text is
+literal, except that a file whose lines all end in CRLF gets CRLF for the LF in
+text copied from a view that hides `\r`.
 
 The [skill](plugin/claude-code/skills/edit/SKILL.md) and its references describe
 the MCP tools; the [reference](docs/reference.md) covers the full CLI and engine
@@ -153,9 +164,9 @@ contract, persistence, crash reconciliation, and limits.
 
 ## Shell-write guard
 
-The plugin registers a `PreToolUse` hook for Claude Code's Bash and PowerShell
-tools. It parses each command and denies ones that write content embedded in
-the command into project files:
+The plugin registers a `PreToolUse` hook for Claude Code's Bash, PowerShell,
+and Write tools. It parses each command and denies ones that write content
+embedded in the command into project files:
 
 - heredocs, here-strings, and `echo`/`printf`, `Write-Output`, or string
   literals redirected, `tee`d, or passed to `Set-Content`, `Add-Content`,
@@ -164,15 +175,35 @@ the command into project files:
   APIs, including .NET's `[IO.File]::WriteAllText`;
 - in-place editors such as `sed -i` and `perl -pi`, and `Get-Content` text
   rewritten with `-replace` or `.Replace()` and written back;
-- patches or edit JSON piped into `patch`, `git apply`, or `ultra-edit`.
+- patches or edit JSON piped into `patch`, `git apply`, or `ultra-edit`;
+- scripts that may write project files: ones that call those write APIs, or
+  move or copy files, on a target not certainly outside the project, or run
+  such commands. A script is judged when Write or a shell command saves it in
+  a temporary directory and its `#!` line or extension (`.py`, `.js`, `.pl`,
+  `.rb`, `.php`, `.ps1`, `.sh`) names its language, and when a command runs a
+  script it saved anywhere (`cat > /tmp/edit.py <<'EOF' … EOF; python3
+  /tmp/edit.py`, `source`, or by path). No file is read from disk, so
+  downloaded installers, a project's own tools, and other repositories'
+  sources are never judged on their own.
+
+Script and inline code targets are resolved through string literals,
+f-strings and template literals, `+` and path joins (`os.path.join`,
+`Path('/tmp') / name`), names assigned once, and the temporary-directory,
+home-directory, and stream APIs (`tempfile`, `os.tmpdir()`,
+`Path.home()`, `os.devnull`, pytest's `tmp_path`). A target counts as outside
+when it resolves to a path, or a leading directory, outside the project, so a
+benchmark that writes `f'/tmp/bench_{n}.json'` is allowed; command-line
+arguments, loop variables, and parameters count as inside.
 
 Only writes that may land in the project count. The project is
 `CLAUDE_PROJECT_DIR`, or the hook event's working directory. Targets certainly
 outside it are allowed: `$GITHUB_OUTPUT` and the other runner files, `/dev/null`
 and `$null`, and absolute paths elsewhere such as `/etc/hosts`, `~/.bashrc`, or
-`$TMPDIR` and `$env:TEMP` files. Paths are compared lexically, and Windows drive,
-UNC, and Git Bash `/c/…` paths ignore case. Relative paths, other variables, and
-globs count as inside.
+`$TMPDIR` and `$env:TEMP` files, including ones named through a variable the
+command assigns once (`OUT=/tmp/o.txt`, `t=$(mktemp)`) or after a known leading
+directory (`/tmp/out_$i.txt`). Paths are compared lexically, and Windows
+drive, UNC, and Git Bash `/c/…` paths ignore case. Relative paths, other
+variables, and expansions that may lead into the project count as inside.
 
 The deny reason tells Claude to use Ultra Edit, native Edit, or Write instead.
 Ordinary output redirection (`cargo test > log.txt`, `git diff > d.patch`),
@@ -180,7 +211,9 @@ plain copies, and heredocs passed to commands that don't write them to files
 (`git commit -F -`, Claude Code's `git commit -m "$(cat <<'EOF' …)"` pattern)
 are allowed. The guard allows anything it cannot parse and is not a sandbox: it
 misses dynamic commands, redirects on grouped commands, rewrites through
-temporary files, scripts already on disk, and symlinks into the project.
+temporary files, scripts it did not see saved (downloaded, edited after saving,
+or saved without a `#!` line or extension and run by a later call), and
+symlinks into the project.
 
 To turn the guard off, set `ULTRA_EDIT_SHELL_WRITES=allow` in Claude Code's
 environment, for example `"env": {"ULTRA_EDIT_SHELL_WRITES": "allow"}` in
@@ -233,16 +266,18 @@ claude --plugin-dir /absolute/path/to/ultra-edit/plugin/claude-code
 ```
 
 The plugin starts `${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp` with the
-arguments `["--root", "${CLAUDE_PROJECT_DIR}"]`; hook commands run the same
+arguments `["--root", "${CLAUDE_PROJECT_DIR}", "--no-instructions"]`, since its
+session card carries the routing the server instructions would repeat; hook commands run the same
 executable with their own argument arrays, without a shell. The root is fixed for
 that server and is not a tool argument.
 
 The [canonical instructions](plugin/claude-code/instructions.md) load through
 `SessionStart` hooks on startup, resume, clear, compaction, and fork, plus
 `SubagentStart` for delegated work. They tell Claude to **always use Ultra Edit
-for coordinated edits to two or more existing UTF-8 files**, to use Write for new
-files and native Edit or Ultra Edit for isolated edits, and to report unavailable
-tools instead of falling back to shell writes. No slash command is required;
+for coordinated edits to two or more existing UTF-8 files**, to edit existing
+files with Ultra Edit, even without reading them first when the exact text is
+known, to use Write for new files, and to report unavailable tools instead of
+falling back to shell writes. No slash command is required;
 `/ultra-edit:edit` loads optional workflow detail. Inspect the exact context
 without starting a server:
 

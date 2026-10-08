@@ -1,0 +1,9 @@
+{
+  "name": "ultra-edit-eval-third-party",
+  "private": true,
+  "description": "Pinned third-party MCP edit servers for the Ultra Edit evaluation's comparison arms",
+  "dependencies": {
+    "@modelcontextprotocol/server-filesystem": "2026.8.31",
+    "@wonderwhy-er/desktop-commander": "0.2.52"
+  }
+}

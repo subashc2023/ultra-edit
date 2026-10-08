@@ -28,6 +28,7 @@ fn request(snapshots: &[Snapshot], changed: &[usize]) -> EditRequest {
             .iter()
             .enumerate()
             .map(|(file, snapshot)| FileRequest {
+                path: None,
                 base: snapshot.id.clone(),
                 changes: changed
                     .iter()
@@ -36,6 +37,7 @@ fn request(snapshots: &[Snapshot], changed: &[usize]) -> EditRequest {
                         target: Target::Exact {
                             old: format!("RETRY_{line:06}: u32 = 100"),
                             scope: None,
+                            lines: None,
                         },
                         text: format!("RETRY_{line:06}: u32 = 250"),
                     })

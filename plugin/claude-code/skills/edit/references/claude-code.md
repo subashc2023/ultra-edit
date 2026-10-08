@@ -115,7 +115,9 @@ claude --plugin-dir "$(Resolve-Path -LiteralPath './plugin/claude-code')"
 
 `--plugin-dir` loads this local plugin for the session. Its `.mcp.json` points to
 `${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp` and supplies
-`["--root", "${CLAUDE_PROJECT_DIR}"]` as separate arguments. Claude Code substitutes
+`["--root", "${CLAUDE_PROJECT_DIR}", "--no-instructions"]` as separate
+arguments; the session card carries the routing that server instructions would
+repeat. Claude Code substitutes
 the plugin and project roots; Windows native launch resolves the `.exe` suffix.
 The hooks use the same private executable with explicit argument arrays, so hook
 launches do not pass through a shell. The server canonicalizes its root
@@ -145,9 +147,9 @@ source-copy procedure is separate from the versioned marketplace cache.
 The [canonical instructions](../../../instructions.md) require direct Ultra Edit
 MCP calls for coordinated edits to two or more existing UTF-8 files. They forbid
 writing file contents through Bash heredocs, generated-content redirection,
-inline editing scripts, and shell-piped edit JSON. Native Write serves new files
-or isolated full rewrites; native Edit or Ultra Edit serves isolated targeted
-edits. Missing or denied required tools are a blocker to report.
+inline editing scripts, and shell-piped edit JSON. Existing files are edited
+with Ultra Edit, without a prior Read when the exact text is known; native Write
+serves new files. Missing or denied required tools are a blocker to report.
 Explicit user instructions and host permissions take precedence over plugin
 guidance. Report contradictory workflow instructions; generic sed/heredoc advice
 does not by itself cancel the user's explicit choice of Ultra Edit.
@@ -185,9 +187,9 @@ update the entire plugin copy, then start a new Claude session. Bundling a
 plugin-root `CLAUDE.md` would not load these instructions automatically; the
 plugin does not edit the user's `CLAUDE.md` or settings files.
 
-A `PreToolUse` hook matched to `Bash|PowerShell` backs the shell rule. It runs
-`ultra-edit-mcp --claude-hook PreToolUse`, which denies commands that write
-content embedded in the command into project files:
+A `PreToolUse` hook matched to `Bash|PowerShell|Write` backs the shell rule.
+It runs `ultra-edit-mcp --claude-hook PreToolUse`, which denies commands that
+write content embedded in the command into project files:
 
 - heredocs or here-strings passed through programs such as `cat`, `tee`, `sed`,
   or `awk` and redirected or `tee`d into a file;
@@ -205,7 +207,21 @@ content embedded in the command into project files:
   `.Remove()`, `+` with a literal, an item assignment, or `ForEach-Object` and
   written back, directly or through a variable; and .NET writes such as
   `[IO.File]::WriteAllText` or `[IO.StreamWriter]::new`. External programs run
-  from PowerShell get the Bash checks.
+  from PowerShell get the Bash checks;
+- scripts that may write project files, judged when Write or a shell command
+  saves them in a temporary directory (`/tmp`, `$TMPDIR`, `%TEMP%`) and their
+  `#!` line, a launcher such as `uv` or `tsx`, or extension (`.py`, `.js`,
+  `.pl`, `.rb`, `.php`, `.ps1`, `.sh`) names the language, and when a command
+  runs a script it saved anywhere (`python3 /tmp/edit.py`, `bash`, `source`,
+  `.`, or by path). A write, move, or copy call counts unless its target
+  resolves outside the project: a string literal, an f-string or template
+  literal, `+`, `%`, `.format()`, or a path join with a known leading
+  directory, a name assigned once to one of those, a `with ... as` binding,
+  or the temporary-directory, home-directory, and stream APIs (`tempfile`,
+  `os.tmpdir()`, `Path.home()`, `os.devnull`, pytest's `tmp_path`, `php://`,
+  Perl's `>&STDOUT`). Arguments, loop variables, and parameters count as
+  inside. Syntax checks (`bash -n`, `perl -c`, `node --check`, `php -l`) run
+  nothing. No file is read from disk.
 
 It looks inside shells run with `-c` (three levels deep), `eval`, `$(…)`,
 backticks, `find -exec`, and wrappers such as `env`, `sudo`, `timeout`, and
@@ -219,11 +235,14 @@ that is certain: `/dev/*`, `NUL`, and `$null`; the runner files
 `$GITHUB_OUTPUT`, `$GITHUB_ENV`, `$GITHUB_PATH`, `$GITHUB_STEP_SUMMARY`, and
 `$GITHUB_STATE`; and absolute paths not under the root after expanding a
 leading `~`, `$HOME`, `$TMPDIR`, `$CLAUDE_PROJECT_DIR`, or in PowerShell
-`$env:USERPROFILE`, `$env:TEMP`, or `$env:TMP`, with `.` and `..` resolved on
-the text. Drive-letter, UNC, and Git Bash `/c/…` paths compare without case,
-with `\` and `/` alike. Relative paths, other variables, command substitutions,
-and globs count as inside, as does an in-place editor without a file operand.
-Inline interpreter code is judged whatever path it writes.
+`$env:USERPROFILE`, `$env:TEMP`, or `$env:TMP`, or a Bash variable the command
+assigns once to a known path or `$(mktemp)`, with `.` and `..` resolved on the
+text. A later expansion or glob leaves the text before it, so
+`/tmp/out_$i.txt` is outside unless that text could lead into the root.
+Drive-letter, UNC, and Git Bash `/c/…` paths compare without case, with `\`
+and `/` alike. Relative paths, other variables, and command substitutions
+count as inside, as does an in-place editor without a file operand. Inline
+interpreter code is judged by its targets as scripts are.
 
 It allows ordinary command output redirected to files (`cargo test > log.txt`,
 `Get-ChildItem | Out-File list.txt`), plain copies
@@ -233,21 +252,25 @@ that do not write them to files (`git commit -F -`, `kubectl apply -f -`, and
 open: malformed input, other tools, parse failures, and internal errors allow
 the call. The deny reason names the pattern and says to edit existing files
 with Ultra Edit or Edit and to create files, including multiline command input,
-with Write; if the user explicitly asked for the command, report the block.
-Each shell call starts the hook executable, which takes a few milliseconds.
+with Write; for a script, it says scratch scripts may write only paths they
+name outside the project, and argument paths count as project files. If the user explicitly asked for the command, report the block.
+Each shell or Write call starts the hook executable, which takes a few
+milliseconds.
 
 ## Root and permissions
 
 Each server uses one fixed root and workspace-local `.ultra-edit` state.
 It never follows a shell `cd` or a subagent into a separate worktree. When working
-elsewhere, pass the intended file's absolute path to snapshot. If that file lies
+elsewhere, name the intended file by its absolute path. If that file lies
 outside the server root, report the blocker; never use a relative path that would
 edit the parent checkout instead. Editing a different root requires a separately
 configured server or session for that workspace.
 
-Native Read/Grep/Glob can help exploration, but only an Ultra Edit snapshot
-supplies the immutable base needed to edit. Do not substitute a filesystem path,
-digest, native Read result, or guessed reference for that base.
+Name each file by `path`: the server reads its current bytes as the base under
+the workspace lock, so native Read/Grep/Glob output is enough to write `old`,
+`lines`, and `after` changes. Only span targets need an Ultra Edit snapshot as
+their `base`; never substitute a digest, native Read result, or guessed span ID
+for one.
 
 MCP tool permissions are controlled by Claude Code. Ultra Edit enforces its own
 canonical-root confinement; it does not inherit native Edit's per-path permission
@@ -260,7 +283,9 @@ blocked command to evade the guard. See Claude Code's
 The guard is not a sandbox. It misses dynamic commands (`$CMD`, `bash -c "$S"`,
 `pwsh -EncodedCommand`, `Invoke-Expression $s`), redirects on grouped commands,
 subshells, loops, or `exec >`, rewrites through temporary files
-(`sed … f > f.tmp && mv f.tmp f`), scripts already on disk, interpreter output
+(`sed … f > f.tmp && mv f.tmp f`), scripts it did not see saved (downloaded,
+edited after saving, or saved without a `#!` line or extension and run by a
+later call), interpreter output
 redirected with `>`, other write APIs (`os.open`, `dd of=`, `vim -c`,
 `Start-Process`, `cmd /c`), content passed through PowerShell function
 parameters or splatting, and symlinks, junctions, or short 8.3 names that lead

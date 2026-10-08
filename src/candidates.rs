@@ -19,10 +19,10 @@ use std::ops::Range;
 use crate::compiler::prefix_table;
 use crate::model::{Candidate, CandidateKind};
 
-const MAX_CANDIDATES: usize = 3;
+pub(crate) const MAX_CANDIDATES: usize = 3;
 /// Longer regions omit their text rather than clip it, so a partial region is
 /// never copied as a target.
-const MAX_TEXT_CHARS: usize = 2_000;
+pub(crate) const MAX_TEXT_CHARS: usize = 2_000;
 const MAX_SIMILAR_LINES: usize = 200_000;
 const MAX_SIMILAR_NEEDLE_CHARS: usize = 20_000;
 /// Scope lines ranked against the needle, each placing one window.
@@ -175,11 +175,17 @@ pub(crate) fn find_target(
 }
 
 /// Completes a message for a target with no occurrences and some candidates.
-/// `exact` candidates here lie outside the target's scope.
-pub(crate) fn not_found(expected: usize, candidates: &[Candidate]) -> String {
+/// `exact` candidates here lie outside the target's scope. A `whitespace`
+/// candidate that equals `needle` once its CRLFs become LF gets a line-ending
+/// hint: text copied from a view that hides `\r` never matches a CRLF file.
+pub(crate) fn not_found(expected: usize, needle: &str, candidates: &[Candidate]) -> String {
     match candidates.first() {
         Some(first) if first.kind == CandidateKind::Exact => format!(
             "Expected {expected} occurrence(s) in the scope, found 0; the text is outside it, first at {}. Use a scope that contains the intended occurrence {REPAIR}.",
+            place(first)
+        ),
+        Some(first) if differs_only_in_line_endings(first, needle) => format!(
+            "Expected {expected} occurrence(s), found 0; a candidate at {} differs only in its CRLF line endings. Copy its exact text, \\r\\n included, into `old` {REPAIR}.",
             place(first)
         ),
         _ => format!(
@@ -189,23 +195,92 @@ pub(crate) fn not_found(expected: usize, candidates: &[Candidate]) -> String {
     }
 }
 
-/// Describes an unmet span expectation, quoting the text the span selected.
-pub(crate) fn mismatch(actual: &str, candidates: &[Candidate]) -> String {
+/// Whether a `whitespace` candidate is `needle` with CRLF where it has bare LF.
+/// The candidate may stop short of spaces or tabs at the needle's edges, which the
+/// whitespace tier trims, so those edges are ignored on both sides.
+fn differs_only_in_line_endings(candidate: &Candidate, needle: &str) -> bool {
+    let edges = [' ', '\t'];
+    candidate.kind == CandidateKind::Whitespace
+        && needle.contains('\n')
+        && !needle.contains('\r')
+        && candidate.text.as_deref().is_some_and(|text| {
+            text.contains("\r\n")
+                && text.replace("\r\n", "\n").trim_matches(edges) == needle.trim_matches(edges)
+        })
+}
+
+/// Describes an unmet expectation, quoting the text that `subject` (such as "Span"
+/// or "Lines 4-5") holds.
+pub(crate) fn mismatch(subject: &str, actual: &str, candidates: &[Candidate]) -> String {
     let rest = if candidates.is_empty() {
         "inspect the original snapshot and choose the intended span".to_owned()
     } else {
         advice(candidates)
     };
+    line_mismatch(subject, actual, "expect", &rest)
+}
+
+/// Describes a line target's unmet expectation: what `subject` (such as "Lines
+/// 4-5") holds instead of `wanted` (such as "expect"), then `rest`, the advice.
+pub(crate) fn line_mismatch(subject: &str, actual: &str, wanted: &str, rest: &str) -> String {
+    // A plural subject such as "Lines 4-5" takes the plural verb.
+    let verb = if subject.starts_with("Lines ") {
+        "hold"
+    } else {
+        "holds"
+    };
     // The quote yields room to the advice; the three extra characters are its
     // quotes and a clipping ellipsis.
-    let fixed = "Span holds , not expect; ".len() + rest.chars().count() + 3;
+    let fixed =
+        subject.len() + verb.len() + "  , not ; ".len() + wanted.len() + rest.chars().count() + 3;
     let room = MESSAGE_CHARS.saturating_sub(fixed);
     let actual = quoted(actual, room.min(QUOTED_CHARS));
-    format!("Span holds {actual}, not expect; {rest}")
+    format!("{subject} {verb} {actual}, not {wanted}; {rest}")
+}
+
+/// Advice for line-wise `expect` text found nowhere as whole lines. An `exact`
+/// candidate then lies inside a line, so `expect` was not whole lines.
+pub(crate) fn line_advice(candidates: &[Candidate]) -> String {
+    match candidates.first() {
+        None => "read the lines again and correct the line numbers or expect".to_owned(),
+        Some(first) if first.kind == CandidateKind::Exact => format!(
+            "expect compares whole lines, and its text is only part of {}; give whole lines {REPAIR}.",
+            place(first)
+        ),
+        Some(_) => advice_into(candidates, "expect"),
+    }
+}
+
+/// Where whole-line text was found again: one place, or how many and the first.
+/// `starts` beyond `cap` mean there are more than `cap`.
+pub(crate) fn line_places(
+    starts: &[usize],
+    cap: usize,
+    retarget: impl Fn(usize) -> String,
+) -> String {
+    match starts {
+        [] => String::new(),
+        [only] => format!("it is at line {only}, so {} {REPAIR}.", retarget(*only)),
+        [first, ..] => {
+            let count = if starts.len() > cap {
+                format!("more than {cap}")
+            } else {
+                starts.len().to_string()
+            };
+            format!(
+                "it occurs {count} times, first at line {first}; use the intended place's line numbers {REPAIR}."
+            )
+        }
+    }
 }
 
 /// Explains candidates briefly; the candidates themselves carry every line.
 fn advice(candidates: &[Candidate]) -> String {
+    advice_into(candidates, "`old`")
+}
+
+/// [`advice`] for text to be copied into `field`.
+fn advice_into(candidates: &[Candidate], field: &str) -> String {
     let Some(first) = candidates.first() else {
         return String::new();
     };
@@ -231,14 +306,14 @@ fn advice(candidates: &[Candidate]) -> String {
     };
     let complete = candidates.iter().all(|candidate| candidate.text.is_some());
     let action = match (first.kind, many, complete) {
-        (_, false, false) => "Read it and copy its exact text into `old`",
-        (_, true, false) => "Read one and copy its exact text into `old`",
-        (CandidateKind::Similar, false, true) => "Verify it, then copy its exact text into `old`",
-        (CandidateKind::Similar, true, true) => "Verify one, then copy its exact text into `old`",
-        (_, false, true) => "Copy its exact text into `old`",
-        (_, true, true) => "Copy the intended one's exact text into `old`",
+        (_, false, false) => "Read it and copy its exact text into",
+        (_, true, false) => "Read one and copy its exact text into",
+        (CandidateKind::Similar, false, true) => "Verify it, then copy its exact text into",
+        (CandidateKind::Similar, true, true) => "Verify one, then copy its exact text into",
+        (_, false, true) => "Copy its exact text into",
+        (_, true, true) => "Copy the intended one's exact text into",
     };
-    format!("{finding}. {action} {REPAIR}.")
+    format!("{finding}. {action} {field} {REPAIR}.")
 }
 
 fn place(candidate: &Candidate) -> String {
@@ -251,7 +326,7 @@ fn place(candidate: &Candidate) -> String {
 
 /// Source text on one line, escaped like a Rust string literal and clipped at
 /// `limit` escaped characters; an ellipsis after the closing quote marks a clip.
-fn quoted(text: &str, limit: usize) -> String {
+pub(crate) fn quoted(text: &str, limit: usize) -> String {
     let mut output = String::from('"');
     let mut width = 0;
     for character in text.chars() {
@@ -1035,6 +1110,7 @@ mod tests {
     fn every_message_fits_what_clients_display() {
         let line = 16_777_216;
         let actual = "\u{0}".repeat(100);
+        let lines = format!("Lines {line}-{line}");
         for kind in [
             CandidateKind::Exact,
             CandidateKind::Whitespace,
@@ -1044,21 +1120,74 @@ mod tests {
                 for text in [false, true] {
                     let candidates = vec![candidate(kind, line - 1, line, text); count];
                     for message in [
-                        not_found(usize::MAX, &candidates),
-                        mismatch(&actual, &candidates),
+                        not_found(usize::MAX, "a\nb", &candidates),
+                        mismatch("Span", &actual, &candidates),
+                        mismatch(&lines, &actual, &candidates),
+                        line_mismatch(&lines, &actual, "expect", &line_advice(&candidates)),
                     ] {
                         assert!(message.chars().count() <= MESSAGE_CHARS, "{message}");
                     }
                 }
             }
         }
-        assert!(mismatch(&actual, &[]).chars().count() <= MESSAGE_CHARS);
+        assert!(mismatch(&lines, &actual, &[]).chars().count() <= MESSAGE_CHARS);
+        assert!(
+            line_mismatch(&lines, &actual, "expect", &line_advice(&[]))
+                .chars()
+                .count()
+                <= MESSAGE_CHARS
+        );
+        let places = line_places(&[line; 6], 5, |_| String::new());
+        assert!(
+            line_mismatch(&lines, &actual, "the expected last line", &places)
+                .chars()
+                .count()
+                <= MESSAGE_CHARS
+        );
         // Ordinary advice leaves the quote its full width.
         let message = mismatch(
+            "Span",
             &"x".repeat(100),
             &[candidate(CandidateKind::Exact, 3, 3, true)],
         );
         assert!(message.contains(&format!("\"{}\"…", "x".repeat(QUOTED_CHARS))));
+        // The line-ending hint fits as well.
+        let mut crlf = candidate(CandidateKind::Whitespace, line - 1, line, true);
+        crlf.text = Some("a\r\nb".into());
+        let message = not_found(usize::MAX, "a\nb", &[crlf]);
+        assert!(message.contains("CRLF line endings"), "{message}");
+        assert!(message.chars().count() <= MESSAGE_CHARS, "{message}");
+    }
+
+    #[test]
+    fn a_range_of_lines_takes_the_plural_verb() {
+        assert_eq!(
+            line_mismatch("Lines 4-5", "a\nb", "expect", "advice"),
+            r#"Lines 4-5 hold "a\nb", not expect; advice"#
+        );
+        assert_eq!(
+            line_mismatch("Line 4", "a", "expect", "advice"),
+            r#"Line 4 holds "a", not expect; advice"#
+        );
+        assert!(mismatch("Span", "a", &[]).starts_with(r#"Span holds "a", not expect;"#));
+    }
+
+    #[test]
+    fn only_a_crlf_twin_of_an_lf_needle_gets_the_line_ending_hint() {
+        let text = "fn main() {\r\n    let x = 1;\r\n}\r\n";
+        let hint = |needle: &str| {
+            let mut budget = usize::MAX;
+            let found = find_target(&mut budget, text, 0..text.len(), needle);
+            assert_eq!(found[0].kind, CandidateKind::Whitespace, "{needle:?}");
+            not_found(1, needle, &found).contains("CRLF line endings")
+        };
+        assert!(hint("fn main() {\n    let x = 1;\n}"));
+        // Indentation the whitespace tier trims from the needle still counts.
+        assert!(hint("    let x = 1;\n}"));
+        // Other whitespace differences get the general advice.
+        assert!(!hint("fn main() {\n  let x = 1;\n}"));
+        // A one-line needle has no line ending to blame.
+        assert!(!hint("let  x = 1;"));
     }
 
     #[test]

@@ -31,10 +31,12 @@ fn main() -> ExitCode {
     let arguments = env::args_os().skip(1).collect::<Vec<_>>();
     if arguments.len() == 1 && (arguments[0] == "--help" || arguments[0] == "-h") {
         println!(
-            "ultra-edit-mcp {}\nUsage: ultra-edit-mcp --root WORKSPACE\n\
+            "ultra-edit-mcp {}\nUsage: ultra-edit-mcp --root WORKSPACE [--no-instructions]\n\
              Or: ultra-edit-mcp --claude-context SessionStart|SubagentStart\n\
              Or: ultra-edit-mcp --claude-hook PreToolUse\n\n\
              Serve MCP over stdio inside one fixed existing workspace.\n\
+             --no-instructions sends no server instructions, for a host that already gives the\n\
+             model the same routing, such as the Claude Code plugin's session card.\n\
              JSON-RPC lines are limited to 16 MiB. Protocol output uses stdout; errors use stderr.\n\
              Cancellation or disconnection does not imply rollback; query receipts before retrying.\n\
              --claude-context prints plugin hook JSON and exits without opening a workspace.\n\
@@ -85,12 +87,16 @@ fn main() -> ExitCode {
         guard_shell_writes();
         return ExitCode::SUCCESS;
     }
-    if arguments.len() != 2 || arguments[0] != "--root" {
-        eprintln!(
-            "Usage: ultra-edit-mcp --root WORKSPACE (or --claude-context EVENT / --claude-hook EVENT / --help / --version)"
-        );
-        return ExitCode::from(2);
-    }
+    let instructions = match &arguments[..] {
+        [root, _] if root == "--root" => true,
+        [root, _, flag] if root == "--root" && flag == "--no-instructions" => false,
+        _ => {
+            eprintln!(
+                "Usage: ultra-edit-mcp --root WORKSPACE [--no-instructions] (or --claude-context EVENT / --claude-hook EVENT / --help / --version)"
+            );
+            return ExitCode::from(2);
+        }
+    };
     let workspace = match Workspace::open(PathBuf::from(&arguments[1])) {
         Ok(workspace) => workspace,
         Err(error) => {
@@ -108,7 +114,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match runtime.block_on(serve(workspace)) {
+    let server = McpServer::new(workspace);
+    let server = if instructions {
+        server
+    } else {
+        server.without_instructions()
+    };
+    match runtime.block_on(serve(server)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("MCP server error: {error}");
@@ -119,8 +131,9 @@ fn main() -> ExitCode {
 
 /// Answers a `PreToolUse` hook: prints a deny decision for a Bash or
 /// PowerShell command that writes file content into the project through the
-/// shell, and nothing otherwise. Every failure allows the call, because a
-/// broken guard must never block a session.
+/// shell, or a Write call that saves a script outside the project that may
+/// write project files, and nothing otherwise. Every failure allows the call,
+/// because a broken guard must never block a session.
 fn guard_shell_writes() {
     let mut input = Vec::new();
     // Read before deciding so the host never writes into a closed pipe.
@@ -135,20 +148,20 @@ fn guard_shell_writes() {
     let Ok(event) = serde_json::from_slice::<serde_json::Value>(&input) else {
         return;
     };
-    let classify = match event["tool_name"].as_str() {
-        Some("Bash") => shell_guard::classify_bash,
-        Some("PowerShell") => shell_guard::classify_powershell,
-        _ => return,
-    };
-    let Some(command) = event["tool_input"]["command"].as_str() else {
-        return;
-    };
+    let input = &event["tool_input"];
     let scope = guard_scope(event["cwd"].as_str());
-    // A classifier bug must not turn into a hook error on every shell call.
-    let Some(finding) = std::panic::catch_unwind(|| classify(command, &scope))
-        .ok()
-        .flatten()
-    else {
+    let classify = || match event["tool_name"].as_str() {
+        Some("Bash") => shell_guard::classify_bash(input["command"].as_str()?, &scope),
+        Some("PowerShell") => shell_guard::classify_powershell(input["command"].as_str()?, &scope),
+        Some("Write") => shell_guard::classify_write(
+            input["file_path"].as_str()?,
+            input["content"].as_str()?,
+            &scope,
+        ),
+        _ => None,
+    };
+    // A classifier bug must not turn into a hook error on every tool call.
+    let Some(finding) = std::panic::catch_unwind(classify).ok().flatten() else {
         return;
     };
     let output = serde_json::json!({"hookSpecificOutput": {
@@ -180,7 +193,7 @@ fn guard_scope(cwd: Option<&str>) -> shell_guard::Scope {
         })
 }
 
-async fn serve(workspace: Workspace) -> Result<(), Box<dyn std::error::Error>> {
+async fn serve(server: McpServer) -> Result<(), Box<dyn std::error::Error>> {
     let failed = CancellationToken::new();
     let transport = StdioTransport {
         input: stdin_messages()?,
@@ -194,11 +207,7 @@ async fn serve(workspace: Workspace) -> Result<(), Box<dyn std::error::Error>> {
             answered: Notify::new(),
         }),
     };
-    McpServer::new(workspace)
-        .serve(transport)
-        .await?
-        .waiting()
-        .await?;
+    server.serve(transport).await?.waiting().await?;
     if failed.is_cancelled() {
         return Err(io::Error::other("MCP transport failed; see stderr").into());
     }

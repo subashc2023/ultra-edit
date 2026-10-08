@@ -1,0 +1,24 @@
+# Example configuration for wayfetch.
+#
+# wayfetch reads ~/.config/wayfetch/config.toml if it exists, or the file given
+# with --config. Every value below is the built-in default, so keep only the
+# lines you change. Flags on the command line override this file.
+
+[http]
+# Timeouts in seconds. The connect timeout covers DNS, TCP, and TLS; the read
+# timeout applies to each wait for response data.
+connect_timeout = 15.0
+read_timeout = 10.0
+
+[retry]
+# Retries after the first failed attempt. Pauses between attempts double from
+# 1 second up to backoff_max seconds.
+max_retries = 3
+backoff_max = 10.0
+
+[pool]
+max_connections = 100
+
+[proxy]
+# No proxy by default. For a local debugging proxy, uncomment the next line.
+# url = "http://127.0.0.1:10080"

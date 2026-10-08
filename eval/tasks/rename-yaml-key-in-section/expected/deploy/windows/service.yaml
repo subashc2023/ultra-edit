@@ -1,0 +1,25 @@
+# Settings for the Windows service build (parcelhub.exe under the Service
+# Control Manager). There is no environment file for this build: the service
+# merges this file on top of config/base.yaml. Install it with
+#
+#   parcelhub.exe install --env windows --config C:\ProgramData\Parcelhub\service.yaml
+
+service:
+  workers: 2
+  listen: 127.0.0.1:8080
+  log_dir: 'C:\ProgramData\Parcelhub\logs'
+
+database:
+  url: postgresql://parcelhub@sql01.corp.example:5432/parcelhub
+  max_connections: 6  # two workers share the license limit of 15 connections
+  pool_timeout: 10.0
+
+cache:
+  # No Redis on the Windows hosts; keep the cache in process.
+  url: memory://
+  pool_size: 1
+
+http:
+  pool_size: 10
+  proxy: http://proxy.corp.example:3128
+  timeout: 20.0
