@@ -295,14 +295,26 @@ the range's end only weakly, so prefer lines with text as `[first, last]`. `afte
 expected lines occur elsewhere, gives the current range, and the diagnostic
 carries them as `exact` candidates, or near misses as below. `after` with empty
 text is `EMPTY_INSERTION`. `after` keeps line `after`, so text that starts by
-restating it is `INSERT_REPEATS_LINE`: its leading lines equal consecutive lines
-of the file, compared without trailing whitespace, that start at or above
-`after` and reach it, as when `expect` or the lines to replace were copied into
-`new`, with at least 8 non-whitespace characters in all. The message names the
-restated lines and the `lines` replacement to send instead. It is not reported
-when another change in the request rewrites any of those lines, since changes
-apply to the original file. A duplicate meant on purpose replaces the lines
-through `lines`, giving them twice.
+restating it is `INSERT_REPEATS_LINE`: its leading lines equal the lines ending
+at `after`, compared without trailing whitespace, as when `expect` or the lines
+to replace were copied into `new`, with at least 8 non-whitespace characters in
+those lines. The message names the kept lines and says to drop them from `new`
+or send a `lines` replacement. When the next lines of `new` also equal the lines
+below `after`, they may be copied context or new lines that look the same, such
+as a sibling method's decorator, so the message gives the replacement for the
+first case and dropping the kept lines for the second. It is not reported when
+other changes in the request replace every restated line that has text, as a
+whole and without keeping its text, since changes apply to the original file.
+A duplicate meant on purpose replaces the lines through `lines`, giving them
+twice. At most 200 lines on each side of `after` are compared.
+
+A single-line `old` without `count` whose match starts or ends inside an ASCII
+word (letters, digits, and `_`), such as `retries = 2` inside
+`max_retries = 20`, is `OLD_INSIDE_WORD`; the message names the word and its
+line. A word holding non-ASCII letters, such as `Hauptstraße`, and a letter right
+after a backslash, as in the escape `\nRestart`, do not count. `count`, even 1,
+matches inside words, and an ambiguity message suggests `in` lines that hold a
+whole-word match.
 
 A span ID is a disclosed ID such as `r5`, `selection`, or `m2`, or a line range
 `rA..rB`, never literal source text. A line range is accepted wherever a span ID

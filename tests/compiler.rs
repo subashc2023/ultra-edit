@@ -2740,10 +2740,32 @@ fn a_single_old_inside_a_word_is_refused_unless_counted() {
         ("Hauptstraße\n", "Hauptstra"),
         ("ルートを保存\n", "ルート"),
         ("é1.4.2\n", "1.4.2"),
+        // A word holding non-ASCII letters is prose, cut to avoid typing them.
+        ("an der Hauptstraße wählen\n", "an der Haupt"),
+        // A letter after a backslash is an escape, not part of the word.
+        ("MSG = \"Saved.\\nRestart required\"\n", "Restart required"),
+        ("p = r\"\\bcolour\\b\"\n", "colour"),
+        // Several lines of copied context may end on part of a name.
+        (
+            "logger = x\n\nDEFAULT_TIMEOUT_S = 30\n",
+            "logger = x\n\nDEFAULT",
+        ),
     ] {
         assert!(
             output(text, exact("w", old, "y")).is_ok(),
             "{old:?} in {text:?}"
         );
     }
+    // Ambiguity advice points at the whole-word match a single `old` may take.
+    let errors = output(
+        "max_retries = 20\nretries = 2\n",
+        exact("w", "retries = 2", "x"),
+    )
+    .unwrap_err();
+    assert_eq!(errors[0].code, "TARGET_AMBIGUOUS");
+    assert!(
+        errors[0].message.contains("\"in\":[2,2]"),
+        "{}",
+        errors[0].message
+    );
 }

@@ -131,17 +131,21 @@ occur elsewhere the message gives the current range. A line past the end is
 Unrestricted `old` searches the complete original file even after a focused
 read. Empty `old` is rejected with `EMPTY_TARGET`; insert with `after` instead,
 and give `after` nonempty text (`EMPTY_INSERTION`). `after` keeps its line, so
-text whose leading lines restate the lines ending at it, or starting at it, is
-refused (`INSERT_REPEATS_LINE`, 8 or more visible characters in all) unless
-another change in the call rewrites them; send the named `lines` replacement
-instead, which also duplicates lines on purpose when it gives them twice. `in`
-takes lines or a span ID, never literal text.
+text whose leading lines restate the lines ending at it is refused
+(`INSERT_REPEATS_LINE`, 8 or more visible characters in those lines) unless
+other changes in the call replace each of them whole. Drop the restated lines
+from `new`, or send the named `lines` replacement if the following lines of
+`new` were copied from the file too; a `lines` replacement that gives lines
+twice duplicates them on purpose. `in` takes lines or a span ID, never literal
+text.
 
-A single `old` must start and end on word boundaries: a match that begins or
-ends inside an ASCII word or number, such as `retries = 2` inside
-`max_retries = 20`, is `OLD_INSIDE_WORD`, since text written without reading
-the file can match a longer name by accident. Extend `old` to whole words, or
-add `"count":1` to replace part of a word on purpose.
+A single-line `old` must start and end on word boundaries: a match that begins
+or ends inside an ASCII word or number, such as `retries = 2` inside
+`max_retries = 20` or `2.3.1` inside `v2.3.1`, is `OLD_INSIDE_WORD`, since text
+written without reading the file can match a longer name by accident. Extend
+`old` to whole words, or add `"count":1` to replace part of a word on purpose.
+Words with non-ASCII letters, escapes such as `\nRestart`, and multi-line `old`
+are exempt.
 
 A line range `rA..rB` works as a `span` or `in` when the base disclosed every
 line from A to B, for instance across a range continued with another range. It

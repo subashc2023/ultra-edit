@@ -336,8 +336,9 @@ fn an_insertion_that_restates_its_anchor_line_is_refused() {
     );
 }
 
-/// A restatement may run past the anchor or end at it, and may differ from the
-/// file only in trailing whitespace; the advice it gets can be followed.
+/// A restatement may end at the anchor or have lines below it that look the
+/// same, and may differ from the file only in trailing whitespace; the advice it
+/// gets can be followed either way.
 #[test]
 fn restated_runs_are_named_whole_and_their_advice_commits_cleanly() {
     let (two, three) = (
@@ -351,25 +352,103 @@ fn restated_runs_are_named_whole_and_their_advice_commits_cleanly() {
     // Lines 2-3 restated after line 2, as a replacement of [2,3] written as `after`.
     let error = rejected(&base, insert(2, Some(two), &new));
     assert_eq!(error.code, "INSERT_REPEATS_LINE");
-    assert!(error.message.contains("lines 2-3"), "{}", error.message);
+    assert!(error.message.contains("keeps line 2"), "{}", error.message);
+    assert!(
+        error.message.contains("equal line 3 too"),
+        "{}",
+        error.message
+    );
     assert!(error.message.contains("lines:[2,3]"), "{}", error.message);
-    // Both routes the message offers give one copy of each line.
     let replaced = ends([2, 3], Some(two), Some(three), &new);
     assert_eq!(outcome(&base, replaced).unwrap(), wanted);
-    let after = insert(3, Some(three), "    rounding=1,");
-    assert_eq!(outcome(&base, after).unwrap(), wanted);
     // The guarded lines copied from a multi-line expect, ending at the anchor.
     let error = rejected(&base, insert(3, Some(&format!("{two}\n{three}")), &new));
     assert_eq!(error.code, "INSERT_REPEATS_LINE");
+    assert!(
+        error.message.contains("keeps lines 2-3"),
+        "{}",
+        error.message
+    );
     assert!(error.message.contains("lines:[2,3]"), "{}", error.message);
+    let after = insert(3, Some(three), "    rounding=1,");
+    assert_eq!(outcome(&base, after).unwrap(), wanted);
     // A restatement without the line's trailing spaces is still a restatement.
     let spaced = spanless(&format!("a\n{two}  \nb\n"));
     let error = rejected(&spaced, insert(2, Some(&format!("{two}  ")), two));
     assert_eq!(error.code, "INSERT_REPEATS_LINE");
 }
 
-/// Changes apply to the original file, so a restated line that another change in
-/// the batch deletes or rewrites appears once, and the batch commits.
+/// A new sibling shaped like the next block matches the lines below the anchor;
+/// dropping only the restated line keeps the next block's decorator.
+#[test]
+fn lines_below_the_anchor_that_look_the_same_are_offered_as_new() {
+    let text = "class User:\n    @property\n    def name(self):\n        return self._name\n\n    @property\n    def age(self):\n        return self._age\n";
+    let base = spanless(text);
+    let anchor = "        return self._name";
+    let sibling = "\n\n    @property\n    def email(self):\n        return self._email";
+    let error = rejected(
+        &base,
+        insert(4, Some(anchor), &format!("{anchor}{sibling}")),
+    );
+    assert_eq!(error.code, "INSERT_REPEATS_LINE");
+    assert!(error.message.contains("If copied"), "{}", error.message);
+    assert!(
+        error.message.contains("if new, drop line 4 from new"),
+        "{}",
+        error.message
+    );
+    let output = outcome(&base, insert(4, Some(anchor), &sibling[1..])).unwrap();
+    assert!(
+        output.contains("\n    @property\n    def email"),
+        "{output}"
+    );
+    assert_eq!(output.matches("@property").count(), 3, "{output}");
+}
+
+/// Text that only repeats the kept lines is told how to duplicate on purpose.
+#[test]
+fn a_bare_restatement_is_told_how_to_duplicate() {
+    let line = "    sim.advance_tick()";
+    let base = spanless(&format!("def test():\n{line}\n    assert sim.ok()\n"));
+    let error = rejected(&base, insert(2, Some(line), line));
+    assert_eq!(error.code, "INSERT_REPEATS_LINE");
+    assert!(
+        error.message.contains("new only repeats line 2"),
+        "{}",
+        error.message
+    );
+    let twice = ends([2, 2], Some(line), None, &format!("{line}\n{line}"));
+    assert_eq!(
+        outcome(&base, twice).unwrap(),
+        format!("def test():\n{line}\n{line}\n    assert sim.ok()\n")
+    );
+}
+
+/// The run search is bounded, so a long repetitive insertion stays fast.
+#[test]
+fn a_long_repetitive_insertion_is_checked_quickly() {
+    let rows = 50_000;
+    let text = format!(
+        "{}    end_of_table_marker,\ntail\n",
+        "    0,\n".repeat(rows)
+    );
+    let base = spanless(&text);
+    let new = vec!["    0,"; rows].join("\n");
+    let started = std::time::Instant::now();
+    let _ = outcome(
+        &base,
+        insert(rows + 1, Some("    end_of_table_marker,"), &new),
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// Changes apply to the original file, so a restated line that another change
+/// replaces as a whole appears once, and the batch commits; a token edit, or an
+/// insertion between restated lines, leaves the line twice and is refused.
 #[test]
 fn a_restated_line_that_the_batch_rewrites_is_not_refused() {
     let anchor = "    tax_table=resolve(region),";
@@ -383,19 +462,18 @@ fn a_restated_line_that_the_batch_rewrites_is_not_refused() {
         },
         text: format!("{anchor}\n    rounding=1,"),
     };
+    let wanted = format!("totals = compute(\n{anchor}\n    rounding=1,\n)\n");
     let mut deleted = ends([2, 2], Some(anchor), None, "");
     deleted.id = "d".into();
     let plan = compile(&request(&base, vec![deleted, insert("i")]), &bases(&base));
+    assert_eq!(plan.unwrap().files[0].output, wanted);
+    let whole = parsed(json!({"id":"o","old":anchor,"new":"    tax_table=None,"}));
+    let plan = compile(&request(&base, vec![whole, insert("i")]), &bases(&base));
     assert_eq!(
         plan.unwrap().files[0].output,
-        format!("totals = compute(\n{anchor}\n    rounding=1,\n)\n")
+        format!("totals = compute(\n    tax_table=None,\n{anchor}\n    rounding=1,\n)\n")
     );
-    let rewritten = parsed(json!({"id":"o","old":"resolve(region)","new":"resolve(country)"}));
-    let plan = compile(&request(&base, vec![rewritten, insert("i")]), &bases(&base));
-    assert_eq!(
-        plan.unwrap().files[0].output,
-        format!(
-            "totals = compute(\n    tax_table=resolve(country),\n{anchor}\n    rounding=1,\n)\n"
-        )
-    );
+    let token = parsed(json!({"id":"o","old":"resolve(region)","new":"resolve(country)"}));
+    let errors = compile(&request(&base, vec![token, insert("i")]), &bases(&base)).unwrap_err();
+    assert_eq!(errors[0].code, "INSERT_REPEATS_LINE", "{errors:?}");
 }
