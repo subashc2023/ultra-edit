@@ -170,9 +170,11 @@ fn a_path_suggestion_survives_the_240_character_clip() {
     let message = &preparation.diagnostics[0].message;
     assert!(message.contains("did you mean"), "{message}");
     let near = fs::canonicalize(root.join(relative)).unwrap();
+    // Messages spell Windows paths without their extended-length prefix.
+    let near = ultra_edit::report::path_for_display(&near.to_string_lossy()).into_owned();
     let clipped: String = message.chars().take(240).collect();
     assert!(
-        clipped.contains(&*near.to_string_lossy()),
+        clipped.contains(&near),
         "{} chars; the client sees: {clipped}",
         message.chars().count()
     );
