@@ -100,8 +100,8 @@ alias). A `path` file supports `old`, `count`, `in` with lines, `lines`, and
 | Replace a disclosed line, selection, or match | `{"span":"m1","expect":"old text","new":"b"}` | The span belongs to this base; `expect` equals its bytes exactly. |
 | Replace a run of disclosed lines' bodies | `{"span":"r146..r150","expect":"…","new":"b"}` | This base disclosed every line from 146 to 150. |
 
-`lines` takes `[first,last]`; `12` and `"12-14"` are read as `[12,12]` and
-`[12,14]`. Line numbers are the ones native Read shows; the empty line Read
+`lines` takes `[first,last]`; `[12]`, `12`, and `"12-14"` are read as `[12,12]`
+and `[12,14]`. Line numbers are the ones native Read shows; the empty line Read
 shows after a final newline stands for the last line.
 
 A line target replaces whole lines, terminators included. Text that does not end
