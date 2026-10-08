@@ -115,7 +115,9 @@ claude --plugin-dir "$(Resolve-Path -LiteralPath './plugin/claude-code')"
 
 `--plugin-dir` loads this local plugin for the session. Its `.mcp.json` points to
 `${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp` and supplies
-`["--root", "${CLAUDE_PROJECT_DIR}"]` as separate arguments. Claude Code substitutes
+`["--root", "${CLAUDE_PROJECT_DIR}", "--no-instructions"]` as separate
+arguments; the session card carries the routing that server instructions would
+repeat. Claude Code substitutes
 the plugin and project roots; Windows native launch resolves the `.exe` suffix.
 The hooks use the same private executable with explicit argument arrays, so hook
 launches do not pass through a shell. The server canonicalizes its root

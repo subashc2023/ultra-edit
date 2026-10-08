@@ -24,8 +24,9 @@ pub const MAX_CANDIDATE_SEARCH_BYTES: usize = 2 * MAX_TEXT_BYTES;
 pub const MAX_CANDIDATE_SEARCHES: usize = 6;
 /// Match starts an ambiguous exact target locates by line.
 const AMBIGUOUS_LINES: usize = 5;
-/// Visible characters a line target's `expect` needs before it guards lines the
-/// base did not disclose: fewer, like a lone `}`, could match after a line shift.
+/// Visible characters that make a line guard strong wherever else its text occurs:
+/// repeated lines such as `port = 8080` are what line numbers tell apart.
+pub const MIN_GUARD_CHARS: usize = 8;
 /// Change IDs an `EOL_ADAPTED` warning names before counting the rest.
 const ADAPTED_IDS: usize = 3;
 
@@ -1380,9 +1381,29 @@ fn resolve_exact(
             )
         } else if !found.is_empty() {
             candidates::not_found(expected, old, &found)
+        } else if actual != 0 {
+            // A count that is off says where the matches are, as ambiguity does.
+            let starts: Vec<_> = base.text[start..end]
+                .match_indices(old)
+                .take(AMBIGUOUS_LINES)
+                .map(|(at, _)| start + at)
+                .collect();
+            let mut lines = line_numbers(&base.text, &starts);
+            lines.dedup();
+            let noun = if lines.len() == 1 { "line" } else { "lines" };
+            let lines: Vec<_> = lines.iter().map(usize::to_string).collect();
+            let more = if actual > starts.len() {
+                " and later"
+            } else {
+                ""
+            };
+            format!(
+                "Expected {expected} occurrence(s), found {actual} at {noun} {}{more}; set count to {actual} to replace every one, or restrict `old` with \"in\":[first,last]",
+                lines.join(", ")
+            )
         } else {
             format!(
-                "Expected {expected} occurrence(s), found {actual}; inspect the snapshot and choose an explicit span or narrower scope"
+                "Expected {expected} occurrence(s), found 0 and nothing similar; read the file again and copy `old` exactly from it"
             )
         };
         let mut diagnostic = at(Some(&base.path), Some(change), code, message);
@@ -1445,8 +1466,8 @@ struct Expect<'a> {
 /// Checks a line target's `expect`. Unless the base disclosed every addressed line,
 /// line numbers from elsewhere may be stale, so one is required: for `lines`, it
 /// must reach the range's last line, either by giving every line or by giving the
-/// last lines too, and, as `old` must, it must match this place alone, so a
-/// shifted number cannot find the same text elsewhere.
+/// last lines too, and it must have `MIN_GUARD_CHARS` visible characters or match
+/// this place alone, so a shifted number cannot find the same short text elsewhere.
 /// Comparing line by line, ignoring line endings, lets text copied from a view
 /// that hides `\r` guard CRLF lines.
 fn line_guard(
@@ -1625,18 +1646,47 @@ fn line_guard(
             diagnostics,
         );
     }
-    if !required {
+    // A line that both the head and the tail check is evidence once.
+    let overlap = match guard {
+        Guard::Prefix { first, last } => (first + head.len()).saturating_sub(last + 1 - tail.len()),
+        Guard::Above { .. } => 0,
+    };
+    let visible: usize = head
+        .iter()
+        .chain(&tail[overlap.min(tail.len())..])
+        .map(|piece| piece.chars().filter(|ch| !ch.is_whitespace()).count())
+        .sum();
+    if !required || visible >= MIN_GUARD_CHARS {
         return true;
     }
-    // Every place the whole guard matches: a guard that matches elsewhere too could
-    // still match after the file shifted, as an ambiguous `old` could.
+    // A short guard, such as a blank line or `}`, must match this place alone: one
+    // that matches elsewhere too could still match after the file shifted.
     let places: Vec<usize> = match guard {
-        Guard::Prefix { .. } => (1..=(lines.count() + 1).saturating_sub(extent))
-            .filter(|&start| {
-                matches_at(start, &head) && matches_at(start + extent - tail.len(), &tail)
-            })
-            .take(AMBIGUOUS_LINES + 1)
-            .collect(),
+        Guard::Prefix { first, last } => {
+            let count = lines.count();
+            let mut places: Vec<usize> = (1..=(count + 1).saturating_sub(extent))
+                .filter(|&start| {
+                    matches_at(start, &head) && matches_at(start + extent - tail.len(), &tail)
+                })
+                .take(AMBIGUOUS_LINES + 1)
+                .collect();
+            // Read's empty line after a final newline clamps to the last line, so a
+            // range ending there keeps its end through a one-line shift while its
+            // length changes: try the ranges one line longer and shorter too.
+            if last == count {
+                for start in [first.wrapping_sub(1), first + 1] {
+                    let length = (count + 1).wrapping_sub(start);
+                    if (1..=count).contains(&start)
+                        && length >= head.len().max(tail.len())
+                        && matches_at(start, &head)
+                        && matches_at(count + 1 - tail.len(), &tail)
+                    {
+                        places.push(start);
+                    }
+                }
+            }
+            places
+        }
         Guard::Above { .. } => (1..=(lines.count() + 1).saturating_sub(head.len()))
             .filter(|&start| matches_at(start, &head))
             .map(|start| start + head.len() - 1)
@@ -1677,12 +1727,12 @@ fn line_guard(
             Guard::Above { .. } => "places",
         };
         let given: Vec<&str> = [expect.head, expect.tail].into_iter().flatten().collect();
-        let quoted = candidates::quoted(&given.join(" "), 30);
+        let quoted = candidates::quoted(&given.join(" "), 28);
         return reject(
             diagnostics,
             "LINE_GUARD_WEAK",
             format!(
-                "expect {quoted} matches {count} {noun} in this file, from line {}, so a stale number could pick another; {advice}",
+                "expect {quoted} is short and matches {count} {noun} in this file, from line {}, so a stale number could pick another; {advice}",
                 places[0]
             ),
         );

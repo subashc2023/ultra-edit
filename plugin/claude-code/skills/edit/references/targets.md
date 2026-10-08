@@ -117,9 +117,12 @@ the first lines of the range, and `[first, last]` gives its first and last
 lines (each may hold several lines). It is required unless the base disclosed
 every addressed line (a `path` file discloses none), and then must reach the
 range's last line, by giving every line or the `[first, last]` pair, and must
-match nowhere else in the file, as `old` must (`LINE_GUARD_REQUIRED`,
-`LINE_GUARD_WEAK`), so a line added or removed inside the range since your Read
-is caught. `after:0`
+have 8 or more visible characters or match nowhere else in the file
+(`LINE_GUARD_REQUIRED`, `LINE_GUARD_WEAK`), so a line added or removed inside
+the range since your Read is caught. Repeated lines such as `port = 8080` are
+what line numbers tell apart, so a long guard may repeat. Lines between the
+first and last parts are not compared, and a blank last line pins the end only
+weakly, so prefer lines with text as `[first, last]`. `after:0`
 takes none. A mismatch is `EXPECTED_TEXT_MISMATCH`, and when the expected lines
 occur elsewhere the message gives the current range. A line past the end is
 `LINE_OUT_OF_RANGE`. On `span`, `expect` is byte-exact.

@@ -61,8 +61,9 @@ exposed by this host.
    final newline keeps the last line's ending) and `after: n` inserts whole lines
    after line n (0 is the top). Both need `expect`, compared without line
    endings: line n's current text, line a's for a one-line range, or
-   `[line a, line b]` (or every line) for a longer one, matching nowhere else in
-   the file, so a stale line number is rejected, not applied.
+   `[line a, line b]` (or every line) for a longer one, with 8 or more visible
+   characters or text found nowhere else in the file, so a stale line number is
+   rejected, not applied.
 3. Inspect the outcome. A rejection wrote nothing; its diagnostics can list
    `candidates` with the current text and lines. Copy an `exact` or `whitespace`
    candidate's `text` verbatim into `old`, confirm a `similar` one is the

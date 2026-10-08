@@ -339,6 +339,11 @@ impl TryFrom<ChangeInput> for Change {
                 Ok([first, last]) => (Some(first), Some(last)),
                 Err(joined) => (Some(joined), None),
             },
+            // An insertion's lines all end at `after`, so any number are one guard.
+            Some(value) if input.after.is_some() => match expect_pair(value)? {
+                Ok(pair) => (Some(joined_lines(&pair)), None),
+                Err(joined) => (Some(joined), None),
+            },
             Some(_) => return Err(EXPECT_FORM.into()),
         };
         let target = if let Some(old) = input.old {
@@ -380,8 +385,7 @@ impl TryFrom<ChangeInput> for Change {
     }
 }
 
-const EXPECT_FORM: &str =
-    "`expect` takes the current text as a string, or for lines [first line, last line]";
+const EXPECT_FORM: &str = "`expect` takes the current text as a string, or as an array of lines: for lines [first line, last line], for after the lines ending there";
 
 /// Reads an array `expect` of a lines target: two strings are its first and last
 /// lines; any other number of strings are its lines in order, joined.
@@ -398,16 +402,19 @@ fn expect_pair(value: serde_json::Value) -> Result<Result<[String; 2], String>, 
     }
     Ok(match <[String; 2]>::try_from(lines) {
         Ok(pair) => Ok(pair),
-        Err(lines) if !lines.is_empty() => {
-            let mut joined = lines.join("\n");
-            // A final LF only ends the last line, so an empty last line needs its own.
-            if lines.last().is_some_and(String::is_empty) {
-                joined.push('\n');
-            }
-            Err(joined)
-        }
+        Err(lines) if !lines.is_empty() => Err(joined_lines(&lines)),
         Err(_) => return Err(EXPECT_FORM.into()),
     })
+}
+
+/// Lines as one line-wise `expect`.
+fn joined_lines(lines: &[String]) -> String {
+    let mut joined = lines.join("\n");
+    // A final LF only ends the last line, so an empty last line needs its own.
+    if lines.last().is_some_and(String::is_empty) {
+        joined.push('\n');
+    }
+    joined
 }
 
 const LINES_FORM: &str = "lines must be [first,last] with 1 <= first <= last, e.g. [146,150]";
@@ -1048,8 +1055,16 @@ mod tests {
                 expect_last: None
             }
         );
+        // An insertion's array gives the lines ending at `after`.
+        let parsed = parse(json!({"after":2,"expect":["a","b"],"new":"x"})).unwrap();
+        assert_eq!(
+            parsed.target,
+            Target::Insert {
+                after: 2,
+                expect: Some("a\nb".into())
+            }
+        );
         for input in [
-            json!({"after":2,"expect":["a","b"],"new":"x"}),
             json!({"span":"r1","expect":["a","b"],"new":"x"}),
             json!({"lines":[1,2],"expect":[],"new":"x"}),
             json!({"lines":[1,2],"expect":["a",1],"new":"x"}),

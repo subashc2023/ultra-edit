@@ -236,7 +236,8 @@ claude --plugin-dir /absolute/path/to/ultra-edit/plugin/claude-code
 ```
 
 The plugin starts `${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp` with the
-arguments `["--root", "${CLAUDE_PROJECT_DIR}"]`; hook commands run the same
+arguments `["--root", "${CLAUDE_PROJECT_DIR}", "--no-instructions"]`, since its
+session card carries the routing the server instructions would repeat; hook commands run the same
 executable with their own argument arrays, without a shell. The root is fixed for
 that server and is not a tool argument.
 

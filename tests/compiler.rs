@@ -1018,7 +1018,7 @@ fn candidates_stay_within_the_target_scope() {
     assert!(error.candidates.is_empty());
     assert_eq!(
         error.message,
-        "Expected 1 occurrence(s), found 0; inspect the snapshot and choose an explicit span or narrower scope"
+        "Expected 1 occurrence(s), found 0 and nothing similar; read the file again and copy `old` exactly from it"
     );
     let error = rejected(&base, scoped("x", "  x = 1", "r3"));
     let third = candidate(CandidateKind::Whitespace, (3, 3), "\tx = 1");
@@ -1080,11 +1080,7 @@ fn similar_candidates_catch_changed_operators_and_names_but_not_unrelated_text()
     ] {
         let error = rejected(&base, exact("unrelated", unrelated, "x"));
         assert!(error.candidates.is_empty(), "{unrelated}: {error:?}");
-        assert!(
-            error
-                .message
-                .ends_with("choose an explicit span or narrower scope")
-        );
+        assert!(error.message.ends_with("copy `old` exactly from it"));
     }
 }
 
@@ -2181,7 +2177,7 @@ fn undisclosed_lines_need_an_expect_that_reaches_the_last_line() {
         (
             ends_change("c", [3, 4], ["}", "}"], ""),
             "LINE_GUARD_WEAK",
-            "expect \"} }\" matches 2 ranges in this file, from line 3, so a stale number could pick another; widen the range by a neighbouring line, repeating it in `new` and `expect`, or use `old`",
+            "expect \"} }\" is short and matches 2 ranges in this file, from line 3, so a stale number could pick another; widen the range by a neighbouring line, repeating it in `new` and `expect`, or use `old`",
         ),
         (
             insert("c", 0, Some("fn a() {"), "x"),
