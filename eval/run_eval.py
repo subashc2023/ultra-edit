@@ -293,6 +293,10 @@ METHODS = {key: how for key, (_, how) in SHELL_METHODS.items()} | {
     MCP_METHOD: "the MCP server's file-editing tools"
 }
 METHOD_HOOK = EVAL_DIR / "method_hook.py"
+# A task's concurrent.json makes this hook change a file while the model works on it.
+CONCURRENT_HOOK = EVAL_DIR / "concurrent_hook.py"
+CONCURRENT_SPEC = "concurrent.json"
+CONCURRENT_HOOK_TIMEOUT_S = 30
 METHOD_HOOK_TIMEOUT_S = 30
 METHOD_DENIAL = (
     "This session measures editing by {how}, and that command writes files with another program, "
@@ -510,6 +514,8 @@ class Task:
     prompt: str
     fixture: dict[str, bytes]
     expected: dict[str, bytes]
+    # From concurrent.json: another writer's changes to one file during the run.
+    concurrent: dict[str, Any] | None = None
 
     def expected_tree(self) -> dict[str, bytes]:
         tree = dict(self.fixture)
@@ -566,7 +572,23 @@ def load_task(path: Path) -> Task:
         prompt = prompt_path.read_bytes().decode("utf-8")
     except UnicodeDecodeError as error:
         raise EvalError(f"task {path.name}: prompt.md is not UTF-8: {error}") from error
-    return Task(path.name, path, prompt, read_tree(fixture_dir), read_tree(expected_dir))
+    concurrent = None
+    spec_path = path / CONCURRENT_SPEC
+    if spec_path.exists():
+        try:
+            concurrent = _concurrent_module().load_spec(spec_path)
+        except ValueError as error:
+            raise EvalError(f"task {path.name}: {CONCURRENT_SPEC}: {error}") from error
+    return Task(path.name, path, prompt, read_tree(fixture_dir), read_tree(expected_dir), concurrent)
+
+
+def _concurrent_module() -> Any:
+    sys.path.insert(0, str(EVAL_DIR))
+    try:
+        import concurrent_hook
+    finally:
+        sys.path.remove(str(EVAL_DIR))
+    return concurrent_hook
 
 
 def validate_task(task: Task) -> list[str]:
@@ -585,7 +607,27 @@ def validate_task(task: Task) -> list[str]:
     for relative in sorted(task.fixture):
         if relative.split("/", 1)[0] in IGNORED_TOP_LEVEL:
             problems.append(f"fixture/{relative} is inside a directory the scorer ignores")
+    if task.concurrent is not None:
+        problems += _concurrent_problems(task)
     return problems
+
+
+def _concurrent_problems(task: Task) -> list[str]:
+    """The other writer's events must apply to the fixture in order, and the expected
+    file must keep what each one wrote."""
+    relative = task.concurrent["file"]
+    if relative not in task.fixture or relative not in task.expected:
+        return [f"{CONCURRENT_SPEC} names {relative}, which must be in fixture/ and expected/"]
+    try:
+        _concurrent_module().apply_all(task.fixture[relative], task.concurrent)
+    except LookupError as error:
+        return [f"{CONCURRENT_SPEC} does not apply to fixture/{relative}: {error}"]
+    return [
+        f"expected/{relative} lacks {change['new']!r} from {CONCURRENT_SPEC}"
+        for event in task.concurrent["events"]
+        for change in event["changes"]
+        if change["new"].encode("utf-8") not in task.expected[relative]
+    ]
 
 
 def discover_tasks(tasks_dir: Path, names: Sequence[str] | None = None) -> list[Task]:
@@ -2260,12 +2302,15 @@ def run_one(config: Config, spec: RunSpec) -> dict[str, Any]:
     settings = build_settings(
         arm, guard, config.guard_matcher, config.extra_settings, config.disabled_plugins
     )
-    settings_path = run_dir / "settings.json"
-    _write_json(settings_path, settings)
     temp_root = Path(
         tempfile.mkdtemp(prefix=WORK_PREFIX, dir=str(config.work_dir) if config.work_dir else None)
     )
     repo = temp_root / "repo"
+    if spec.task.concurrent is not None:
+        write_concurrent_state(spec.task, run_dir)
+        add_concurrent_hooks(settings, spec.task, repo.resolve(), run_dir.resolve())
+    settings_path = run_dir / "settings.json"
+    _write_json(settings_path, settings)
     base_env = os.environ if config.base_env is None else config.base_env
     exit_code: int | None = None
     timed_out = False
@@ -2343,6 +2388,16 @@ def run_one(config: Config, spec: RunSpec) -> dict[str, Any]:
         guard_matcher=config.guard_matcher,
         third_party_servers=config.third_party_servers,
     )
+    concurrent = None
+    if spec.task.concurrent is not None:
+        concurrent = concurrent_report(spec.task, run_dir, actual, len(transcript.tool_calls))
+        errors += concurrent.pop("errors")
+        warnings += concurrent.pop("warnings")
+        metrics.update(
+            concurrent_applied=concurrent["applied"],
+            concurrent_triggers=",".join(concurrent["triggers"]),
+            concurrent_kept=concurrent["kept"],
+        )
     outcome = classify(transcript, comparison, errors, timed_out)
     if setup_error is not None:
         outcome = "infra_error"
@@ -2386,8 +2441,91 @@ def run_one(config: Config, spec: RunSpec) -> dict[str, Any]:
         "files": {"dir": f"runs/{spec.run_id}"},
         "environment": run_environment(config, arm),
     }
+    if concurrent is not None:
+        record["concurrent"] = concurrent
     _write_json(run_dir / "result.json", record)
     return record
+
+
+def write_concurrent_state(task: Task, run_dir: Path) -> None:
+    """The hook's starting state: no event applied, the file as the fixture has it."""
+    fixture = task.fixture[task.concurrent["file"]]
+    _write_json(
+        run_dir / "concurrent-state.json",
+        {"next": 0, "sha256": hashlib.sha256(fixture).hexdigest(), "calls": 0},
+    )
+
+
+def add_concurrent_hooks(settings: dict[str, Any], task: Task, repo: Any, run_dir: Path) -> None:
+    """Hooks that apply the task's concurrent events: after any tool call (PostToolUse,
+    every tool) and, for events still pending, when the session stops."""
+    state = run_dir / "concurrent-state.json"
+    args = [
+        str(CONCURRENT_HOOK),
+        "--spec", str((task.path / CONCURRENT_SPEC).resolve()),
+        "--repo", str(repo),
+        "--state", str(state),
+        "--log", str(run_dir / "concurrent.jsonl"),
+    ]  # fmt: skip
+
+    def entry(extra: Sequence[str] = (), matcher: str | None = None) -> dict[str, Any]:
+        hook = {
+            "type": "command",
+            "command": sys.executable,
+            "args": [*args, *extra],
+            "timeout": CONCURRENT_HOOK_TIMEOUT_S,
+        }
+        return {"hooks": [hook], **({"matcher": matcher} if matcher is not None else {})}
+
+    hooks = settings.setdefault("hooks", {})
+    hooks.setdefault("PostToolUse", []).append(entry(matcher="*"))
+    hooks.setdefault("Stop", []).append(entry(["--at-stop"]))
+
+
+def concurrent_report(
+    task: Task, run_dir: Path, actual: Mapping[str, bytes], tool_calls: int
+) -> dict[str, Any]:
+    """What the other writer did in a run, and whether the final file kept it. A hook
+    that failed, or never ran although tools were called, makes the run invalid; an
+    event whose text the model had already changed is only a warning, since the bytes
+    then fail on their own."""
+    entries: list[dict[str, Any]] = []
+    log = run_dir / "concurrent.jsonl"
+    if log.exists():
+        for line in log.read_text(encoding="utf-8").splitlines():
+            try:
+                entries.append(json.loads(line))
+            except ValueError:
+                entries.append({"error": f"hook_error: unreadable log line {line[:80]!r}"})
+    try:
+        calls = json.loads((run_dir / "concurrent-state.json").read_text(encoding="utf-8"))["calls"]
+    except (OSError, ValueError, KeyError, TypeError):
+        calls = 0
+    errors, warnings = [], []
+    for entry in entries:
+        error = str(entry.get("error", ""))
+        if error.startswith("apply_failed"):
+            warnings.append(f"concurrent change not applied: {error}")
+        elif error:
+            errors.append(f"concurrent hook: {error}")
+    events = task.concurrent["events"]
+    applied = [entry for entry in entries if entry.get("applied")]
+    if tool_calls and not calls and not entries:
+        errors.append("concurrent hook never ran")
+    elif len(applied) < len(events) and not warnings:
+        warnings.append(f"{len(events) - len(applied)} concurrent event(s) never fired")
+    final = actual.get(task.concurrent["file"], b"")
+    kept = bool(final) and all(
+        change["new"].encode("utf-8") in final for event in events for change in event["changes"]
+    )
+    return {
+        "events": entries,
+        "applied": len(applied),
+        "triggers": [str(e.get("trigger")) for e in applied],
+        "kept": kept,
+        "errors": errors,
+        "warnings": warnings,
+    }
 
 
 def run_environment(config: Config, arm: ArmSpec) -> dict[str, Any]:
@@ -2707,6 +2845,28 @@ def summarize(records: Sequence[Mapping[str, Any]], title: str = "Ultra Edit eva
                 for arm in arms
             ]
             lines.append(f"| {name} | " + " | ".join(cells) + " |")
+    concurrent = [record for record in scored_records(records) if record.get("concurrent")]
+    if concurrent:
+        lines += [
+            "",
+            "## Concurrent changes",
+            "",
+            "Tasks with a concurrent.json, where another writer changes a file during the session. "
+            "Stale view counts runs whose first change landed after the model was shown the file "
+            "and before it wrote it; kept counts runs whose final file holds every change the other "
+            "writer made.",
+            "",
+            "| Arm | Runs | Stale view | Kept | Correct |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+        for arm in arms:
+            subset = [record for record in concurrent if record["arm"] == arm]
+            if not subset:
+                continue
+            stale = sum(1 for record in subset if record["concurrent"]["triggers"][:1] == ["seen"])
+            kept = sum(1 for record in subset if record["concurrent"]["kept"])
+            correct = sum(1 for record in subset if record["correct"])
+            lines.append(f"| {arm} | {len(subset)} | {stale} | {kept} | {correct} |")
     failures = [record for record in records if record.get("outcome") in ("fail", "timeout")]
     if failures:
         lines += ["", "## Failed runs", ""]
@@ -3042,6 +3202,8 @@ def _dry_run(
         spec = next(item for item in plan if item.arm == arm.name)
         run_dir = out_dir / "runs" / spec.run_id
         settings = build_settings(arm, str(guard), args.guard_matcher, extra, args.disable_plugins)
+        if spec.task.concurrent is not None:
+            add_concurrent_hooks(settings, spec.task, "<temp>/repo", run_dir)
         argv = build_command(
             claude_argv,
             arm=arm,

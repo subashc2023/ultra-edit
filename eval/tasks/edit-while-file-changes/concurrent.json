@@ -1,0 +1,31 @@
+{
+  "file": "src/orders/settings.py",
+  "description": "Another developer saves two changes to settings.py: a region block and a fuller comment once the model has seen the retry settings, then a new timeout line after the model's first write to the file.",
+  "events": [
+    {
+      "after": "seen",
+      "seen": [
+        "RETRY_LIMIT = 3"
+      ],
+      "changes": [
+        {
+          "old": "\n# Retry policy\n",
+          "new": "\n# Region routing\nDEFAULT_REGION = \"eu-west-1\"\nFALLBACK_REGIONS = (\"eu-central-1\", \"us-east-1\")\n\n# Retry policy\n"
+        },
+        {
+          "old": "  # attempts per request\n",
+          "new": "  # attempts per request, including the first\n"
+        }
+      ]
+    },
+    {
+      "after": "write",
+      "changes": [
+        {
+          "old": "CONNECT_TIMEOUT_S = 3.0  # TCP and TLS handshake\n",
+          "new": "CONNECT_TIMEOUT_S = 3.0  # TCP and TLS handshake\nDNS_TIMEOUT_S = 2.0  # name resolution\n"
+        }
+      ]
+    }
+  ]
+}

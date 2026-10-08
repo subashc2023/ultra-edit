@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import base64
 import csv
+import hashlib
 import importlib.util
 import io
 import json
 import os
 import shutil
 import stat
+import subprocess
 import statistics
 import sys
 import tempfile
@@ -56,6 +58,8 @@ INTENT_TASKS = [
     "remove-deprecated-option",
     "rename-function-not-method",
 ]
+# Another writer changes a file during the run (concurrent.json).
+STALE_TASKS = ["edit-while-file-changes"]
 # Keeps tests independent of whatever eval/third_party/arms.json holds.
 NO_THIRD_PARTY = str(REPO_ROOT / "eval" / "third_party" / "no-such-arms-file.json")
 ULTRA = evaluation.ULTRA_TOOL_PREFIX
@@ -884,7 +888,9 @@ class CommandTests(unittest.TestCase):
 class TaskFixtureTests(unittest.TestCase):
     def test_all_tasks_are_well_formed(self):
         tasks = evaluation.discover_tasks(TASKS_DIR)
-        self.assertEqual([task.name for task in tasks], sorted(ORIGINAL_TASKS + NEW_TASKS + INTENT_TASKS))
+        self.assertEqual(
+            [task.name for task in tasks], sorted(ORIGINAL_TASKS + NEW_TASKS + INTENT_TASKS + STALE_TASKS)
+        )
         for task in tasks:
             with self.subTest(task=task.name):
                 self.assertEqual(evaluation.validate_task(task), [])
@@ -950,6 +956,46 @@ class TaskFixtureTests(unittest.TestCase):
         self.assertEqual(task.fixture["src/routes.py"], generator.fixture_bytes())
         self.assertEqual(task.expected["src/routes.py"], generator.expected_bytes())
 
+    def test_stale_task_events_apply_to_the_fixture_in_order(self):
+        task = evaluation.load_task(TASKS_DIR / "edit-while-file-changes")
+        self.assertIsNotNone(task.concurrent)
+        relative = task.concurrent["file"]
+        hook = evaluation._concurrent_module()
+        changed = hook.apply_all(task.fixture[relative], task.concurrent)
+        self.assertEqual([event["after"] for event in task.concurrent["events"]], ["seen", "write"])
+        for event in task.concurrent["events"]:
+            for change in event["changes"]:
+                self.assertIn(change["new"].encode(), changed)
+                self.assertIn(change["new"].encode(), task.expected[relative])
+        # The seen string shows only in the file the other writer changes.
+        for path, data in task.fixture.items():
+            if path != relative:
+                self.assertNotIn(b"RETRY_LIMIT = 3", data, path)
+        self.assertNotIn("RETRY_LIMIT = 3", task.prompt)
+
+    def test_malformed_concurrent_specs_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "stale"
+            files = {
+                "prompt.md": b"Edit `a.txt`.\n",
+                "fixture/a.txt": b"one\ntwo\n",
+                "expected/a.txt": b"one\n2\n",
+            }
+            evaluation.write_tree(root, files)
+            spec = {"file": "a.txt", "events": [{"after": "write", "changes": [{"old": "one\n", "new": "1\n"}]}]}
+            (root / "concurrent.json").write_text(json.dumps(spec), encoding="utf-8")
+            problems = evaluation.validate_task(evaluation.load_task(root))
+            self.assertEqual(problems, ["expected/a.txt lacks '1\\n' from concurrent.json"])
+            spec["events"][0]["changes"][0]["old"] = "three\n"
+            (root / "concurrent.json").write_text(json.dumps(spec), encoding="utf-8")
+            problems = evaluation.validate_task(evaluation.load_task(root))
+            self.assertEqual(len(problems), 1)
+            self.assertIn("does not apply", problems[0])
+            spec["events"][0]["after"] = "later"
+            (root / "concurrent.json").write_text(json.dumps(spec), encoding="utf-8")
+            with self.assertRaisesRegex(evaluation.EvalError, "after must be"):
+                evaluation.load_task(root)
+
     def test_malformed_tasks_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "broken"
@@ -970,6 +1016,101 @@ class TaskFixtureTests(unittest.TestCase):
                 evaluation.discover_tasks(Path(directory))
             with self.assertRaises(evaluation.EvalError):
                 evaluation.discover_tasks(TASKS_DIR, ["no-such-task"])
+
+
+class ConcurrentHookTests(unittest.TestCase):
+    """The hook that changes a file while the model works on it."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.file = self.repo / "app.py"
+        self.file.write_bytes(b"A = 1\nB = 2\nC = 3\n")
+        self.spec = {
+            "file": "app.py",
+            "events": [
+                {"after": "seen", "seen": ["B = 2"], "changes": [{"old": "A = 1\n", "new": "A = 1\nZ = 0\n"}]},
+                {"after": "write", "changes": [{"old": "C = 3\n", "new": "C = 3  # three\n"}]},
+            ],
+        }
+        self.spec_path = self.root / "concurrent.json"
+        self.spec_path.write_text(json.dumps(self.spec), encoding="utf-8")
+        self.state = self.root / "state.json"
+        self.state.write_text(
+            json.dumps({"next": 0, "sha256": hashlib.sha256(self.file.read_bytes()).hexdigest(), "calls": 0}),
+            encoding="utf-8",
+        )
+        self.log = self.root / "log.jsonl"
+
+    def hook(self, payload, *extra):
+        argv = [
+            sys.executable,
+            str(evaluation.CONCURRENT_HOOK),
+            "--spec", str(self.spec_path),
+            "--repo", str(self.repo),
+            "--state", str(self.state),
+            "--log", str(self.log),
+            *extra,
+        ]  # fmt: skip
+        completed = subprocess.run(argv, input=json.dumps(payload), capture_output=True, text=True, check=False)
+        self.assertEqual((completed.returncode, completed.stdout), (0, ""), completed.stderr)
+
+    def entries(self):
+        if not self.log.exists():
+            return []
+        return [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
+
+    def post(self, tool, response, tool_input=None):
+        self.hook(
+            {
+                "hook_event_name": "PostToolUse",
+                "tool_name": tool,
+                "tool_input": tool_input or {},
+                "tool_response": response,
+            }
+        )
+
+    def test_events_fire_after_the_model_sees_the_text_and_after_its_write(self):
+        self.post("Glob", {"filenames": ["app.py"]})
+        self.assertEqual(self.entries(), [], "a listing shows no content")
+        self.post("Read", {"file": {"content": "A = 1\nB = 2\nC = 3\n"}})
+        self.assertEqual(self.file.read_bytes(), b"A = 1\nZ = 0\nB = 2\nC = 3\n")
+        self.post("Read", {"file": {"content": "A = 1\nZ = 0\nB = 2\nC = 3\n"}})
+        self.assertEqual(len(self.entries()), 1, "the write event waits for the model's write")
+        self.file.write_bytes(self.file.read_bytes().replace(b"B = 2", b"B = 20"))
+        self.post("Edit", "ok")
+        self.assertEqual(self.file.read_bytes(), b"A = 1\nZ = 0\nB = 20\nC = 3  # three\n")
+        self.hook({"hook_event_name": "Stop"}, "--at-stop")
+        entries = self.entries()
+        self.assertEqual([(e["event"], e["trigger"], e["tool"], e["call"]) for e in entries],
+                         [(1, "seen", "Read", 1), (2, "write", "Edit", 3)])  # fmt: skip
+
+    def test_a_blind_write_fires_the_seen_event_and_stop_applies_the_rest(self):
+        self.file.write_bytes(b"A = 1\nB = 20\nC = 3\n")
+        self.post("mcp__plugin_ultra-edit_ultra-edit__ultra_edit", {"kind": "completed"})
+        self.assertEqual(self.file.read_bytes(), b"A = 1\nZ = 0\nB = 20\nC = 3\n")
+        self.hook({"hook_event_name": "Stop"}, "--at-stop")
+        self.assertEqual(self.file.read_bytes(), b"A = 1\nZ = 0\nB = 20\nC = 3  # three\n")
+        self.assertEqual([e["trigger"] for e in self.entries()], ["write", "stop"])
+
+    def test_json_escaped_text_counts_as_seen(self):
+        self.spec["events"][0]["seen"] = ['B = "2"']
+        self.spec_path.write_text(json.dumps(self.spec), encoding="utf-8")
+        self.post("mcp__fs__read_file", {"content": [{"type": "text", "text": 'B = "2"'}]})
+        self.assertEqual(self.entries()[0]["trigger"], "seen")
+
+    def test_text_the_model_already_changed_is_reported_not_forced(self):
+        self.file.write_bytes(b"A = 100\nB = 2\nC = 3\n")
+        self.post("Edit", "ok")
+        self.assertEqual(self.file.read_bytes(), b"A = 100\nB = 2\nC = 3\n")
+        self.hook({"hook_event_name": "Stop"}, "--at-stop")
+        entries = self.entries()
+        self.assertEqual(len(entries), 1, "no event is tried after one fails")
+        self.assertFalse(entries[0]["applied"])
+        self.assertTrue(entries[0]["error"].startswith("apply_failed"))
 
 
 class IntegrityTests(unittest.TestCase):
@@ -1264,6 +1405,50 @@ class HarnessProcessTests(unittest.TestCase):
         diff = (out / "runs" / "crlf-and-lf__native__r2" / "diff.txt").read_text(encoding="utf-8")
         self.assertIn('-"set SIGN_BUILD=1\\r\\n"', diff)
         self.assertIn('+"set SIGN_BUILD=1\\n"', diff)
+
+    def stale_plan(self, task, keep_first_event=True):
+        """Writes as a model would make them: from a view that has the first event
+        (or not) but not the second, which lands after the write."""
+        relative = task.concurrent["file"]
+        first, second = task.concurrent["events"]
+        data = task.expected[relative]
+        for change in second["changes"]:
+            data = data.replace(change["new"].encode(), change["old"].encode())
+        if not keep_first_event:
+            for change in first["changes"]:
+                data = data.replace(change["new"].encode(), change["old"].encode())
+        self.write_plan({**task.expected, relative: data})
+        plan = json.loads(self.plan_path.read_text(encoding="utf-8"))
+        plan["reads"] = [relative]
+        self.plan_path.write_text(json.dumps(plan), encoding="utf-8")
+
+    @unittest.skipUnless(HAS_GIT, "git is required")
+    def test_run_one_changes_a_file_under_the_model_and_scores_both_writers(self):
+        task = evaluation.load_task(TASKS_DIR / "edit-while-file-changes")
+        self.stale_plan(task)
+        out = self.root / "results"
+        result = evaluation.run_one(self.config(out), evaluation.RunSpec(task, "native", 1))
+        self.assertEqual(result["outcome"], "pass", result)
+        self.assertEqual(result["concurrent"]["triggers"], ["seen", "write"])
+        self.assertTrue(result["concurrent"]["kept"])
+        self.assertEqual(result["metrics"]["concurrent_applied"], 2)
+        self.assertEqual(result["integrity"]["errors"], [])
+        settings = json.loads((out / "runs" / "edit-while-file-changes__native__r1" / "settings.json").read_text())
+        self.assertEqual(settings["hooks"]["PostToolUse"][0]["matcher"], "*")
+        self.assertIn("--at-stop", settings["hooks"]["Stop"][0]["hooks"][0]["args"])
+
+    @unittest.skipUnless(HAS_GIT, "git is required")
+    def test_run_one_fails_a_write_that_drops_the_other_writers_change(self):
+        task = evaluation.load_task(TASKS_DIR / "edit-while-file-changes")
+        self.stale_plan(task, keep_first_event=False)
+        out = self.root / "results"
+        result = evaluation.run_one(self.config(out), evaluation.RunSpec(task, "native", 1))
+        self.assertEqual(result["outcome"], "fail", result)
+        self.assertFalse(result["concurrent"]["kept"])
+        self.assertEqual(result["concurrent"]["triggers"], ["seen", "write"])
+        summary = evaluation.summarize([result])
+        self.assertIn("## Concurrent changes", summary)
+        self.assertIn("| native | 1 | 1 | 0 | 0 |", summary)
 
     @unittest.skipUnless(HAS_GIT, "git is required")
     def test_run_one_reports_a_missing_claude_as_infrastructure(self):

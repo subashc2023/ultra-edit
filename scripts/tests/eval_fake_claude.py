@@ -9,6 +9,8 @@ it reports each configured server as connected, lists the plan's "mcp_tools"
 for it, and edits through its "mcp_edit_tool". --disallowedTools removes tools
 from init. When the --settings file defines PreToolUse hooks it runs them, as
 Claude Code does, on one read-only and one heredoc Bash call. The plan's
+"reads" lists files it Reads before writing; PostToolUse hooks run after each
+Read and each write, and Stop hooks at the end. The plan's
 "sleep" maps an arm name (read from the run directory) to seconds to wait
 before finishing. It logs what it saw to $FAKE_CLAUDE_LOG, or to
 $FAKE_CLAUDE_LOG_DIR/<run directory>.json for parallel runs.
@@ -18,6 +20,7 @@ import base64
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import time
@@ -98,6 +101,24 @@ def hook_response(event, completed):
             "stderr": completed.stderr,
         }
     )
+
+
+def run_hooks(settings, event, payload, tool_name=None):
+    """Run the settings' hooks for one event, as Claude Code does, and report them."""
+    for entry in settings.get("hooks", {}).get(event, []):
+        matcher = entry.get("matcher")
+        if tool_name is not None and matcher not in (None, "", "*"):
+            if not re.fullmatch(matcher, tool_name):
+                continue
+        for hook in entry["hooks"]:
+            completed = subprocess.run(
+                [hook["command"], *hook.get("args", [])],
+                input=json.dumps({"hook_event_name": event, "cwd": os.getcwd(), **payload}),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            hook_response(event, completed)
 
 
 def option(args, name):
@@ -219,6 +240,16 @@ def main():
             denied = completed.returncode == 2 or '"deny"' in completed.stdout
             tool_result(tool_id, "blocked by hook" if denied else "", is_error=denied)
 
+    for index, relative in enumerate(plan.get("reads", [])):
+        tool_id = f"toolu_read_{index}"
+        tool_input = {"file_path": str(pathlib.Path(relative).resolve())}
+        assistant(f"msg_read_{index}", {"type": "tool_use", "id": tool_id, "name": "Read", "input": tool_input})
+        content = pathlib.Path(relative).read_text(encoding="utf-8")
+        response = {"type": "text", "file": {"filePath": tool_input["file_path"], "content": content}}
+        payload = {"tool_name": "Read", "tool_input": tool_input, "tool_response": response, "tool_use_id": tool_id}
+        run_hooks(settings, "PostToolUse", payload, "Read")
+        tool_result(tool_id, content)
+
     for index, (relative, encoded) in enumerate(sorted(plan["writes"].items())):
         tool_id = f"toolu_{index}"
         assistant(
@@ -229,9 +260,12 @@ def main():
         path = pathlib.Path(relative)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(base64.b64decode(encoded))
+        payload = {"tool_name": edit_tool, "tool_input": {"file_path": relative}, "tool_response": "ok", "tool_use_id": tool_id}
+        run_hooks(settings, "PostToolUse", payload, edit_tool)
         tool_result(tool_id, json.dumps({"kind": "completed", "commit": "committed"}) if plugin_dir else "ok")
 
     time.sleep(plan.get("sleep", {}).get(arm, 0))
+    run_hooks(settings, "Stop", {"stop_hook_active": False})
     emit(
         {
             "type": "result",

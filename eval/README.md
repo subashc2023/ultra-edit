@@ -8,7 +8,7 @@ the spread of each across repetitions. It runs headless `claude -p` sessions,
 saves each raw stream-json transcript, and scores the final bytes.
 
 > **Cost warning.** Every run is a real Claude Code session billed to your
-> account: tasks × arms × `--reps` sessions (17 tasks × 3 default arms = 51
+> account: tasks × arms × `--reps` sessions (23 tasks × 3 default arms = 69
 > runs per repetition; `--arm all` runs every arm). `--dry-run` and
 > `--preflight` never call a model. Paid runs need confirmation (or `--yes`),
 > each run is capped by `--max-budget-usd` (default 2), and `--max-total-usd`
@@ -116,6 +116,29 @@ stay byte-identical, and no file may be added or removed.
 | `bump-version-in-context` | Intent-level: bump the package's own version where the same string also pins another dependency and appears in history |
 | `remove-deprecated-option` | Intent-level: remove an option's parser entry, handler, config field, docs, and tests, beside a look-alike option that stays |
 | `rename-function-not-method` | Intent-level: rename a module function and its references, but not methods, other modules' functions, or prose with the same name |
+| `edit-while-file-changes` | Stale file: another writer changes `settings.py` after the model reads it and again after its first write there, shifting the lines it edits and rewording one of them |
+
+A task may also hold a `concurrent.json`, which simulates another writer (a
+teammate, a formatter, a second agent) editing one file during the session. It
+names the `file` and lists `events`, each a list of exact `changes` (`old`,
+`new`; `old` must occur exactly once when the event applies) and a trigger:
+
+- `"after": "seen"` fires after the first tool call whose input or result
+  contains one of the event's `seen` strings, that is, once the model has been
+  shown that part of the file, or after a call that changed the file;
+- `"after": "write"` fires after the first call that changed the file since the
+  previous event.
+
+The run's settings add `concurrent_hook.py` as a `PostToolUse` hook for every
+tool (matcher `*`), which applies at most one event per call, and as a `Stop`
+hook, which applies any event still pending so every run ends with all of them
+applied. `expected/` therefore holds both writers' changes, and a route that
+writes from an out-of-date view loses the other writer's change or edits the
+wrong line. Each run records the events in `concurrent.jsonl` and in its result
+(`concurrent`: what fired, after which tool, and whether the final file kept every
+change), and the summary adds a "Concurrent changes" table. A hook that failed,
+or never ran although tools were called, makes the run invalid; an event whose
+text the model had already changed is a warning, since its bytes then fail anyway.
 
 ## Setup
 
