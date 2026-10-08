@@ -419,7 +419,7 @@ fn joined_lines(lines: &[String]) -> String {
 
 const LINES_FORM: &str = "lines must be [first,last] with 1 <= first <= last, e.g. [146,150]";
 
-/// Reads `lines` given as `[a, b]`, `a`, `"a"`, or `"a-b"`; strings are canonicalized
+/// Reads `lines` given as `[a, b]`, `[a]`, `a`, `"a"`, or `"a-b"`; all are canonicalized
 /// to the pair, so every spelling derives the same request ID.
 fn lines_input(value: &serde_json::Value) -> Result<[usize; 2], String> {
     if let Some(text) = value.as_str()
@@ -438,6 +438,8 @@ fn line_pair(value: &serde_json::Value) -> Option<[usize; 2]> {
         serde_json::Value::Number(_) => [number(value)?; 2],
         serde_json::Value::Array(pair) => match pair.as_slice() {
             [first, last] => [number(first)?, number(last)?],
+            // One line given alone, as in `[8]`.
+            [line] => [number(line)?; 2],
             _ => return None,
         },
         serde_json::Value::String(text) => {
@@ -910,6 +912,7 @@ mod tests {
     fn every_spelling_of_lines_is_canonicalized() {
         for lines in [
             json!([7, 7]),
+            json!([7]),
             json!(7),
             json!("7"),
             json!("7-7"),
