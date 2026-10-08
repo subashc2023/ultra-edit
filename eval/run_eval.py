@@ -52,6 +52,8 @@ THIRD_PARTY_DIR = EVAL_DIR / "third_party"
 DEFAULT_THIRD_PARTY_ARMS = THIRD_PARTY_DIR / "arms.json"
 DEFAULT_THIRD_PARTY_INSTALL = THIRD_PARTY_DIR / "install"
 THIRD_PARTY_README = "eval/third_party/README.md"
+# Each run's work directory, which holds the project, is a temporary directory named so.
+WORK_PREFIX = "ue-eval-"
 
 # The arms that run when no --arm is given; --arm all adds every other arm.
 DEFAULT_ARMS = ("native", "native-guard", "ultra-edit")
@@ -275,9 +277,10 @@ SHELL_METHODS = {
 METHOD_HOOK = EVAL_DIR / "method_hook.py"
 METHOD_HOOK_TIMEOUT_S = 30
 METHOD_DENIAL = (
-    "This session measures editing by {how}, and that command writes files another way, so it "
-    "was blocked. Make every file change by {how}. Read-only commands and scratch files in /tmp "
-    "are allowed."
+    "This session measures editing by {how}, and that command writes files with another program, "
+    "so it was blocked. Make every file change by {how}. Other programs may read files and print "
+    "output, and > or tee may save that output under /tmp, but no other program may write files "
+    "itself, not even scratch files."
 )
 
 
@@ -930,6 +933,7 @@ _POWERSHELL = re.compile(r"(?i)\b(?:pwsh|powershell)(?:\.exe)?\b")
 _WRITE_API = re.compile(
     r"\.write_text\(|\.write_bytes\(|(?<!stdout)(?<!stderr)\.write\("
     r"|\bopen\([^)\n]*,\s*['\"][rwa]?[wa]b?\+?['\"]"
+    r"|\bopen\s*\(?\s*(?:my\s+)?[$*]?\w+\s*,\s*['\"](?:\+?>|\+<)"
     r"|writeFileSync|appendFileSync|\bwriteFile\(|\bappendFile\(|\bFile\.write|\bIO\.write|file_put_contents"
 )
 _PS_WRITE = re.compile(
@@ -1050,10 +1054,56 @@ _METHOD_PROGRAMS = {
 _COMMAND_WRAPPERS = frozenset({"env", "sudo", "command", "builtin", "nohup", "time", "exec", "xargs"})
 # A shell function definition's head: `name() {` or `function name {`.
 _FUNCTION_HEAD = re.compile(r"^(?:function\s+[\w-]+\s*(?:\(\))?|[A-Za-z_][\w-]*\s*\(\))\s*\{?\s*")
-# A redirection or tee into the temporary directory: scratch files, not project files.
+# A redirection or tee into the temporary directory: scratch files, not project files,
+# unless the path is inside a run's work directory, which holds the project.
 _TEMP_TARGET = re.compile(
-    r"(>>?|\btee(?:\s+-a)?)[ \t]*([\"']?)(?:/tmp/|/var/tmp/|\$\{?TMPDIR\}?/?)[^\s;&|<>()\"']*\2"
+    r"(>>?|\btee(?:\s+-a)?)[ \t]*([\"']?)(?:/tmp/|/var/tmp/|\$\{?TMPDIR\}?/?)"
+    rf"(?!{WORK_PREFIX})[^\s;&|<>()\"']*\2"
 )
+# The same with a relative target, which is scratch after a cd into the temporary directory.
+_RELATIVE_TARGET = re.compile(r"(>>?|\btee(?:\s+-a)?)[ \t]*([\"']?)(?![/$~&\"'])[^\s;&|<>()\"']+\2")
+_TEMP_DIR = re.compile(rf"(?:/tmp|/var/tmp|\$\{{?TMPDIR\}}?)(?:/(?!{WORK_PREFIX})\S*|/?)")
+_CD = re.compile(r"\s*\(?\s*cd\s+(?:--\s+)?(\S+)")
+_ASSIGN = re.compile(r"\s*([A-Za-z_]\w*)=(.*)")
+_SHELL_SEPARATOR = re.compile(r"(&&|\|\||[;|])")
+
+
+def _scratch_writes(command: str) -> str:
+    """The command with output that > or tee saves into the temporary directory sent to
+    /dev/null instead: absolute targets there, and relative ones after a cd into it (to
+    a path there, or to a variable set from one or from mktemp)."""
+    temp_vars: set[str] = set()
+    in_temp = False
+    lines: list[str] = []
+    pending: list[str] = []
+    for line in command.split("\n"):
+        if pending:
+            if line.lstrip("\t") == pending[0]:
+                pending.pop(0)
+            lines.append(line)
+            continue
+        pending.extend(
+            next(group for group in match.groups() if group is not None) for match in _HEREDOC.finditer(line)
+        )
+        pieces = _SHELL_SEPARATOR.split(line)
+        for index in range(0, len(pieces), 2):
+            if assign := _ASSIGN.match(pieces[index]):
+                value = assign.group(2).strip().strip("\"'")
+                if value.startswith("$(mktemp") or _TEMP_DIR.fullmatch(value):
+                    temp_vars.add(assign.group(1))
+            elif cd := _CD.match(pieces[index]):
+                target = cd.group(1).strip("\"')")
+                variable = re.match(r"\$\{?([A-Za-z_]\w*)", target)
+                if target.startswith("/") or variable:
+                    in_temp = bool(_TEMP_DIR.fullmatch(target)) or bool(variable and variable.group(1) in temp_vars)
+                elif target in ("-", "~") or target.startswith("~"):
+                    in_temp = False
+            piece = _TEMP_TARGET.sub(lambda match: f"{match.group(1)} /dev/null", pieces[index])
+            if in_temp:
+                piece = _RELATIVE_TARGET.sub(lambda match: f"{match.group(1)} /dev/null", piece)
+            pieces[index] = piece
+        lines.append("".join(pieces))
+    return "\n".join(lines)
 
 
 def shell_methods(command: Any) -> set[str]:
@@ -1098,11 +1148,12 @@ def shell_methods(command: Any) -> set[str]:
 def off_method_write(command: Any, method: str) -> bool:
     """Whether a command writes files other than by `method`: it writes with another
     method's program, or writes (by the write and edit heuristics) without its own.
-    Writes into the temporary directory, such as a patch or data file, do not count."""
+    Output that > or tee saves into the temporary directory, such as a patch built from
+    `sed -n` slices, does not count; another program writing even a scratch file does."""
     if not isinstance(command, str):
         return False
-    project = _TEMP_TARGET.sub(lambda match: f"{match.group(1)} /dev/null", command)
-    used = shell_methods(command)
+    project = _scratch_writes(command)
+    used = shell_methods(project)
     if not (used or shell_write_kinds(project) or shell_edit_kinds(project)):
         return False
     return method not in used or bool(used - {method})
@@ -2175,7 +2226,7 @@ def run_one(config: Config, spec: RunSpec) -> dict[str, Any]:
     settings_path = run_dir / "settings.json"
     _write_json(settings_path, settings)
     temp_root = Path(
-        tempfile.mkdtemp(prefix="ue-eval-", dir=str(config.work_dir) if config.work_dir else None)
+        tempfile.mkdtemp(prefix=WORK_PREFIX, dir=str(config.work_dir) if config.work_dir else None)
     )
     repo = temp_root / "repo"
     base_env = os.environ if config.base_env is None else config.base_env

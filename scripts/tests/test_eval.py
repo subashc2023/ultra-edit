@@ -2413,10 +2413,25 @@ class ShellMethodTests(unittest.TestCase):
         ("cat > /tmp/ed.py <<'E'\nopen('f','w')\nE\npython3 /tmp/ed.py", "sed", True),
         ("cat > src/a.py <<'EOF'\nx\nEOF", "patch", True),
         ("printf '\\n' >> app/handlers.py", "python", True),
-        # Reads and scratch files in the temporary directory are not writes.
+        ("sed 's/a/b/' f > f.tmp && mv f.tmp f", "patch", True),
+        ("cat > /tmp/ed.pl <<'E'\nopen my $f,'>',$file;\nE\nperl /tmp/ed.pl f a b", "sed", False),
+        ("cat > /tmp/ed.pl <<'E'\nopen my $f,'>',$file;\nE\nperl /tmp/ed.pl f a b", "python", True),
+        # Another program writing a scratch file still edits another way.
+        ("python3 - <<'P'\nopen('/tmp/new.ts','w').write(s)\nP\ngit apply /tmp/p.diff", "patch", True),
+        ("sed -i 's/a/b/' /tmp/gen.py; git apply /tmp/p.diff", "patch", True),
+        # The project lives in a temporary work directory; writes there are not scratch.
+        ("cat > /tmp/ue-eval-ab12/repo/src/a.py <<'EOF'\nx\nEOF", "patch", True),
+        # Reads, and output that > or tee saves into the temporary directory, are not writes.
         ("grep -n x f; sed -n 1,5p f", "patch", False),
         ("cat > /tmp/spec.txt <<'EOF'\na\nEOF", "sed", False),
         ('echo x > "$TMPDIR/notes"', "patch", False),
+        ("{ sed -n 1,3p f; cat /tmp/h.txt; } > /tmp/new && git diff --no-index f /tmp/new > /tmp/p.diff\n"
+         "git apply /tmp/p.diff", "patch", False),
+        ("awk '{print $0 \"\\r\"}' /tmp/a.diff > /tmp/b.diff && git apply /tmp/b.diff", "patch", False),
+        # Relative targets after a cd into the temporary directory are scratch too.
+        ("cd /tmp/ed && cat > p.diff <<'E'\nx\nE\ncd /tmp/ue-eval-q/repo && git apply /tmp/ed/p.diff", "patch", False),
+        ("T=$(mktemp -d); cd $T; printf 'a\\n' > notes; cd -; git apply $T/p.diff", "patch", False),
+        ("cd /tmp && echo x > a.txt; cd /tmp/ue-eval-ab/repo; echo y > b.txt", "patch", True),
         (None, "sed", False),
     ]
 

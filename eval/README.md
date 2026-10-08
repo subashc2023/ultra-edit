@@ -44,8 +44,10 @@ Each shell arm also gets a `PreToolUse` hook on Bash, `method_hook.py --method
 appended prompt says such commands are blocked. Without it the arms measured
 whatever the model reached for: in earlier rounds only 14 of 42 `shell-patch`
 sessions used `git apply` for every write, the rest using `sed -i` or Python.
-Reads and scratch files in the temporary directory are allowed. Each shell run
-records `off_method_attempts` and `off_method_writes` (attempts that ran
+Other programs may read files and print output, and `>` or `tee` may save that
+output under the temporary directory (a patch built from `sed -n` slices, say),
+but no other program may write a file itself, scratch files included, so a
+Python-generated diff does not pass for `git apply`. Each shell run records `off_method_attempts` and `off_method_writes` (attempts that ran
 unblocked; any are an integrity warning).
 
 Before an arm's measured runs, one short session per arm caches its shared
