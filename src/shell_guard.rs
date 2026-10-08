@@ -8,8 +8,10 @@
 //! allowed, because a false positive blocks legitimate work. A write target
 //! counts as outside the project only when that is certain.
 
+use std::cell::RefCell;
 use std::fmt;
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 
 mod powershell;
 mod scope;
@@ -32,6 +34,10 @@ const MAX_TOKENS: usize = 250_000;
 const MAX_CALL_SPAN: usize = 512;
 /// Program names longer than this are shortened in the deny reason.
 const MAX_PROGRAM_CHARS: usize = 16;
+/// Files a command list writes that later commands may run as scripts.
+const MAX_WRITTEN: usize = 64;
+/// The largest temporary script read from disk.
+const MAX_SCRIPT_BYTES: u64 = 1 << 20;
 
 /// Reserved words that can precede a command without changing what it runs.
 const KEYWORDS: &[&str] = &[
@@ -79,6 +85,9 @@ pub enum Pattern {
     GeneratedToFile,
     /// Inline interpreter code that calls a file-write API.
     InlineScriptWrite,
+    /// A script file, written earlier in the command or left in the temporary
+    /// directory, that an interpreter runs and that calls a file-write API.
+    ScriptFileWrite,
     /// An in-place editor such as `sed -i` or `perl -pi`.
     InPlaceEdit,
     /// Embedded content applied to files by `patch`, `git apply`, or `ultra-edit`.
@@ -105,6 +114,9 @@ impl fmt::Display for Finding {
             Pattern::GeneratedToFile => write!(formatter, "`{program}` output written to a file"),
             Pattern::InlineScriptWrite => {
                 write!(formatter, "inline `{program}` code that writes a file")
+            }
+            Pattern::ScriptFileWrite => {
+                write!(formatter, "a `{program}` script file that writes a file")
             }
             Pattern::InPlaceEdit => write!(formatter, "in-place editing with `{program}`"),
             Pattern::AppliedContent => {
@@ -146,11 +158,13 @@ pub fn classify_powershell(command: &str, scope: &Scope) -> Option<Finding> {
 fn scan(script: &str, scope: &Scope, depth: usize) -> Option<Finding> {
     let mut lexer = Lexer::new(script);
     let commands = lexer.list(false);
+    let written = Written::default();
     let context = Context {
         source: script,
         dialect: Dialect::Bash,
         scope,
         depth,
+        written: &written,
     };
     check(&commands, context)
         .or_else(|| {
@@ -187,9 +201,43 @@ struct Context<'a> {
     /// How many enclosing `bash -c`, `eval`, backtick, or `pwsh -Command`
     /// scripts this one runs in.
     depth: usize,
+    /// Files outside the project that earlier commands wrote, with their text.
+    written: &'a Written,
 }
 
+/// Files that commands of one script wrote outside the project, as (target
+/// word, text), so a later command that runs one as a script can be checked.
+pub(super) type Written = RefCell<Vec<(String, String)>>;
+
 impl Context<'_> {
+    /// Notes that `target` now holds `text`, when `target` is a file outside
+    /// the project; a write inside it is reported before this is reached.
+    fn record(&self, target: &Word, text: &str) {
+        let mut written = self.written.borrow_mut();
+        if is_file(&target.text) && written.len() < MAX_WRITTEN {
+            written.push((target.text.clone(), text.to_owned()));
+        }
+    }
+
+    /// The text of a script file that `path` names: one written earlier in this
+    /// script, matched by name when either spelling is relative (a `cd` may lie
+    /// between them), or else one already in the temporary directory.
+    fn script(&self, path: &str) -> Option<String> {
+        let name = |text: &str| text.rsplit(['/', '\\']).next().unwrap_or(text).to_owned();
+        let written = self.written.borrow();
+        written
+            .iter()
+            .rev()
+            .find(|(target, _)| target == path)
+            .or_else(|| {
+                written.iter().rev().find(|(target, _)| {
+                    (!is_absolute(target) || !is_absolute(path)) && name(target) == name(path)
+                })
+            })
+            .map(|(_, text)| text.clone())
+            .or_else(|| temporary_script(path))
+    }
+
     /// Whether a write to `word` may reach a file inside the project.
     fn counts(&self, word: &Word) -> bool {
         let raw = self.source.get(word.span.clone()).unwrap_or_default();
@@ -892,12 +940,20 @@ fn inspect(
             if to_file {
                 Err(content.finding())
             } else {
+                record_outputs(command, &content.text, context);
                 Ok(Some(content))
             }
         }
         Family::Tee => match stdin {
             Some(content) if tee_writes(arguments, context) => Err(content.finding()),
-            stdin => Ok(stdin),
+            stdin => {
+                if let Some(content) = &stdin {
+                    for file in arguments.iter().filter(|word| !word.text.starts_with('-')) {
+                        context.record(file, &content.text);
+                    }
+                }
+                Ok(stdin)
+            }
         },
         Family::Sed if sed_in_place(arguments).is_some_and(|files| context.edits(&files)) => {
             found(Pattern::InPlaceEdit)
@@ -907,7 +963,13 @@ fn inspect(
         }
         Family::Filter | Family::Sed | Family::Awk => match stdin {
             Some(content) if to_file => Err(content.finding()),
-            stdin => Ok(stdin),
+            stdin => {
+                // `cat > /tmp/edit.py <<'EOF'` leaves a script a later command may run.
+                if let (Family::Filter, Some(content)) = (family(&program), &stdin) {
+                    record_outputs(command, &content.text, context);
+                }
+                Ok(stdin)
+            }
         },
         Family::Interpreter(language) => {
             let invocation = invocation(language, &program, arguments);
@@ -915,11 +977,23 @@ fn inspect(
             if invocation.in_place && context.edits(&files.iter().collect::<Vec<_>>()) {
                 return found(Pattern::InPlaceEdit);
             }
+            // A script file runs instead of inline code. Its text counts when it
+            // is known: written earlier in the command, or left in the
+            // temporary directory, as edit scripts usually are.
+            let script = invocation
+                .script_at
+                .and_then(|at| arguments.get(at))
+                .and_then(|word| context.script(&word.text));
+            let pattern = if script.is_some() {
+                Pattern::ScriptFileWrite
+            } else {
+                Pattern::InlineScriptWrite
+            };
             // Without inline code or a script file, standard input is the program.
             let code = if !invocation.code.is_empty() {
                 invocation.code.join("\n")
             } else if invocation.script {
-                String::new()
+                script.unwrap_or_default()
             } else {
                 stdin.map(|content| content.text).unwrap_or_default()
             };
@@ -941,14 +1015,14 @@ fn inspect(
                 }
                 _ => writes(language, &code),
             };
-            if writes {
-                found(Pattern::InlineScriptWrite)
-            } else {
-                Ok(None)
-            }
+            if writes { found(pattern) } else { Ok(None) }
         }
         Family::Shell => match shell_script(arguments, stdin) {
-            Some(script) => nested(&script, context),
+            Some(ShellInput::Code(script)) => nested(&script, context),
+            Some(ShellInput::File(word)) => match context.script(&word.text) {
+                Some(script) => nested(&script, context),
+                None => Ok(None),
+            },
             None => Ok(None),
         },
         Family::Eval => nested(&join(arguments), context),
@@ -956,8 +1030,84 @@ fn inspect(
         Family::Applier if stdin.is_some() && applies(&program, arguments) => {
             found(Pattern::AppliedContent)
         }
-        Family::Applier | Family::Other => Ok(None),
+        Family::Applier => Ok(None),
+        // `chmod +x /tmp/edit.py && /tmp/edit.py` runs the script by its path.
+        Family::Other if first.text.contains(['/', '\\']) => {
+            let Some(script) = context.script(&first.text) else {
+                return Ok(None);
+            };
+            let interpreter = shebang(&script).unwrap_or_default();
+            match family(&interpreter) {
+                Family::Interpreter(language) if language_writes(language, &script, context) => {
+                    Err(Finding {
+                        pattern: Pattern::ScriptFileWrite,
+                        program: interpreter,
+                    })
+                }
+                Family::Shell => nested(&script, context),
+                _ => Ok(None),
+            }
+        }
+        Family::Other => Ok(None),
     }
+}
+
+/// Records `text` as the content of each file the command's standard output
+/// is redirected to.
+fn record_outputs(command: &Command, text: &str, context: Context) {
+    for redirect in &command.redirects {
+        if let Redirect::Output {
+            stdout: true,
+            target,
+        } = redirect
+        {
+            context.record(target, text);
+        }
+    }
+}
+
+/// The program a script's `#!` line names, past `env` and its options.
+fn shebang(script: &str) -> Option<String> {
+    let line = script.lines().next()?.strip_prefix("#!")?;
+    let mut words = line.split_whitespace();
+    let mut program = program_name(words.next()?);
+    if program == "env" {
+        program = program_name(words.find(|word| !word.starts_with('-'))?);
+    }
+    Some(program)
+}
+
+/// Whether code in `language` writes a file, as `inspect` decides for inline code.
+fn language_writes(language: Language, code: &str, context: Context) -> bool {
+    match language {
+        Language::PowerShell => {
+            let foreign = context.scope.foreign();
+            context.depth < MAX_SCRIPT_DEPTH
+                && powershell::scan(code, &foreign, context.depth + 1).is_some()
+        }
+        _ => writes(language, code),
+    }
+}
+
+/// An absolute path's text, when it names a small file in the temporary
+/// directory. Scripts elsewhere, such as the project's own tools, are not read.
+fn temporary_script(path: &str) -> Option<String> {
+    let path = Path::new(path);
+    if !path.is_absolute() || path.components().any(|part| part.as_os_str() == "..") {
+        return None;
+    }
+    let mut roots = vec![std::env::temp_dir()];
+    if cfg!(unix) {
+        roots.extend(["/tmp", "/var/tmp"].map(PathBuf::from));
+    }
+    if !roots.iter().any(|root| path.starts_with(root)) {
+        return None;
+    }
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_SCRIPT_BYTES {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
 }
 
 /// Classifies a Bash script that the command runs, such as `bash -c` text.
@@ -1276,7 +1426,13 @@ fn awk_in_place(arguments: &[Word]) -> Option<Vec<&Word>> {
 }
 
 /// The script a shell runs from `-c` or, with no script file, standard input.
-fn shell_script(arguments: &[Word], stdin: Option<Content>) -> Option<String> {
+/// What a shell runs: inline or standard-input code, or a script file.
+enum ShellInput<'w> {
+    Code(String),
+    File(&'w Word),
+}
+
+fn shell_script(arguments: &[Word], stdin: Option<Content>) -> Option<ShellInput<'_>> {
     let mut command = false;
     let mut read_stdin = false;
     let mut index = 0;
@@ -1308,12 +1464,14 @@ fn shell_script(arguments: &[Word], stdin: Option<Content>) -> Option<String> {
         }
     }
     if command {
-        return arguments.get(index).map(|word| word.text.clone());
+        return arguments
+            .get(index)
+            .map(|word| ShellInput::Code(word.text.clone()));
     }
     if read_stdin || index >= arguments.len() {
-        return stdin.map(|content| content.text);
+        return stdin.map(|content| ShellInput::Code(content.text));
     }
-    None
+    arguments.get(index).map(ShellInput::File)
 }
 
 /// Whether `patch`, `git apply`, or an `ultra-edit` edit command applies its
@@ -1359,6 +1517,8 @@ struct Invocation {
     code: Vec<String>,
     /// Whether a script file runs, so standard input is data rather than code.
     script: bool,
+    /// Which argument names that script file, when it is one.
+    script_at: Option<usize>,
     in_place: bool,
     /// Where the operands after the options, code, and any script file start.
     operands: usize,
@@ -1466,6 +1626,7 @@ fn invocation(language: Language, program: &str, arguments: &[Word]) -> Invocati
         }
         if text == "--" {
             invocation.script = invocation.code.is_empty() && index < arguments.len();
+            invocation.script_at = invocation.script.then_some(index);
             invocation.operands = index + usize::from(invocation.script);
             break;
         }
@@ -1492,6 +1653,7 @@ fn invocation(language: Language, program: &str, arguments: &[Word]) -> Invocati
         let Some(cluster) = text.strip_prefix('-').filter(|cluster| !cluster.is_empty()) else {
             // With inline code, the first operand is data; otherwise it is the script.
             invocation.script = invocation.code.is_empty();
+            invocation.script_at = invocation.script.then_some(index - 1);
             invocation.operands = index - usize::from(!invocation.script);
             break;
         };
@@ -1543,6 +1705,7 @@ fn powershell(program: &str, arguments: &[Word]) -> Invocation {
                 invocation.code.push(join(&arguments[index - 1..]));
             } else {
                 invocation.script = true;
+                invocation.script_at = Some(index - 1);
             }
             break;
         };
@@ -1561,10 +1724,14 @@ fn powershell(program: &str, arguments: &[Word]) -> Invocation {
             }
             break;
         }
-        // Script files and encoded commands are not inspected.
-        if matches!(name, "f" | "e" | "ec")
-            || (name.len() >= 2 && ("file".starts_with(name) || "encodedcommand".starts_with(name)))
-        {
+        // A script file is inspected when its text is known; an encoded
+        // command is not.
+        if name == "f" || (name.len() >= 2 && "file".starts_with(name)) {
+            invocation.script = true;
+            invocation.script_at = Some(index).filter(|&at| at < arguments.len());
+            break;
+        }
+        if matches!(name, "e" | "ec") || (name.len() >= 2 && "encodedcommand".starts_with(name)) {
             invocation.script = true;
             break;
         }

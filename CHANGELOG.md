@@ -93,6 +93,14 @@ All notable changes to Ultra Edit are documented here. Releases follow
   span IDs take. `TARGET_AMBIGUOUS` names the lines of the first five matches.
   `TARGET_NOT_FOUND` says when the best whitespace candidate differs from `old`
   only in CRLF line endings. Codes, fields, and the `spans` summary are unchanged.
+- The shell guard now checks script files the way it checks inline code. When
+  a command writes a script outside the project and then runs it
+  (`cat > /tmp/edit.py <<'EOF' … EOF; python3 /tmp/edit.py`), or an interpreter
+  or shell runs a script left in the temporary directory, a script that calls a
+  file-write API is denied as `a python3 script file that writes a file`. In the
+  benchmark, 4 of 14 guarded native sessions wrote project files this way past
+  the guard. Scripts elsewhere on disk, such as the project's own tools, are
+  not read.
 
 ## [0.3.0] - 2026-09-25
 

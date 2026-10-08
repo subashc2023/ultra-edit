@@ -13,7 +13,7 @@ use std::ops::Range;
 
 use super::{
     Command, Content, Context, Dialect, Finding, MAX_NESTING, MAX_SCRIPT_DEPTH, MAX_TOKENS,
-    Pattern, Scope, Word, inspect, program_name,
+    Pattern, Scope, Word, Written, inspect, program_name,
 };
 
 /// Reserved words after which the next token decides whether a statement is
@@ -805,12 +805,14 @@ fn lossy(bytes: &[u8]) -> String {
 pub(super) fn scan(script: &str, scope: &Scope, depth: usize) -> Option<Finding> {
     let mut lexer = Lexer::new(script);
     let body = lexer.script(None);
+    let written = Written::default();
     let mut checker = Checker {
         context: Context {
             source: script,
             dialect: Dialect::PowerShell,
             scope,
             depth,
+            written: &written,
         },
         variables: HashMap::new(),
         flows: HashMap::new(),

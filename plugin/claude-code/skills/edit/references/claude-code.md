@@ -262,7 +262,8 @@ blocked command to evade the guard. See Claude Code's
 The guard is not a sandbox. It misses dynamic commands (`$CMD`, `bash -c "$S"`,
 `pwsh -EncodedCommand`, `Invoke-Expression $s`), redirects on grouped commands,
 subshells, loops, or `exec >`, rewrites through temporary files
-(`sed … f > f.tmp && mv f.tmp f`), scripts already on disk, interpreter output
+(`sed … f > f.tmp && mv f.tmp f`), scripts on disk outside the temporary
+directory, interpreter output
 redirected with `>`, other write APIs (`os.open`, `dd of=`, `vim -c`,
 `Start-Process`, `cmd /c`), content passed through PowerShell function
 parameters or splatting, and symlinks, junctions, or short 8.3 names that lead

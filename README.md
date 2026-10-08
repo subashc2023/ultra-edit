@@ -167,7 +167,11 @@ the command into project files:
   APIs, including .NET's `[IO.File]::WriteAllText`;
 - in-place editors such as `sed -i` and `perl -pi`, and `Get-Content` text
   rewritten with `-replace` or `.Replace()` and written back;
-- patches or edit JSON piped into `patch`, `git apply`, or `ultra-edit`.
+- patches or edit JSON piped into `patch`, `git apply`, or `ultra-edit`;
+- script files that an interpreter or shell runs and that call those write
+  APIs, when the command itself wrote the script
+  (`cat > /tmp/edit.py <<'EOF' … EOF; python3 /tmp/edit.py`) or the script sits
+  in the temporary directory.
 
 Only writes that may land in the project count. The project is
 `CLAUDE_PROJECT_DIR`, or the hook event's working directory. Targets certainly
@@ -183,7 +187,8 @@ plain copies, and heredocs passed to commands that don't write them to files
 (`git commit -F -`, Claude Code's `git commit -m "$(cat <<'EOF' …)"` pattern)
 are allowed. The guard allows anything it cannot parse and is not a sandbox: it
 misses dynamic commands, redirects on grouped commands, rewrites through
-temporary files, scripts already on disk, and symlinks into the project.
+temporary files, scripts on disk outside the temporary directory, and symlinks
+into the project.
 
 To turn the guard off, set `ULTRA_EDIT_SHELL_WRITES=allow` in Claude Code's
 environment, for example `"env": {"ULTRA_EDIT_SHELL_WRITES": "allow"}` in

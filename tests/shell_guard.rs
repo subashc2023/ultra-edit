@@ -9,7 +9,9 @@ use ultra_edit::shell_guard::{
     classify_powershell, deny_reason, is_absolute,
 };
 
-use Pattern::{AppliedContent, GeneratedToFile, HeredocToFile, InPlaceEdit, InlineScriptWrite};
+use Pattern::{
+    AppliedContent, GeneratedToFile, HeredocToFile, InPlaceEdit, InlineScriptWrite, ScriptFileWrite,
+};
 
 const DENIED: &[(&str, Pattern, &str)] = &[
     // Heredocs and here-strings whose content reaches a file.
@@ -833,6 +835,103 @@ fn scoped_bash_denies_writes_that_may_reach_the_project() {
     }
     let unc = Scope::new("\\\\server\\share\\repo");
     assert!(classify_bash("echo x > '\\\\SERVER\\Share\\repo\\a.txt'", &unc).is_some());
+}
+
+/// Scripts written outside the project, then run in the same command.
+const SCRIPTS_RUN: &[(&str, Pattern, &str)] = &[
+    (
+        "cat > /tmp/ed.py <<'E'\nopen('a.txt', 'w').write('x')\nE\npython3 /tmp/ed.py && git diff --stat",
+        ScriptFileWrite,
+        "python3",
+    ),
+    (
+        "cat > /tmp/ed.py <<'EOF'\nfrom pathlib import Path\nPath('/work/repo/a').write_text('x')\nEOF\ncd /tmp; python3 ed.py",
+        ScriptFileWrite,
+        "python3",
+    ),
+    (
+        "printf 'open(\"a\", \"w\")' > $TMPDIR/x.py; python3 -u $TMPDIR/x.py",
+        ScriptFileWrite,
+        "python3",
+    ),
+    (
+        "cat <<'EOF' | tee /tmp/x.pl > /dev/null\nopen(F, '>', 'a.txt');\nEOF\nperl /tmp/x.pl",
+        ScriptFileWrite,
+        "perl",
+    ),
+    (
+        "cat > /tmp/x.js <<'EOF'\nrequire('fs').writeFileSync('a', 'x')\nEOF\nnode -- /tmp/x.js",
+        ScriptFileWrite,
+        "node",
+    ),
+    (
+        "cat > /tmp/x.sh <<'EOF'\nsed -i 's/a/b/' src/a.txt\nEOF\nbash /tmp/x.sh",
+        InPlaceEdit,
+        "sed",
+    ),
+    (
+        "cat > /tmp/x.py <<'EOF'\n#!/usr/bin/env python3\nopen('a', 'w')\nEOF\nchmod +x /tmp/x.py && /tmp/x.py",
+        ScriptFileWrite,
+        "python3",
+    ),
+];
+
+/// Scripts that are run without writing files, or whose text is unknown.
+const SCRIPTS_ALLOWED: &[&str] = &[
+    "cat > /tmp/ed.py <<'E'\nprint(open('a.txt').read())\nE\npython3 /tmp/ed.py",
+    "cat > /tmp/ed.py <<'E'\nopen('a.txt', 'w')\nE\npython3 /tmp/other.py",
+    "cat > /tmp/x.sh <<'EOF'\ngrep -n x src/a.txt\nEOF\nbash /tmp/x.sh",
+    "python3 scripts/generate.py",
+    "python3 /tmp/no-such-ultra-edit-script.py",
+    "python3 -m pytest -q",
+];
+
+#[test]
+fn scoped_bash_checks_scripts_written_then_run() {
+    let scope = unix_scope();
+    for (command, pattern, program) in SCRIPTS_RUN {
+        let expected = Finding {
+            pattern: *pattern,
+            program: (*program).to_owned(),
+        };
+        assert_eq!(
+            classify_bash(command, &scope),
+            Some(expected),
+            "{command:?}"
+        );
+    }
+    for command in SCRIPTS_ALLOWED {
+        assert_eq!(classify_bash(command, &scope), None, "{command:?}");
+    }
+}
+
+#[test]
+fn scoped_bash_reads_a_script_left_in_the_temporary_directory() {
+    let mut writer = tempfile::Builder::new().suffix(".py").tempfile().unwrap();
+    writer
+        .write_all(b"open('src/a.txt', 'w').write('x')\n")
+        .unwrap();
+    let path = writer.path().to_str().unwrap().to_owned();
+    let command = format!("python3 '{path}'");
+    assert_eq!(
+        classify_bash(&command, &unix_scope()),
+        Some(Finding {
+            pattern: ScriptFileWrite,
+            program: "python3".to_owned(),
+        })
+    );
+    let mut reader = tempfile::Builder::new().suffix(".py").tempfile().unwrap();
+    reader
+        .write_all(b"print(open('src/a.txt').read())\n")
+        .unwrap();
+    let command = format!("python3 '{}'", reader.path().to_str().unwrap());
+    assert_eq!(classify_bash(&command, &unix_scope()), None);
+    // A script inside the project is its own tooling and is not read.
+    let project = TempDir::new_in(".").unwrap();
+    let tool = project.path().canonicalize().unwrap().join("tool.py");
+    fs::write(&tool, "open('a', 'w')\n").unwrap();
+    let command = format!("python3 '{}'", tool.to_str().unwrap());
+    assert_eq!(classify_bash(&command, &unix_scope()), None);
 }
 
 #[test]
