@@ -228,10 +228,10 @@ forms:
 
 | Change | Contract |
 | --- | --- |
-| `{"old":"text","new":"…"}` | Exactly one occurrence in the original file. |
+| `{"old":"text","new":"…"}` | Exactly one occurrence in the original file, not starting or ending inside an ASCII word. |
 | `{"old":"text","in":"r5","new":"…"}` | Exactly one occurrence contained in a disclosed span. |
 | `{"old":"text","in":[72,87],"new":"…"}` | Exactly one occurrence contained in lines 72-87, from line 72's start through line 87's terminator. |
-| `{"old":"text","count":3,"new":"…"}` | Exactly 3 non-overlapping, left-to-right occurrences in the whole file, or within `in`. |
+| `{"old":"text","count":3,"new":"…"}` | Exactly 3 non-overlapping, left-to-right occurrences in the whole file, or within `in`, inside words or not. |
 | `{"span":"r5","new":"…"}` | Replace that span with literal `new`. |
 | `{"span":"r5","expect":"old line","new":"…"}` | Replace only if the selected original bytes equal `expect` exactly. |
 | `{"span":"r12..r18","new":"…"}` | Replace a run of disclosed lines, from the start of line 12's body to the end of line 18's. |
@@ -294,10 +294,15 @@ the range's end only weakly, so prefer lines with text as `[first, last]`. `afte
 `EXPECTED_TEXT_MISMATCH`: the message quotes the addressed lines and, when the
 expected lines occur elsewhere, gives the current range, and the diagnostic
 carries them as `exact` candidates, or near misses as below. `after` with empty
-text is `EMPTY_INSERTION`. `after` keeps line `after`, so text whose first line
-restates it, when that line has at least 8 non-whitespace characters, is
-`INSERT_REPEATS_LINE`: the output would hold the line twice. A duplicate meant
-on purpose replaces the line through `lines`, giving it twice.
+text is `EMPTY_INSERTION`. `after` keeps line `after`, so text that starts by
+restating it is `INSERT_REPEATS_LINE`: its leading lines equal consecutive lines
+of the file, compared without trailing whitespace, that start at or above
+`after` and reach it, as when `expect` or the lines to replace were copied into
+`new`, with at least 8 non-whitespace characters in all. The message names the
+restated lines and the `lines` replacement to send instead. It is not reported
+when another change in the request rewrites any of those lines, since changes
+apply to the original file. A duplicate meant on purpose replaces the lines
+through `lines`, giving them twice.
 
 A span ID is a disclosed ID such as `r5`, `selection`, or `m2`, or a line range
 `rA..rB`, never literal source text. A line range is accepted wherever a span ID

@@ -45,10 +45,20 @@ All notable changes to Ultra Edit are documented here. Releases follow
   that file's path.
   New diagnostics: `LINE_OUT_OF_RANGE`, `EMPTY_INSERTION`, and an
   `OVERLAPPING_CHANGES` message naming the single `lines` change to send.
-  `INSERT_REPEATS_LINE` refuses an `after` insertion whose first line restates
-  the line it follows (8 or more visible characters), a replacement written as
-  an insertion that would leave the line twice. One benchmark session committed
-  that duplicate; no other insertion of 616 recorded did it.
+  `INSERT_REPEATS_LINE` refuses an `after` insertion whose leading lines
+  restate the lines that end at or start at the line it follows (8 or more
+  visible characters in all, ignoring trailing whitespace): a replacement
+  written as an insertion, which would leave those lines twice. It names the
+  `lines` replacement to send instead, and stays quiet when another change in
+  the request rewrites the restated lines. One benchmark session sent such an
+  insertion and committed the duplicate; none of the other 614 recorded
+  insertions restated their anchor.
+- `OLD_INSIDE_WORD`: a single `old` whose match starts or ends inside an ASCII
+  word or number, such as `retries = 2` inside `max_retries = 20` or
+  `timeout = 30` inside `timeout = 300`, is refused, naming the word. Text
+  written without reading the file can otherwise match a longer name. `count`,
+  even 1, still matches inside words on purpose. Of 3,922 `old` edits in the
+  benchmark transcripts, none started or ended inside an ASCII word.
 - Line-ending adaptation: in a file whose every line ends in CRLF, `old`, `new`,
   and `expect` text holding LF but no CR is matched and written as CRLF, with an
   `EOL_ADAPTED` warning. Native Read hides the CR, so multi-line text copied
@@ -78,15 +88,16 @@ All notable changes to Ultra Edit are documented here. Releases follow
   that starts past the last line still fails. The benchmark saw five such
   failures, each costing a round trip.
 - The plugin's session routing card is rewritten path-first and cut from 4,191
-  to 1,698 bytes, and the server instructions from 1,431 to about 650
+  to 1,802 bytes, and the server instructions from 1,431 to about 650
   characters. The edit skill now covers recovery and span targets; ordinary
   edits need only the card. The card now says an `old` edit needs no prior Read
   when the task or earlier output gives the exact text: a miss writes nothing
-  and shows the closest text. Line targets still take Read's numbers.
+  and shows the closest text, and a match inside a longer word is refused. Line
+  targets still take Read's numbers, and their guards should be lines with text.
 - The plugin starts the server with the new `--no-instructions` flag: its session
   card already gives the routing, and the duplicate server instructions cost
   about 280 tokens on every model call. The edit tool's schema also drops
-  property descriptions that its description already gives, from 2,927 to 2,149
+  property descriptions that its description already gives, from 2,927 to 2,209
   bytes. Other hosts still receive the instructions.
 - `ultra_edit` carries `_meta: {"anthropic/alwaysLoad": true}`, so Claude Code
   loads its schema up front instead of behind a `ToolSearch` round trip, which

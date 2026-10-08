@@ -91,10 +91,10 @@ editing code. These are concrete ways to reduce payloads compared with heredoc
 rewrites; actual token and cost savings depend on the task, model, and retries.
 Snapshots and tool instructions also cost context. Measured with the
 [evaluation harness](eval/README.md), Ultra Edit cost 1.06x native Claude Code
-on tasks that native editing often finished with a blind shell substitution,
-0.67x native editing with shell writes blocked, and 1.03x native on tasks that
-leave finding the edit sites to the model; see
-[the results](docs/performance.md#model-level-results).
+(0.67x native editing with shell writes blocked) on tasks that native editing
+often finished with a blind shell substitution, and 1.03x native (0.90x with
+shell writes blocked) on tasks that leave finding the edit sites to the model;
+see [the results](docs/performance.md#model-level-results).
 
 ### What you give up
 
@@ -134,9 +134,9 @@ writing twice.
 }
 ```
 
-`old` must occur exactly once (or `count` times), and `lines`/`after` address
-whole lines by Read's numbers, guarded by `expect`, so a stale line number is
-rejected instead of applied. Span targets on an immutable snapshot from
+`old` must occur exactly once, as whole words (or `count` times, which may
+match inside words), and `lines`/`after` address whole lines by Read's numbers,
+guarded by `expect`, so a stale line number is rejected instead of applied. Span targets on an immutable snapshot from
 `ultra_edit_snapshot` (`r12` for line 12, `m1` for a search match) remain for
 files too large to Read.
 
@@ -271,9 +271,10 @@ that server and is not a tool argument.
 The [canonical instructions](plugin/claude-code/instructions.md) load through
 `SessionStart` hooks on startup, resume, clear, compaction, and fork, plus
 `SubagentStart` for delegated work. They tell Claude to **always use Ultra Edit
-for coordinated edits to two or more existing UTF-8 files**, to use Write for new
-files and native Edit or Ultra Edit for isolated edits, and to report unavailable
-tools instead of falling back to shell writes. No slash command is required;
+for coordinated edits to two or more existing UTF-8 files**, to edit existing
+files with Ultra Edit, even without reading them first when the exact text is
+known, to use Write for new files, and to report unavailable tools instead of
+falling back to shell writes. No slash command is required;
 `/ultra-edit:edit` loads optional workflow detail. Inspect the exact context
 without starting a server:
 

@@ -184,16 +184,16 @@ against `native`, with a 95% bootstrap interval.
   edits are not acceptable, `native-guard` is the comparable native route; it
   attempted shell writes in 26 runs, all blocked, and cost 1.50x (1.46-1.54)
   what `ultra-edit` did.
-- Before the card change, both Ultra Edit arms cost 1.20x `native`, with 2.4
+- Before the card change, both Ultra Edit arms cost 1.20x `native`, with 2.5
   Read calls per run against native's 1.4. Allowing `old` edits without a Read
-  halved that to 1.2 and cut mean cost per run from $0.074 to $0.066; turns fell
+  halved that to 1.3 and cut mean cost per run from $0.074 to $0.065; turns fell
   to 0.75x native's and tool calls to 0.72x. The fixed context is about 2.0k
   tokens per API call for the card and the always-loaded tool schema.
 - First try fell from 39 to 37 and from 37 to 34, 13 misses against 8. Most of
-  the rise is `unicode-quotes`, from 1 miss to 5: blind `old` edits whose prompt
-  cannot show an invisible character. Each was rejected without a write, fixed
-  from the near match the rejection quoted, and still cost less than reading
-  first.
+  the rise is `unicode-quotes`, from 1 miss to 5: blind `old` edits that typed
+  the prompt's no-break space as an ordinary space. Each was rejected without a
+  write; four copied the near match the rejection quoted and one shortened
+  `old`, and the task still cost less than reading first.
 - The one `ultra-edit-only` failure restated an anchor line as the first line of
   an `after` insertion, leaving the line twice. The server now refuses that
   (`INSERT_REPEATS_LINE`); no other recorded insertion of 616 did it.
@@ -214,7 +214,7 @@ function of the same name. With 3 repetitions each:
 | `ultra-edit` | 9/9 | 9/9 | 1.03 (0.92-1.14) |
 | `ultra-edit-only` | 9/9 | 9/9 | 0.97 (0.88-1.07) |
 
-The two misses were model slips: `native` dropped a space from a user-agent
+The two failures were model slips: `native` dropped a space from a user-agent
 string, and `native-guard` removed one blank line too many. On the version bump
 and the rename, both Ultra Edit arms finished in two tool calls: a search, then
 one edit built from its output.

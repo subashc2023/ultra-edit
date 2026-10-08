@@ -147,9 +147,9 @@ source-copy procedure is separate from the versioned marketplace cache.
 The [canonical instructions](../../../instructions.md) require direct Ultra Edit
 MCP calls for coordinated edits to two or more existing UTF-8 files. They forbid
 writing file contents through Bash heredocs, generated-content redirection,
-inline editing scripts, and shell-piped edit JSON. Native Write serves new files
-or isolated full rewrites; native Edit or Ultra Edit serves isolated targeted
-edits. Missing or denied required tools are a blocker to report.
+inline editing scripts, and shell-piped edit JSON. Existing files are edited
+with Ultra Edit, without a prior Read when the exact text is known; native Write
+serves new files. Missing or denied required tools are a blocker to report.
 Explicit user instructions and host permissions take precedence over plugin
 guidance. Report contradictory workflow instructions; generic sed/heredoc advice
 does not by itself cancel the user's explicit choice of Ultra Edit.
@@ -261,14 +261,16 @@ milliseconds.
 
 Each server uses one fixed root and workspace-local `.ultra-edit` state.
 It never follows a shell `cd` or a subagent into a separate worktree. When working
-elsewhere, pass the intended file's absolute path to snapshot. If that file lies
+elsewhere, name the intended file by its absolute path. If that file lies
 outside the server root, report the blocker; never use a relative path that would
 edit the parent checkout instead. Editing a different root requires a separately
 configured server or session for that workspace.
 
-Native Read/Grep/Glob can help exploration, but only an Ultra Edit snapshot
-supplies the immutable base needed to edit. Do not substitute a filesystem path,
-digest, native Read result, or guessed reference for that base.
+Name each file by `path`: the server reads its current bytes as the base under
+the workspace lock, so native Read/Grep/Glob output is enough to write `old`,
+`lines`, and `after` changes. Only span targets need an Ultra Edit snapshot as
+their `base`; never substitute a digest, native Read result, or guessed span ID
+for one.
 
 MCP tool permissions are controlled by Claude Code. Ultra Edit enforces its own
 canonical-root confinement; it does not inherit native Edit's per-path permission

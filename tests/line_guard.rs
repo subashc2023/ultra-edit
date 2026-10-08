@@ -335,3 +335,67 @@ fn an_insertion_that_restates_its_anchor_line_is_refused() {
         format!("{text})\n")
     );
 }
+
+/// A restatement may run past the anchor or end at it, and may differ from the
+/// file only in trailing whitespace; the advice it gets can be followed.
+#[test]
+fn restated_runs_are_named_whole_and_their_advice_commits_cleanly() {
+    let (two, three) = (
+        "    tax_table=resolve(region),",
+        "    discount=lookup(customer),",
+    );
+    let text = format!("def f(\n{two}\n{three}\n)\n");
+    let base = spanless(&text);
+    let new = format!("{two}\n{three}\n    rounding=1,");
+    let wanted = format!("def f(\n{two}\n{three}\n    rounding=1,\n)\n");
+    // Lines 2-3 restated after line 2, as a replacement of [2,3] written as `after`.
+    let error = rejected(&base, insert(2, Some(two), &new));
+    assert_eq!(error.code, "INSERT_REPEATS_LINE");
+    assert!(error.message.contains("lines 2-3"), "{}", error.message);
+    assert!(error.message.contains("lines:[2,3]"), "{}", error.message);
+    // Both routes the message offers give one copy of each line.
+    let replaced = ends([2, 3], Some(two), Some(three), &new);
+    assert_eq!(outcome(&base, replaced).unwrap(), wanted);
+    let after = insert(3, Some(three), "    rounding=1,");
+    assert_eq!(outcome(&base, after).unwrap(), wanted);
+    // The guarded lines copied from a multi-line expect, ending at the anchor.
+    let error = rejected(&base, insert(3, Some(&format!("{two}\n{three}")), &new));
+    assert_eq!(error.code, "INSERT_REPEATS_LINE");
+    assert!(error.message.contains("lines:[2,3]"), "{}", error.message);
+    // A restatement without the line's trailing spaces is still a restatement.
+    let spaced = spanless(&format!("a\n{two}  \nb\n"));
+    let error = rejected(&spaced, insert(2, Some(&format!("{two}  ")), two));
+    assert_eq!(error.code, "INSERT_REPEATS_LINE");
+}
+
+/// Changes apply to the original file, so a restated line that another change in
+/// the batch deletes or rewrites appears once, and the batch commits.
+#[test]
+fn a_restated_line_that_the_batch_rewrites_is_not_refused() {
+    let anchor = "    tax_table=resolve(region),";
+    let text = format!("totals = compute(\n{anchor}\n)\n");
+    let base = spanless(&text);
+    let insert = |id: &str| Change {
+        id: id.into(),
+        target: Target::Insert {
+            after: 2,
+            expect: Some(anchor.into()),
+        },
+        text: format!("{anchor}\n    rounding=1,"),
+    };
+    let mut deleted = ends([2, 2], Some(anchor), None, "");
+    deleted.id = "d".into();
+    let plan = compile(&request(&base, vec![deleted, insert("i")]), &bases(&base));
+    assert_eq!(
+        plan.unwrap().files[0].output,
+        format!("totals = compute(\n{anchor}\n    rounding=1,\n)\n")
+    );
+    let rewritten = parsed(json!({"id":"o","old":"resolve(region)","new":"resolve(country)"}));
+    let plan = compile(&request(&base, vec![rewritten, insert("i")]), &bases(&base));
+    assert_eq!(
+        plan.unwrap().files[0].output,
+        format!(
+            "totals = compute(\n    tax_table=resolve(country),\n{anchor}\n    rounding=1,\n)\n"
+        )
+    );
+}

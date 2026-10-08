@@ -20,7 +20,7 @@ use crate::{
 
 const INSTRUCTIONS: &str = "Edit existing UTF-8 files in the launch workspace with ultra_edit: name each \
 file by absolute `path` and put all related changes, across files, in one call, \
-which commits all or nothing. `old` must occur once (or `count` times); `lines` and `after` take \
+which commits all or nothing. `old` must occur once as whole words (or `count` times); `lines` and `after` take \
 Read's line numbers and need `expect`. Use ultra_edit_snapshot only for span targets or files too \
 large to Read. An identical call replays its recorded result and writes nothing. On partial or \
 outcome_unknown, stop and use ultra_edit_status or ultra_edit_inspect; never retry under a new \
@@ -231,7 +231,7 @@ impl McpServer {
     #[tool(
         name = "ultra_edit",
         meta = always_load(),
-        description = "Apply related changes to existing UTF-8 files as one all-or-nothing batch. Name each file by absolute `path`, or by a snapshot `base` for span targets. Changes: {old,new}, old occurring once (count:N for N; in:[a,b] limits it to those lines); {lines:[a,b],expect,new} replaces whole lines, \"\" deletes; {after:n,expect,new} inserts. expect is the line's text, or [first line, last line] of a range. Changes apply to the file as it was before the call. Text is literal; in an all-CRLF file LF is written as CRLF. Omit request_id: an identical call replays; never retry partial or outcome_unknown under a new ID.",
+        description = "Apply related changes to existing UTF-8 files as one all-or-nothing batch. Name each file by absolute `path`, or by a snapshot `base` for span targets. Changes: {old,new}, old occurring once as whole words (count:N for N, even inside words; in:[a,b] limits it to those lines); {lines:[a,b],expect,new} replaces whole lines, \"\" deletes; {after:n,expect,new} inserts below line n, which stays. expect is the line's text, or [first line, last line] of a range. Changes apply to the file as it was before the call. Text is literal; in an all-CRLF file LF is written as CRLF. Omit request_id: an identical call replays; never retry partial or outcome_unknown under a new ID.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,

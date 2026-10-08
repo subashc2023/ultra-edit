@@ -937,7 +937,10 @@ fn exact_match_counts_agree_with_exhaustive_unicode_search() {
                         &bases(&base),
                     );
                     if count == 1 {
-                        assert!(result.is_ok(), "{text:?}, {needle:?}");
+                        // A single match inside an ASCII word is found, then refused.
+                        if let Err(errors) = result {
+                            assert_eq!(errors[0].code, "OLD_INSIDE_WORD", "{text:?}, {needle:?}");
+                        }
                     } else {
                         assert_eq!(
                             result.unwrap_err()[0].actual,
@@ -2681,4 +2684,66 @@ fn a_change_whose_old_holds_a_cr_stays_literal_so_crlf_converts_to_lf() {
     .unwrap();
     assert_eq!(plan.files[0].output, "A\r\nB\r\n");
     assert_eq!(plan.warnings[0].code, "EOL_ADAPTED");
+}
+
+/// A single `old` that starts or ends inside an ASCII word matched a longer name
+/// or number, which text written without reading the file does by accident.
+#[test]
+fn a_single_old_inside_a_word_is_refused_unless_counted() {
+    let output = |text: &str, change: Change| {
+        let base = snapshot("w.py".into(), text.into());
+        compile(&request(&base, vec![change]), &bases(&base))
+            .map(|plan| plan.files[0].output.clone())
+    };
+    let refused = |text: &str, old: &str, word: &str| {
+        let errors = output(text, exact("w", old, "x")).unwrap_err();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].code, "OLD_INSIDE_WORD", "{old:?} in {text:?}");
+        assert!(
+            errors[0].message.contains(&format!("`{word}` at line 2")),
+            "{}",
+            errors[0].message
+        );
+        assert!(
+            errors[0].message.contains("\"count\":1"),
+            "{}",
+            errors[0].message
+        );
+    };
+    refused("x\nmax_retries = 20\n", "retries = 2", "max_retries");
+    refused("x\ntimeout = 300\n", "timeout = 30", "300");
+    refused(
+        "x\nTEMPLATE_DEBUG = True\n",
+        "DEBUG = True",
+        "TEMPLATE_DEBUG",
+    );
+    refused("x\nversion 11.4.2\n", "1.4.2", "11");
+    // `count`, even 1, takes part of a word on purpose.
+    let counted = Change {
+        id: "w".into(),
+        target: Target::All {
+            old: "retries = 2".into(),
+            scope: None,
+            expected: 1,
+            lines: None,
+        },
+        text: "retries = 3".into(),
+    };
+    assert_eq!(
+        output("x\nmax_retries = 20\n", counted).unwrap(),
+        "x\nmax_retries = 30\n"
+    );
+    // Whole words, punctuation edges, and non-ASCII neighbours are not words here.
+    for (text, old) in [
+        ("cfg = load(cfg)\n", "load(cfg)"),
+        ("a.retries = 2;\n", "retries = 2"),
+        ("Hauptstraße\n", "Hauptstra"),
+        ("ルートを保存\n", "ルート"),
+        ("é1.4.2\n", "1.4.2"),
+    ] {
+        assert!(
+            output(text, exact("w", old, "y")).is_ok(),
+            "{old:?} in {text:?}"
+        );
+    }
 }

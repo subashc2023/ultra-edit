@@ -54,9 +54,11 @@ exposed by this host.
    }
    ```
 
-   `old` must occur exactly once in the file; add neighbouring text until it
+   `old` must occur exactly once in the file, starting and ending on word
+   boundaries (`OLD_INSIDE_WORD` otherwise); add neighbouring text until it
    does, or restrict it to whole lines with `"in": [first, last]`. With
-   `"count": N` it replaces exactly N non-overlapping occurrences. `lines`
+   `"count": N` it replaces exactly N non-overlapping occurrences, inside words
+   too. `lines`
    replaces whole lines by Read's numbers (`""` deletes them; text without a
    final newline keeps the last line's ending) and `after: n` inserts whole lines
    after line n (0 is the top). Both need `expect`, compared without line

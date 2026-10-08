@@ -1025,7 +1025,7 @@ fn different_automatic_requests_never_reuse_a_request_id() {
 #[test]
 fn omitted_change_ids_become_their_one_based_positions() {
     let (dir, workspace, first) = setup("one two");
-    fs::write(dir.path().join("second.txt"), "three").unwrap();
+    fs::write(dir.path().join("second.txt"), "three four").unwrap();
     let second = workspace.read("second.txt").unwrap();
     let mut automatic = request(
         "",
@@ -1050,7 +1050,7 @@ fn omitted_change_ids_become_their_one_based_positions() {
         .prepare(request(
             "",
             &second,
-            vec![change("mine", "th", "TH"), change("", "ree", "REE")],
+            vec![change("mine", "three", "3"), change("", "four", "4")],
         ))
         .unwrap();
     assert!(mixed.ready);

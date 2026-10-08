@@ -8,13 +8,15 @@ each file by absolute `path` (the server root ignores `cd` and worktrees):
  {"old":"cfg","new":"config","count":2},
  {"after":1,"expect":"import os","new":"import re"},
  {"lines":[7,8],"expect":["def main():","    run()"],"new":"def main(argv):\n    run(argv)"}]}]}
-- `old` must occur exactly once: add context, or limit it to lines with
-  `"in":[first,last]`. `"count":N` replaces exactly N occurrences. When the task
-  or earlier output gives the exact text, edit without reading the file first.
+- `old` must occur exactly once, as whole words: add context, or limit it to
+  lines with `"in":[first,last]`. `"count":N` replaces exactly N occurrences,
+  even inside words. When the task or earlier output gives the exact text, edit
+  without reading the file first.
 - `lines:[a,b]` replaces whole lines (`"new":""` deletes them); `after:n`
-  inserts after line n (0 = top). Both take Read's line numbers and need
-  `expect`: the text of line n or a, or `[line a, line b]`, with 8+ visible
-  characters or unique in the file.
+  inserts after line n (0 = top) and keeps it, so `new` must not repeat it. Both
+  take Read's line numbers and need `expect`: the text of line n or a, or
+  `[line a, line b]`. Choose lines with 8+ visible characters, not a blank line
+  or a lone `}`.
 - Every change applies to the file as it was before the call. Text is literal,
   without Read's line-number gutter; in an all-CRLF file, LF is written as CRLF.
 

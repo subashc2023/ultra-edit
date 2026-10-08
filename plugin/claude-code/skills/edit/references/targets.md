@@ -91,10 +91,10 @@ alias). A `path` file supports `old`, `count`, `in` with lines, `lines`, and
 
 | Intent | Change | Requirement |
 | --- | --- | --- |
-| Replace unique exact text anywhere in the file | `{"old":"a","new":"b"}` | Exactly one occurrence in the entire original file. |
+| Replace unique exact text anywhere in the file | `{"old":"a","new":"b"}` | Exactly one occurrence in the entire original file, on word boundaries. |
 | Replace unique exact text within some lines | `{"old":"a","new":"b","in":[72,87]}` | Exactly one occurrence wholly inside lines 72-87. |
 | Replace unique exact text inside an inspected span | `{"old":"a","new":"b","in":"selection"}` | The span belongs to this base; one occurrence inside it. |
-| Replace every occurrence | `{"old":"a","new":"b","count":3}` | Exactly 3 non-overlapping occurrences in the file, or in `in`. |
+| Replace every occurrence | `{"old":"a","new":"b","count":3}` | Exactly 3 non-overlapping occurrences in the file, or in `in`, inside words or not. |
 | Replace or delete whole lines | `{"lines":[40,42],"expect":["fn load(cfg) {","}"],"new":"..."}` | Lines exist; `expect` matches their first and last lines. `""` deletes them. |
 | Insert whole lines | `{"after":3,"expect":"use std::fs;","new":"use std::io;"}` | Line 3 exists; `expect` matches the lines ending at 3. `after:0` inserts at the top. |
 | Replace a disclosed line, selection, or match | `{"span":"m1","expect":"old text","new":"b"}` | The span belongs to this base; `expect` equals its bytes exactly. |
@@ -131,9 +131,17 @@ occur elsewhere the message gives the current range. A line past the end is
 Unrestricted `old` searches the complete original file even after a focused
 read. Empty `old` is rejected with `EMPTY_TARGET`; insert with `after` instead,
 and give `after` nonempty text (`EMPTY_INSERTION`). `after` keeps its line, so
-text that starts by restating a line of 8 or more visible characters is refused
-(`INSERT_REPEATS_LINE`); to duplicate a line on purpose, replace it with
-`lines` and give it twice. `in` takes lines or a span ID, never literal text.
+text whose leading lines restate the lines ending at it, or starting at it, is
+refused (`INSERT_REPEATS_LINE`, 8 or more visible characters in all) unless
+another change in the call rewrites them; send the named `lines` replacement
+instead, which also duplicates lines on purpose when it gives them twice. `in`
+takes lines or a span ID, never literal text.
+
+A single `old` must start and end on word boundaries: a match that begins or
+ends inside an ASCII word or number, such as `retries = 2` inside
+`max_retries = 20`, is `OLD_INSIDE_WORD`, since text written without reading
+the file can match a longer name by accident. Extend `old` to whole words, or
+add `"count":1` to replace part of a word on purpose.
 
 A line range `rA..rB` works as a `span` or `in` when the base disclosed every
 line from A to B, for instance across a range continued with another range. It
