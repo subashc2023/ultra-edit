@@ -138,7 +138,9 @@ rejected instead of applied. Span targets on an immutable snapshot from
 files too large to Read.
 
 Every target resolves against the original bytes, and the whole batch is
-rejected if any target is missing, ambiguous, overlapping, or stale. When a
+rejected if any target is missing, ambiguous, overlapping, or stale. Two
+targets that share a few bytes both keep unchanged, such as `old` anchors with
+common context, are applied side by side instead. When a
 target is not found or an `expect` guard fails, the diagnostic lists up to three
 candidates with their exact current text and lines: the text outside a wrong
 scope, a region that differs only in whitespace or line endings, or one at least

@@ -2259,6 +2259,54 @@ fn a_ranged_base_guards_only_the_lines_it_disclosed() {
 }
 
 #[test]
+fn anchors_sharing_context_they_both_keep_merge() {
+    let text = "log() { printf '%s' \"$(date)\" \"$*\"; }\n";
+    let base = snapshot("deploy.sh".into(), text.into());
+    // The two `old` texts share `"$(date`, and both new texts keep it.
+    let plan = compile(
+        &request(
+            &base,
+            vec![
+                exact("a", "printf '%s' \"$(date", "printf '[%s] %s' \"$(date"),
+                exact("b", "\"$(date)\" \"$*\"", "\"$(date)\" \"$ENV\" \"$*\""),
+            ],
+        ),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(
+        plan.files[0].output,
+        "log() { printf '[%s] %s' \"$(date)\" \"$ENV\" \"$*\"; }\n"
+    );
+    // A change that rewrites the shared bytes still conflicts.
+    let errors = compile(
+        &request(
+            &base,
+            vec![
+                exact("a", "printf '%s' \"$(date", "printf '%s' \"$(when"),
+                exact("b", "\"$(date)\" \"$*\"", "\"$(date)\" \"$ENV\" \"$*\""),
+            ],
+        ),
+        &bases(&base),
+    )
+    .unwrap_err();
+    assert_eq!(errors[0].code, "OVERLAPPING_CHANGES");
+    // So does one change contained in another.
+    let errors = compile(
+        &request(
+            &base,
+            vec![
+                exact("a", "printf '%s' \"$(date)\"", "printf '%s' \"$(date)\""),
+                exact("b", "'%s'", "'%s'"),
+            ],
+        ),
+        &bases(&base),
+    )
+    .unwrap_err();
+    assert_eq!(errors[0].code, "OVERLAPPING_CHANGES");
+}
+
+#[test]
 fn line_targets_touching_one_another_conflict_with_a_combining_hint() {
     let text = "1\n2\n3\n4\n5\n6\n";
     assert_eq!(

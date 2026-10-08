@@ -104,6 +104,10 @@ All notable changes to Ultra Edit are documented here. Releases follow
   are never judged. The `PreToolUse` matcher is now `Bash|PowerShell|Write`. In
   the benchmark, 4 of 14 guarded native sessions wrote project files past the
   guard by saving a script with Write and running it.
+- Two changes whose targets partly overlap no longer reject the batch when
+  both keep the shared bytes unchanged, as when two `old` anchors share a few
+  bytes of context: each applies to its own side. Contained or rewritten
+  overlaps are still rejected as `OVERLAPPING_CHANGES`.
 - The guard resolves script and inline-code targets instead of requiring a
   bare literal. Constants, f-strings and template literals, `+`, `%`,
   `.format()`, `os.path.join` and `Path('/tmp') / name` with a known leading

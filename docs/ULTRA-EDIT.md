@@ -76,7 +76,7 @@ References establish *which content* an edit addresses. They cannot establish th
 | What does each change search? | The same original snapshot for that file. |
 | Can a later change target newly inserted text? | No; express the final replacement directly. |
 | What if one target is missing or ambiguous? | Reject the complete plan before changing any target file. |
-| What if replacement spans overlap? | Reject and identify the conflicting changes. |
+| What if replacement spans overlap? | Reject and identify the conflicting changes, unless both keep the shared bytes unchanged; then each applies to its own side. |
 | Can locating context overlap? | Yes; context is distinct from bytes being replaced. |
 | What about competing insertions at one position? | Require the caller to combine them. |
 | Does array order affect independent changes? | No. |

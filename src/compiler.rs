@@ -444,6 +444,7 @@ pub fn compile_with(
         replacements.sort_by(|left, right| {
             (left.start, left.end, &left.change_id).cmp(&(right.start, right.end, &right.change_id))
         });
+        merge_kept_overlaps(&base.text, &mut replacements);
         'overlaps: for (index, left) in replacements.iter().enumerate() {
             if overlap_limit_reached {
                 break;
@@ -1136,6 +1137,28 @@ enum Extent {
 }
 
 /// How to merge two overlapping changes; line targets name the merged change.
+/// Trims a partial overlap between sorted neighbouring replacements when both
+/// keep the shared bytes: the left text ends with them and the right text
+/// starts with them, as when two `old` anchors share a few bytes of context.
+/// The shared bytes then stay once, between the two changes; any other
+/// overlap is left for the conflict check.
+fn merge_kept_overlaps(text: &str, replacements: &mut [Replacement]) {
+    for index in 1..replacements.len() {
+        let (before, after) = replacements.split_at_mut(index);
+        let (left, right) = (&mut before[index - 1], &after[0]);
+        if !(left.start < right.start && right.start < left.end && left.end < right.end) {
+            continue;
+        }
+        let Some(shared) = text.get(right.start..left.end) else {
+            continue;
+        };
+        if left.text.ends_with(shared) && right.text.starts_with(shared) {
+            left.text.truncate(left.text.len() - shared.len());
+            left.end = right.start;
+        }
+    }
+}
+
 fn combine_advice(left: Option<&Extent>, right: Option<&Extent>) -> String {
     let takes = |extent: Option<&Extent>| {
         matches!(
