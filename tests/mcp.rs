@@ -413,9 +413,8 @@ fn broken_stdout_exits_without_panic_while_stdin_stays_open() {
                 .map(|id| format!("{}\n", json!({"jsonrpc":"2.0","id":id,"method":"ping"})))
                 .collect::<String>()
         };
-        let _ = input.write_all(payload.as_bytes());
-        let _ = input.flush();
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut sent = None::<Instant>;
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
@@ -424,6 +423,14 @@ fn broken_stdout_exits_without_panic_while_stdin_stays_open() {
                 let _ = child.kill();
                 let _ = child.wait();
                 panic!("Broken stdout did not terminate the server while stdin remained open");
+            }
+            // A child another test forks while the reader is dropped holds the
+            // pipe's read end until it execs, so replies written then succeed;
+            // more input makes the server write again once the pipe is closed.
+            if sent.is_none_or(|sent| sent.elapsed() >= Duration::from_millis(100)) {
+                let _ = input.write_all(payload.as_bytes());
+                let _ = input.flush();
+                sent = Some(Instant::now());
             }
             std::thread::sleep(Duration::from_millis(10));
         };
@@ -1036,14 +1043,21 @@ fn bundled_plugin_launches_hooks_and_mcp_without_path_lookup() {
         .tempdir()
         .unwrap();
     fs::create_dir(package.path().join("runtime")).unwrap();
-    fs::copy(
-        env!("CARGO_BIN_EXE_ultra-edit-mcp"),
-        package.path().join(format!(
-            "runtime/ultra-edit-mcp{}",
-            std::env::consts::EXE_SUFFIX
-        )),
-    )
-    .unwrap();
+    let copied = package.path().join(format!(
+        "runtime/ultra-edit-mcp{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    fs::copy(env!("CARGO_BIN_EXE_ultra-edit-mcp"), &copied).unwrap();
+    // A child another test forks while the copy is open for writing holds it
+    // open until that child execs, and running the copy meanwhile is refused.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while let Err(error) = Command::new(&copied).arg("--version").output() {
+        assert!(
+            error.kind() == std::io::ErrorKind::ExecutableFileBusy && Instant::now() < deadline,
+            "{error}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let executable = |configuration: &Value| {
         let path = configuration["command"].as_str().unwrap();
         assert!(path.starts_with("${CLAUDE_PLUGIN_ROOT}/runtime/"));
