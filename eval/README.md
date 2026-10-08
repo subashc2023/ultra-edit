@@ -28,7 +28,7 @@ and every third-party arm in `third_party/arms.json`.
 | `native-guard` | Native tools plus Ultra Edit's shell guard: a `PreToolUse` hook (matcher `Bash\|PowerShell`, set by `--guard-matcher`) running `<staged runtime>/ultra-edit-mcp --claude-hook PreToolUse`, configured in a generated `--settings` file | Whether blocking heredoc, here-string, inline-script, `sed -i`, `-replace`, and `echo`/`printf`/`Set-Content` writes into the project alone improves native editing. |
 | `ultra-edit` | The full plugin via `--plugin-dir <staged plugin>`: MCP tools, routing hooks, skill | The complete product against both baselines. |
 | `ultra-edit-only` | `ultra-edit` plus `--disallowedTools Edit,Write,MultiEdit,NotebookEdit` | Ultra Edit when the model cannot fall back to native edits. |
-| `shell-sed` | Native tools minus Edit/Write/MultiEdit/NotebookEdit; `--append-system-prompt` asks for sed, awk, or perl one-liners through Bash | Stream-editor edits. |
+| `shell-sed` | Native tools minus Edit/Write/MultiEdit/NotebookEdit; `--append-system-prompt` asks for sed, awk, or perl one-liners through Bash; a method hook enforces it | Stream-editor edits. |
 | `shell-python` | Same, asking for Python 3 code through Bash (`python3 - <<'PY' ... PY`) | Scripted edits. |
 | `shell-patch` | Same, asking for unified diffs applied with `git apply` through Bash | Patch-based edits. |
 | third-party | An MCP server from `third_party/arms.json` via `--mcp-config <run>/mcp.json`, usually with native edit tools disallowed | Popular MCP edit servers against Ultra Edit. |
@@ -38,6 +38,22 @@ hook, MCP server, disallowed tools, and appended system prompt differ. The
 shell arms' appended prompt starts "For this session the Edit, Write,
 MultiEdit, and NotebookEdit tools are unavailable." Arm order is shuffled per
 task and repetition (`--seed`) to spread prompt-cache effects across arms.
+
+Each shell arm also gets a `PreToolUse` hook on Bash, `method_hook.py --method
+{sed,python,patch}`, that denies a command writing files any other way, and the
+appended prompt says such commands are blocked. Without it the arms measured
+whatever the model reached for: in earlier rounds only 14 of 42 `shell-patch`
+sessions used `git apply` for every write, the rest using `sed -i` or Python.
+Reads and scratch files in the temporary directory are allowed. Each shell run
+records `off_method_attempts` and `off_method_writes` (attempts that ran
+unblocked; any are an integrity warning).
+
+Before an arm's measured runs, one short session per arm caches its shared
+system-and-tools prompt prefix (`warmup.jsonl`; `--no-warmup` skips it), so an
+arm measured after a pause is not charged for writing that prefix while another
+measured right after it is. Each run records the Claude Code build and the
+Ultra Edit executable's SHA-256 it ran with, and `--resume` refuses to mix runs
+measured with different ones unless `--allow-drift` is given.
 
 ### Third-party arms
 

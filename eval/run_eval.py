@@ -225,6 +225,7 @@ class ArmSpec:
     mcp_server: Mapping[str, Any] | None = field(default=None, hash=False, compare=False)
     edit_tools: tuple[str, ...] = NATIVE_EDIT_TOOL_NAMES  # full names; counted as edit calls
     required_tools: tuple[str, ...] = ()  # full names that must be listed at init
+    method: str | None = None  # shell arms: the method key in SHELL_METHODS, enforced by a hook
 
     @property
     def third_party(self) -> bool:
@@ -255,15 +256,39 @@ class ArmSpec:
             "mcp_server": self.mcp_server,
             "edit_tools": list(self.edit_tools),
             "required_tools": list(self.required_tools),
+            "method": self.method,
         }
 
 
-def _shell_arm(name: str, method: str, how: str) -> ArmSpec:
+# Shell arm methods: what the description names, and how the prompt and hook say it.
+SHELL_METHODS = {
+    "sed": ("sed/awk/perl", "running sed (or awk or perl one-liners) through the Bash tool"),
+    "python": (
+        "Python scripts",
+        "running Python 3 code through the Bash tool, for example python3 - <<'PY' ... PY",
+    ),
+    "patch": (
+        "git apply",
+        "applying unified diffs with git apply through the Bash tool, for example git apply <<'PATCH' ... PATCH",
+    ),
+}
+METHOD_HOOK = EVAL_DIR / "method_hook.py"
+METHOD_HOOK_TIMEOUT_S = 30
+METHOD_DENIAL = (
+    "This session measures editing by {how}, and that command writes files another way, so it "
+    "was blocked. Make every file change by {how}. Read-only commands and scratch files in /tmp "
+    "are allowed."
+)
+
+
+def _shell_arm(name: str, method: str) -> ArmSpec:
+    label, how = SHELL_METHODS[method]
     return ArmSpec(
         name,
-        f"Native tools without Edit/Write; every change through Bash with {method}.",
+        f"Native tools without Edit/Write; every change through Bash with {label}.",
         disallowed_tools=NATIVE_EDIT_TOOL_NAMES,
-        append_system_prompt=_SHELL_ONLY + how,
+        append_system_prompt=f"{_SHELL_ONLY}{how}. Commands that write files any other way are blocked.",
+        method=method,
     )
 
 
@@ -279,22 +304,9 @@ BUILTIN_ARMS: dict[str, ArmSpec] = {
             plugin=True,
             disallowed_tools=NATIVE_EDIT_TOOL_NAMES,
         ),
-        _shell_arm(
-            "shell-sed",
-            "sed/awk/perl",
-            "running sed (or awk or perl one-liners) through the Bash tool.",
-        ),
-        _shell_arm(
-            "shell-python",
-            "Python scripts",
-            "running Python 3 code through the Bash tool, for example python3 - <<'PY' ... PY.",
-        ),
-        _shell_arm(
-            "shell-patch",
-            "git apply",
-            "applying unified diffs with git apply through the Bash tool, "
-            "for example git apply <<'PATCH' ... PATCH.",
-        ),
+        _shell_arm("shell-sed", "sed"),
+        _shell_arm("shell-python", "python"),
+        _shell_arm("shell-patch", "patch"),
     )
 }
 
@@ -1017,6 +1029,85 @@ WRITE_PROGRAMS = frozenset(
 )
 
 
+# Programs that change files, by the shell arm method they belong to.
+_METHOD_PROGRAMS = {
+    "sed": "sed",
+    "gsed": "sed",
+    "awk": "sed",
+    "gawk": "sed",
+    "mawk": "sed",
+    "nawk": "sed",
+    "perl": "sed",
+    "node": "other",
+    "nodejs": "other",
+    "deno": "other",
+    "bun": "other",
+    "ruby": "other",
+    "php": "other",
+    "pwsh": "other",
+    "powershell": "other",
+}
+_COMMAND_WRAPPERS = frozenset({"env", "sudo", "command", "builtin", "nohup", "time", "exec", "xargs"})
+# A shell function definition's head: `name() {` or `function name {`.
+_FUNCTION_HEAD = re.compile(r"^(?:function\s+[\w-]+\s*(?:\(\))?|[A-Za-z_][\w-]*\s*\(\))\s*\{?\s*")
+# A redirection or tee into the temporary directory: scratch files, not project files.
+_TEMP_TARGET = re.compile(
+    r"(>>?|\btee(?:\s+-a)?)[ \t]*([\"']?)(?:/tmp/|/var/tmp/|\$\{?TMPDIR\}?/?)[^\s;&|<>()\"']*\2"
+)
+
+
+def shell_methods(command: Any) -> set[str]:
+    """The shell edit methods a command writes files with: sed (sed, awk, or perl run in
+    place or redirected into a file), python and other (node, ruby, ...) when the command
+    holds a file-write call, and patch (git apply, patch). Reads such as `sed -n` do not
+    count. Heredoc bodies and quoted text do not name programs, so inline code that
+    mentions sed is not a sed run."""
+    if not isinstance(command, str):
+        return set()
+    found: set[str] = set()
+    code_writes = bool(_WRITE_API.search(command))
+    body_free = _QUOTED.sub("''", _strip_heredoc_bodies(command))
+    for segment in _SEGMENT_SPLIT.split(body_free):
+        segment = _FUNCTION_HEAD.sub("", segment.strip().lstrip("({ ").strip())
+        words = segment.split()
+        while words and (
+            "=" in words[0].split("/")[0] or words[0] in _COMMAND_WRAPPERS or words[0].startswith("-")
+        ):
+            words.pop(0)
+        if words and words[0] == "timeout" and len(words) > 1:
+            words = words[2:]
+        if not words:
+            continue
+        program = words[0].replace("\\", "/").rsplit("/", 1)[-1].lower().removesuffix(".exe")
+        method = _METHOD_PROGRAMS.get(program)
+        if program == "git" or program == "patch":
+            if _PATCH_APPLY.match(" ".join(words)):
+                found.add("patch")
+        elif re.fullmatch(r"python[0-9.]*|py", program):
+            if code_writes:
+                found.add("python")
+        elif method == "sed":
+            in_place = (_IN_PLACE_FLAG.search(segment) and program != "awk") or _AWK_IN_PLACE.search(segment)
+            if in_place or _REDIRECT.search(segment) or (program == "perl" and code_writes):
+                found.add("sed")
+        elif method == "other" and code_writes:
+            found.add("other")
+    return found
+
+
+def off_method_write(command: Any, method: str) -> bool:
+    """Whether a command writes files other than by `method`: it writes with another
+    method's program, or writes (by the write and edit heuristics) without its own.
+    Writes into the temporary directory, such as a patch or data file, do not count."""
+    if not isinstance(command, str):
+        return False
+    project = _TEMP_TARGET.sub(lambda match: f"{match.group(1)} /dev/null", command)
+    used = shell_methods(command)
+    if not (used or shell_write_kinds(project) or shell_edit_kinds(project)):
+        return False
+    return method not in used or bool(used - {method})
+
+
 def mcp_reported_error(text: str) -> str | None:
     """The reason in a {"result": "error", "reason": ...} that an MCP server returned as a
     successful result (mcp-text-editor does this), else None."""
@@ -1157,10 +1248,13 @@ def api_call_metrics(transcript: Transcript) -> dict[str, Any]:
     }
 
 
-def compute_metrics(transcript: Transcript, edit_tools: Collection[str] = ()) -> dict[str, Any]:
+def compute_metrics(
+    transcript: Transcript, edit_tools: Collection[str] = (), method: str | None = None
+) -> dict[str, Any]:
     """Run metrics. edit_tools adds full tool names (third-party MCP edit tools) to the
     edit calls; native writes, content-writing shell commands, and Ultra Edit commits
-    always count."""
+    always count. A shell arm's method adds counts of Bash commands that write files
+    another way: attempted, and run without an error (past the method hook)."""
     by_name: Counter[str] = Counter()
     ultra_statuses: Counter[str] = Counter()
     write_kinds: Counter[str] = Counter()
@@ -1211,6 +1305,10 @@ def compute_metrics(transcript: Transcript, edit_tools: Collection[str] = ()) ->
             if result is not None and result.is_error:
                 counts["shell_errors"] += 1
             command = call.input.get("command") if isinstance(call.input, dict) else None
+            if method and call.name == "Bash" and off_method_write(command, method):
+                counts["off_method_attempts"] += 1
+                if result is not None and not result.is_error:
+                    counts["off_method_writes"] += 1
             kinds = shell_write_kinds(command, call.name)
             other_edits = shell_edit_kinds(command) if call.name == "Bash" else []
             edit_kinds.update(other_edits)
@@ -1281,6 +1379,9 @@ def compute_metrics(transcript: Transcript, edit_tools: Collection[str] = ()) ->
         "stream_lines": transcript.lines,
         "stream_parse_errors": transcript.parse_errors,
     }
+    if method:
+        metrics["off_method_attempts"] = counts["off_method_attempts"]
+        metrics["off_method_writes"] = counts["off_method_writes"]
     metrics.update(api_call_metrics(transcript))
     metrics.update(token_usage(transcript.result))
     return metrics
@@ -1417,20 +1518,33 @@ def check_integrity(
     if offered:
         errors.append(f"disallowed tool(s) listed at init: {', '.join(offered)}")
     pre_tool = [event for event in hooks if event.get("hook_event") == "PreToolUse"]
-    if spec.guard_hook:
+    if spec.guard_hook or spec.method:
         failed = [event for event in pre_tool if event.get("outcome") == "error"]
+        hook = "guard" if spec.guard_hook else "method"
         if failed:
-            errors.append(f"guard hook failed {len(failed)} time(s)")
-        guarded = guarded_tools(guard_matcher)
+            errors.append(f"{hook} hook failed {len(failed)} time(s)")
+        guarded = guarded_tools(guard_matcher) if spec.guard_hook else frozenset({"Bash"})
         shell_calls = sorted({call.name for call in transcript.tool_calls if call.name in guarded})
         if hook_events_expected and shell_calls and not pre_tool:
             errors.append(
                 f"{' and '.join(shell_calls)} called but no PreToolUse hook event was reported; "
-                "the guard did not run "
+                f"the {hook} hook did not run "
                 "(use --no-hook-check if this Claude Code omits PreToolUse hook events)"
             )
     elif not spec.plugin and pre_tool:
         warnings.append(f"PreToolUse hooks ran in the {name} arm (managed hooks?)")
+    if spec.method:
+        through = sum(
+            1
+            for call in transcript.tool_calls
+            if call.name == "Bash"
+            and isinstance(call.input, dict)
+            and off_method_write(call.input.get("command"), spec.method)
+            and call.result is not None
+            and not call.result.is_error
+        )
+        if through:
+            warnings.append(f"{through} Bash command(s) wrote files other than by {spec.method}, unblocked")
     expected_servers = {spec.server_name} | set(third_party_servers)
     other_servers = sorted(
         str(entry.get("name"))
@@ -1557,7 +1671,8 @@ def build_settings(
     extra: Mapping[str, Any] | None = None,
     disabled_plugins: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """The per-run --settings document. Only the guard arm adds a hook."""
+    """The per-run --settings document. The guard arm adds the guard hook; shell arms add
+    the method hook that denies writes made any other way."""
     spec = arm_spec(arm)
     settings: dict[str, Any] = {
         "disableClaudeAiConnectors": True,
@@ -1579,6 +1694,22 @@ def build_settings(
                             "command": str(guard_executable),
                             "args": list(GUARD_HOOK_ARGS),
                             "timeout": GUARD_HOOK_TIMEOUT_S,
+                        }
+                    ],
+                }
+            ]
+        }
+    if spec.method:
+        settings["hooks"] = {
+            "PreToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": sys.executable,
+                            "args": [str(METHOD_HOOK), "--method", spec.method],
+                            "timeout": METHOD_HOOK_TIMEOUT_S,
                         }
                     ],
                 }
@@ -2115,7 +2246,7 @@ def run_one(config: Config, spec: RunSpec) -> dict[str, Any]:
         (run_dir / "diff.txt").write_text(
             describe_differences(expected, actual, comparison), encoding="utf-8"
         )
-    metrics = compute_metrics(transcript, arm.edit_tools)
+    metrics = compute_metrics(transcript, arm.edit_tools, arm.method)
     errors, warnings = check_integrity(
         arm,
         transcript,
@@ -3005,16 +3136,19 @@ def rescore_records(results_dir: Path, registry: ArmRegistry) -> list[dict[str, 
     rescored = []
     for record in records:
         arm = record.get("arm")
-        if isinstance(recorded_specs.get(arm), dict) and "edit_tools" in recorded_specs[arm]:
-            edit_tools = tuple(recorded_specs[arm]["edit_tools"])
+        recorded = recorded_specs.get(arm) if isinstance(recorded_specs.get(arm), dict) else {}
+        if "edit_tools" in recorded:
+            edit_tools = tuple(recorded["edit_tools"])
         elif arm in registry.arms:
             edit_tools = registry.arms[arm].edit_tools
         else:
             edit_tools = NATIVE_EDIT_TOOL_NAMES
+        # Runs recorded before arms had methods were not held to one.
+        method = recorded.get("method") if "method" in recorded else None
         stream = results_dir / "runs" / str(record.get("run_id")) / "stream.jsonl"
         updated = dict(record)
         if stream.exists():
-            metrics = compute_metrics(parse_stream_file(stream), edit_tools)
+            metrics = compute_metrics(parse_stream_file(stream), edit_tools, method)
             updated["metrics"] = metrics
             updated["first_attempt"] = first_attempt(metrics, bool(record.get("correct")))
         rescored.append(updated)

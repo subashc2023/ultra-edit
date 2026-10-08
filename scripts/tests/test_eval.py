@@ -1053,7 +1053,7 @@ class IntegrityTests(unittest.TestCase):
         bash = (assistant("m", tool_use("t", "Bash", {"command": "ls"})), tool_result("t", "a"))
         silent = transcript_from(init_message(), *bash, result_message())
         errors, _ = evaluation.check_integrity("native-guard", silent)
-        self.assertTrue(errors and "guard did not run" in errors[0])
+        self.assertTrue(errors and "guard hook did not run" in errors[0])
         self.assertEqual(
             evaluation.check_integrity("native-guard", silent, hook_events_expected=False), ([], [])
         )
@@ -1445,8 +1445,19 @@ class ArmRegistryTests(unittest.TestCase):
                 self.assertEqual("--disallowedTools" in bypass, bool(disallowed))
         guard = evaluation.build_settings("native-guard", "/x/ultra-edit-mcp")
         self.assertIn("hooks", guard)
-        for name in ("ultra-edit-only", "shell-sed", "shell-python", "shell-patch"):
-            self.assertEqual(evaluation.build_settings(name), evaluation.build_settings("native"))
+        self.assertEqual(evaluation.build_settings("ultra-edit-only"), evaluation.build_settings("native"))
+        for name, method in (("shell-sed", "sed"), ("shell-python", "python"), ("shell-patch", "patch")):
+            settings = evaluation.build_settings(name)
+            hook = settings.pop("hooks")["PreToolUse"][0]
+            self.assertEqual(settings, evaluation.build_settings("native"))
+            self.assertEqual(hook["matcher"], "Bash")
+            command = hook["hooks"][0]
+            self.assertEqual(command["command"], sys.executable)
+            self.assertEqual(command["args"], [str(evaluation.METHOD_HOOK), "--method", method])
+            self.assertIn(
+                "Commands that write files any other way are blocked.",
+                evaluation.BUILTIN_ARMS[name].append_system_prompt,
+            )
         with self.assertRaises(evaluation.EvalError):
             evaluation.build_command(["claude"], arm="ultra-edit-only", settings_path="s.json")
         with self.assertRaises(evaluation.EvalError):
@@ -1717,9 +1728,13 @@ class ThirdPartyIntegrityTests(unittest.TestCase):
         self.assertEqual(self.check("native", offered, result_message()), ([], []))
         clean = init_message(tools=("Read", "Bash"))
         self.assertEqual(self.check("shell-patch", clean, result_message()), ([], []))
-        hooked = (clean, hook_response("PreToolUse"), result_message())
+        hooked = (
+            init_message(tools=("Read", "Edit", "Write", "Bash")),
+            hook_response("PreToolUse"),
+            result_message(),
+        )
         self.assertIn(
-            "PreToolUse hooks ran in the shell-sed arm (managed hooks?)", self.check("shell-sed", *hooked)[1]
+            "PreToolUse hooks ran in the native arm (managed hooks?)", self.check("native", *hooked)[1]
         )
 
     def test_ultra_edit_only_has_the_ultra_edit_requirements(self):
@@ -2104,7 +2119,7 @@ class ParallelAndThirdPartyRunTests(unittest.TestCase):
         self.assertEqual(len(lines), 3, output.getvalue())
         self.assertTrue(all("PASS" in line for line in lines))
         self.assertEqual(evaluation.summarize(records), evaluation.summarize(log.records))
-        metrics = records[0]["metrics"]
+        metrics = next(r for r in records if r["arm"] == "native")["metrics"]
         # Two stream lines per response share one id and one usage.
         self.assertEqual(metrics["api_calls"], len(self.task.expected))
         self.assertEqual(metrics["first_call_context_tokens"], 1000)
@@ -2370,6 +2385,111 @@ class ParallelAndThirdPartyRunTests(unittest.TestCase):
         self.assertIn("PROBLEM: arm fs-test: MCP server command not found", output.getvalue())
         self.assertIn("eval/third_party/README.md", output.getvalue())
         self.assertFalse((out / "runs.jsonl").exists())
+
+
+METHOD_HOOK_SPEC = importlib.util.spec_from_file_location("ultra_edit_method_hook", evaluation.METHOD_HOOK)
+
+
+class ShellMethodTests(unittest.TestCase):
+    """The shell arms' method classifier, hook, metrics, and integrity warning."""
+
+    OFF_METHOD = [
+        # (command, method, writes another way)
+        ("sed -i 's/a/b/' f.txt", "sed", False),
+        ("sed -i 's/a/b/' f.txt", "patch", True),
+        ("cd /tmp/r && perl -pi -e 's/a/b/' f", "sed", False),
+        ("sed 's/a/b/' f > f.tmp && mv f.tmp f", "sed", False),
+        ('rep(){ F="$1" perl -0777 -pi -e \'x\' "$F"; }\nrep a b c', "sed", False),
+        ("cat > /tmp/x.patch <<'P'\n--- a/f\n+++ b/f\nP\ngit apply /tmp/x.patch && git diff", "patch", False),
+        ("git apply <<'PATCH'\nsed -i x\nPATCH", "patch", False),
+        ("git -C repo apply --whitespace=nowarn x.patch", "patch", False),
+        ("python3 -c 'print(1)'; git apply x.patch", "patch", False),
+        ("git apply --check x.patch", "patch", False),
+        ("python3 - <<'PY'\nopen('f','w').write('x')\nPY", "python", False),
+        ("python3 - <<'PY'\nopen('f','w').write('x')\nPY", "patch", True),
+        ("python3 - <<'PY'\nopen('f','w').write('x')\nPY\nsed -n 1,4p g | cat -A", "python", False),
+        ("python3 - <<'PY'\nopen('f','w').write('x')\nPY\nsed -i s/a/b/ g", "python", True),
+        ("cat > /tmp/ed.py <<'E'\nopen('f','w')\nE\npython3 /tmp/ed.py", "python", False),
+        ("cat > /tmp/ed.py <<'E'\nopen('f','w')\nE\npython3 /tmp/ed.py", "sed", True),
+        ("cat > src/a.py <<'EOF'\nx\nEOF", "patch", True),
+        ("printf '\\n' >> app/handlers.py", "python", True),
+        # Reads and scratch files in the temporary directory are not writes.
+        ("grep -n x f; sed -n 1,5p f", "patch", False),
+        ("cat > /tmp/spec.txt <<'EOF'\na\nEOF", "sed", False),
+        ('echo x > "$TMPDIR/notes"', "patch", False),
+        (None, "sed", False),
+    ]
+
+    def test_off_method_writes(self):
+        for command, method, expected in self.OFF_METHOD:
+            with self.subTest(command=command, method=method):
+                self.assertEqual(evaluation.off_method_write(command, method), expected)
+
+    def test_hook_denies_only_off_method_bash_writes(self):
+        hook = importlib.util.module_from_spec(METHOD_HOOK_SPEC)
+        METHOD_HOOK_SPEC.loader.exec_module(hook)
+        bash = lambda command: {"tool_name": "Bash", "tool_input": {"command": command}}  # noqa: E731
+        denied = hook.decision(bash("sed -i 's/a/b/' f.txt"), "patch")
+        reason = denied["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("applying unified diffs with git apply", reason)
+        self.assertIsNone(hook.decision(bash("git apply <<'P'\nx\nP"), "patch"))
+        self.assertIsNone(hook.decision(bash("cat -A f.txt"), "patch"))
+        self.assertIsNone(hook.decision({"tool_name": "Read", "tool_input": {}}, "patch"))
+        self.assertIsNone(hook.decision("not an event", "patch"))
+
+    def test_hook_runs_as_configured(self):
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "sed -i s/a/b/ f"},
+        }
+        args = [str(evaluation.METHOD_HOOK), "--method", "python"]
+        denied = evaluation.run_text([sys.executable, *args], input=json.dumps(event), stdin=None)
+        self.assertEqual(denied.returncode, 0, denied.stderr)
+        self.assertEqual(json.loads(denied.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+        event["tool_input"]["command"] = "python3 - <<'P'\nopen('f','w')\nP"
+        allowed = evaluation.run_text([sys.executable, *args], input=json.dumps(event), stdin=None)
+        self.assertEqual((allowed.returncode, allowed.stdout), (0, ""))
+        broken = evaluation.run_text([sys.executable, *args], input="{", stdin=None)
+        self.assertEqual((broken.returncode, broken.stdout), (0, ""))
+        usage = evaluation.run_text([sys.executable, str(evaluation.METHOD_HOOK)], input="{}", stdin=None)
+        self.assertEqual(usage.returncode, 2)
+
+    def transcript(self, denied):
+        command = "python3 - <<'P'\nopen('f','w')\nP"
+        return transcript_from(
+            init_message(tools=("Read", "Bash")),
+            hook_response("PreToolUse"),
+            assistant("m1", tool_use("t1", "Bash", {"command": command})),
+            tool_result("t1", "blocked" if denied else "", is_error=denied),
+            assistant("m2", tool_use("t2", "Bash", {"command": "sed -i s/a/b/ f"})),
+            tool_result("t2", ""),
+            result_message(),
+        )
+
+    def test_metrics_and_integrity_count_writes_that_got_through(self):
+        for denied in (True, False):
+            with self.subTest(denied=denied):
+                transcript = self.transcript(denied)
+                metrics = evaluation.compute_metrics(transcript, method="sed")
+                self.assertEqual(metrics["off_method_attempts"], 1)
+                self.assertEqual(metrics["off_method_writes"], 0 if denied else 1)
+                errors, warnings = evaluation.check_integrity("shell-sed", transcript)
+                self.assertEqual(errors, [])
+                expected = [] if denied else ["1 Bash command(s) wrote files other than by sed, unblocked"]
+                self.assertEqual(warnings, expected)
+        self.assertNotIn("off_method_attempts", evaluation.compute_metrics(self.transcript(False)))
+
+    def test_method_arm_requires_hook_events_for_bash(self):
+        transcript = transcript_from(
+            init_message(tools=("Read", "Bash")),
+            assistant("m1", tool_use("t1", "Bash", {"command": "sed -n 1p f"})),
+            tool_result("t1", "x"),
+            result_message(),
+        )
+        errors, _ = evaluation.check_integrity("shell-patch", transcript)
+        self.assertTrue(errors and "method hook did not run" in errors[0], errors)
 
 
 if __name__ == "__main__":
