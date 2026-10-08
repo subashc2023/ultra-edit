@@ -92,9 +92,12 @@ rewrites; actual token and cost savings depend on the task, model, and retries.
 Snapshots and tool instructions also cost context. Measured with the
 [evaluation harness](eval/README.md), Ultra Edit cost 1.06x native Claude Code
 (0.67x native editing with shell writes blocked) on tasks that native editing
-often finished with a blind shell substitution, and 1.03x native (0.90x with
-shell writes blocked) on tasks that leave finding the edit sites to the model;
-see [the results](docs/performance.md#model-level-results).
+often finished with a blind shell substitution. On eight tasks that leave
+finding the edit sites to the model it was correct in every run, at 1.03x and
+1.22x native in two rounds, while native editing with shell writes blocked
+failed 5 of 20 runs and cost more. When another writer changed a file during
+the session, it cost 0.71x native; see
+[the results](docs/performance.md#model-level-results).
 
 ### What you give up
 

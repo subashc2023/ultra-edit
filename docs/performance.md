@@ -147,14 +147,14 @@ time is not an equivalent performance baseline.
 ## Model-level results
 
 A model-level comparison runs the same edit tasks through each route. The
-[evaluation harness](../eval/README.md) runs 17 fixture tasks, including
-escape-heavy, line-ending, near-duplicate, large-file, and intent-level cases,
-under 10 arms: native Claude Code tools with and without the shell guard, the
-full plugin and the plugin with native edit tools disabled, three shell-edit
-arms, and three third-party MCP edit servers. It scores exact final bytes,
-first-try success, tool calls, tool errors, Bash file writes, turns, tokens, and
-cost, so the plugin's instruction and snapshot overhead counts. It has no
-stale-file task yet.
+[evaluation harness](../eval/README.md) runs 23 fixture tasks, including
+escape-heavy, line-ending, near-duplicate, large-file, intent-level, and
+stale-file cases, under 10 arms: native Claude Code tools with and without the
+shell guard, the full plugin and the plugin with native edit tools disabled,
+three shell-edit arms, and three third-party MCP edit servers. It scores exact
+final bytes, first-try success, tool calls, tool errors, Bash file writes,
+turns, tokens, and cost, so the plugin's instruction and snapshot overhead
+counts.
 
 One round on 2026-10-08: Claude Code 2.1.294, Sonnet, 3 repetitions, 420 runs,
 none invalid. The two Ultra Edit arms were run again later that day, after the
@@ -218,3 +218,107 @@ The two failures were model slips: `native` dropped a space from a user-agent
 string, and `native-guard` removed one blank line too many. On the version bump
 and the rename, both Ultra Edit arms finished in two tool calls: a search, then
 one edit built from its output.
+
+Five more intent-level tasks were run on 2026-10-08 with the same settings, after
+`OLD_INSIDE_WORD` and `INSERT_REPEATS_LINE` landed: a CSS class renamed beside
+hyphenated names that contain it (`btn-primary-outline`, `--btn-primary-bg`), a
+feature flag retired by keeping its on-branches dedented, a default of 10 raised
+beside another default of 10 on the next line, one YAML section's `pool_size`
+key renamed while two other sections keep the name, and a function moved to
+another module with its imports and docs entry. For each, an agent that never
+saw the expected bytes carried out the prompt and matched them. The $4.50 cap
+stopped the round in its third repetition; the table counts the 44 runs in task
+repetitions that all four arms finished.
+
+| Arm | Correct | First try | Cost vs native |
+| --- | --- | --- | --- |
+| `native` | 11/11 | 11/11 | 1.00 |
+| `native-guard` | 7/11 | 5/11 | 1.52 (1.43-1.62) |
+| `ultra-edit` | 11/11 | 10/11 | 1.22 (1.16-1.28) |
+| `ultra-edit-only` | 11/11 | 7/11 | 1.27 (1.16-1.37) |
+
+- On both renames, `native` wrote every site with one `perl` or `sed` command
+  whose regex excluded the look-alikes; on the CSS rename that took 0.8k output
+  tokens, against 3.1k for a 29-change `ultra_edit` call. That is the route the
+  shell guard blocks.
+  `native-guard`, left with Edit, failed all three CSS renames and one of two
+  YAML renames, and cost 1.25x (1.17-1.33) what `ultra-edit` did.
+- Every `native-guard` CSS failure was the same slip, three runs out of three:
+  an `old_string` ending in a space whose `new_string` dropped it, as in
+  `".form-actions .btn-primary + "` written as `".form-actions .btn-accent +"`,
+  which joins `+` to the next selector. Ultra Edit would write that text too,
+  but answers it with a `WHITESPACE_EDGE` warning quoting the joined line; the
+  one such warning in these rounds, a doubled indent in a Haiku run, was fixed
+  in the next call.
+- On the other three tasks Ultra Edit cost the same as `native`, except the
+  function move at 1.25x: after a multi-hunk batch, the model looked at the
+  result again with `git diff` or Read in 5 and 6 of 11 runs of the two Ultra
+  Edit arms, against 2 of 12 `native` runs, which Claude Code tells that their
+  file state is current.
+  The five first-try misses were blank-line or ```` ``` ```` guards refused as
+  `LINE_GUARD_WEAK`, one missed `old`, one call with no changes, and one call
+  whose JSON Claude Code could not parse.
+
+## Haiku results
+
+The four Claude Code arms were run with Haiku on all 23 tasks on 2026-10-08,
+with the same settings and 2 repetitions each: 184 runs, none invalid, $1.33 in
+all.
+
+| Arm | Correct | First try | Cost vs native |
+| --- | --- | --- | --- |
+| `native` | 46/46 | 43/46 | 1.00 |
+| `native-guard` | 44/46 | 28/46 | 1.21 (1.15-1.26) |
+| `ultra-edit` | 46/46 | 36/46 | 1.09 (1.05-1.14) |
+| `ultra-edit-only` | 46/46 | 39/46 | 1.05 (1.00-1.09) |
+
+- The smaller model did not open a correctness gap: Haiku finished every task
+  with native tools as well. Both `native-guard` failures were the CSS rename's
+  dropped trailing space, the slip Sonnet made in all three of its runs.
+- Ultra Edit took about half the turns (0.54x) and tool calls (0.49x) of
+  `native`, and 0.91x its context tokens, but 1.16x its output tokens; it cost
+  0.91x what `native-guard` did.
+- Each of the 17 first-try misses in the Ultra Edit arms was refused without a
+  write and fixed in a later call: 8 `old` texts that missed, half of them on
+  `unicode-quotes`; 3 calls whose JSON Claude Code could not parse because the
+  model closed the nested `files` and `changes` arrays with one brace too many
+  (Sonnet did that in 2 of about 490 Ultra Edit runs); 2 stale `expect` guards
+  on the stale-file task; 2 ambiguous `old` texts; and 2 weak guards.
+
+## Stale-file results
+
+`edit-while-file-changes` simulates another writer. As soon as the model has
+been shown the retry settings, the writer inserts a block above them and
+rewords the comment on a line the model edits; after the model's first write to
+the file, it inserts a line above the next edit site (see
+[`concurrent.json`](../eval/README.md#tasks)). Run on 2026-10-08 under all 10
+arms with the same settings, 3 repetitions each:
+
+| Arm | Correct | First try | Cost vs native |
+| --- | --- | --- | --- |
+| `native` | 3/3 | 0/3 | 1.00 |
+| `native-guard` | 3/3 | 1/3 | 0.88 (0.74-1.02) |
+| `ultra-edit` | 3/3 | 2/3 | 0.71 (0.58-0.87) |
+| `ultra-edit-only` | 3/3 | 2/3 | 0.68 (0.56-0.85) |
+| `shell-python` | 3/3 | 0/3 | 0.72 (0.65-0.77) |
+| `shell-sed` | 3/3 | 3/3 | 0.54 (0.49-0.58) |
+| `shell-patch` | 3/3 | 0/3 | 0.83 (0.72-0.96) |
+| `desktop-commander` | 3/3 | 3/3 | 1.05 (0.92-1.17) |
+| `mcp-filesystem` | 3/3 | 3/3 | 0.70 (0.63-0.75) |
+| `mcp-text-editor` | 3/3 | 2/3 | 1.36 (1.23-1.50) |
+
+- In every run the first change landed after the model had been shown the
+  file, and every run ended with both writers' changes. Each route either
+  matched text in the current file (Edit's `old_string`, `ultra_edit`'s `old`,
+  sed patterns, MCP `old`/`new` pairs) or noticed the change: native Edit's
+  modification-time check, `expect` on an Ultra Edit line target,
+  `mcp-text-editor`'s file hash against a whole-file rewrite, `git apply`
+  comparing the lines it removes, and an assertion the model wrote into its own
+  Python script.
+- Recovery cost differed. `native` Edit refused twice per run with "File has
+  been modified since read", and the model read the file again each time: 4.0
+  Read calls per run, against 2.3-2.7 in the Ultra Edit arms.
+- One `ultra-edit` run inserted with `after:19` from its earlier read after the
+  anchor had moved to line 23. `expect` refused the batch, the message named
+  line 23, and the next call committed. The other Ultra Edit miss was an `old`
+  that also matched inside `WEBHOOK_RETRY_LIMIT`.

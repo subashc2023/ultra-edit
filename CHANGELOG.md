@@ -5,6 +5,8 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-08
+
 ### Added
 
 - Path mode: a file entry can name its file by `path` instead of a snapshot
@@ -97,6 +99,13 @@ All notable changes to Ultra Edit are documented here. Releases follow
   or lands beside more whitespace. Bytes are still written as given. These
   warnings follow the plan's `NUL_BYTE` and `MIXED_LINE_ENDINGS` warnings, so
   compact responses keep showing those.
+- The evaluation harness now also runs shell edits (`sed`, Python, `git apply`,
+  each held to its method by a hook) and three third-party MCP edit servers,
+  with parallel runs, spend caps, transient-error retries, and paired
+  statistics, over 23 tasks. Eight are intent-level: they describe a change
+  without quoting its lines. In `edit-while-file-changes`, another writer
+  changes a file during the session; a task's `concurrent.json` drives that
+  through `PostToolUse` and `Stop` hooks.
 
 ### Changed
 
@@ -286,6 +295,7 @@ All notable changes to Ultra Edit are documented here. Releases follow
 - A self-hosted Claude Code marketplace package with SHA-256 verification and
   GitHub build-provenance attestations.
 
+[0.4.0]: https://github.com/subashc2023/ultra-edit/releases/tag/v0.4.0
 [0.3.0]: https://github.com/subashc2023/ultra-edit/releases/tag/v0.3.0
 [0.2.0]: https://github.com/subashc2023/ultra-edit/releases/tag/v0.2.0
 [0.1.0]: https://github.com/subashc2023/ultra-edit/releases/tag/v0.1.0
