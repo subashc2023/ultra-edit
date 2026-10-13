@@ -5,6 +5,27 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ## [Unreleased]
 
+### Added
+
+- A committed `ultra_edit` call returns `changed`: each committed file's edited
+  lines as they now read, numbered as Read numbers them, with one line of
+  context, within 40 lines of 160 characters (`omitted` counts the rest). In
+  the benchmark's intent-level rounds the model ran `git diff` or Read after a
+  multi-hunk batch in 5 and 6 of 11 Ultra Edit runs, against 2 of 12 native
+  ones; the new line numbers also serve later `lines` and `after` targets.
+  Replays, `ultra_edit_commit`, and receipts read later carry none. The session
+  card says so. In the Rust API, `EditResult::Completed` gains a `changed`
+  field.
+
+### Changed
+
+- `LINE_GUARD_WEAK` names the fewest lines, by number, that would make the
+  guard strong: which part of `[first, last]` to grow, which lines to give as
+  an insertion's `expect`, or which neighbour to widen a range to. It never
+  quotes their text, since the number it checks may be the stale one. The card
+  lists a ```` ``` ```` fence among the weak guards; such guards were the most
+  common first-try miss in the intent-level rounds.
+
 ## [0.4.0] - 2026-10-08
 
 ### Added

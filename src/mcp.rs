@@ -270,7 +270,7 @@ impl McpServer {
                     }
                     structured(json!({"kind": "receipt", "receipt": value}))
                 }
-                Some(receipt) => Ok(completed(receipt, false, false)),
+                Some(receipt) => Ok(completed(receipt, false, false, &[])),
                 None => structured(json!({
                     "kind": "receipt_unavailable", "request_id": request_id, "receipt": null
                 })),
@@ -320,7 +320,7 @@ impl McpServer {
         };
         self.operate(recovery, move |workspace| {
             let (receipt, replayed) = workspace.commit_or_replay(&request.plan)?;
-            Ok(completed(receipt, true, replayed))
+            Ok(completed(receipt, true, replayed, &[]))
         })
         .await
     }
@@ -516,14 +516,17 @@ fn edited(result: EditResult) -> Result<CallToolResult, Error> {
     match result {
         EditResult::Rejected { preparation } => prepared(preparation),
         EditResult::Completed {
-            receipt, replayed, ..
-        } => Ok(completed(receipt, true, replayed)),
+            receipt,
+            replayed,
+            changed,
+            ..
+        } => Ok(completed(receipt, true, replayed, &changed)),
     }
 }
 
 fn prepared(preparation: Preparation) -> Result<CallToolResult, Error> {
     if let Some(receipt) = preparation.receipt {
-        return Ok(completed(receipt, true, preparation.replayed));
+        return Ok(completed(receipt, true, preparation.replayed, &[]));
     }
     let mut value = json!({
         "kind": if preparation.ready { "ready" } else { "rejected" },
@@ -540,7 +543,12 @@ fn prepared(preparation: Preparation) -> Result<CallToolResult, Error> {
     Ok(tool_result(value, !preparation.ready))
 }
 
-fn completed(receipt: Receipt, mutation: bool, replayed: bool) -> CallToolResult {
+fn completed(
+    receipt: Receipt,
+    mutation: bool,
+    replayed: bool,
+    changed: &[report::ChangedLines],
+) -> CallToolResult {
     let mut value = json!({
         "kind": "completed",
         "request_id": receipt.request_id,
@@ -550,6 +558,9 @@ fn completed(receipt: Receipt, mutation: bool, replayed: bool) -> CallToolResult
         "warnings": report::warning_summaries(&receipt.warnings),
         "report": receipt_report(&receipt, replayed),
     });
+    if !changed.is_empty() {
+        value["changed"] = json!(changed);
+    }
     report::flag_replayed(&mut value, replayed);
     tool_result(value, mutation && receipt.commit != CommitStatus::Committed)
 }

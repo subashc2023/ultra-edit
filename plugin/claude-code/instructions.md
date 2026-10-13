@@ -15,12 +15,14 @@ each file by absolute `path` (the server root ignores `cd` and worktrees):
 - `lines:[a,b]` replaces whole lines (`"new":""` deletes them); `after:n`
   inserts after line n (0 = top) and keeps it, so `new` must not repeat it. Both
   take Read's line numbers and need `expect`: the text of line n or a, or
-  `[line a, line b]`. Choose lines with 8+ visible characters, not a blank line
-  or a lone `}`.
+  `[line a, line b]`. Choose lines with 8+ visible characters, not a blank line,
+  a lone `}`, or a ``` fence.
 - Every change applies to the file as it was before the call. Text is literal,
   without Read's line-number gutter; in an all-CRLF file, LF is written as CRLF.
 
-`commit: "committed"` means done. `rejected` wrote nothing: fix only the listed
+`commit: "committed"` means done, and `changed` shows the edited lines as they
+now read, with their new numbers: no need to Read or diff them again.
+`rejected` wrote nothing: fix only the listed
 changes, using the closest text it shows, and resend the whole call. On
 `partial` or `outcome_unknown`, stop and report; never resend under a new
 `request_id`. An identical call replays its result without writing.

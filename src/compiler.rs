@@ -2299,7 +2299,9 @@ fn line_guard(
             .collect(),
     };
     if places.len() > 1 {
+        let more = stronger_guard(context, guard, head.len(), tail.len(), extent);
         let more = match guard {
+            _ if !more.is_empty() => more,
             Guard::Prefix { .. } if head.len() + tail.len() < extent => {
                 "add lines to it (each part of [first, last] may hold several)".to_owned()
             }
@@ -2343,6 +2345,87 @@ fn line_guard(
         );
     }
     true
+}
+
+/// Names the fewest lines a weak guard could add to reach `MIN_GUARD_CHARS`, or
+/// empty when none do. Only line numbers are named, never their text: the guard
+/// exists because the number may be stale, so the text must come from the
+/// caller's own view of the file, not from the place the number points to now.
+fn stronger_guard(
+    context: &FileContext,
+    guard: Guard,
+    head: usize,
+    tail: usize,
+    extent: usize,
+) -> String {
+    let (base, lines) = (context.base, context.lines());
+    let visible = |range: std::ops::RangeInclusive<usize>| -> usize {
+        range
+            .map(|line| {
+                base.text[lines.body(line)]
+                    .chars()
+                    .filter(|ch| !ch.is_whitespace())
+                    .count()
+            })
+            .sum()
+    };
+    let span = |first: usize, last: usize| {
+        if first == last {
+            format!("line {first}")
+        } else {
+            format!("lines {first}-{last}")
+        }
+    };
+    match guard {
+        Guard::Prefix { first, last } if head + tail < extent => {
+            let tail_start = last + 1 - tail;
+            let tail_seen = visible(tail_start..=last);
+            let head_seen = visible(first..=first + head - 1);
+            // Grow one part toward the other, whichever needs fewer lines.
+            let grown_head = (head + 1..=extent - tail)
+                .find(|&k| visible(first..=first + k - 1) + tail_seen >= MIN_GUARD_CHARS);
+            let grown_tail = (tail + 1..=extent - head)
+                .find(|&k| head_seen + visible(last + 1 - k..=last) >= MIN_GUARD_CHARS);
+            match (grown_head, grown_tail) {
+                (Some(k), Some(j)) if j - tail < k - head => format!(
+                    "make its last part {} (a part may hold several lines)",
+                    span(last + 1 - j, last)
+                ),
+                (Some(k), _) => format!(
+                    "make its first part {} (a part may hold several lines)",
+                    span(first, first + k - 1)
+                ),
+                (None, Some(j)) => format!(
+                    "make its last part {} (a part may hold several lines)",
+                    span(last + 1 - j, last)
+                ),
+                (None, None) => String::new(),
+            }
+        }
+        Guard::Prefix { first, last } => {
+            let seen = visible(first..=last);
+            if first > 1 && seen + visible(first - 1..=first - 1) >= MIN_GUARD_CHARS {
+                format!(
+                    "widen the range to lines [{},{last}], repeating line {} in `new` and `expect`",
+                    first - 1,
+                    first - 1
+                )
+            } else if last < lines.count() && seen + visible(last + 1..=last + 1) >= MIN_GUARD_CHARS
+            {
+                format!(
+                    "widen the range to lines [{first},{}], repeating line {} in `new` and `expect`",
+                    last + 1,
+                    last + 1
+                )
+            } else {
+                String::new()
+            }
+        }
+        Guard::Above { line } => (head + 1..=line.min(head + 8))
+            .find(|&k| visible(line + 1 - k..=line) >= MIN_GUARD_CHARS)
+            .map(|k| format!("give {} as expect", span(line + 1 - k, line)))
+            .unwrap_or_default(),
+    }
 }
 
 /// Advice and candidates for guarded lines that are not where the target says:

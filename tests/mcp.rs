@@ -182,9 +182,20 @@ fn edit(request_id: &str, base: &Value, span: &str, text: &str) -> Value {
 
 /// What repeating the call that returned `original` returns: the same recorded
 /// result, flagged, with the replay notice leading its report.
+/// A committed response as its receipt is retrieved later: without the changed
+/// lines, which show the files only as the commit left them.
+fn recorded(original: &Value) -> Value {
+    let mut recorded = original.clone();
+    if let Some(fields) = recorded.as_object_mut() {
+        fields.remove("changed");
+    }
+    recorded
+}
+
 fn replay_of(original: &Value) -> Value {
     assert!(original.get("replayed").is_none(), "{original}");
-    let mut replay = original.clone();
+    // A replay shows no changed lines: the files may have changed since.
+    let mut replay = recorded(original);
     replay["replayed"] = json!(true);
     replay["report"] = json!(format!(
         "{REPLAY_NOTICE}\n{}",
@@ -888,7 +899,7 @@ fn diff_and_byte_warnings_are_available_before_and_after_commit() {
         json!({"query":{"kind":"receipt","request_id":"review"}}),
         false,
     );
-    assert_eq!(status, committed);
+    assert_eq!(status, recorded(&committed));
     assert_eq!(
         fs::read_to_string(root.path().join("file.txt")).unwrap(),
         before
@@ -1202,7 +1213,7 @@ fn focused_batch_edit_preserves_bytes_and_retries_after_restart() {
         json!({"query":{"kind":"receipt","request_id":"batch"}}),
         false,
     );
-    assert_eq!(status, committed);
+    assert_eq!(status, recorded(&committed));
     assert_eq!(
         client.call("ultra_edit", request.clone(), false),
         replay_of(&committed)
@@ -2053,7 +2064,7 @@ fn omitted_ids_are_derived_and_identical_calls_replay_with_a_flag() {
         json!({"query":{"kind":"receipt","request_id":request_id}}),
         false,
     );
-    assert_eq!(status, committed);
+    assert_eq!(status, recorded(&committed));
     let evidence = client.call(
         "ultra_edit_status",
         json!({"query":{"kind":"evidence","reference":committed["plan_id"]}}),
@@ -2164,10 +2175,20 @@ fn the_routing_cards_example_commits_through_the_server_by_path() {
         fs::read_to_string(&file).unwrap(),
         "import os\nimport re\n\nretries = 3\nconfig = load(config)\n\n\ndef main(argv):\n    run(argv)\n"
     );
+    // The edited lines come back as they now read, so no Read or diff is needed.
+    assert_eq!(
+        done["changed"],
+        json!([{"path": file.to_str().unwrap(), "lines": [
+            "1 | import os", "2 | import re", "3 | ", "4 | retries = 3",
+            "5 | config = load(config)", "6 | ", "7 | ", "8 | def main(argv):", "9 |     run(argv)"
+        ]}])
+    );
+    assert!(done["report"].as_str().unwrap().len() + done["changed"].to_string().len() < 1_000);
     // Resending the identical call replays the recorded result and writes nothing.
     let again = client.call("ultra_edit", example, false);
     assert_eq!(again["commit"], "committed");
     assert_eq!(again["replayed"], true, "{again}");
+    assert!(again.get("changed").is_none(), "{again}");
     client.close();
 }
 

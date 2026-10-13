@@ -597,3 +597,104 @@ fn merged_and_adjacent_changes_commit_and_undo() {
     assert_eq!(read(&dir, "main.rs"), main);
     assert_eq!(read(&dir, "doc.md"), doc);
 }
+
+fn changed(result: EditResult) -> Vec<report::ChangedLines> {
+    match result {
+        EditResult::Completed { changed, .. } => changed,
+        other => panic!("Expected a receipt, got {other:?}"),
+    }
+}
+
+/// A committed edit returns each changed region as it now reads, numbered as Read
+/// numbers it, with a line of context, so the caller need not read it again.
+#[test]
+fn a_committed_edit_returns_its_changed_lines_with_new_numbers() {
+    let text: String = (1..=12).map(|n| format!("line {n}\r\n")).collect();
+    let (dir, workspace) = setup(&[("a.txt", &text), ("b.txt", "\u{feff}first\nsecond\n")]);
+    let a = dir.path().join("a.txt").display().to_string();
+    let b = dir.path().join("b.txt").display().to_string();
+    let lines = |lines: [usize; 2], expect: &str, text: &str| Change {
+        id: String::new(),
+        target: Target::Lines {
+            lines,
+            expect: Some(expect.into()),
+            expect_last: None,
+        },
+        text: text.into(),
+    };
+    let views = changed(
+        workspace
+            .edit(request(vec![
+                at(
+                    &a,
+                    vec![
+                        // Two lines become three, shifting everything below.
+                        lines([2, 2], "line 2", "line 2a\r\nline 2b\r\nline 2c\r\n"),
+                        // A deletion shows the lines on either side.
+                        lines([6, 6], "line 6", ""),
+                        exact("line 11", "line eleven"),
+                    ],
+                ),
+                at(&b, vec![exact("first", "1st")]),
+            ]))
+            .unwrap(),
+    );
+    assert_eq!(views.len(), 2);
+    assert_eq!(views[0].path, a);
+    assert_eq!(
+        views[0].lines,
+        [
+            "1 | line 1",
+            "2 | line 2a",
+            "3 | line 2b",
+            "4 | line 2c",
+            "5 | line 3",
+            "7 | line 5",
+            "8 | line 7",
+            "11 | line 10",
+            "12 | line eleven",
+            "13 | line 12",
+        ]
+    );
+    assert_eq!(views[0].omitted, 0);
+    // The BOM is not shown, and a line past the end is not invented.
+    assert_eq!(views[1].lines, ["1 | 1st", "2 | second"]);
+
+    // A replay returns no lines: the file may have changed since.
+    fs::write(dir.path().join("c.txt"), "c\n").unwrap();
+    let c = dir.path().join("c.txt").display().to_string();
+    let first = changed(
+        workspace
+            .edit(request(vec![at(&c, vec![exact("c", "d")])]))
+            .unwrap(),
+    );
+    assert_eq!(first[0].lines, ["1 | d"]);
+    let again = workspace.edit(request(vec![at(&c, vec![exact("c", "d")])]));
+    assert!(changed(again.unwrap()).is_empty());
+}
+
+/// A batch larger than the bounds reports how many lines it left out.
+#[test]
+fn changed_lines_are_bounded() {
+    let text: String = (1..=200).map(|n| format!("value_{n} = old\n")).collect();
+    let (dir, workspace) = setup(&[("big.txt", &text)]);
+    let big = dir.path().join("big.txt").display().to_string();
+    let change = Change {
+        id: String::new(),
+        target: Target::All {
+            old: " = old".into(),
+            scope: None,
+            expected: 200,
+            lines: None,
+        },
+        text: " = new".into(),
+    };
+    let views = changed(
+        workspace
+            .edit(request(vec![at(&big, vec![change])]))
+            .unwrap(),
+    );
+    assert_eq!(views[0].lines.len(), 40);
+    assert_eq!(views[0].omitted, 160);
+    assert_eq!(read(&dir, "big.txt").matches("= new").count(), 200);
+}

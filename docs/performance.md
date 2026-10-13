@@ -146,6 +146,10 @@ time is not an equivalent performance baseline.
 
 ## Model-level results
 
+Every round below ran on Linux. None has run on Windows yet, where Claude
+Code's Bash tool corrupts command payloads and the shell routes are expected
+to fail.
+
 A model-level comparison runs the same edit tasks through each route. The
 [evaluation harness](../eval/README.md) runs 23 fixture tasks, including
 escape-heavy, line-ending, near-duplicate, large-file, intent-level, and
