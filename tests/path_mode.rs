@@ -640,7 +640,9 @@ fn a_committed_edit_returns_its_changed_lines_with_new_numbers() {
             .unwrap(),
     );
     assert_eq!(views.len(), 2);
-    assert_eq!(views[0].path, a);
+    // Stored paths are canonical, as `/private/var` for macOS's `/var`.
+    let canonical = fs::canonicalize(dir.path().join("a.txt")).unwrap();
+    assert_eq!(views[0].path, canonical.display().to_string());
     assert_eq!(
         views[0].lines,
         [

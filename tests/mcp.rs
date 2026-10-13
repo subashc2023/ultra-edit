@@ -2176,12 +2176,27 @@ fn the_routing_cards_example_commits_through_the_server_by_path() {
         "import os\nimport re\n\nretries = 3\nconfig = load(config)\n\n\ndef main(argv):\n    run(argv)\n"
     );
     // The edited lines come back as they now read, so no Read or diff is needed.
+    // The path is the canonical one, as `/private/var` for macOS's `/var`.
+    assert_eq!(done["changed"].as_array().unwrap().len(), 1, "{done}");
+    assert!(
+        done["changed"][0]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("app.py")
+    );
     assert_eq!(
-        done["changed"],
-        json!([{"path": file.to_str().unwrap(), "lines": [
-            "1 | import os", "2 | import re", "3 | ", "4 | retries = 3",
-            "5 | config = load(config)", "6 | ", "7 | ", "8 | def main(argv):", "9 |     run(argv)"
-        ]}])
+        done["changed"][0]["lines"],
+        json!([
+            "1 | import os",
+            "2 | import re",
+            "3 | ",
+            "4 | retries = 3",
+            "5 | config = load(config)",
+            "6 | ",
+            "7 | ",
+            "8 | def main(argv):",
+            "9 |     run(argv)"
+        ])
     );
     assert!(done["report"].as_str().unwrap().len() + done["changed"].to_string().len() < 1_000);
     // Resending the identical call replays the recorded result and writes nothing.
