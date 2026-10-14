@@ -76,9 +76,11 @@ entry has a `description`, a `server_name`, an `mcp_server` (`command`, `args`,
 `env`), the `edit_tools` that count as edit calls (required), the
 `required_tools` that must be listed at init, an optional `append_system_prompt`, and
 `disallowed_tools` (default: the four native edit tools). In `command`, `args`,
-and `env`, `{repo}` becomes the run's temporary repository and
+and `env`, `{repo}` becomes the run's temporary repository,
 `{third_party_dir}` the install directory (`third_party/install`, or
-`--third-party-dir DIR`). Tool names are `mcp__<server_name>__<tool>`.
+`--third-party-dir DIR`), `{venv_bin}` the install's virtual-environment
+programs (`venv/bin`, or `venv/Scripts` on Windows), and `{exe}` `.exe` on
+Windows and nothing elsewhere. Tool names are `mcp__<server_name>__<tool>`.
 
 Each run writes the substituted server to `<run>/mcp.json` and passes
 `--mcp-config` without `--strict-mcp-config`. With a permission mode other than
@@ -148,9 +150,11 @@ text the model had already changed is a warning, since its bytes then fail anywa
 ## Setup
 
 1. Install Git and Python 3.10 or newer. Claude Code must be 2.1.139 or newer;
-   the flags were verified against 2.1.282, and `--disallowedTools`,
+   the flags were verified against 2.1.282, `--disallowedTools`,
    `--append-system-prompt`, and `--mcp-config` (used by the newer arms)
-   against 2.1.292. `--preflight` checks the flags each selected arm needs.
+   against 2.1.292, and every arm's preflight against 2.1.294, the build of the
+   rounds in `docs/performance.md`. `--preflight` checks the flags each selected
+   arm needs.
 2. Build the runtime from the repository root:
    `cargo build --locked --release`. The harness stages a copy of
    `plugin/claude-code` with the executables in its `runtime/` directory
@@ -254,14 +258,45 @@ python3 eval/run_eval.py --model sonnet --reps 1 --max-total-usd 5
 python3 eval/run_eval.py --arm all --model sonnet --reps 5 --jobs 4 --max-total-usd 60
 ```
 
-GitHub Actions: add an `ANTHROPIC_API_KEY` repository secret (a dedicated key
-with a spend limit), or `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`, then
-run the manual `Eval` workflow (`.github/workflows/eval.yml`). It builds the
-runtime on `ubuntu-24.04` or `windows-2025`, installs the pinned Claude Code,
-runs the preflight, then evaluates with the chosen model, repetitions, spend
-limit, and tasks. The runner is a fresh VM, so `bypassPermissions` is contained.
-The job summary shows `summary.md`; the `eval-<runner>-<run id>` artifact holds
-the full results, with the secret's value redacted from every file.
+### GitHub Actions
+
+Add an `ANTHROPIC_API_KEY` repository secret (a dedicated key with a spend
+limit), or `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`, then run the
+manual `Eval` workflow (`.github/workflows/eval.yml`) from the Actions tab, or
+with `gh workflow run eval.yml -f runner=windows-2025 -f arms=all -f reps=3`.
+
+| Input | Default | Meaning |
+| --- | --- | --- |
+| `runner` | `ubuntu-24.04` | `ubuntu-24.04`, `windows-2025`, or `both`, which runs the same round on each at once |
+| `arms` | empty | Space-separated arms; empty runs the three default arms, `all` every arm |
+| `model` | `sonnet` | `--model` for every arm |
+| `reps` | 1 | `--reps` |
+| `jobs` | 4 | `--jobs` on each runner |
+| `max-total-usd` | 5 | `--max-total-usd` on each runner |
+| `tasks` | empty | Space-separated tasks; empty runs every task |
+| `preflight-only` | false | Set up and check the runner and arms, but start no model session |
+
+Each runner builds the runtime, sets up Node.js 24 and Python 3.13, installs
+Claude Code 2.1.294 (the build of the rounds in `docs/performance.md`) and runs
+its native executable rather than npm's `claude.cmd`, installs the third-party
+servers when an arm needs them, and runs the preflight before any paid session.
+The harness starts from PowerShell, so sessions on Windows do not inherit Git
+Bash's environment, and its temporary repositories go under the runner's temp
+directory (`--work-dir`), since a Windows runner's system temp directory is the
+short path `C:\Users\RUNNER~1\...`, which no user sees. On Windows the workflow
+also names Git Bash for Claude Code (`CLAUDE_CODE_GIT_BASH_PATH`) and makes
+`python3` run Python, since the `shell-python` arm's prompt names it.
+
+The evaluation step has 330 minutes; one that reaches the limit still
+summarizes, redacts, and uploads the runs that finished. A round of every arm
+(23 tasks × 10 arms × 3 repetitions, 690 sessions) may not fit: split it into
+dispatches by `tasks` and pool their results with `stats.py`. No Windows round
+has run yet, so start one with `preflight-only`, then one task at `reps` 1.
+The runner is a fresh VM, so `bypassPermissions` is contained. The job summary
+shows `summary.md`; the `eval-<runner>-<run id>` artifact holds the full
+results, with the secret's value redacted from every file.
+
+### Options
 
 Narrow a run with repeatable `--task NAME` and `--arm NAME`. Pin `--model` so
 every arm uses the same model. `--jobs N` runs N sessions at once (default 1);
@@ -293,12 +328,31 @@ login needs). Run `--help` for the full list.
 - The harness finds `claude` with `shutil.which` (`claude.exe` from the native
   installer, or npm's `claude.cmd`) and never uses a shell. The prompt goes to
   stdin, so newlines, quotes, and backslashes never pass through `cmd.exe`.
-  Prefer `claude.exe`; with `claude.cmd`, avoid `&`, `%`, and `^` in the
-  checkout and temp paths.
+  npm's `claude.cmd` would pass every argument through `cmd.exe`, so when
+  `PATH` finds it, the harness runs the native `claude.exe` that recent npm
+  packages hold beside it, at `node_modules\@anthropic-ai\claude-code\bin`;
+  with an older package it keeps `claude.cmd`, and then `&`, `%`, and `^` must
+  stay out of the checkout and temp paths. `--claude PATH` is used as given.
 - Claude Code needs Git for Windows (Git Bash) and may also offer a
   PowerShell tool. The guard covers both by default (`--guard-matcher Bash`
   limits it to Bash), and the metrics count PowerShell writes
-  (`powershell_write`).
+  (`powershell_write`). Set `CLAUDE_CODE_GIT_BASH_PATH` when another
+  `bash.exe`, such as WSL's, comes first on `PATH`.
+- Start the harness from PowerShell or `cmd.exe`, where Windows users usually run
+  Claude Code. Started from Git Bash, every session inherits Git Bash's
+  environment, such as `MSYSTEM` and a `PATH` that puts Git's Unix tools ahead
+  of Windows' own.
+- The `shell-python` arm's prompt names `python3`, which a Windows install of
+  Python lacks or answers with the Microsoft Store's placeholder, so that arm's
+  first command would fail for a reason unrelated to editing. The workflow
+  copies `python.exe` to `python3.exe` beside it.
+- When `TEMP` is an 8.3 short path (`C:\Users\RUNNER~1\...` on GitHub's
+  runners), pass `--work-dir` so sessions see the long paths users see.
+- Install the third-party servers from Git Bash:
+  `bash eval/third_party/setup.sh`. The arms start Node servers as
+  `node <entry script>` and the Python one from `venv\Scripts`, since Claude
+  Code starts a server without a shell and cannot run npm's extensionless
+  `.bin` scripts there.
 - `.gitattributes` marks `eval/tasks/**` as `-text`, so checkouts keep CRLF and
   LF bytes even with `core.autocrlf=true`. Each temporary repository also sets
   `core.autocrlf=false`.
