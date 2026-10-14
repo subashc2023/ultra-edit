@@ -326,3 +326,29 @@ arms with the same settings, 3 repetitions each:
   anchor had moved to line 23. `expect` refused the batch, the message named
   line 23, and the next call committed. The other Ultra Edit miss was an `old`
   that also matched inside `WEBHOOK_RETRY_LIMIT`.
+
+## Pooled failure rates
+
+The README's failure rates add up the four Sonnet rounds above (65 runs per
+Claude Code arm) and the Haiku round (46). Intervals are Wilson 95%, as
+`eval/stats.py` computes them, and p-values come from a two-sided Fisher's
+exact test. Costs are not pooled: the rounds ran different builds of the
+plugin, so each cost ratio stays with its round.
+
+| Arm | Exact, Sonnet | Exact, Haiku | First try, Sonnet | First try, Haiku |
+| --- | --- | --- | --- | --- |
+| `native` | 64/65 (92-100%) | 46/46 (92-100%) | 58/65 (79-95%) | 43/46 (82-98%) |
+| `native-guard` | 59/65 (81-96%) | 44/46 (85-99%) | 26/65 (29-52%) | 28/46 (46-74%) |
+| `ultra-edit` | 65/65 (94-100%) | 46/46 (92-100%) | 58/65 (79-95%) | 36/46 (64-88%) |
+| `ultra-edit-only` | 64/65 (92-100%) | 46/46 (92-100%) | 52/65 (69-88%) | 39/46 (72-92%) |
+
+- Over both models, `ultra-edit` was exact in 111 of 111 runs (97-100%),
+  `native` in 110, and `native-guard` in 103. `ultra-edit` against
+  `native-guard` gives p = 0.007; Sonnet alone, 0 of 65 wrong against 6, gives
+  p = 0.028, and the eight intent-level tasks alone, 0 of 20 against 5,
+  p = 0.047.
+- On the first try, `ultra-edit` and `native` tie on Sonnet at 58 of 65. On
+  Haiku `native` leads, 43 of 46 against 36, at p = 0.07.
+- The shell and third-party arms ran the exact-text and stale-file tasks, 45
+  runs each: `mcp-filesystem` was exact in 33 (59-84%), `mcp-text-editor` in
+  41 (79-96%), and every other arm in all 45 (92-100%).

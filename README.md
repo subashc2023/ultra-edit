@@ -10,12 +10,24 @@ Claude often edits files through Bash heredocs, `sed -i`, and inline Python
 instead of its Edit tool, and auto mode's system prompt encourages it. On
 Windows, the Bash tool has been observed dropping backslashes, `<`, `>`, and
 `..` from command payloads before the shell sees them, so those edits corrupt
-files no matter how they are quoted.
+files no matter how they are quoted. Claude Code's tracker has reports of
+backslashes halved inside quoted heredocs
+([anthropics/claude-code#89392](https://github.com/anthropics/claude-code/issues/89392))
+and of commands cut off near 8,000 characters
+([anthropics/claude-code#93618](https://github.com/anthropics/claude-code/issues/93618)).
 
 Ultra Edit gives Claude an edit tool that never touches a shell. Changes travel
 as MCP JSON to a native Rust engine, are checked against the files' current
 bytes, and land all together or not at all. A hook blocks shell commands that
 write file content into the project.
+
+Every model-level benchmark so far ran on Linux, where native Claude Code is as
+accurate and on most tasks slightly cheaper, mostly because it writes through
+the shell.
+Ultra Edit pays off where that route is unsafe or unwanted: with shell writes
+blocked, it was the cheapest route that stayed exact, and unlike two of the
+three MCP edit servers tested, it never changed bytes outside the requested
+edits. See [Benchmarks](#benchmarks).
 
 ## Features
 
@@ -127,23 +139,108 @@ Setting it inside a shell command has no effect.
 
 ## Benchmarks
 
-Measured with the [evaluation harness](eval/README.md) on Sonnet, Claude Code
-2.1.294, on Linux. Cost is the geometric mean of per-task cost ratios against
-native Claude Code.
+The [evaluation harness](eval/README.md) runs each task in a fresh, isolated
+headless Claude Code session and scores the exact final bytes of every file.
+Its 23 tasks are small repositories of 1 to 10 files: 14 state the exact text
+to change, 8 describe the change and leave finding the sites to the model, and
+in one another writer edits a file mid-session. Every round ran on Linux with
+Claude Code 2.1.294; Sonnet ran each task 3 times per route and Haiku twice.
+Cost is the geometric mean of per-task cost ratios against native Claude Code.
 
 | Task set | Ultra Edit | Native | Native, shell writes blocked |
 | --- | --- | --- | --- |
-| 14 tasks with the exact text given | 42/42 correct, 1.06x | 42/42, 1.00x | 41/42, 1.58x |
-| 5 intent-level tasks (find the sites) | 11/11 correct, 1.22x | 11/11, 1.00x | 7/11, 1.52x |
-| Another writer changes a file mid-edit | 3/3 correct, 0.71x | 3/3, 1.00x | 3/3, 0.88x |
+| 14 tasks with the exact text given | 42/42 exact, 1.06x | 42/42, 1.00x | 41/42, 1.58x |
+| 3 intent-level tasks (find the sites) | 9/9 exact, 1.03x | 8/9, 1.00x | 8/9, 1.15x |
+| 5 more intent-level tasks | 11/11 exact, 1.22x | 11/11, 1.00x | 7/11, 1.52x |
+| Another writer changes a file mid-edit | 3/3 exact, 0.71x | 3/3, 1.00x | 3/3, 0.88x |
+| All 23 tasks on Haiku | 46/46 exact, 1.09x | 46/46, 1.00x | 44/46, 1.21x |
 
-Native Claude Code is as accurate on Linux, mostly because it writes through the
-shell (30 of 42 runs on the first set). With shell writes blocked, Ultra Edit is
-cheaper and more reliable than native Edit alone. Two of three third-party MCP
-edit servers reported success while writing wrong bytes, by converting CRLF to
-LF or adding a final newline. Windows runs, where shell writes are expected to
-fail, are still to come. See [all results](docs/performance.md#model-level-results),
-including Haiku, and the engine's [timings](docs/performance.md).
+### Failure rates
+
+Pooled over every round:
+
+| | Ultra Edit | Native | Native, shell writes blocked |
+| --- | --- | --- | --- |
+| Wrong final bytes, Sonnet (65 runs each) | 0 | 1 | 6 |
+| Wrong final bytes, Haiku (46 runs each) | 0 | 0 | 2 |
+| Not right on the first try, Sonnet | 7 (11%) | 7 (11%) | 39 (60%) |
+| Not right on the first try, Haiku | 10 (22%) | 3 (7%) | 18 (39%) |
+
+A run is not right on the first try if it ended wrong or any edit call on the
+way failed: a refused Ultra Edit call, an Edit error, or a blocked shell write.
+No wrong runs in 111 puts Ultra Edit's rate below 3.3% (95% Wilson interval),
+and the gap to native with shell writes blocked, 8 wrong in 111, is significant
+(Fisher's exact test, p = 0.007). Native's first-try lead on Haiku is not
+(p = 0.07).
+
+### How each route failed
+
+- **Ultra Edit** checks the whole batch before writing, so a missing,
+  ambiguous, or stale target is refused with nothing changed. The common
+  refusals were text typed differently from the file (a no-break space typed
+  as a space; the refusal quotes the near match), a guard on a weak line such
+  as a blank line or a fence, a line number that a concurrent change had moved,
+  and JSON that Claude Code could not parse (3 of 92 Haiku runs; 2 of about 490
+  Sonnet runs, earlier rounds included). Of 222 runs with the plugin, with
+  native edit tools available or disabled, one committed a wrong result: an
+  insertion that repeated the line it followed, which the server now refuses.
+- **Native Edit with shell writes blocked:** on the exact-text tasks the model
+  tried a shell write in 26 of 42 runs, all blocked, which accounts for nearly
+  all of its first-try misses there. Five of its eight wrong results were one
+  slip that Edit wrote as given: an `old_string` ending in a space whose
+  `new_string` dropped it, joining two CSS selectors. Ultra Edit writes such
+  text too, but warns and quotes the joined line.
+- **Third-party MCP edit servers**, on the exact-text tasks: two of three wrote
+  wrong bytes while reporting success, one rewriting CRLF files as LF (12 of 42
+  runs) and the other adding a final newline to a file without one (3 of 42).
+  The third was exact in every run, at 1.81x native's cost.
+- **Shell edits:** native Claude Code wrote through the shell in 30 of 42
+  exact-text runs. Held to one method, `sed`, Python, and `git apply` were exact
+  in every run; on the exact-text tasks Python was the cheapest route measured,
+  at 0.85x native, and `git apply` missed its first try in 16 of 42.
+- **A file changed mid-edit:** every route kept both writers' changes. Native
+  Edit refused twice per run as modified since read and re-read the file (4.0
+  Reads per run, against 2.3-2.7 for Ultra Edit); Ultra Edit's `expect` caught
+  the one stale line number.
+
+### Context and cost
+
+- **Fixed overhead:** about 2.0k tokens on every API call, mostly the session
+  card (1.9 KB) and the `ultra_edit` schema (2.2 KB), which loads up front so
+  an edit needs no `ToolSearch` round trip. The prompt cache serves both after
+  the first call, and the snapshot and recovery tools stay deferred until used.
+- **Fewer, larger calls:** on Sonnet's exact-text tasks, Ultra Edit runs took
+  0.75x native's turns and 0.72x its tool calls; on Haiku, across all tasks,
+  0.54x and 0.49x, with 0.91x the context tokens but 1.16x the output tokens.
+  Each change restates its text: a 29-site CSS rename was 3.1k output tokens as
+  one `ultra_edit` call and 0.8k as native's one `perl` regex. In the 1.22x
+  intent-level round, the two renames and a function move, after which the
+  model re-checked its batch, cost more; the other two tasks cost the same as
+  native.
+- **No Read before a known edit:** when the prompt or earlier output gives the
+  exact text, the card has Claude send an `old` edit without reading the file,
+  since a miss writes nothing and quotes the closest match. That cut Reads from
+  2.5 to 1.3 per run (native: 1.4) and cost from 1.20x to 1.06x native.
+- **No re-read after an edit:** after a multi-hunk batch, the model ran
+  `git diff` or Read again in about half the Ultra Edit runs, against 2 of 12
+  native runs. A committed call now returns the changed lines with their new
+  numbers instead; the rounds above predate it.
+- **Steadier cost:** on the exact-text tasks, cost varied about half as much
+  across repetitions as native's (mean coefficient of variation 0.05-0.06,
+  against 0.10).
+
+### Not yet measured
+
+- Windows, where the shell route is expected to fail, and Opus.
+- Large repositories and long sessions, including compaction. The fixtures are
+  1 to 10 files, most under 200 lines.
+- Permission prompts, other plugins, and `CLAUDE.md` files: runs use isolated
+  settings and `bypassPermissions`.
+
+The exact-text prompts let a blind `sed` or Python substitution succeed, which
+favors the shell routes. The [per-round results](docs/performance.md#model-level-results)
+cover all ten routes, and the [engine timings](docs/performance.md) are measured
+separately.
 
 ## Compared with native Edit
 
@@ -164,6 +261,13 @@ What you give up:
 - **IDE diff review** in VS Code and JetBrains shows native edits only.
 - **Per-path Edit permission rules** such as `Edit(secrets/**)` do not apply.
   Edits are confined to the project root and use MCP tool permissions.
+- **About 2.0k tokens of context** on every API call, mostly served from the
+  prompt cache; see [context and cost](#context-and-cost).
+- **A `.ultra-edit/` directory** in the project keeps snapshots, receipts, and
+  journals for replay and undo. It ignores itself in Git and stores each large
+  string once; nothing is removed automatically, and
+  [`prune-snapshots`](docs/reference.md#persistence-and-evidence) reclaims old
+  snapshots.
 
 Ultra Edit edits existing UTF-8 files only. File creation, deletion, and
 renames stay with Write and the shell. File writes are sequential, so a
