@@ -5,8 +5,9 @@
       "server_name": "filesystem",
       "mcp_server": {
         "type": "stdio",
-        "command": "{third_party_dir}/node_modules/.bin/mcp-server-filesystem",
+        "command": "node",
         "args": [
+          "{third_party_dir}/node_modules/@modelcontextprotocol/server-filesystem/dist/index.js",
           "{repo}"
         ],
         "env": {}
@@ -31,12 +32,14 @@
       "server_name": "desktop-commander",
       "mcp_server": {
         "type": "stdio",
-        "command": "{third_party_dir}/node_modules/.bin/desktop-commander",
+        "command": "node",
         "args": [
+          "{third_party_dir}/node_modules/@wonderwhy-er/desktop-commander/dist/index.js",
           "--no-onboarding"
         ],
         "env": {
           "HOME": "{third_party_dir}/dc-home",
+          "USERPROFILE": "{third_party_dir}/dc-home",
           "DESKTOP_COMMANDER_DISABLE_TELEMETRY": "1"
         }
       },
@@ -64,7 +67,7 @@
       "server_name": "text-editor",
       "mcp_server": {
         "type": "stdio",
-        "command": "{third_party_dir}/venv/bin/mcp-text-editor",
+        "command": "{third_party_dir}/{venv_bin}/mcp-text-editor{exe}",
         "args": [],
         "env": {}
       },

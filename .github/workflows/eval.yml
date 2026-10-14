@@ -6,45 +6,62 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        description: Runner to evaluate on
+        description: Runner to evaluate on; both runs the same round on each at once
         type: choice
         options:
           - ubuntu-24.04
           - windows-2025
+          - both
         default: ubuntu-24.04
+      arms:
+        description: Space-separated arms; empty runs native, native-guard, and ultra-edit; all runs every arm
+        type: string
+        default: ""
       model:
         description: Model alias or full name, used by every arm
         type: string
         default: sonnet
       reps:
-        description: Repetitions per task and arm (6 tasks x 3 arms each)
+        description: Repetitions per task and arm
         type: number
         default: 1
+      jobs:
+        description: Sessions run at once on each runner
+        type: number
+        default: 4
       max-total-usd:
-        description: Stop starting runs once recorded spend reaches this
+        description: Stop starting runs once a runner's recorded spend reaches this
         type: string
         default: "5"
       tasks:
         description: Space-separated task names; empty runs every task
         type: string
         default: ""
+      preflight-only:
+        description: Set up and check the runner and arms, but start no model session
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
-concurrency:
-  group: eval-${{ github.ref }}-${{ inputs.runner }}
-  cancel-in-progress: false
-
 env:
   CARGO_TERM_COLOR: always
   RUST_VERSION: 1.89.0
-  CLAUDE_CODE_VERSION: 2.1.282
+  # The build of every round in docs/performance.md, so new rounds compare with them.
+  CLAUDE_CODE_VERSION: 2.1.294
 
 jobs:
   eval:
-    name: Evaluate on ${{ inputs.runner }}
-    runs-on: ${{ inputs.runner }}
+    name: Evaluate on ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs.runner == 'both' && '["ubuntu-24.04", "windows-2025"]' || format('["{0}"]', inputs.runner)) }}
+    runs-on: ${{ matrix.runner }}
+    concurrency:
+      group: eval-${{ github.ref }}-${{ matrix.runner }}
+      cancel-in-progress: false
     timeout-minutes: 360
     steps:
       - name: Check out the source
@@ -63,47 +80,116 @@ jobs:
         with:
           node-version: "24"
 
+      # The harness, its hooks, and the shell-python arm's python3 use this Python.
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      # The harness and Claude Code start from PowerShell, as on most Windows machines:
+      # under Git Bash, every session would inherit MSYSTEM and a PATH that puts
+      # Git's Unix tools first.
       - name: Install Claude Code
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          npm install --global "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
-          claude --version | grep --fixed-strings "$CLAUDE_CODE_VERSION"
+          npm install --global "@anthropic-ai/claude-code@$env:CLAUDE_CODE_VERSION"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          # The native executable itself: npm's claude.cmd on Windows would pass every
+          # argument through cmd.exe.
+          $claude = Join-Path (npm root --global) "@anthropic-ai" "claude-code" "bin" "claude.exe"
+          $version = & $claude --version
+          if ("$version" -notlike "*$env:CLAUDE_CODE_VERSION*") {
+            throw "expected Claude Code $env:CLAUDE_CODE_VERSION, got $version"
+          }
+          "CLAUDE_EXE=$claude" >> $env:GITHUB_ENV
+
+      - name: Prepare Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Claude Code's Bash tool runs Git Bash; name it, so no other bash.exe on PATH,
+          # such as WSL's, is used.
+          $bash = Join-Path $env:ProgramFiles "Git\bin\bash.exe"
+          if (-not (Test-Path $bash)) { throw "no Git Bash at $bash" }
+          "CLAUDE_CODE_GIT_BASH_PATH=$bash" >> $env:GITHUB_ENV
+          # The shell-python arm's prompt names python3, which a Windows install of Python
+          # lacks or answers with the Microsoft Store's placeholder.
+          $python = (Get-Command python).Source
+          Copy-Item $python (Join-Path (Split-Path $python) "python3.exe") -Force
+          python3 --version
+
+      - name: Choose the arms
+        id: arms
+        shell: pwsh
+        env:
+          ARMS: ${{ inputs.arms }}
+        run: |
+          $thirdParty = (Get-Content eval/third_party/arms.json -Raw | ConvertFrom-Json).arms.PSObject.Properties.Name
+          $needed = @(-split "$env:ARMS" | Where-Object { $_ -eq "all" -or $_ -in $thirdParty }).Count -gt 0
+          "third-party=$("$needed".ToLower())" >> $env:GITHUB_OUTPUT
+
+      - name: Install the third-party servers
+        if: steps.arms.outputs.third-party == 'true'
+        shell: bash
+        run: bash eval/third_party/setup.sh
 
       - name: Check the harness without a model
-        run: python eval/run_eval.py --preflight
+        shell: pwsh
+        env:
+          ARMS: ${{ inputs.arms }}
+        run: |
+          $arguments = @("--preflight", "--claude", $env:CLAUDE_EXE)
+          foreach ($arm in -split "$env:ARMS" | Where-Object { $_ }) { $arguments += @("--arm", $arm) }
+          python eval/run_eval.py @arguments
 
       - name: Run the evaluation
-        shell: bash
+        if: ${{ !inputs.preflight-only }}
+        shell: pwsh
+        # Leaves time to summarize, redact, and upload what finished.
+        timeout-minutes: 330
         env:
           API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           MODEL: ${{ inputs.model }}
           REPS: ${{ inputs.reps }}
+          JOBS: ${{ inputs.jobs }}
           MAX_TOTAL_USD: ${{ inputs.max-total-usd }}
+          ARMS: ${{ inputs.arms }}
           TASKS: ${{ inputs.tasks }}
         run: |
-          set -euo pipefail
-          if [ -n "$API_KEY" ]; then
-            export ANTHROPIC_API_KEY="$API_KEY"
-          elif [ -n "$OAUTH_TOKEN" ]; then
-            export CLAUDE_CODE_OAUTH_TOKEN="$OAUTH_TOKEN"
-          else
-            echo "::error::Add an ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN repository secret."
+          if ($env:API_KEY) {
+            $env:ANTHROPIC_API_KEY = $env:API_KEY
+          } elseif ($env:OAUTH_TOKEN) {
+            $env:CLAUDE_CODE_OAUTH_TOKEN = $env:OAUTH_TOKEN
+          } else {
+            "::error::Add an ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN repository secret."
             exit 1
-          fi
-          unset API_KEY OAUTH_TOKEN
-          task_args=()
-          for task in $TASKS; do
-            task_args+=(--task "$task")
-          done
-          python eval/run_eval.py \
-            --model "$MODEL" \
-            --reps "$REPS" \
-            --max-total-usd "$MAX_TOTAL_USD" \
-            --out eval-results \
-            --yes \
-            "${task_args[@]}"
+          }
+          Remove-Item Env:API_KEY, Env:OAUTH_TOKEN -ErrorAction SilentlyContinue
+          # Temporary repositories go under the runner's temp directory: on Windows the
+          # system one is the short path C:\Users\RUNNER~1\..., which no user sees.
+          $arguments = @(
+            "--model", $env:MODEL,
+            "--reps", $env:REPS,
+            "--jobs", $env:JOBS,
+            "--max-total-usd", $env:MAX_TOTAL_USD,
+            "--claude", $env:CLAUDE_EXE,
+            "--work-dir", $env:RUNNER_TEMP,
+            "--out", "eval-results",
+            "--yes"
+          )
+          foreach ($arm in -split "$env:ARMS" | Where-Object { $_ }) { $arguments += @("--arm", $arm) }
+          foreach ($task in -split "$env:TASKS" | Where-Object { $_ }) { $arguments += @("--task", $task) }
+          python eval/run_eval.py @arguments
+
+      # A round stopped by the time limit has runs.jsonl but no summary.
+      - name: Summarize the finished runs
+        if: always()
+        shell: pwsh
+        run: |
+          if ((Test-Path eval-results/runs.jsonl) -and -not (Test-Path eval-results/summary.md)) {
+            python eval/run_eval.py --summarize eval-results
+          }
 
       # The model has a shell, so a transcript could echo its environment.
       - name: Redact credentials from the results
@@ -146,7 +232,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: eval-${{ inputs.runner }}-${{ github.run_id }}
+          name: eval-${{ matrix.runner }}-${{ github.run_id }}
           path: eval-results/
           if-no-files-found: ignore
           retention-days: 30

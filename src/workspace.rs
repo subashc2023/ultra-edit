@@ -12,6 +12,10 @@ use crate::storage::{SnapshotPruning, Storage};
 
 const REPORT_LINES: usize = 60;
 const REPORT_CHARS: usize = 6_000;
+/// Bounds on the changed lines a committed edit returns: enough to confirm a
+/// typical batch, while a mass rename stays a small part of the response.
+const CHANGED_LINES: usize = 40;
+const CHANGED_LINE_CHARS: usize = 160;
 
 // Each operation derives request IDs under its own domain, so an edit, repair,
 // and undo key can never coincide.
@@ -72,6 +76,10 @@ pub enum EditResult {
         /// without a new commit attempt.
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         replayed: bool,
+        /// Each committed file's changed lines as they now read; empty on a replay,
+        /// since the files may have changed since.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        changed: Vec<report::ChangedLines>,
     },
 }
 
@@ -685,11 +693,18 @@ impl Workspace {
         if !preparation.ready {
             return Ok(EditResult::Rejected { preparation });
         }
-        let (receipt, replayed) = self.commit_plan(&self.plan(&preparation.reference)?)?;
+        let plan = self.plan(&preparation.reference)?;
+        let (receipt, replayed) = self.commit_plan(&plan)?;
+        let changed = if replayed {
+            Vec::new()
+        } else {
+            report::changed_lines(&plan, &receipt, CHANGED_LINES, CHANGED_LINE_CHARS)
+        };
         Ok(EditResult::Completed {
             report: receipt_report(&receipt, replayed),
             receipt,
             replayed,
+            changed,
         })
     }
 

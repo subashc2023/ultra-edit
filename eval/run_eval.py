@@ -457,7 +457,7 @@ def load_arm_registry(arms_file: Path | None = DEFAULT_THIRD_PARTY_ARMS) -> ArmR
 
 
 def substitute_placeholders(value: Any, replacements: Mapping[str, str]) -> Any:
-    """Replace {repo} and {third_party_dir} in every string of a JSON value."""
+    """Replace each {name} in `replacements` in every string of a JSON value."""
     if isinstance(value, str):
         for key, replacement in replacements.items():
             value = value.replace("{" + key + "}", replacement)
@@ -469,11 +469,24 @@ def substitute_placeholders(value: Any, replacements: Mapping[str, str]) -> Any:
     return value
 
 
-def mcp_config(arm: ArmSpec, repo: Any, third_party_dir: Any) -> dict[str, Any]:
+def third_party_replacements(repo: Any, third_party_dir: Any, windows: bool | None = None) -> dict[str, str]:
+    """The placeholders of an arms.json server: the run's repository, the install
+    directory, and the two names that differ on Windows, where a virtual environment
+    keeps its scripts in Scripts/ and an executable's name ends in .exe."""
+    windows = os.name == "nt" if windows is None else windows
+    return {
+        "repo": str(repo),
+        "third_party_dir": str(third_party_dir),
+        "venv_bin": "venv/Scripts" if windows else "venv/bin",
+        "exe": ".exe" if windows else "",
+    }
+
+
+def mcp_config(arm: ArmSpec, repo: Any, third_party_dir: Any, windows: bool | None = None) -> dict[str, Any]:
     """The --mcp-config document for one run of a third-party arm."""
     if arm.mcp_server is None or arm.server_name is None:
         raise EvalError(f"arm {arm.name} has no MCP server")
-    replacements = {"repo": str(repo), "third_party_dir": str(third_party_dir)}
+    replacements = third_party_replacements(repo, third_party_dir, windows)
     return {"mcpServers": {arm.server_name: substitute_placeholders(dict(arm.mcp_server), replacements)}}
 
 
@@ -1746,11 +1759,18 @@ def run_text(argv: Sequence[str], **options: Any) -> subprocess.CompletedProcess
     )
 
 
-def resolve_claude(explicit: str | None) -> list[str] | None:
+def resolve_claude(explicit: str | None, windows: bool | None = None) -> list[str] | None:
+    """The claude command. On Windows, npm's claude.cmd shim passes every argument
+    through cmd.exe, so the native executable it wraps runs instead when there is one."""
+    windows = os.name == "nt" if windows is None else windows
     candidate = explicit or "claude"
     if os.path.sep in candidate or (os.path.altsep and os.path.altsep in candidate):
         return [candidate] if Path(candidate).exists() else None
     found = shutil.which(candidate)
+    if found and windows and found.lower().endswith(".cmd"):
+        native = Path(found).parent / "node_modules" / "@anthropic-ai" / "claude-code" / "bin" / "claude.exe"
+        if native.is_file():
+            return [str(native)]
     return [found] if found else None
 
 

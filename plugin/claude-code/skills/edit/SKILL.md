@@ -32,8 +32,11 @@ exposed by this host.
   warning means the file changed since that commit; pass a new `request_id` only
   if the change is still needed. A rejected path request is not recorded, so
   resending it after fixing the cause evaluates it again.
-- Confirm `commit: "committed"` before reporting all edits applied. `partial`
-  and `outcome_unknown` require recovery; stop further mutations on uncertainty.
+- Confirm `commit: "committed"` before reporting all edits applied. Its
+  `changed` lists the edited lines as they now read, with their new line
+  numbers; use it to check the result and to address later lines instead of
+  reading or diffing the file again. `partial` and `outcome_unknown` require
+  recovery; stop further mutations on uncertainty.
   Current bytes matching the candidate do not prove historical success.
 
 ## Normal flow

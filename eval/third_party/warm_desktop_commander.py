@@ -4,36 +4,54 @@
     python3 eval/third_party/warm_desktop_commander.py INSTALL_DIR
 
 Desktop Commander checks for Chrome after the MCP handshake and downloads it in
-the background when none is found. This script performs the handshake with the
-arm's environment, then waits until the download finishes or ten minutes pass.
+the background when none is found. This script starts the server as the
+desktop-commander arm in arms.json does, with its environment, performs the
+handshake, then waits until the download finishes or ten minutes pass.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import queue
+import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from run_eval import DEFAULT_THIRD_PARTY_ARMS, load_arm_registry, mcp_config  # noqa: E402
+
 TIMEOUT_S = 600
+ARM = "desktop-commander"
 
 
 def main() -> int:
     install = Path(sys.argv[1]).resolve()
-    executable = install / "node_modules" / ".bin" / "desktop-commander"
-    home = install / "dc-home"
-    env = {**os.environ, "HOME": str(home), "DESKTOP_COMMANDER_DISABLE_TELEMETRY": "1"}
+    arm = load_arm_registry(DEFAULT_THIRD_PARTY_ARMS).arms[ARM]
+    server = mcp_config(arm, install, install)["mcpServers"][arm.server_name]
+    command = shutil.which(server["command"]) or server["command"]
     process = subprocess.Popen(
-        [str(executable)],
+        [command, *server.get("args", [])],
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
-        env=env,
+        env={**os.environ, **server.get("env", {})},
         cwd=str(install),
     )
     assert process.stdin is not None and process.stderr is not None
+    # A thread reads stderr, since a pipe cannot be made non-blocking on every platform.
+    chunks: queue.Queue[bytes] = queue.Queue()
+    stderr = process.stderr
+
+    def pump() -> None:
+        for line in iter(stderr.readline, b""):
+            chunks.put(line)
+
+    threading.Thread(target=pump, daemon=True).start()
     handshake = [
         {
             "jsonrpc": "2.0",
@@ -53,10 +71,11 @@ def main() -> int:
     deadline = time.monotonic() + TIMEOUT_S
     status = "timed out"
     log = b""
-    os.set_blocking(process.stderr.fileno(), False)
     while time.monotonic() < deadline:
-        chunk = process.stderr.read() or b""
-        log += chunk
+        try:
+            log += chunks.get(timeout=1)
+        except queue.Empty:
+            pass
         if b"Chrome download complete" in log:
             status = "downloaded"
             break
@@ -67,7 +86,6 @@ def main() -> int:
         if b"Downloading Chrome" not in log and time.monotonic() > deadline - TIMEOUT_S + 20:
             status = "already available"
             break
-        time.sleep(1)
     process.terminate()
     try:
         process.wait(timeout=10)

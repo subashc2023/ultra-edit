@@ -798,6 +798,23 @@ class CommandTests(unittest.TestCase):
         with self.assertRaises(evaluation.EvalError):
             evaluation.build_command(["claude"], arm="ultra-edit", settings_path="s.json")
 
+    def test_npm_shim_resolves_to_the_native_executable_on_windows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = Path(directory)
+            shim = prefix / "claude.cmd"
+            shim.write_text("@echo off\n", encoding="utf-8")
+            native = prefix / "node_modules" / "@anthropic-ai" / "claude-code" / "bin" / "claude.exe"
+            native.parent.mkdir(parents=True)
+            native.write_bytes(b"MZ")
+            with mock.patch.object(evaluation.shutil, "which", return_value=str(shim)):
+                self.assertEqual(evaluation.resolve_claude(None, windows=True), [str(native)])
+                # Elsewhere, or with an explicit path, the command is used as given.
+                self.assertEqual(evaluation.resolve_claude(None, windows=False), [str(shim)])
+                self.assertEqual(evaluation.resolve_claude(str(shim), windows=True), [str(shim)])
+                # An older package without the native executable keeps the shim.
+                native.unlink()
+                self.assertEqual(evaluation.resolve_claude(None, windows=True), [str(shim)])
+
     def test_version_and_required_flags(self):
         self.assertEqual(evaluation.parse_version("2.1.282 (Claude Code)"), (2, 1, 282))
         self.assertIsNone(evaluation.parse_version("claude"))
@@ -1723,6 +1740,44 @@ class ArmRegistryTests(unittest.TestCase):
         self.assertEqual(
             evaluation.third_party_arm("x", entry).disallowed_tools, evaluation.NATIVE_EDIT_TOOL_NAMES
         )
+
+    def test_third_party_placeholders_follow_the_platform(self):
+        arm = evaluation.third_party_arm(
+            "py-test",
+            third_party_entry(
+                mcp_server={"command": "{third_party_dir}/{venv_bin}/server{exe}", "args": ["{repo}"]}
+            ),
+        )
+        for windows, command in (
+            (False, "/opt/tp/venv/bin/server"),
+            (True, "/opt/tp/venv/Scripts/server.exe"),
+        ):
+            server = evaluation.mcp_config(arm, "/tmp/run/repo", "/opt/tp", windows=windows)["mcpServers"]["fs"]
+            self.assertEqual(server, {"command": command, "args": ["/tmp/run/repo"]})
+
+    def test_shipped_third_party_arms_start_on_every_platform(self):
+        """Claude Code starts a server's command without a shell, so on Windows it cannot
+        run an extensionless npm .bin script, and a virtual environment has no bin/."""
+        registry = evaluation.load_arm_registry(evaluation.DEFAULT_THIRD_PARTY_ARMS)
+        self.assertEqual(registry.unavailable, {})
+        install = "C:/tp"
+        for arm in registry.arms.values():
+            if not arm.third_party:
+                continue
+            server = evaluation.mcp_config(arm, "C:/repo", install, windows=True)["mcpServers"][arm.server_name]
+            command = server["command"]
+            with self.subTest(arm=arm.name):
+                if command.startswith(install):
+                    self.assertTrue(command.endswith(".exe"), command)
+                    self.assertNotIn("/bin/", command)
+                else:
+                    self.assertNotIn("/", command)  # a program found on PATH, such as node
+                for item in server.get("args", []):
+                    self.assertNotIn("/.bin/", item)
+                env = server.get("env", {})
+                if "HOME" in env:
+                    # Node finds the home directory through USERPROFILE on Windows.
+                    self.assertEqual(env.get("USERPROFILE"), env["HOME"])
 
     def test_third_party_arm_names_and_edit_tools_are_validated(self):
         path = write_arms_file(

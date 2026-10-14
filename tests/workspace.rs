@@ -57,6 +57,7 @@ fn outcome(result: EditResult) -> (Receipt, bool, String) {
             receipt,
             replayed,
             report,
+            ..
         } => (receipt, replayed, report),
         other => panic!("Expected a receipt, got {other:?}"),
     }
