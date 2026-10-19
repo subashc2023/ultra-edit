@@ -367,7 +367,7 @@ fn a_line_added_inside_a_range_since_the_read_is_caught_at_its_end() {
 }
 
 #[test]
-fn line_targets_moved_since_the_read_commit_where_their_expect_is() {
+fn stale_line_numbers_commit_where_their_text_is() {
     let backoff = "RETRY_BACKOFF_S = 0.5  # doubled after each failed attempt";
     let timeout = "READ_TIMEOUT_S = 10.0  # waiting for the first byte";
     let text = format!("RETRY_LIMIT = 3  # attempts per request\n{backoff}\n\n{timeout}\n");
@@ -404,6 +404,15 @@ fn line_targets_moved_since_the_read_commit_where_their_expect_is() {
                 },
                 text: "READ_TIMEOUT_S = 20.0  # waiting for the first byte".into(),
             },
+            Change {
+                id: String::new(),
+                target: Target::Exact {
+                    old: "RETRY_LIMIT = 3".into(),
+                    scope: None,
+                    lines: Some([1, 1]),
+                },
+                text: "RETRY_LIMIT = 5".into(),
+            },
         ],
     )]);
     let (done, replayed) = receipt(workspace.edit(stale.clone()).unwrap());
@@ -412,7 +421,7 @@ fn line_targets_moved_since_the_read_commit_where_their_expect_is() {
     assert_eq!(
         read(&dir, "settings.py"),
         format!(
-            "DEFAULT_REGION = \"eu-west-1\"\n\nRETRY_LIMIT = 3  # attempts per request\n{backoff}\nRETRY_JITTER = True\n\nREAD_TIMEOUT_S = 20.0  # waiting for the first byte\n"
+            "DEFAULT_REGION = \"eu-west-1\"\n\nRETRY_LIMIT = 5  # attempts per request\n{backoff}\nRETRY_JITTER = True\n\nREAD_TIMEOUT_S = 20.0  # waiting for the first byte\n"
         )
     );
     let moved: Vec<&str> = done
@@ -421,7 +430,7 @@ fn line_targets_moved_since_the_read_commit_where_their_expect_is() {
         .filter(|warning| warning.code == "LINES_MOVED")
         .map(|warning| warning.message.as_str())
         .collect();
-    assert_eq!(moved.len(), 2, "{:?}", done.warnings);
+    assert_eq!(moved.len(), 3, "{:?}", done.warnings);
     assert!(
         moved[0]
             .starts_with("Change 1.1: after:2 did not hold expect, which holds only at after:4"),
@@ -434,6 +443,12 @@ fn line_targets_moved_since_the_read_commit_where_their_expect_is() {
         ),
         "{}",
         moved[1]
+    );
+    assert!(
+        moved[2]
+            .starts_with("Change 1.3: in:[1,1] did not hold `old`, which occurs only at line 3"),
+        "{}",
+        moved[2]
     );
     // The stored plan names the lines it wrote, which its commit checked.
     let Evidence::Plan(plan) = workspace.evidence(&done.plan_id).unwrap() else {
@@ -449,7 +464,11 @@ fn line_targets_moved_since_the_read_commit_where_their_expect_is() {
             targets[..],
             [
                 Target::Insert { after: 4, .. },
-                Target::Lines { lines: [6, 6], .. }
+                Target::Lines { lines: [6, 6], .. },
+                Target::Exact {
+                    lines: Some([3, 3]),
+                    ..
+                }
             ]
         ),
         "{targets:?}"

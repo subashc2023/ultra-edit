@@ -629,7 +629,8 @@ pub fn compile_with(
         .collect();
     warnings.append(&mut edge_warnings);
     // The plan records the lines each moved target applies to, so a stored
-    // plan's line targets still derive its replacements.
+    // plan's line targets still derive its replacements and its `in` lines hold
+    // its matches.
     let mut request = request.clone();
     for change in request.files.iter_mut().flat_map(|file| &mut file.changes) {
         if let Some(target) = moves.remove(change.id.as_str()) {
@@ -982,8 +983,8 @@ fn longest_blank_run(text: &str) -> usize {
         .1
 }
 
-/// Names the lines each moved line target gave and the lines it applied to. A
-/// stale read or a miscount put them there, so other numbers from it may be off.
+/// Names the lines each moved target gave and the lines it applied to. A stale
+/// read or a miscount put them there, so other numbers from it may be off.
 fn warn_moved(path: &str, moved: &[Moved], warnings: &mut Vec<Diagnostic>) {
     let place = |target: &Target| match target {
         Target::Lines {
@@ -991,20 +992,36 @@ fn warn_moved(path: &str, moved: &[Moved], warnings: &mut Vec<Diagnostic>) {
             ..
         } => format!("lines:[{first},{last}]"),
         Target::Insert { after, .. } => format!("after:{after}"),
+        Target::Exact {
+            lines: Some([first, last]),
+            ..
+        } => format!("in:[{first},{last}]"),
         Target::Exact { .. } | Target::All { .. } | Target::Span { .. } => String::new(),
     };
     for moved in moved {
         let id: String = moved.change.id.chars().take(QUOTED_ID_CHARS).collect();
-        warnings.push(at(
-            Some(path),
-            Some(moved.change),
-            "LINES_MOVED",
-            format!(
-                "Change {id}: {} did not hold expect, which holds only at {}, so the change applied there; reread the file before more line edits",
-                place(&moved.change.target),
+        let given = place(&moved.change.target);
+        let message = match moved.target {
+            // An `old` names the lines its match spans.
+            Target::Exact {
+                lines: Some([first, last]),
+                ..
+            } => {
+                let used = if first == last {
+                    format!("line {first}")
+                } else {
+                    format!("lines {first}-{last}")
+                };
+                format!(
+                    "Change {id}: {given} did not hold `old`, which occurs only at {used}, so the change applied there; reread the file before more line edits"
+                )
+            }
+            _ => format!(
+                "Change {id}: {given} did not hold expect, which holds only at {}, so the change applied there; reread the file before more line edits",
                 place(&moved.target)
             ),
-        ));
+        };
+        warnings.push(at(Some(path), Some(moved.change), "LINES_MOVED", message));
     }
 }
 
@@ -1363,13 +1380,13 @@ struct FileContext<'a> {
     /// whitespace, and its visible characters, so the run search reads a line
     /// once however many insertions compare it.
     trimmed: RefCell<HashMap<usize, (usize, usize)>>,
-    /// Line targets applied where their guard holds instead of at their stated
-    /// lines, in request order.
+    /// Targets applied where their guard or `old` holds instead of at their
+    /// stated lines, in request order.
     moved: Vec<Moved<'a>>,
 }
 
-/// A line target whose stated lines do not hold its guard, applied at the one
-/// other place where the guard holds.
+/// A line target whose stated lines do not hold its guard, or an `old` whose
+/// `in` lines hold no match, applied at the one other place where it holds.
 struct Moved<'a> {
     change: &'a Change,
     /// The target with the lines it applies to, which the plan records.
@@ -1555,7 +1572,7 @@ fn conflicts(left: &Replacement, right: &Replacement) -> bool {
     }
 }
 
-/// Refuses each moved line target whose replacement conflicts with another
+/// Refuses each moved target whose replacement conflicts with another
 /// change's, as its stated lines are refused: the other changes were placed
 /// without knowing of the move. Each moved target is compared with every
 /// replacement, at most `MAX_CHANGES` times `MAX_REPLACEMENTS` comparisons.
@@ -2104,7 +2121,8 @@ fn restatement_message(
 
 /// Resolves an `exact` or `all` target by searching its scope for `old`, adapted
 /// like `text` to the base's line endings, and for an `exact` target found
-/// nowhere as written, to the base's Unicode spaces.
+/// nowhere as written, to the base's Unicode spaces. An `exact` target whose `in`
+/// lines hold no match applies where [`moved_old`] places it, if anywhere.
 fn resolve_exact<'a>(
     context: &mut FileContext<'a>,
     change: &'a Change,
@@ -2267,6 +2285,28 @@ fn resolve_exact<'a>(
         diagnostic.expected = Some(expected);
         diagnostic.actual = Some(actual);
         diagnostic.candidates = found;
+        if exact
+            && actual == 0
+            && lines.is_some()
+            && let Some((position, target)) = moved_old(context, change, old)
+        {
+            if !budget.reserve(1, text) {
+                diagnostics.push(resource_limit(base, change));
+                return;
+            }
+            replacements.push(Replacement {
+                start: position,
+                end: position + old.len(),
+                text: text.to_owned(),
+                change_id: change.id.clone(),
+            });
+            context.moved.push(Moved {
+                change,
+                target,
+                refusal: diagnostic,
+            });
+            return;
+        }
         diagnostics.push(diagnostic);
         return;
     }
@@ -2299,6 +2339,43 @@ fn resolve_exact<'a>(
         text: text.to_owned(),
         change_id: change.id.clone(),
     }));
+}
+
+/// Where an `exact` `old` applies when its `in` lines hold no match, as lines
+/// from a stale read or a miscount may not, with the target naming the lines it
+/// applies to: the match an unscoped `old` would take, the only one in the file
+/// or the only whole-word one, cutting no word. Like a moved line target's guard,
+/// `old` needs `MIN_GUARD_CHARS` visible characters, so short text that occurs
+/// once by chance is not taken for the text the lines meant.
+fn moved_old(context: &FileContext, change: &Change, old: &str) -> Option<(usize, Target)> {
+    let text = &context.base.text;
+    if visible(old) < MIN_GUARD_CHARS {
+        return None;
+    }
+    let scan = scan_occurrences(text, old, 0, 1);
+    let position = match scan.overlapping {
+        0 => return None,
+        1 => scan.positions[0],
+        _ => match whole_words(text, 0..text.len(), old, false)?[..] {
+            [position] => position,
+            _ => return None,
+        },
+    };
+    if word_cut(text, position, old.len(), one_line(old)).is_some() {
+        return None;
+    }
+    let lines = context.lines();
+    let first = lines.line_of(position);
+    // A match that starts in a leading BOM is in no line's scope.
+    if position < lines.body(first).start {
+        return None;
+    }
+    let last = lines.line_of(position + old.len() - 1);
+    let mut target = change.target.clone();
+    if let Target::Exact { lines, .. } = &mut target {
+        *lines = Some([first, last]);
+    }
+    Some((position, target))
 }
 
 /// Whether an ASCII space in `old` may stand for one of `ADAPTED_SPACES`: it has

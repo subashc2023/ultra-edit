@@ -270,6 +270,120 @@ fn a_line_target_is_not_moved_by_a_weak_repeated_or_split_guard() {
     );
 }
 
+fn scoped(id: &str, old: &str, lines: [usize; 2], text: &str) -> Change {
+    Change {
+        id: id.into(),
+        target: Target::Exact {
+            old: old.into(),
+            scope: None,
+            lines: Some(lines),
+        },
+        text: text.into(),
+    }
+}
+
+/// An `old` whose `in` lines went stale applies at its one match in the file,
+/// as an unscoped `old` would take it, and the plan records the lines it spans.
+#[test]
+fn an_old_whose_in_lines_moved_applies_at_its_one_match() {
+    // The webhook limit holds `RETRY_LIMIT = 3` inside a longer name.
+    let shifted = format!("{ROUTING}{READ}WEBHOOK_RETRY_LIMIT = 3\n");
+    let base = spanless(&shifted);
+    let changes = vec![
+        scoped("limit", "RETRY_LIMIT = 3", [2, 2], "RETRY_LIMIT = 5"),
+        scoped(
+            "heading",
+            "failed attempt\n\n# Timeouts",
+            [3, 5],
+            "failed attempt\n\n# Timeouts, in seconds",
+        ),
+        scoped(
+            "read",
+            "READ_TIMEOUT_S = 10.0",
+            [7, 7],
+            "READ_TIMEOUT_S = 20.0",
+        ),
+    ];
+    let plan = compile(&request(&base, changes), &bases(&base)).unwrap();
+    assert_eq!(
+        plan.files[0].output,
+        shifted
+            .replace("RETRY_LIMIT = 3  #", "RETRY_LIMIT = 5  #")
+            .replace("# Timeouts\n", "# Timeouts, in seconds\n")
+            .replace("READ_TIMEOUT_S = 10.0", "READ_TIMEOUT_S = 20.0")
+    );
+    let moved: Vec<(&str, &str)> = plan
+        .warnings
+        .iter()
+        .map(|warning| (warning.code.as_str(), warning.message.as_str()))
+        .collect();
+    assert_eq!(
+        moved,
+        [
+            (
+                "LINES_MOVED",
+                "Change limit: in:[2,2] did not hold `old`, which occurs only at line 6, so the change applied there; reread the file before more line edits"
+            ),
+            (
+                "LINES_MOVED",
+                "Change heading: in:[3,5] did not hold `old`, which occurs only at lines 7-9, so the change applied there; reread the file before more line edits"
+            ),
+            (
+                "LINES_MOVED",
+                "Change read: in:[7,7] did not hold `old`, which occurs only at line 11, so the change applied there; reread the file before more line edits"
+            ),
+        ]
+    );
+    let lines: Vec<Option<[usize; 2]>> = plan.request.files[0]
+        .changes
+        .iter()
+        .map(|change| match change.target {
+            Target::Exact { lines, .. } => lines,
+            _ => None,
+        })
+        .collect();
+    assert_eq!(lines, [Some([6, 6]), Some([7, 9]), Some([11, 11])]);
+    // The recorded lines hold each match, so the stored request compiles alike.
+    let again = compile(&plan.request, &bases(&base)).unwrap();
+    assert_eq!(again.files[0].output, plan.files[0].output);
+    assert!(again.warnings.is_empty(), "{:?}", again.warnings);
+}
+
+/// An `old` leaves its `in` lines only for a match nothing else could be: short
+/// text, two whole-word matches, a lone match inside a longer name, a match in a
+/// leading BOM, and a new place another change edits keep the refusal.
+#[test]
+fn an_old_is_not_moved_by_short_repeated_or_partial_text() {
+    for (text, old) in [
+        ("a = 1\nzzzz\n", "a = 1"),
+        (
+            "timeout = 30  # seconds\nzzzz\ntimeout = 30  # seconds\n",
+            "timeout = 30  # seconds",
+        ),
+        ("MAX_RETRY_LIMIT = 3\nzzzz\n", "RETRY_LIMIT = 3"),
+        ("\u{feff}name = 1000\nzzzz\n", "\u{feff}name = 1000"),
+    ] {
+        let error = rejected(&spanless(text), scoped("c", old, [2, 2], "x"));
+        assert_eq!(error.code, "TARGET_NOT_FOUND", "{text:?}: {error:?}");
+    }
+    // Another change edits the new place; it was placed without knowing of the
+    // move, so the stale lines are refused as before, not reported as overlapping.
+    let base = spanless("# header\nalpha = 1  # first setting\nbeta = 2  # second setting\n");
+    let stale = scoped("stale", "alpha = 1  # first", [1, 1], "x");
+    let other = parsed(json!({"id":"other","old":"# first setting","new":"# the first setting"}));
+    let errors = compile(&request(&base, vec![stale, other]), &bases(&base)).unwrap_err();
+    let codes: Vec<(&str, Option<&str>)> = errors
+        .iter()
+        .map(|error| (error.code.as_str(), error.change_id.as_deref()))
+        .collect();
+    assert_eq!(codes, [("TARGET_NOT_FOUND", Some("stale"))]);
+    assert!(
+        errors[0].message.contains("outside it, first at line 2"),
+        "{}",
+        errors[0].message
+    );
+}
+
 /// A moved insertion is judged where it applies: text restating the line it
 /// follows there is refused, naming the moved `after`.
 #[test]

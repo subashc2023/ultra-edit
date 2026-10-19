@@ -233,7 +233,7 @@ forms:
 | --- | --- |
 | `{"old":"text","new":"…"}` | Exactly one occurrence in the original file, not starting or ending inside an ASCII word; when more occur and exactly one of them cuts no word, that one. |
 | `{"old":"text","in":"r5","new":"…"}` | Exactly one occurrence contained in a disclosed span. |
-| `{"old":"text","in":[72,87],"new":"…"}` | Exactly one occurrence contained in lines 72-87, from line 72's start through line 87's terminator. |
+| `{"old":"text","in":[72,87],"new":"…"}` | Exactly one occurrence contained in lines 72-87, from line 72's start through line 87's terminator; with none there, the one occurrence an unrestricted `old` would take, if `old` has at least 8 non-whitespace characters (`LINES_MOVED`). |
 | `{"old":"text","count":3,"new":"…"}` | Exactly 3 non-overlapping, left-to-right occurrences in the whole file, or within `in`, inside words or not; when more occur and exactly 3 of them cut no word, those 3. |
 | `{"span":"r5","new":"…"}` | Replace that span with literal `new`. |
 | `{"span":"r5","expect":"old line","new":"…"}` | Replace only if the selected original bytes equal `expect` exactly. |
@@ -351,6 +351,15 @@ advice too; the whole-word scan stops after 10,000 matches. An ambiguity message
 `in` lines where a whole-word match is the only match in those whole lines, and
 otherwise says to add surrounding text, or that every match is inside a longer
 word; it examines at most 10,000 matches.
+
+An `old` without `count` whose `in` lines hold no occurrence, as lines from a
+stale read or a miscount may not, applies where line targets would move to: the
+one occurrence an unrestricted `old` would take, its only one in the file or
+its only one that cuts no word, when `old` has at least 8 non-whitespace
+characters. A nonblocking `LINES_MOVED` warning names the `in` lines given and
+the lines the occurrence spans, and the stored plan records those as its `in`.
+Shorter text, several such occurrences, a span `in`, and a moved change that
+would conflict with another change in the request stay `TARGET_NOT_FOUND`.
 
 A span ID is a disclosed ID such as `r5`, `selection`, or `m2`, or a line range
 `rA..rB`, never literal source text. A line range is accepted wherever a span ID

@@ -92,7 +92,7 @@ alias). A `path` file supports `old`, `count`, `in` with lines, `lines`, and
 | Intent | Change | Requirement |
 | --- | --- | --- |
 | Replace unique exact text anywhere in the file | `{"old":"a","new":"b"}` | Exactly one occurrence in the entire original file, on word boundaries; matches inside longer names do not count when exactly one is whole (`WHOLE_WORDS_ONLY`). |
-| Replace unique exact text within some lines | `{"old":"a","new":"b","in":[72,87]}` | Exactly one occurrence wholly inside lines 72-87. |
+| Replace unique exact text within some lines | `{"old":"a","new":"b","in":[72,87]}` | Exactly one occurrence wholly inside lines 72-87; with none there, the one an unrestricted `old` would take, if `old` has 8 or more visible characters (`LINES_MOVED`). |
 | Replace unique exact text inside an inspected span | `{"old":"a","new":"b","in":"selection"}` | The span belongs to this base; one occurrence inside it. |
 | Replace every occurrence | `{"old":"a","new":"b","count":3}` | Exactly 3 non-overlapping occurrences in the file, or in `in`, inside words or not; or, when more occur, exactly the 3 that cut no word, leaving those inside longer names (`WHOLE_WORDS_ONLY`). |
 | Replace or delete whole lines | `{"lines":[40,42],"expect":["fn load(cfg) {","}"],"new":"..."}` | Lines exist; `expect` matches their first and last lines. `""` deletes them. |
@@ -136,8 +136,12 @@ expected lines occur elsewhere the message gives the current range. A line past
 the end is `LINE_OUT_OF_RANGE`. On `span`, `expect` is byte-exact.
 
 Unrestricted `old` searches the complete original file even after a focused
-read. Empty `old` is rejected with `EMPTY_TARGET`; insert with `after` instead,
-and give `after` nonempty text (`EMPTY_INSERTION`). `after` keeps its line, so
+read. An `old` with 8 or more visible characters whose `in` lines hold no match,
+as lines from a stale read may not, applies at the one match an unrestricted
+`old` would take, with the same `LINES_MOVED` warning; otherwise it is
+`TARGET_NOT_FOUND`. Empty `old` is rejected with `EMPTY_TARGET`; insert with
+`after` instead, and give `after` nonempty text (`EMPTY_INSERTION`). `after`
+keeps its line, so
 text whose leading lines restate the lines ending at it is refused
 (`INSERT_REPEATS_LINE`, 8 or more visible characters in those lines) unless
 other changes in the call delete each of them, and any copied lines below,

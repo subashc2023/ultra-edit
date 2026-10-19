@@ -58,6 +58,17 @@ All notable changes to Ultra Edit are documented here. Releases follow
   moved apart, and a moved change that would overlap another change in the
   request are still refused with `EXPECTED_TEXT_MISMATCH`. Six first-try
   rejections in the Windows eval were of this kind.
+- An `old` without `count` whose `in` lines hold no occurrence, for the same
+  reasons, now applies at the one occurrence an unrestricted `old` would take,
+  its only one in the file or its only one that cuts no word, when `old` has 8
+  or more visible characters. The same `LINES_MOVED` warning names the `in`
+  lines given and the lines used, and the stored plan records the lines used.
+  Shorter text, several such occurrences, a span `in`, and a moved change that
+  would overlap another change in the request are still refused with
+  `TARGET_NOT_FOUND`. In the sixth round of the Windows eval, one
+  `edit-while-file-changes` run gave each `old` an `in` from its first Read, and
+  the other writer then added four lines above them; replayed against the
+  changed file, that rejected first call now commits the expected output.
 - Matches inside longer names no longer get in the way of a rename: an `old`
   that occurs several times but exactly once as whole words takes that match,
   and a `count` that numbers only the whole-word matches replaces just those, so
