@@ -14,6 +14,17 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ### Changed
 
+- A `lines` or `after` change whose lines no longer hold its `expect`, because
+  the file changed since it was read or the lines were miscounted, now applies
+  where `expect` holds instead of being refused: when `expect` has 8 or more
+  visible characters, reaches the change's end as a required one must, and
+  holds at exactly one place where the whole change fits, both parts of a
+  `[first, last]` pair shifted together. A nonblocking `LINES_MOVED` warning
+  names the lines given and the lines used, and the stored plan records the
+  lines used. A shorter `expect`, one that holds at several places, parts that
+  moved apart, and a moved change that would overlap another change in the
+  request are still refused with `EXPECTED_TEXT_MISMATCH`. Six first-try
+  rejections in the Windows eval were of this kind.
 - Matches inside longer names no longer get in the way of a rename: an `old`
   that occurs several times but exactly once as whole words takes that match,
   and a `count` that numbers only the whole-word matches replaces just those, so

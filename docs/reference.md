@@ -295,10 +295,19 @@ numbers tell apart, so they are accepted. For a range that ends at the file's
 last line, the ranges one line longer and shorter are checked too, since Read's
 empty last line keeps such a range's end through a one-line shift. Lines between
 the first and last parts are not compared: a blank or repeated last line pins
-the range's end only weakly, so prefer lines with text as `[first, last]`. `after:0` takes none. A mismatch is
-`EXPECTED_TEXT_MISMATCH`: the message quotes the addressed lines and, when the
-expected lines occur elsewhere, gives the current range, and the diagnostic
-carries them as `exact` candidates, or near misses as below. `after` with empty
+the range's end only weakly, so prefer lines with text as `[first, last]`. `after:0` takes none.
+When the stated lines do not hold `expect`, the change applies where it holds,
+if it holds at exactly one place where the whole target fits and is strong: it
+has at least 8 non-whitespace characters and reaches the target's end as a
+required `expect` must (for `lines`, every line or the pair, both parts shifted
+together and checked there as at the stated lines). A number that went stale
+since the read, or was miscounted, then edits only lines that hold `expect`. A
+nonblocking `LINES_MOVED` warning names the lines given and the lines used, and
+the stored plan records the lines used. Otherwise, and
+when the moved target would conflict with another change in the request, a
+mismatch is `EXPECTED_TEXT_MISMATCH`: the message quotes the addressed lines
+and, when the expected lines occur elsewhere, gives the current range, and the
+diagnostic carries them as `exact` candidates, or near misses as below. `after` with empty
 text is `EMPTY_INSERTION`. `after` keeps line `after`, so text that starts by
 restating it is `INSERT_REPEATS_LINE`: its leading lines equal the lines ending
 at `after`, compared without trailing whitespace, as when `expect` or the lines

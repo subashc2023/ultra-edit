@@ -66,8 +66,10 @@ exposed by this host.
    after line n (0 is the top). Both need `expect`, compared without line
    endings: line n's current text, line a's for a one-line range, or
    `[line a, line b]` (or every line) for a longer one, with 8 or more visible
-   characters or text found nowhere else in the file, so a stale line number is
-   rejected, not applied.
+   characters or text found nowhere else in the file. A stale line number never
+   edits other text: when the lines given do not hold `expect`, an `expect` with
+   8 or more visible characters that holds at exactly one other place moves the
+   change there, with a `LINES_MOVED` warning; anything else is rejected.
 3. Inspect the outcome. A rejection wrote nothing; its diagnostics can list
    `candidates` with the current text and lines. Copy an `exact` or `whitespace`
    candidate's `text` verbatim into `old`, confirm a `similar` one is the

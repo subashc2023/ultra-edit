@@ -2064,32 +2064,73 @@ fn line_expect_compares_whole_lines_ignoring_line_endings() {
                 .contains(&format!("setting_7 = 7{eol}    added{eol}    setting_8"))
         );
     }
-    // A shifted line number points to where the expected lines are.
+    // A shifted line number applies where its strong expect is, and says so.
     let base = spanless(&settings(12, "\n"));
-    let error = rejected(
-        &base,
-        lines_change("c", [5, 5], Some("    setting_6 = 6"), "x"),
-    );
-    assert_eq!(error.code, "EXPECTED_TEXT_MISMATCH");
+    let plan = compile(
+        &request(
+            &base,
+            vec![lines_change("c", [5, 5], Some("    setting_6 = 6"), "x")],
+        ),
+        &bases(&base),
+    )
+    .unwrap();
     assert_eq!(
-        error.candidates,
+        plan.files[0].output,
+        settings(12, "\n").replace("    setting_6 = 6\n", "x\n")
+    );
+    assert_eq!(
+        (
+            plan.warnings[0].code.as_str(),
+            plan.warnings[0].message.as_str()
+        ),
+        (
+            "LINES_MOVED",
+            "Change c: lines:[5,5] did not hold expect, which holds only at lines:[6,6], so the change applied there; reread the file before more line edits"
+        )
+    );
+    // A moved range keeps its length.
+    let plan = compile(
+        &request(
+            &base,
+            vec![ends_change(
+                "c",
+                [4, 6],
+                ["    setting_5 = 5", "    setting_7 = 7"],
+                "x",
+            )],
+        ),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(
+        plan.files[0].output,
+        settings(12, "\n").replace(
+            "    setting_5 = 5\n    setting_6 = 6\n    setting_7 = 7\n",
+            "x\n"
+        )
+    );
+    // Where another change edits the new place, the shifted line is refused, and
+    // the message points to where the expected lines are.
+    let errors = compile(
+        &request(
+            &base,
+            vec![
+                lines_change("c", [5, 5], Some("    setting_6 = 6"), "x"),
+                exact("o", "setting_6 = 6", "setting_6 = 7"),
+            ],
+        ),
+        &bases(&base),
+    )
+    .unwrap_err();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].code, "EXPECTED_TEXT_MISMATCH");
+    assert_eq!(
+        errors[0].candidates,
         [candidate(CandidateKind::Exact, (6, 6), "    setting_6 = 6")]
     );
     assert_eq!(
-        error.message,
+        errors[0].message,
         "Line 5 holds \"    setting_5 = 5\", not expect; it is at line 6, so use lines [6,6] if the whole range moved (ultra_edit_repair can replace just this change)."
-    );
-    // The new range for a moved head keeps the range's length.
-    let error = rejected(
-        &base,
-        ends_change("c", [4, 6], ["    setting_5 = 5", "    setting_7 = 7"], "x"),
-    );
-    assert!(
-        error
-            .message
-            .contains("it is at line 5, so use lines [5,7] if the whole range moved"),
-        "{}",
-        error.message
     );
     // A line added inside the range moves its end, which the last lines catch.
     let mut grown: Vec<String> = settings(12, "\n").lines().map(str::to_owned).collect();
@@ -2337,6 +2378,22 @@ fn a_range_ending_in_blank_lines_may_guard_the_text_before_them() {
     )
     .unwrap();
     assert_eq!(plan.files[0].output, "intro\n\n## Next\n");
+    // Numbered before two lines were added above, the range moves to lines 3-7,
+    // where its tail is checked the same way.
+    let plan = compile(
+        &request(
+            &base,
+            vec![range(
+                [1, 5],
+                "## Legacy export",
+                "position must skip the owner column.",
+            )],
+        ),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(plan.files[0].output, "intro\n\n## Next\n");
+    assert_eq!(plan.warnings[0].code, "LINES_MOVED");
     for change in [
         // The tail must be the last text in the range, not text further up.
         range([3, 7], "## Legacy export", "body"),
