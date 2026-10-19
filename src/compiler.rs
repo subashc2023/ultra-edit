@@ -585,7 +585,7 @@ pub fn compile_with(
             // Neighbours are judged in the output, where an adjacent change's text
             // may stand beside this one instead of the original bytes.
             let mut edges = Vec::new();
-            for (id, range) in placed {
+            for (id, range) in &placed {
                 if let Some(change) = targets.get(id) {
                     let old = match &change.target {
                         Target::Exact { old, .. } | Target::All { old, .. } => old,
@@ -593,7 +593,7 @@ pub fn compile_with(
                     };
                     let crlf = context.crlf() && !literal(change);
                     let (old, new) = (adapt_eol(crlf, old), adapt_eol(crlf, &change.text));
-                    for edge in whitespace_edges(&output, &range, &old, &new) {
+                    for edge in whitespace_edges(&output, range, &old, &new) {
                         let junction = match edge {
                             Edge::DropsTrailing | Edge::AddsTrailing => range.end,
                             Edge::DropsLeading | Edge::AddsLeading => range.start,
@@ -603,6 +603,7 @@ pub fn compile_with(
                 }
             }
             warn_edges(&base.path, &output, edges, &mut edge_warnings);
+            warn_blank_runs(&base.path, &base.text, &output, &placed, &mut edge_warnings);
             warnings.extend(context.whole_words);
             PreparedFile {
                 base: base.clone(),
@@ -636,7 +637,8 @@ const EDGE_WHITESPACE: [char; 4] = [' ', '\t', '\r', '\n'];
 /// Characters a `WHITESPACE_EDGE` warning quotes on each side of the junction,
 /// short enough that the message fits the 240 characters clients display.
 const EDGE_CONTEXT_CHARS: usize = 40;
-/// `WHITESPACE_EDGE` warnings per file; each one scans its output line.
+/// `WHITESPACE_EDGE` warnings per file, each scanning its output line, and
+/// likewise `BLANK_LINES_JOINED` warnings.
 const MAX_EDGE_WARNINGS: usize = 8;
 
 /// Finds the edges where an exact target's `old` and `new` agree on their outermost
@@ -760,6 +762,118 @@ fn warn_edges(
             ),
         ));
     }
+}
+
+/// Warns where whitespace on both sides of a change's edge holds more blank lines
+/// in a row than `base` had anywhere, naming them as output lines: an `old` that
+/// takes the blank lines above a block but stops before its last line ending
+/// leaves one too many. The start or end of the file stands in for whitespace
+/// beside a deletion, which can blank the line it cuts there too. Each run is
+/// warned once, for the first change meeting it, and the bytes are written as
+/// given. An edge beside text costs a byte on each side; only the whitespace
+/// around an edge is scanned, and the base once, when an edge joins whitespace.
+fn warn_blank_runs(
+    path: &str,
+    base: &str,
+    output: &str,
+    placed: &[(&str, Range<usize>)],
+    warnings: &mut Vec<Diagnostic>,
+) {
+    let top = if output.starts_with('\u{feff}') { 3 } else { 0 };
+    let longest = OnceCell::new();
+    let mut measured: Option<usize> = None;
+    let (mut warned, mut line, mut cursor) = (0, 1, 0);
+    for (id, range) in placed {
+        let deletion = range.is_empty();
+        for junction in [range.start, range.end] {
+            let (before, after) = output.split_at(junction);
+            // An edge in the whitespace already measured meets the same run.
+            if measured.is_some_and(|end| junction <= end)
+                || !(before.ends_with(EDGE_WHITESPACE) || (deletion && junction == top))
+                || !(after.starts_with(EDGE_WHITESPACE) || (deletion && after.is_empty()))
+            {
+                continue;
+            }
+            let start = before.trim_end_matches(EDGE_WHITESPACE).len();
+            let end = output.len() - after.trim_start_matches(EDGE_WHITESPACE).len();
+            measured = Some(end);
+            let (first, count) = blank_lines(output, start..end);
+            let most = *longest.get_or_init(|| longest_blank_run(base));
+            if count <= most {
+                continue;
+            }
+            if warned == MAX_EDGE_WARNINGS {
+                return;
+            }
+            warned += 1;
+            line += output.as_bytes()[cursor..first]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count();
+            cursor = first;
+            let run = if count == 1 {
+                format!("a blank line, line {line}")
+            } else {
+                format!(
+                    "{count} blank lines in a row, lines {line}-{}",
+                    line + count - 1
+                )
+            };
+            let had = if most == 0 {
+                "none".to_owned()
+            } else {
+                format!("at most {most}")
+            };
+            let shown: String = id.chars().take(24).collect();
+            let mut warning = at(
+                Some(path),
+                None,
+                "BLANK_LINES_JOINED",
+                format!(
+                    "Change {shown}: the whitespace around its edge now holds {run}; the file had {had}"
+                ),
+            );
+            warning.change_id = Some((*id).to_owned());
+            warnings.push(warning);
+        }
+    }
+}
+
+/// The blank lines, numbered as Read numbers lines, inside the whitespace
+/// `stretch` of `text`: the byte where the first starts, and how many there are.
+/// Each line ending in the stretch starts a line, and so does a stretch that
+/// starts the file; the last line started is blank only if no text follows it.
+fn blank_lines(text: &str, stretch: Range<usize>) -> (usize, usize) {
+    let whitespace = &text[stretch.clone()];
+    // An empty file has no line to be blank.
+    let top =
+        !whitespace.is_empty() && stretch.start == if text.starts_with('\u{feff}') { 3 } else { 0 };
+    let first = match whitespace.find('\n') {
+        Some(index) if !top => stretch.start + index + 1,
+        _ => stretch.start,
+    };
+    let starts = usize::from(top) + whitespace.matches('\n').count();
+    // The last line started holds text, or is the empty line Read shows after a
+    // final line ending, unless the stretch runs to the end of the file without one.
+    let open = whitespace.ends_with('\n') || stretch.end < text.len();
+    (first, starts.saturating_sub(usize::from(open)))
+}
+
+/// The most blank lines in a row in `text`, as Read numbers lines; an empty file,
+/// as in [`blank_lines`], has none.
+fn longest_blank_run(text: &str) -> usize {
+    text.strip_prefix('\u{feff}')
+        .unwrap_or(text)
+        .split_inclusive('\n')
+        .fold((0, 0), |(run, longest), line| {
+            let run = if line.trim_start_matches(EDGE_WHITESPACE).is_empty() {
+                run + 1
+            } else {
+                0
+            };
+            (run, longest.max(run))
+        })
+        .1
 }
 
 /// Says which changes had LF written as CRLF to match an all-CRLF file.

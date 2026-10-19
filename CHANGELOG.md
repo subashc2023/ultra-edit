@@ -11,6 +11,16 @@ All notable changes to Ultra Edit are documented here. Releases follow
   prints it names the file it stands for: `/c/x` is `C:\x`, and `/tmp/x` is in
   the user's temporary directory. A path copied from `pwd` in Claude Code's
   Bash tool no longer fails with `TARGET_MISSING`.
+- A nonblocking `BLANK_LINES_JOINED` warning names the output lines where a
+  change's edge has whitespace on both sides that now holds more blank lines in
+  a row than the file had anywhere, as when an `old` takes the blank lines above
+  a function but stops before its last line ending. Beside a deletion, the start
+  or end of the file counts as whitespace. Bytes are still written as given, and
+  the warnings follow each file's `WHITESPACE_EDGE` warnings, at most eight per
+  file. One Windows eval run committed three blank lines where its file never
+  had more than two, with no warning; replayed, that call now carries this one.
+  No eval task's expected files hold a longer run of blank lines than its
+  fixture files, so no single correct edit of one triggers it.
 
 ### Changed
 

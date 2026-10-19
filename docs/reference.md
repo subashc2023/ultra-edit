@@ -456,6 +456,20 @@ at most eight per file. The bytes are still written exactly as given. These
 warnings follow every `NUL_BYTE` and `MIXED_LINE_ENDINGS` warning of the plan, so
 the six warnings a compact response shows never trade one of those for this lint.
 
+A nonblocking `BLANK_LINES_JOINED` warning flags a change of any kind that has
+whitespace on both sides of an edge, where that whitespace now holds more blank
+lines in a row than the file had anywhere, as when an `old` takes the two blank
+lines above a function but stops before its last line ending, which joins the
+two below into three. A blank line holds only spaces, tabs, and its line
+ending, and lines are numbered as Read numbers them. Beside a deletion, the
+start or end of the file counts as whitespace. Blank lines that only a change's
+own text holds, inside it or at an edge beside text or the start or end of the
+file, are not flagged, so a whole-file rewrite or an undo never is. The message
+names the output lines, as in `Change 1.3: the whitespace around its edge now
+holds 3 blank lines in a row, lines 33-35; the file had at most 2`, once per run
+and at most eight per file, after that file's `WHITESPACE_EDGE` warnings. The
+bytes are still written exactly as given.
+
 ## Preview, repair, retry, and undo
 
 `prepare` writes an immutable preview and returns a `p...` reference, or retains
