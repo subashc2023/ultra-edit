@@ -1822,6 +1822,237 @@ fn edge_warnings_judge_neighbours_in_the_output_not_the_original() {
     );
 }
 
+fn blank_warnings(text: &str, changes: Vec<Change>) -> (String, Vec<Diagnostic>) {
+    let base = snapshot("blank.py".into(), text.into());
+    let plan = compile(&request(&base, changes), &bases(&base)).unwrap();
+    let warnings = plan
+        .warnings
+        .into_iter()
+        .filter(|warning| warning.code == "BLANK_LINES_JOINED")
+        .collect();
+    (plan.files[0].output.clone(), warnings)
+}
+
+/// Functions two blank lines apart, as in the eval's `utils.py`.
+const FUNCTIONS: &str =
+    "def slug():\n    return 1\n\n\ndef parse():\n    return 2\n\n\ndef chunked():\n    return 3\n";
+
+#[test]
+fn whitespace_joined_into_a_longer_blank_run_warns_without_blocking() {
+    // The eval case: `old` takes the blank lines above `parse` but stops before
+    // its last line ending, so that line ending joins the two blank lines below.
+    let (output, warnings) = blank_warnings(
+        FUNCTIONS,
+        vec![exact("1.3", "\n\ndef parse():\n    return 2", "")],
+    );
+    assert_eq!(
+        output,
+        "def slug():\n    return 1\n\n\n\ndef chunked():\n    return 3\n"
+    );
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].change_id.as_deref(), Some("1.3"));
+    assert_eq!(warnings[0].file.as_deref(), Some("blank.py"));
+    assert_eq!(
+        warnings[0].message,
+        "Change 1.3: the whitespace around its edge now holds 3 blank lines in a row, lines 3-5; the file had at most 2"
+    );
+    // Deleting only the function's lines joins both pairs, and an insertion that
+    // starts with blank lines after one adds to it.
+    for (change, run) in [
+        (
+            lines_change("lines", [5, 6], None, ""),
+            "4 blank lines in a row, lines 3-6",
+        ),
+        (
+            insert("after", 7, None, "\n\ndef extra():\n    return 4"),
+            "3 blank lines in a row, lines 7-9",
+        ),
+        // Deleting a line's text leaves its indentation, a blank line too.
+        (
+            exact("indent", "return 2", ""),
+            "3 blank lines in a row, lines 6-8",
+        ),
+        // Blank lines `new` ends with meet the file's own below `old`.
+        (
+            exact("tail", "    return 2\n", "    return 2\n\n\n\n"),
+            "5 blank lines in a row, lines 7-11",
+        ),
+    ] {
+        let (_, warnings) = blank_warnings(FUNCTIONS, vec![change]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0]
+                .message
+                .ends_with(&format!("now holds {run}; the file had at most 2")),
+            "{}",
+            warnings[0].message
+        );
+    }
+}
+
+#[test]
+fn edits_that_leave_no_longer_blank_run_carry_no_blank_line_warning() {
+    for (text, change) in [
+        // The deletion the eval asked for, with its blank lines above or below.
+        (
+            FUNCTIONS,
+            exact("above", "\n\ndef parse():\n    return 2\n", ""),
+        ),
+        (
+            FUNCTIONS,
+            exact("below", "def parse():\n    return 2\n\n\n", ""),
+        ),
+        (FUNCTIONS, lines_change("lines", [3, 6], None, "")),
+        // Text beside blank lines, and whole lines after them, stay as they were.
+        (FUNCTIONS, exact("word", "return 2", "return 20")),
+        (
+            FUNCTIONS,
+            lines_change("line", [5, 5], None, "def parse(text):"),
+        ),
+        (FUNCTIONS, insert("between", 3, None, "x = 1")),
+        // A change's own blank lines beside text join nothing, as in a rewrite.
+        (FUNCTIONS, span_change("whole", "r0", "\n\n\nx = 1\n\n\n\n")),
+        (
+            FUNCTIONS,
+            exact("own", "    return 2\n\n\n", "    return 2\n\n\n\n"),
+        ),
+        (
+            FUNCTIONS,
+            exact("lead", "\n    return 3", "\n\n\n\n    return 3"),
+        ),
+        // Joined spaces hold no line ending, and an emptied file no line.
+        ("total = a + b\n", exact("plus", "+", "")),
+        ("only\n", exact("all", "only\n", "")),
+    ] {
+        let (_, warnings) = blank_warnings(text, vec![change]);
+        assert!(warnings.is_empty(), "{text:?}: {warnings:?}");
+    }
+}
+
+#[test]
+fn a_run_no_longer_than_one_the_file_already_had_carries_no_warning() {
+    // Three blank lines already stand before `TAIL`, so three more add nothing new.
+    let text = format!("{FUNCTIONS}\n\n\nTAIL = 4\n");
+    let (output, warnings) = blank_warnings(
+        &text,
+        vec![exact("1.3", "\n\ndef parse():\n    return 2", "")],
+    );
+    assert!(output.contains("return 1\n\n\n\ndef chunked"));
+    assert!(warnings.is_empty(), "{warnings:?}");
+    // So does a run right after a byte-order mark.
+    let (_, warnings) = blank_warnings("\u{feff}\n\n\nA\n\nB\n\nC\n", vec![exact("b", "B", "")]);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    // One more than that still warns, measured against the file's longest run.
+    let (_, warnings) = blank_warnings(&text, vec![lines_change("lines", [5, 6], None, "")]);
+    assert_eq!(
+        warnings[0].message,
+        "Change lines: the whitespace around its edge now holds 4 blank lines in a row, lines 3-6; the file had at most 3"
+    );
+}
+
+#[test]
+fn blank_runs_are_counted_as_read_numbers_lines() {
+    for (text, old, run) in [
+        // LF text matched to an all-CRLF file.
+        (
+            FUNCTIONS.replace('\n', "\r\n"),
+            "\n\ndef parse():\n    return 2",
+            "3 blank lines in a row, lines 3-5; the file had at most 2",
+        ),
+        // At the start of the file, after a byte-order mark, and at its end.
+        (
+            "# Title\n\nText\n".into(),
+            "# Title",
+            "2 blank lines in a row, lines 1-2; the file had at most 1",
+        ),
+        (
+            "\u{feff}# Title\n\nText\n".into(),
+            "# Title",
+            "2 blank lines in a row, lines 1-2; the file had at most 1",
+        ),
+        (
+            "Text\n\n    end".into(),
+            "end",
+            "2 blank lines in a row, lines 2-3; the file had at most 1",
+        ),
+        // The indentation of the line after a run starts that line.
+        (
+            "class A:\n    x = 1\n\n    y = 2\n\n    z = 3\n".into(),
+            "y = 2",
+            "3 blank lines in a row, lines 3-5; the file had at most 1",
+        ),
+        // A file with no blank line.
+        (
+            "a\nb\nc\n".into(),
+            "b",
+            "a blank line, line 2; the file had none",
+        ),
+    ] {
+        let (_, warnings) = blank_warnings(&text, vec![exact("c", old, "")]);
+        assert_eq!(warnings.len(), 1, "{text:?}: {warnings:?}");
+        assert!(
+            warnings[0].message.ends_with(run),
+            "{text:?}: {}",
+            warnings[0].message
+        );
+    }
+}
+
+#[test]
+fn blank_line_warnings_are_once_per_run_bounded_and_follow_edge_warnings() {
+    // Two deletions meeting in one run warn once, for the first.
+    let (output, warnings) = blank_warnings(
+        "a\n\nb\nc\n\nd\n",
+        vec![exact("b", "b\n", ""), exact("c", "c", "")],
+    );
+    assert_eq!(output, "a\n\n\n\nd\n");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0].change_id.as_deref(), Some("b"));
+    // Each run of a counted change warns, up to eight per file.
+    let text: String = (0..10)
+        .map(|index| format!("k{index}\n\nDROP\n\n"))
+        .collect();
+    let all = Change {
+        id: "all".into(),
+        target: Target::All {
+            old: "DROP\n".into(),
+            scope: Some("r0".into()),
+            expected: 10,
+            lines: None,
+        },
+        text: String::new(),
+    };
+    let (_, warnings) = blank_warnings(&text, vec![all]);
+    assert_eq!(warnings.len(), 8);
+    assert!(
+        warnings[7].message.contains("lines 23-24;"),
+        "{}",
+        warnings[7].message
+    );
+    // A long ID still fits what clients display.
+    let id = "i".repeat(300);
+    let (_, warnings) = blank_warnings(FUNCTIONS, vec![lines_change(&id, [5, 6], None, "")]);
+    assert!(warnings[0].message.chars().count() <= 240);
+    assert_eq!(warnings[0].change_id.as_deref(), Some(id.as_str()));
+    // The warning follows the plan's byte and whitespace-edge warnings.
+    let base = snapshot("order.txt".into(), "a = b\n\nc\n\nd\0\n".into());
+    let plan = compile(
+        &request(
+            &base,
+            vec![exact("edge", "= ", "="), exact("blank", "c", "")],
+        ),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(plan.files[0].output, "a =b\n\n\n\nd\0\n");
+    let codes: Vec<_> = plan
+        .warnings
+        .iter()
+        .map(|warning| warning.code.as_str())
+        .collect();
+    assert_eq!(codes, ["NUL_BYTE", "WHITESPACE_EDGE", "BLANK_LINES_JOINED"]);
+}
+
 #[test]
 fn a_span_range_over_inconsistent_line_offsets_is_rejected_not_sliced() {
     // A tampered snapshot whose line 2 lies before line 1 must not reach a
