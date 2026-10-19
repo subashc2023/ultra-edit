@@ -2053,6 +2053,182 @@ fn blank_line_warnings_are_once_per_run_bounded_and_follow_edge_warnings() {
     assert_eq!(codes, ["NUL_BYTE", "WHITESPACE_EDGE", "BLANK_LINES_JOINED"]);
 }
 
+fn final_break_warnings(text: &str, changes: Vec<Change>) -> (String, Vec<Diagnostic>) {
+    let base = snapshot("final.py".into(), text.into());
+    let plan = compile(&request(&base, changes), &bases(&base)).unwrap();
+    let warnings = plan
+        .warnings
+        .into_iter()
+        .filter(|warning| warning.code == "FINAL_LINE_BREAK_KEPT")
+        .collect();
+    (plan.files[0].output.clone(), warnings)
+}
+
+/// A line and the two blank lines before a constant, as in the eval's `handlers.py`.
+const LOGGER: &str = "logger = get_logger()\n\n\nDEFAULT_TIMEOUT_S = 30\n";
+
+#[test]
+fn line_target_text_ending_in_a_line_break_names_what_follows_its_last_line() {
+    // The eval case: `new` lists the moved class and the two blank lines after it
+    // joined by line breaks, so its final line break ends the first blank line.
+    let moved = "logger = get_logger()\n\n\nclass RetryPolicy:\n    pass\n\n";
+    let (output, warnings) =
+        final_break_warnings(LOGGER, vec![lines_change("1.3", [1, 3], None, moved)]);
+    assert_eq!(
+        output,
+        "logger = get_logger()\n\n\nclass RetryPolicy:\n    pass\n\nDEFAULT_TIMEOUT_S = 30\n"
+    );
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].change_id.as_deref(), Some("1.3"));
+    assert_eq!(warnings[0].file.as_deref(), Some("final.py"));
+    assert_eq!(
+        warnings[0].message,
+        "Change 1.3: `new` ends in a line break, so no line ending is added after it: line 5 \"    pass\" is followed by a blank line, then line 7 \"DEFAULT_TIMEOUT_S = 30\""
+    );
+    for (change, follows) in [
+        // Inserted text, as in the eval run that inserted after the blank lines.
+        (
+            insert("after", 3, None, "class RetryPolicy:\n    pass\n\n"),
+            "line 5 \"    pass\" is followed by a blank line, then line 7 \"DEFAULT_TIMEOUT_S = 30\"",
+        ),
+        // One line break leaves no blank line before the next line.
+        (
+            insert("direct", 3, None, "class RetryPolicy:\n    pass\n"),
+            "line 5 \"    pass\" is followed directly by line 6 \"DEFAULT_TIMEOUT_S = 30\"",
+        ),
+        // The count takes in the file's own blank lines after the change.
+        (
+            lines_change("more", [1, 1], None, "log = 1\n\n\n"),
+            "line 1 \"log = 1\" is followed by 4 blank lines, then line 6 \"DEFAULT_TIMEOUT_S = 30\"",
+        ),
+        // At the end of the file.
+        (
+            lines_change("end", [4, 4], None, "DEFAULT_TIMEOUT_S = 60\n"),
+            "line 4 \"DEFAULT_TIMEOUT_S = 60\" ends the file",
+        ),
+        (
+            insert("tail", 4, None, "TAIL = 1\n\n"),
+            "line 5 \"TAIL = 1\" is followed by a blank line, then the end of the file",
+        ),
+    ] {
+        let (_, warnings) = final_break_warnings(LOGGER, vec![change]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].message.ends_with(follows),
+            "{}",
+            warnings[0].message
+        );
+    }
+}
+
+#[test]
+fn line_targets_without_a_final_line_break_and_literal_targets_carry_no_final_break_warning() {
+    for change in [
+        // Shorthand text without a final line break gets the line's own.
+        lines_change("joined", [1, 1], None, "log = 1"),
+        insert("joined", 3, None, "class RetryPolicy:\n    pass"),
+        lines_change("deleted", [2, 3], None, ""),
+        // Blank lines alone name no line.
+        insert("blank", 1, None, "\n"),
+        lines_change("blank", [2, 2], None, "\n"),
+        // `old` and span text is placed exactly, with no line ending added.
+        exact(
+            "old",
+            "DEFAULT_TIMEOUT_S = 30\n",
+            "DEFAULT_TIMEOUT_S = 60\n",
+        ),
+        span_change("whole", "r0", "x = 1\n\n"),
+    ] {
+        let (_, warnings) = final_break_warnings(LOGGER, vec![change]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+}
+
+#[test]
+fn final_break_warnings_number_lines_as_read_does_and_are_bounded() {
+    // LF text adapted to an all-CRLF file, quoted without its CR.
+    let (output, warnings) = final_break_warnings(
+        &LOGGER.replace('\n', "\r\n"),
+        vec![insert("crlf", 3, None, "class RetryPolicy:\n    pass\n\n")],
+    );
+    assert!(output.contains("    pass\r\n\r\nDEFAULT"), "{output:?}");
+    assert!(
+        warnings[0].message.ends_with(
+            "line 5 \"    pass\" is followed by a blank line, then line 7 \"DEFAULT_TIMEOUT_S = 30\""
+        ),
+        "{}",
+        warnings[0].message
+    );
+    // A byte-order mark is not part of the first line's text.
+    let (_, warnings) = final_break_warnings(
+        "\u{feff}a = 1\nb = 2\n",
+        vec![lines_change("bom", [1, 1], None, "a = 2\n")],
+    );
+    assert!(
+        warnings[0]
+            .message
+            .ends_with("line 1 \"a = 2\" is followed directly by line 2 \"b = 2\""),
+        "{}",
+        warnings[0].message
+    );
+    // Each such change warns, up to eight per file.
+    let changes = (1..=10)
+        .map(|line| {
+            lines_change(
+                &format!("c{line}"),
+                [line, line],
+                None,
+                &format!("line {line}!\n"),
+            )
+        })
+        .collect();
+    let (_, warnings) = final_break_warnings(&numbered(10), changes);
+    assert_eq!(warnings.len(), 8);
+    assert!(
+        warnings[7].message.contains("line 8 \"line 8!\""),
+        "{}",
+        warnings[7].message
+    );
+    // A long ID and a long line still fit what clients display.
+    let id = "i".repeat(300);
+    let long = format!("{}\n\n", "x".repeat(300));
+    let (_, warnings) = final_break_warnings(LOGGER, vec![lines_change(&id, [1, 1], None, &long)]);
+    assert!(
+        warnings[0].message.chars().count() <= 240,
+        "{}",
+        warnings[0].message
+    );
+    assert_eq!(warnings[0].change_id.as_deref(), Some(id.as_str()));
+    // The warning follows the file's byte, whitespace-edge, and blank-line warnings.
+    let base = snapshot("order.txt".into(), "a = b\n\nc\n\nd\0\n".into());
+    let plan = compile(
+        &request(
+            &base,
+            vec![
+                exact("edge", "= ", "="),
+                exact("blank", "c", ""),
+                insert("final", 5, None, "e\n"),
+            ],
+        ),
+        &bases(&base),
+    )
+    .unwrap();
+    let codes: Vec<_> = plan
+        .warnings
+        .iter()
+        .map(|warning| warning.code.as_str())
+        .collect();
+    assert_eq!(
+        codes,
+        [
+            "NUL_BYTE",
+            "WHITESPACE_EDGE",
+            "BLANK_LINES_JOINED",
+            "FINAL_LINE_BREAK_KEPT"
+        ]
+    );
+}
+
 #[test]
 fn a_span_range_over_inconsistent_line_offsets_is_rejected_not_sliced() {
     // A tampered snapshot whose line 2 lies before line 1 must not reach a

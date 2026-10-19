@@ -498,6 +498,18 @@ holds 3 blank lines in a row, lines 33-35; the file had at most 2`, once per run
 and at most eight per file, after that file's `WHITESPACE_EDGE` warnings. The
 bytes are still written exactly as given.
 
+A nonblocking `FINAL_LINE_BREAK_KEPT` warning flags a `lines` or `after` change
+whose `new` ends in a line feed. A line target adds a line ending only to text
+that lacks one, so this text is written as given, and text that lists its lines
+joined by line feeds comes out one blank line short: `"x\n\n"` writes `x` and
+one blank line, not two. The message names the text's last line, the blank
+lines after it, and the line after those, as in ``Change 1.3: `new` ends in a
+line break, so no line ending is added after it: line 67 "        )" is
+followed by a blank line, then line 69 "DEFAULT_TIMEOUT_S = 30"``, at most eight
+per file, after that file's `BLANK_LINES_JOINED` warnings. Text of blank lines
+alone is not flagged, nor is `old` or span text, which is placed exactly. The
+bytes are still written exactly as given.
+
 ## Preview, repair, retry, and undo
 
 `prepare` writes an immutable preview and returns a `p...` reference, or retains

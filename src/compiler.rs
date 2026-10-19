@@ -611,6 +611,7 @@ pub fn compile_with(
             }
             warn_edges(&base.path, &output, edges, &mut edge_warnings);
             warn_blank_runs(&base.path, &base.text, &output, &placed, &mut edge_warnings);
+            warn_final_line_breaks(&base.path, &output, &placed, &targets, &mut edge_warnings);
             warnings.extend(context.whole_words);
             moves.extend(
                 context
@@ -659,7 +660,7 @@ const EDGE_WHITESPACE: [char; 4] = [' ', '\t', '\r', '\n'];
 /// short enough that the message fits the 240 characters clients display.
 const EDGE_CONTEXT_CHARS: usize = 40;
 /// `WHITESPACE_EDGE` warnings per file, each scanning its output line, and
-/// likewise `BLANK_LINES_JOINED` warnings.
+/// likewise `BLANK_LINES_JOINED` and `FINAL_LINE_BREAK_KEPT` warnings.
 const MAX_EDGE_WARNINGS: usize = 8;
 
 /// Finds the edges where an exact target's `old` and `new` agree on their outermost
@@ -857,6 +858,90 @@ fn warn_blank_runs(
             warning.change_id = Some((*id).to_owned());
             warnings.push(warning);
         }
+    }
+}
+
+/// Characters a `FINAL_LINE_BREAK_KEPT` warning quotes of each line it names,
+/// short enough that the message fits the 240 characters clients display.
+const ENDING_CONTEXT_CHARS: usize = 32;
+
+/// Warns where a `lines` or `after` change's text ends in a line break. A line
+/// target adds a line ending only to text that lacks one, so this text is written
+/// as given, and text that lists its lines joined by line breaks, as shorthand
+/// examples do, comes out one blank line short: `"x\n\n"` leaves one blank line
+/// after `x`, not two. The message names the text's last line, the blank lines
+/// after it, and the line after those, at most eight per file. Text of blank
+/// lines alone names no line and is not flagged. The bytes are still written
+/// exactly as given.
+fn warn_final_line_breaks(
+    path: &str,
+    output: &str,
+    placed: &[(&str, Range<usize>)],
+    targets: &HashMap<&str, &Change>,
+    warnings: &mut Vec<Diagnostic>,
+) {
+    let top = if output.starts_with('\u{feff}') { 3 } else { 0 };
+    let (mut warned, mut line, mut cursor) = (0, 1, 0);
+    for (id, range) in placed {
+        let Some(change) = targets.get(id) else {
+            continue;
+        };
+        let end = range.start
+            + output[range.clone()]
+                .trim_end_matches(EDGE_WHITESPACE)
+                .len();
+        if !matches!(change.target, Target::Lines { .. } | Target::Insert { .. })
+            || !change.text.ends_with('\n')
+            || end == range.start
+        {
+            continue;
+        }
+        if warned == MAX_EDGE_WARNINGS {
+            return;
+        }
+        warned += 1;
+        line += output.as_bytes()[cursor..end]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count();
+        cursor = end;
+        let rest = &output[end..];
+        let next = end + rest.len() - rest.trim_start_matches(EDGE_WHITESPACE).len();
+        let (_, blank) = blank_lines(output, end..next);
+        let start = output[..end].rfind('\n').map_or(top, |index| index + 1);
+        let last = candidates::quoted(&output[start..end], ENDING_CONTEXT_CHARS);
+        let then = if next < output.len() {
+            let start = output[..next].rfind('\n').map_or(top, |index| index + 1);
+            let stop = output[next..]
+                .find('\n')
+                .map_or(output.len(), |index| next + index);
+            let text = &output[start..stop];
+            format!(
+                "line {} {}",
+                line + output[end..next].matches('\n').count(),
+                candidates::quoted(
+                    text.strip_suffix('\r').unwrap_or(text),
+                    ENDING_CONTEXT_CHARS
+                )
+            )
+        } else {
+            "the end of the file".to_owned()
+        };
+        let follows = match blank {
+            0 if next < output.len() => format!("is followed directly by {then}"),
+            0 => "ends the file".to_owned(),
+            1 => format!("is followed by a blank line, then {then}"),
+            count => format!("is followed by {count} blank lines, then {then}"),
+        };
+        let shown: String = change.id.chars().take(QUOTED_ID_CHARS).collect();
+        warnings.push(at(
+            Some(path),
+            Some(change),
+            "FINAL_LINE_BREAK_KEPT",
+            format!(
+                "Change {shown}: `new` ends in a line break, so no line ending is added after it: line {line} {last} {follows}"
+            ),
+        ));
     }
 }
 

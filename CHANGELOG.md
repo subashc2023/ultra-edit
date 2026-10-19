@@ -33,6 +33,17 @@ All notable changes to Ultra Edit are documented here. Releases follow
   had more than two, with no warning; replayed, that call now carries this one.
   No eval task's expected files hold a longer run of blank lines than its
   fixture files, so no single correct edit of one triggers it.
+- A nonblocking `FINAL_LINE_BREAK_KEPT` warning flags a `lines` or `after`
+  change whose `new` ends in a line feed, which is written as given, and names
+  the text's last line, the blank lines after it, and the next line. Text that
+  lists its lines joined by line feeds, as the session card's examples do, comes
+  out one blank line short: `"x\n\n"` writes `x` and one blank line, not two.
+  Text of blank lines alone is not flagged. Bytes are still written as given,
+  and the warnings follow each file's `BLANK_LINES_JOINED` warnings, at most
+  eight per file. Of the eight line targets in the Windows eval whose `new`
+  ended in a line feed, seven were a blank line short of the task's layout and
+  the eighth was a model's correction of one; one of the seven made the fifth
+  round's only wrong result.
 
 ### Changed
 

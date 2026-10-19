@@ -107,9 +107,11 @@ shows after a final newline stands for the last line.
 A line target replaces whole lines, terminators included. Text that does not end
 in a line feed keeps the last replaced line's ending, so a CRLF file stays CRLF
 and a file without a final newline still lacks one; text that ends in a line
-feed is written as given. Deleting the last line of a file without a final
-newline also removes the line ending before it, so the file still lacks one.
-Inserted lines get the file's line ending the same way.
+feed is written as given, so `"x\n\n"` writes `x` and one blank line, not two,
+with a nonblocking `FINAL_LINE_BREAK_KEPT` warning naming the lines after it.
+Deleting the last line of a file without a final newline also removes the line
+ending before it, so the file still lacks one. Inserted lines get the file's
+line ending the same way.
 
 `expect` on `lines` and `after` is compared line by line, ignoring line endings.
 For `after`, it gives the lines ending at `after`. For `lines`, a string gives
