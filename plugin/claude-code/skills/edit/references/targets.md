@@ -152,6 +152,16 @@ as `\nRestart` are exempt, and an `old` with text on several lines may end
 inside a word; Han, kana, and other uncased scripts separate words, and a cut
 between two digits always counts.
 
+Rendered text shows a no-break or thin space (U+00A0, U+2007, U+2009, U+202F)
+as an ordinary one. An `old` without `count` that occurs nowhere as written
+takes its one match in scope where the file holds such a space for one of its
+ASCII spaces, if `new` repeats the text around each such space: `new` is then
+written with the file's spaces in that repeated text, with a nonblocking
+`SPACES_ADAPTED` warning. With a second such match, or a space in text that `new`
+changes, it stays `TARGET_NOT_FOUND`; copy the candidate's `text`, which holds
+the file's spaces, into `old` and write `new` with them. An `old` that holds one
+of these spaces stays literal.
+
 A line range `rA..rB` works as a `span` or `in` when the base disclosed every
 line from A to B, for instance across a range continued with another range. It
 behaves like `selection` for those lines: from the start of line A's body to the

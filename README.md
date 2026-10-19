@@ -156,7 +156,9 @@ snapshot, keeping its spans. Receipts report `committed`, `partial`,
 `not_committed`, or `outcome_unknown` per file; nothing outside the declared
 targets changes, including line endings, BOMs, and trailing whitespace. Text is
 literal, except that a file whose lines all end in CRLF gets CRLF for the LF in
-text copied from a view that hides `\r`.
+text copied from a view that hides `\r`, and an `old` typed with an ordinary
+space where the file holds a no-break or thin one takes its one such match,
+keeping the file's space where `new` repeats `old`.
 
 The [skill](plugin/claude-code/skills/edit/SKILL.md) and its references describe
 the MCP tools; the [reference](docs/reference.md) covers the full CLI and engine

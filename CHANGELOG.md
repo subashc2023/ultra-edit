@@ -11,6 +11,18 @@ All notable changes to Ultra Edit are documented here. Releases follow
   prints it names the file it stands for: `/c/x` is `C:\x`, and `/tmp/x` is in
   the user's temporary directory. A path copied from `pwd` in Claude Code's
   Bash tool no longer fails with `TARGET_MISSING`.
+- An `old` without `count` that occurs nowhere as written takes its one match
+  where the file holds a no-break or thin space (U+00A0, U+2007, U+2009, or
+  U+202F) for one of its ASCII spaces, since rendered text such as a task's
+  prompt shows those as ordinary spaces. `new` is written with the file's
+  spaces in the text it repeats from `old`, their common prefix and suffix, and
+  a nonblocking `SPACES_ADAPTED` warning names the changes and spaces. A second
+  such match, an adapted space in text `new` changes or that an inserted or
+  deleted part could sit on either side of, an `old` that holds one of these
+  spaces, `count`, and undo keep the previous behaviour. In the round-three
+  Windows eval, one `unicode-quotes` run typed an ordinary space in
+  `limit is 10 km` where the file holds U+00A0 and was rejected; replayed
+  against the task's files, that first call now commits the expected output.
 
 ### Changed
 
