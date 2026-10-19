@@ -17,9 +17,8 @@ each file by absolute `path` (the server root ignores `cd` and worktrees):
 - `lines:[a,b]` replaces whole lines (`"new":""` deletes them); `after:n`
   inserts after line n (0 = top) and keeps it, so `new` must not repeat it. Both
   take Read's line numbers and need `expect`: all of line n or a, indentation
-  included, or `[line a, line b]`. Its parts need 8+ visible characters in all,
-  so one may be blank or `)`; if fewer, join a neighbour into a part
-  (`"\ndef f():"`).
+  included, or `[line a, line b]`. Each part needs 8+ visible characters: for a
+  blank line or a lone `)`, join its neighbour into that part (`"\ndef f():"`).
 - Every change applies to the file as it was before the call. Text is literal,
   without Read's line-number gutter; in an all-CRLF file, LF is written as CRLF.
 
