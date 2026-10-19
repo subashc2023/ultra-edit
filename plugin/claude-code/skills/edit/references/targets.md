@@ -124,9 +124,14 @@ what line numbers tell apart, so a long guard may repeat. Lines between the
 first and last parts are not compared, and a blank last line pins the end only
 weakly, so prefer lines with text as `[first, last]`: when the range ends in
 blank lines, the last part may name the text line just before them. `after:0`
-takes none. A mismatch is `EXPECTED_TEXT_MISMATCH`, and when the expected lines
-occur elsewhere the message gives the current range. A line past the end is
-`LINE_OUT_OF_RANGE`. On `span`, `expect` is byte-exact.
+takes none. When the lines given do not hold `expect`, an `expect` with 8 or
+more visible characters that reaches the end as a required one must, and holds
+at exactly one place where the whole change fits (both parts of a pair shifted
+together), moves the change there, with a nonblocking `LINES_MOVED` warning
+naming the lines given and used. Otherwise, or when the moved change would
+overlap another change, a mismatch is `EXPECTED_TEXT_MISMATCH`, and when the
+expected lines occur elsewhere the message gives the current range. A line past
+the end is `LINE_OUT_OF_RANGE`. On `span`, `expect` is byte-exact.
 
 Unrestricted `old` searches the complete original file even after a focused
 read. Empty `old` is rejected with `EMPTY_TARGET`; insert with `after` instead,

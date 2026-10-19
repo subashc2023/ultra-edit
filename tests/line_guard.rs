@@ -112,6 +112,182 @@ fn a_guard_must_be_long_or_match_one_place() {
     );
 }
 
+/// Settings as a caller read them, and the block another writer then added
+/// above them, which moves every line the caller numbered four lines down.
+const READ: &str = "# Retry policy\nRETRY_LIMIT = 3  # attempts per request\nRETRY_BACKOFF_S = 0.5  # doubled after each failed attempt\n\n# Timeouts\nCONNECT_TIMEOUT_S = 3.0  # TCP and TLS handshake\nREAD_TIMEOUT_S = 10.0  # waiting for the first byte\n";
+const ROUTING: &str = "# Region routing\nDEFAULT_REGION = \"eu-west-1\"\nFALLBACK_REGIONS = (\"eu-central-1\", \"us-east-1\")\n\n";
+const BACKOFF: &str = "RETRY_BACKOFF_S = 0.5  # doubled after each failed attempt";
+const CONNECT: &str = "CONNECT_TIMEOUT_S = 3.0  # TCP and TLS handshake";
+const READ_TIMEOUT: &str = "READ_TIMEOUT_S = 10.0  # waiting for the first byte";
+
+/// Stale numbers whose strong `expect` holds at one other place apply there,
+/// a range whole, and the plan records the lines it applied to.
+#[test]
+fn a_line_target_whose_lines_moved_applies_where_its_expect_holds() {
+    let shifted = format!("{ROUTING}{READ}");
+    let base = spanless(&shifted);
+    let mut jitter = insert(3, Some(BACKOFF), "RETRY_JITTER = True");
+    jitter.id = "jitter".into();
+    let mut timeouts = ends(
+        [6, 7],
+        Some(CONNECT),
+        Some(READ_TIMEOUT),
+        "CONNECT_TIMEOUT_S = 5.0\nREAD_TIMEOUT_S = 20.0",
+    );
+    timeouts.id = "timeouts".into();
+    let plan = compile(&request(&base, vec![jitter, timeouts]), &bases(&base)).unwrap();
+    assert_eq!(
+        plan.files[0].output,
+        shifted
+            .replace(
+                &format!("{BACKOFF}\n"),
+                &format!("{BACKOFF}\nRETRY_JITTER = True\n")
+            )
+            .replace(
+                &format!("{CONNECT}\n{READ_TIMEOUT}\n"),
+                "CONNECT_TIMEOUT_S = 5.0\nREAD_TIMEOUT_S = 20.0\n"
+            )
+    );
+    let moved: Vec<(&str, &str)> = plan
+        .warnings
+        .iter()
+        .map(|warning| (warning.code.as_str(), warning.message.as_str()))
+        .collect();
+    assert_eq!(
+        moved,
+        [
+            (
+                "LINES_MOVED",
+                "Change jitter: after:3 did not hold expect, which holds only at after:7, so the change applied there; reread the file before more line edits"
+            ),
+            (
+                "LINES_MOVED",
+                "Change timeouts: lines:[6,7] did not hold expect, which holds only at lines:[10,11], so the change applied there; reread the file before more line edits"
+            ),
+        ]
+    );
+    let targets: Vec<&Target> = plan.request.files[0]
+        .changes
+        .iter()
+        .map(|change| &change.target)
+        .collect();
+    assert_eq!(
+        targets,
+        [
+            &Target::Insert {
+                after: 7,
+                expect: Some(BACKOFF.into()),
+            },
+            &Target::Lines {
+                lines: [10, 11],
+                expect: Some(CONNECT.into()),
+                expect_last: Some(READ_TIMEOUT.into()),
+            },
+        ]
+    );
+}
+
+/// A target moves only where nothing else could be meant: a short guard, one
+/// that holds at two places, ends that moved apart, a guard that does not reach
+/// the range's end, and a new place another change edits keep the refusal.
+#[test]
+fn a_line_target_is_not_moved_by_a_weak_repeated_or_split_guard() {
+    // `}` holds at line 2 alone, but so short a guard proves nothing, nor does a
+    // short line given as both the first and the last line of one.
+    let short = spanless("fn a() {\n}\nfn b() {}\n");
+    let error = rejected(&short, ends([1, 1], Some("}"), None, ""));
+    assert_eq!(error.code, "EXPECTED_TEXT_MISMATCH");
+    assert!(
+        error.message.contains("it is at line 2"),
+        "{}",
+        error.message
+    );
+    let error = rejected(&short, insert(1, Some("}"), "x"));
+    assert_eq!(error.code, "EXPECTED_TEXT_MISMATCH");
+    let once = spanless("zzzz\nabcd\n");
+    let error = rejected(&once, ends([1, 1], Some("abcd"), Some("abcd"), "x"));
+    assert_eq!(error.code, "EXPECTED_TEXT_MISMATCH");
+    // A strong guard that holds at two places could mean either.
+    let twice = spanless(
+        "[primary]\ntimeout = 30  # seconds\n[replica]\ntimeout = 30  # seconds\nother = 1\n",
+    );
+    let error = rejected(
+        &twice,
+        ends([5, 5], Some("timeout = 30  # seconds"), None, "x"),
+    );
+    assert_eq!(error.code, "EXPECTED_TEXT_MISMATCH");
+    assert!(
+        error.message.contains("it occurs 2 times"),
+        "{}",
+        error.message
+    );
+    // A line added above the range and one inside it: the first line moved one
+    // line down and the last line two, so the range did not move whole.
+    let split = spanless(
+        "// header\nfn keep() {}\nfn remove_me() {\n    step_one();\n    step_one_b();\n    step_two();\n}\n",
+    );
+    let error = rejected(
+        &split,
+        ends(
+            [2, 4],
+            Some("fn remove_me() {"),
+            Some("    step_two();"),
+            "",
+        ),
+    );
+    assert_eq!(error.code, "EXPECTED_TEXT_MISMATCH");
+    // A base that disclosed the lines lets expect give only the first line,
+    // which cannot show where a moved range ends.
+    let full = snapshot(
+        "full.txt".into(),
+        "// header\nalpha = 1  # first\nbeta = 2  # second\n".into(),
+    );
+    let error = rejected(&full, ends([1, 2], Some("alpha = 1  # first"), None, ""));
+    assert_eq!(error.code, "EXPECTED_TEXT_MISMATCH");
+    // Another change edits the new place; it was placed without knowing of the
+    // move, so the stale lines are refused as before, not reported as overlapping.
+    let base = spanless("# header\nalpha = 1  # first setting\nbeta = 2  # second setting\n");
+    let mut stale = ends(
+        [1, 1],
+        Some("alpha = 1  # first setting"),
+        None,
+        "alpha = 10  # first setting",
+    );
+    stale.id = "stale".into();
+    let other = parsed(json!({"id":"other","old":"# first setting","new":"# the first setting"}));
+    let errors = compile(&request(&base, vec![stale, other]), &bases(&base)).unwrap_err();
+    let codes: Vec<(&str, Option<&str>)> = errors
+        .iter()
+        .map(|error| (error.code.as_str(), error.change_id.as_deref()))
+        .collect();
+    assert_eq!(codes, [("EXPECTED_TEXT_MISMATCH", Some("stale"))]);
+    assert!(
+        errors[0]
+            .message
+            .contains("it is at line 2, so use lines [2,2]"),
+        "{}",
+        errors[0].message
+    );
+}
+
+/// A moved insertion is judged where it applies: text restating the line it
+/// follows there is refused, naming the moved `after`.
+#[test]
+fn a_moved_insertion_that_restates_its_new_anchor_names_the_moved_after() {
+    let anchor = "    tax_table=resolve(region),";
+    let base = spanless(&format!("# one\n# two\ntotals = compute(\n{anchor}\n)\n"));
+    let error = rejected(
+        &base,
+        insert(2, Some(anchor), &format!("{anchor}\n    rounding=1,")),
+    );
+    assert_eq!(error.code, "INSERT_REPEATS_LINE");
+    assert!(
+        error.message.starts_with("after:4 keeps line 4"),
+        "{}",
+        error.message
+    );
+}
+
 /// Past five places, a line's count is given as more than five.
 #[test]
 fn a_head_found_more_than_five_times_is_not_counted_as_five() {

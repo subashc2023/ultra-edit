@@ -471,6 +471,7 @@ pub fn compile_with(
                 &mut budget,
             );
         }
+        keep_moves_apart(&mut context, &mut replacements, &mut diagnostics);
         refuse_restatements(&context, &replacements, &mut diagnostics);
         replacements.sort_by(|left, right| {
             (left.start, left.end, &left.change_id).cmp(&(right.start, right.end, &right.change_id))
@@ -484,22 +485,7 @@ pub fn compile_with(
                 if right.start > left.end {
                     break;
                 }
-                // Boundary insertions also conflict, so there is one explicit ordering
-                // policy, except beside a deletion, where either order gives the same text.
-                let insertion = |replacement: &Replacement| replacement.start == replacement.end;
-                let deletion = |replacement: &Replacement| {
-                    replacement.start < replacement.end && replacement.text.is_empty()
-                };
-                let conflict = if (insertion(left) && deletion(right))
-                    || (deletion(left) && insertion(right))
-                {
-                    right.start < left.end && left.start < right.start
-                } else if insertion(left) || insertion(right) {
-                    right.start <= left.end
-                } else {
-                    right.start < left.end
-                };
-                if conflict {
+                if conflicts(left, right) {
                     if overlap_count == MAX_OVERLAP_DIAGNOSTICS {
                         diagnostics.push(at(Some(&base.path), None, "RESOURCE_LIMIT", format!("More than {MAX_OVERLAP_DIAGNOSTICS} overlap diagnostics; remaining conflict discovery stopped")));
                         overlap_limit_reached = true;
@@ -561,6 +547,7 @@ pub fn compile_with(
     // Edge warnings follow every byte warning, so the few a compact response
     // shows never trade a NUL or mixed line ending for a whitespace lint.
     let mut edge_warnings = Vec::new();
+    let mut moves = HashMap::new();
     let files = resolved
         .into_iter()
         .map(|(context, replacements, changes)| {
@@ -581,6 +568,7 @@ pub fn compile_with(
             }
             output.push_str(&base.text[cursor..]);
             warn_output(&base.path, &output, &mut warnings);
+            warn_moved(&base.path, &context.moved, &mut warnings);
             warn_adapted(&base.path, &context.adapted, &mut warnings);
             // Neighbours are judged in the output, where an adjacent change's text
             // may stand beside this one instead of the original bytes.
@@ -604,6 +592,12 @@ pub fn compile_with(
             }
             warn_edges(&base.path, &output, edges, &mut edge_warnings);
             warnings.extend(context.whole_words);
+            moves.extend(
+                context
+                    .moved
+                    .into_iter()
+                    .map(|moved| (moved.change.id.as_str(), moved.target)),
+            );
             PreparedFile {
                 base: base.clone(),
                 output,
@@ -613,9 +607,17 @@ pub fn compile_with(
         })
         .collect();
     warnings.append(&mut edge_warnings);
+    // The plan records the lines each moved target applies to, so a stored
+    // plan's line targets still derive its replacements.
+    let mut request = request.clone();
+    for change in request.files.iter_mut().flat_map(|file| &mut file.changes) {
+        if let Some(target) = moves.remove(change.id.as_str()) {
+            change.target = target;
+        }
+    }
     Ok(PreparedPlan {
         id: new_id("p"),
-        request: request.clone(),
+        request,
         files,
         warnings,
     })
@@ -757,6 +759,32 @@ fn warn_edges(
             format!(
                 "Change {id}: {finding}; line {line} now reads {}",
                 candidates::quoted(&excerpt, 2 * EDGE_CONTEXT_CHARS + 10)
+            ),
+        ));
+    }
+}
+
+/// Names the lines each moved line target gave and the lines it applied to. A
+/// stale read or a miscount put them there, so other numbers from it may be off.
+fn warn_moved(path: &str, moved: &[Moved], warnings: &mut Vec<Diagnostic>) {
+    let place = |target: &Target| match target {
+        Target::Lines {
+            lines: [first, last],
+            ..
+        } => format!("lines:[{first},{last}]"),
+        Target::Insert { after, .. } => format!("after:{after}"),
+        Target::Exact { .. } | Target::All { .. } | Target::Span { .. } => String::new(),
+    };
+    for moved in moved {
+        let id: String = moved.change.id.chars().take(QUOTED_ID_CHARS).collect();
+        warnings.push(at(
+            Some(path),
+            Some(moved.change),
+            "LINES_MOVED",
+            format!(
+                "Change {id}: {} did not hold expect, which holds only at {}, so the change applied there; reread the file before more line edits",
+                place(&moved.change.target),
+                place(&moved.target)
             ),
         ));
     }
@@ -1082,6 +1110,20 @@ struct FileContext<'a> {
     /// whitespace, and its visible characters, so the run search reads a line
     /// once however many insertions compare it.
     trimmed: RefCell<HashMap<usize, (usize, usize)>>,
+    /// Line targets applied where their guard holds instead of at their stated
+    /// lines, in request order.
+    moved: Vec<Moved<'a>>,
+}
+
+/// A line target whose stated lines do not hold its guard, applied at the one
+/// other place where the guard holds.
+struct Moved<'a> {
+    change: &'a Change,
+    /// The target with the lines it applies to, which the plan records.
+    target: Target,
+    /// What the stated lines get, given instead when the moved target would
+    /// conflict with another change.
+    refusal: Diagnostic,
 }
 
 impl<'a> FileContext<'a> {
@@ -1097,7 +1139,16 @@ impl<'a> FileContext<'a> {
             extents: HashMap::new(),
             restated: Vec::new(),
             trimmed: RefCell::new(HashMap::new()),
+            moved: Vec::new(),
         }
+    }
+
+    /// The target a change applies: its own, or the one its guard moved it to.
+    fn target(&self, change: &'a Change) -> &Target {
+        self.moved
+            .iter()
+            .find(|moved| moved.change.id == change.id)
+            .map_or(&change.target, |moved| &moved.target)
     }
 
     /// Line `number`'s body without trailing whitespace, and its visible
@@ -1221,6 +1272,60 @@ fn merge_kept_overlaps(text: &str, replacements: &mut [Replacement]) {
             left.text.truncate(left.text.len() - shared.len());
             left.end = right.start;
         }
+    }
+}
+
+/// Whether two replacements, `left` sorted first, conflict. Boundary insertions
+/// also conflict, so there is one explicit ordering policy, except beside a
+/// deletion, where either order gives the same text.
+fn conflicts(left: &Replacement, right: &Replacement) -> bool {
+    let insertion = |replacement: &Replacement| replacement.start == replacement.end;
+    let deletion = |replacement: &Replacement| {
+        replacement.start < replacement.end && replacement.text.is_empty()
+    };
+    if (insertion(left) && deletion(right)) || (deletion(left) && insertion(right)) {
+        right.start < left.end && left.start < right.start
+    } else if insertion(left) || insertion(right) {
+        right.start <= left.end
+    } else {
+        right.start < left.end
+    }
+}
+
+/// Refuses each moved line target whose replacement conflicts with another
+/// change's, as its stated lines are refused: the other changes were placed
+/// without knowing of the move. Each moved target is compared with every
+/// replacement, at most `MAX_CHANGES` times `MAX_REPLACEMENTS` comparisons.
+fn keep_moves_apart(
+    context: &mut FileContext,
+    replacements: &mut Vec<Replacement>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let clashes = |id: &str| {
+        replacements
+            .iter()
+            .filter(|own| own.change_id == id)
+            .any(|own| {
+                replacements.iter().any(|other| {
+                    let (left, right) = if (own.start, own.end) <= (other.start, other.end) {
+                        (own, other)
+                    } else {
+                        (other, own)
+                    };
+                    other.change_id != id && conflicts(left, right)
+                })
+            })
+    };
+    let (refused, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut context.moved)
+        .into_iter()
+        .partition(|moved| clashes(&moved.change.id));
+    context.moved = kept;
+    for moved in refused {
+        replacements.retain(|replacement| replacement.change_id != moved.change.id);
+        context
+            .restated
+            .retain(|restated| restated.change.id != moved.change.id);
+        diagnostics.push(moved.refusal);
     }
 }
 
@@ -1348,18 +1453,37 @@ fn resolve_change<'a>(
         head: expect.as_deref(),
         tail: expect_last.as_deref(),
     };
-    if !line_guard(context, change, guard, expect, diagnostics, budget) {
-        return;
-    }
+    let (guard, moved) = match line_guard(context, change, guard, expect, diagnostics, budget) {
+        Placed::Stated => (guard, None),
+        Placed::Refused => return,
+        Placed::Moved { guard, refusal } => {
+            let mut target = change.target.clone();
+            match (&mut target, guard) {
+                (Target::Lines { lines, .. }, Guard::Prefix { first, last }) => {
+                    *lines = [first, last];
+                }
+                (Target::Insert { after, .. }, Guard::Above { line }) => *after = line,
+                _ => {}
+            }
+            let moved = Moved {
+                change,
+                target,
+                refusal,
+            };
+            (guard, Some(moved))
+        }
+    };
     if let Guard::Above { line } = guard
         && let Some(restated) = restated_lines(change, context, line, &text)
     {
         context.restated.push(restated);
     }
-    let found = derived_replacement(&base.text, context.lines(), &change.target, &text);
+    let target = moved.as_ref().map_or(&change.target, |moved| &moved.target);
+    let found = derived_replacement(&base.text, context.lines(), target, &text);
     let Some((range, written)) = found else {
         return;
     };
+    context.moved.extend(moved);
     let extent = match guard {
         Guard::Prefix { first, last } => Extent::Lines {
             first,
@@ -1501,7 +1625,7 @@ fn refuse_restatements(
                 merged_lines(context, replacements, change, [first, last], &touching);
             Advice::Merge(low, high, partial)
         };
-        let Target::Insert { after, .. } = change.target else {
+        let Target::Insert { after, .. } = *context.target(change) else {
             continue;
         };
         let mut diagnostic = at(
@@ -2143,13 +2267,27 @@ struct Expect<'a> {
     tail: Option<&'a str>,
 }
 
+/// Where a line target's guard lets it apply.
+enum Placed {
+    /// At the stated lines.
+    Stated,
+    /// Nowhere; diagnostics say why.
+    Refused,
+    /// At the one other place where the guard holds; `refusal` is what the
+    /// stated lines get.
+    Moved { guard: Guard, refusal: Diagnostic },
+}
+
 /// Checks a line target's `expect`. Unless the base disclosed every addressed line,
 /// line numbers from elsewhere may be stale, so one is required: for `lines`, it
 /// must reach the range's last line, either by giving every line or by giving the
 /// last lines too, and it must have `MIN_GUARD_CHARS` visible characters or match
 /// this place alone, so a shifted number cannot find the same short text elsewhere.
-/// Comparing line by line, ignoring line endings, lets text copied from a view
-/// that hides `\r` guard CRLF lines.
+/// When the stated lines do not hold it, a guard that reaches the target's end
+/// with `MIN_GUARD_CHARS` visible characters places the target where it holds,
+/// if that is exactly one place: a stale or miscounted number then applies only
+/// to text the guard matches. Comparing line by line, ignoring line endings, lets
+/// text copied from a view that hides `\r` guard CRLF lines.
 fn line_guard(
     context: &FileContext,
     change: &Change,
@@ -2157,19 +2295,19 @@ fn line_guard(
     expect: Expect,
     diagnostics: &mut Vec<Diagnostic>,
     budget: &mut Budget,
-) -> bool {
+) -> Placed {
     let base = context.base;
     let lines = context.lines();
     let reject = |diagnostics: &mut Vec<Diagnostic>, code: &str, message: String| {
         diagnostics.push(at(Some(&base.path), Some(change), code, message));
-        false
+        Placed::Refused
     };
     let head = expect.head.map(expected_lines).unwrap_or_default();
     let tail = expect.tail.map(expected_lines).unwrap_or_default();
     let (addressed, extent) = match guard {
         Guard::Above { line: 0 } => {
             if head.iter().all(|piece| piece.is_empty()) {
-                return true;
+                return Placed::Stated;
             }
             return reject(
                 diagnostics,
@@ -2280,15 +2418,12 @@ fn line_guard(
                 Guard::Above { .. } => format!("use after:{}", start + head.len() - 1),
             },
         );
-        return mismatch_at(
-            context,
-            change,
-            head_start,
-            head.len(),
-            "expect",
-            rest,
-            diagnostics,
-        );
+        let refusal = mismatch_at(context, change, head_start, head.len(), "expect", rest);
+        if reaches_end && let Some(guard) = moved(context, guard, &head, &tail) {
+            return Placed::Moved { guard, refusal };
+        }
+        diagnostics.push(refusal);
+        return Placed::Refused;
     }
     // Where the tail guard ends: the range's last line or, when the range ends in
     // blank lines and the tail names the text before them, that text's line.
@@ -2331,15 +2466,15 @@ fn line_guard(
             |start| format!("the range is [{first},{}]", start + tail.len() - 1),
         );
         let tail_start = last + 1 - tail.len();
-        return mismatch_at(
+        diagnostics.push(mismatch_at(
             context,
             change,
             tail_start,
             tail.len(),
             "the expected last lines",
             rest,
-            diagnostics,
-        );
+        ));
+        return Placed::Refused;
     }
     // A line that both the head and the tail check is evidence once.
     let overlap = match guard {
@@ -2354,7 +2489,7 @@ fn line_guard(
         .map(|piece| piece.chars().filter(|ch| !ch.is_whitespace()).count())
         .sum();
     if !required || visible >= MIN_GUARD_CHARS {
-        return true;
+        return Placed::Stated;
     }
     // A short guard, such as a blank line or `}`, must match this place alone: one
     // that matches elsewhere too could still match after the file shifted.
@@ -2434,7 +2569,64 @@ fn line_guard(
             ),
         );
     }
-    true
+    Placed::Stated
+}
+
+/// The one place other than the stated lines where a guard that reaches the
+/// target's end, with `MIN_GUARD_CHARS` visible characters, holds as it would at
+/// the stated lines, and the whole target fits: for `lines`, its first and last
+/// lines there together, shifted alike.
+fn moved(context: &FileContext, guard: Guard, head: &[&str], tail: &[&str]) -> Option<Guard> {
+    let (base, lines) = (context.base, context.lines());
+    let count = lines.count();
+    let matches_at = |start: usize, pieces: &[&str]| {
+        pieces
+            .iter()
+            .enumerate()
+            .all(|(offset, piece)| base.text[lines.body(start + offset)] == **piece)
+    };
+    let shown = |pieces: &[&str]| pieces.iter().map(|piece| visible(piece)).sum::<usize>();
+    let places: Vec<Guard> = match guard {
+        Guard::Prefix { first, last } => {
+            let extent = last - first + 1;
+            // A line that both the head and the tail check is evidence once.
+            let overlap = (head.len() + tail.len()).saturating_sub(extent);
+            if shown(head) + shown(&tail[overlap.min(tail.len())..]) < MIN_GUARD_CHARS {
+                return None;
+            }
+            (1..=(count + 1).saturating_sub(extent))
+                .filter(|&start| {
+                    let end = start + extent - 1;
+                    matches_at(start, head)
+                        && (tail.is_empty()
+                            || matches_at(end + 1 - tail.len(), tail)
+                            || before_blank_end(context, start, end, head, tail)
+                                .is_some_and(|line| matches_at(line + 1 - tail.len(), tail)))
+                })
+                .take(2)
+                .map(|start| Guard::Prefix {
+                    first: start,
+                    last: start + extent - 1,
+                })
+                .collect()
+        }
+        Guard::Above { .. } => {
+            if shown(head) < MIN_GUARD_CHARS {
+                return None;
+            }
+            (1..=(count + 1).saturating_sub(head.len()))
+                .filter(|&start| matches_at(start, head))
+                .take(2)
+                .map(|start| Guard::Above {
+                    line: start + head.len() - 1,
+                })
+                .collect()
+        }
+    };
+    match places[..] {
+        [place] => Some(place),
+        _ => None,
+    }
 }
 
 /// Advice and candidates for guarded lines that are not where the target says:
@@ -2497,7 +2689,7 @@ fn before_blank_end(
     (visible >= MIN_GUARD_CHARS).then_some(end)
 }
 
-/// Pushes `EXPECTED_TEXT_MISMATCH` quoting the `count` lines from `start`.
+/// `EXPECTED_TEXT_MISMATCH` quoting the `count` lines from `start`.
 fn mismatch_at(
     context: &FileContext,
     change: &Change,
@@ -2505,8 +2697,7 @@ fn mismatch_at(
     count: usize,
     wanted: &str,
     (rest, found): (String, Vec<Candidate>),
-    diagnostics: &mut Vec<Diagnostic>,
-) -> bool {
+) -> Diagnostic {
     let (base, lines) = (context.base, context.lines());
     let end = start + count - 1;
     let actual = &base.text[lines.body(start).start..lines.body(end).end];
@@ -2522,8 +2713,7 @@ fn mismatch_at(
         candidates::line_mismatch(&subject, actual, wanted, &rest),
     );
     diagnostic.candidates = found;
-    diagnostics.push(diagnostic);
-    false
+    diagnostic
 }
 
 /// Advice and candidates for line-wise text found nowhere as whole lines.

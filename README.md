@@ -139,7 +139,9 @@ writing twice.
 
 `old` must occur exactly once, as whole words (or `count` times, which may
 match inside words), and `lines`/`after` address whole lines by Read's numbers,
-guarded by `expect`, so a stale line number is rejected instead of applied. Span targets on an immutable snapshot from
+guarded by `expect`, so a stale line number never edits other text: a long
+`expect` that holds at exactly one other place moves the change there, with a
+`LINES_MOVED` warning, and anything else is rejected. Span targets on an immutable snapshot from
 `ultra_edit_snapshot` (`r12` for line 12, `m1` for a search match) remain for
 files too large to Read.
 
