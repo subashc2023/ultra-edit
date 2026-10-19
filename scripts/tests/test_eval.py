@@ -1829,7 +1829,8 @@ class ArmRegistryTests(unittest.TestCase):
             self.assertIn(f"== {name} (example: crlf-and-lf__{name}__r1) ==", text)
         self.assertIn('"cc-plugin-telemetry@builtin": false', text)
         self.assertIn("WARNING: arm fs-test: missing install path", text)
-        self.assertIn(f'"{self.root / "install" / "server.py"}"', text)
+        # The arm's own "{third_party_dir}/server.py" template, substituted verbatim and printed as JSON.
+        self.assertIn(json.dumps(f"{self.root / 'install'}/server.py"), text)
         self.assertIn('"<temp>/repo"', text)
         self.assertIn("--mcp-config", text)
         self.assertIn(",mcp__fs ", text)
