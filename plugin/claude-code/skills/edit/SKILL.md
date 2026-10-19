@@ -55,11 +55,12 @@ exposed by this host.
    ```
 
    `old` must occur exactly once in the file, starting and ending on word
-   boundaries (`OLD_INSIDE_WORD` otherwise); add neighbouring text until it
-   does, or restrict it to whole lines with `"in": [first, last]`. With
-   `"count": N` it replaces exactly N non-overlapping occurrences, inside words
-   too; when N counts only the whole-word ones, matches inside longer names stay
-   (`COUNT_WHOLE_WORDS` names them). `lines`
+   boundaries (`OLD_INSIDE_WORD` otherwise), not counting matches inside longer
+   names when exactly one is whole; add neighbouring text until it does, or
+   restrict it to whole lines with `"in": [first, last]`. With `"count": N` it
+   replaces exactly N non-overlapping occurrences, inside words too; when N
+   counts only the whole-word ones, matches inside longer names stay
+   (`WHOLE_WORDS_ONLY` names them). `lines`
    replaces whole lines by Read's numbers (`""` deletes them; text without a
    final newline keeps the last line's ending) and `after: n` inserts whole lines
    after line n (0 is the top). Both need `expect`, compared without line

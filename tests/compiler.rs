@@ -2756,9 +2756,9 @@ fn a_single_old_inside_a_word_is_refused_unless_counted() {
             "{old:?} in {text:?}"
         );
     }
-    // Ambiguity advice points at the whole-word match a single `old` may take.
+    // Ambiguity advice points at a whole-word match a single `old` may take.
     let errors = output(
-        "max_retries = 20\nretries = 2\n",
+        "max_retries = 20\nretries = 2\nretries = 2\n",
         exact("w", "retries = 2", "x"),
     )
     .unwrap_err();
@@ -2770,12 +2770,35 @@ fn a_single_old_inside_a_word_is_refused_unless_counted() {
     );
 }
 
-/// A count of a name's own uses, while longer names also hold it, takes only the
-/// whole-word matches, as a rename means; a count of every match takes them all.
+/// An `old` that occurs once as whole words, or a count of a name's own uses, while
+/// longer names also hold it, takes only the whole-word matches, as a rename means;
+/// a count of every match takes them all.
 #[test]
-fn a_count_of_whole_words_leaves_longer_names() {
+fn whole_word_matches_leave_longer_names() {
+    let base = snapshot(
+        "settings.py".into(),
+        "MAX_RETRIES = 3\nMAX_RETRIES_PER_HOST = 2\n".into(),
+    );
+    let plan = compile(
+        &request(&base, vec![exact("rename", "MAX_RETRIES", "RETRY_LIMIT")]),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(
+        plan.files[0].output,
+        "RETRY_LIMIT = 3\nMAX_RETRIES_PER_HOST = 2\n"
+    );
+    assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+    assert_eq!(plan.warnings[0].code, "WHOLE_WORDS_ONLY");
+    assert_eq!(
+        plan.warnings[0].message,
+        "Change rename: `old` took its one whole-word match, so the one inside `MAX_RETRIES_PER_HOST` at line 2 stayed"
+    );
     let text = "MAX_RETRIES = 3\nMAX_RETRIES_PER_HOST = 2\nretry(MAX_RETRIES)\n";
     let base = snapshot("settings.py".into(), text.into());
+    // Two whole-word matches are still ambiguous.
+    let error = rejected(&base, exact("rename", "MAX_RETRIES", "RETRY_LIMIT"));
+    assert_eq!(error.code, "TARGET_AMBIGUOUS");
     let count = |expected| Change {
         id: "rename".into(),
         target: Target::All {
@@ -2792,7 +2815,7 @@ fn a_count_of_whole_words_leaves_longer_names() {
         "RETRY_LIMIT = 3\nMAX_RETRIES_PER_HOST = 2\nretry(RETRY_LIMIT)\n"
     );
     assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
-    assert_eq!(plan.warnings[0].code, "COUNT_WHOLE_WORDS");
+    assert_eq!(plan.warnings[0].code, "WHOLE_WORDS_ONLY");
     assert_eq!(
         plan.warnings[0].message,
         "Change rename: count took only the whole-word matches, so the one inside `MAX_RETRIES_PER_HOST` at line 2 stayed"
@@ -2923,8 +2946,16 @@ fn ambiguity_advice_names_lines_that_hold_one_whole_word_match() {
             json!({"id":"w","old":old,"new":new,"in":range}),
         ))
     };
-    let section =
-        "[default]\nmax_retries = 3\ntimeout = 30\n\n[upload]\nretries = 3\ntimeout = 30\n";
+    // A lone whole-word match is taken without advice, so each case below holds two.
+    assert_eq!(
+        compiled(
+            "MAX_RETRIES = 3\nRETRIES = 3\n",
+            json!({"id":"w","old":"RETRIES = 3\n","new":"RETRIES = 5\n"}),
+        )
+        .unwrap(),
+        "MAX_RETRIES = 3\nRETRIES = 5\n"
+    );
+    let section = "[default]\nmax_retries = 3\ntimeout = 30\n\n[upload]\nretries = 3\ntimeout = 30\n\n[sync]\nretries = 3\ntimeout = 30\n";
     assert_eq!(
         follow(
             section,
@@ -2933,24 +2964,27 @@ fn ambiguity_advice_names_lines_that_hold_one_whole_word_match() {
         )
         .unwrap()
         .unwrap(),
-        "[default]\nmax_retries = 3\ntimeout = 30\n\n[upload]\nretries = 5\ntimeout = 60\n"
+        section.replacen(
+            "\nretries = 3\ntimeout = 30",
+            "\nretries = 5\ntimeout = 60",
+            1
+        )
     );
     assert_eq!(
         follow(
-            "MAX_RETRIES = 3\nRETRIES = 3\n",
+            "MAX_RETRIES = 3\nRETRIES = 3\nRETRIES = 3\n",
             "RETRIES = 3\n",
             "RETRIES = 5\n"
         )
         .unwrap()
         .unwrap(),
-        "MAX_RETRIES = 3\nRETRIES = 5\n"
+        "MAX_RETRIES = 3\nRETRIES = 5\nRETRIES = 3\n"
     );
     // The whole-word match past the five lines shown is found.
-    let late =
-        "a_retries = 2\nb_retries = 2\nc_retries = 2\nd_retries = 2\ne_retries = 2\nretries = 2\n";
+    let late = "a_retries = 2\nb_retries = 2\nc_retries = 2\nd_retries = 2\ne_retries = 2\nretries = 2\nretries = 2\n";
     assert_eq!(
         follow(late, "retries = 2", "retries = 3").unwrap().unwrap(),
-        late.replace("\nretries = 2", "\nretries = 3")
+        late.replacen("\nretries = 2", "\nretries = 3", 1)
     );
     // No whole-word match: the message says so and names no lines.
     let errors = compiled(

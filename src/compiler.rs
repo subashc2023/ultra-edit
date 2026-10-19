@@ -1071,7 +1071,7 @@ struct FileContext<'a> {
     disclosed: OnceCell<HashSet<usize>>,
     /// Changes whose text was adapted to CRLF, in request order.
     adapted: Vec<&'a str>,
-    /// Warnings for counts that took only the whole-word matches, in request order.
+    /// Warnings for targets that took only whole-word matches, in request order.
     whole_words: Vec<Diagnostic>,
     /// The lines each line target addresses, which overlap advice names.
     extents: HashMap<&'a str, Extent>,
@@ -1772,12 +1772,12 @@ fn resolve_exact(
             matches.positions,
         )
     };
-    // A count takes every match, but a caller renaming `MAX_RETRIES` counts its own
-    // uses, not those inside `MAX_RETRIES_PER_HOST`: a count that numbers just the
-    // matches cutting no word takes those, and a warning names what stayed. Whole-word
-    // matches never outnumber all matches, so only a count below them is checked.
-    let whole = if !exact && expected < actual {
-        whole_words(&base.text, start..end, old)
+    // Every match counts, but a caller renaming `MAX_RETRIES` means its own uses, not
+    // those inside `MAX_RETRIES_PER_HOST`: an `old` with one match that cuts no word,
+    // or a count that numbers just those, takes them, and a warning names what stayed.
+    // Whole-word matches never outnumber all matches, so only fewer are checked.
+    let whole = if expected < actual {
+        whole_words(&base.text, start..end, old, !exact)
     } else {
         None
     };
@@ -1972,17 +1972,20 @@ fn inside_word(text: &str, boundary: usize) -> String {
     )
 }
 
-/// The left-to-right, non-overlapping matches of `old` in `range` that cut no word,
-/// as offsets into the range; `None` past `ADVISED_MATCHES` starts, which bounds the
-/// scan as it bounds ambiguity advice.
-fn whole_words(text: &str, range: Range<usize>, old: &str) -> Option<Vec<usize>> {
+/// The left-to-right matches of `old` in `range` that cut no word, as offsets into
+/// the range, skipping ones that overlap an earlier match when `separate`, as a
+/// count replaces them; `None` past `ADVISED_MATCHES` starts, which bounds the scan
+/// as it bounds ambiguity advice.
+fn whole_words(text: &str, range: Range<usize>, old: &str, separate: bool) -> Option<Vec<usize>> {
     let one_line = one_line(old);
     let (mut whole, mut free) = (Vec::new(), 0);
     for (examined, at) in overlapping_starts(&text[range.clone()], old).enumerate() {
         if examined == ADVISED_MATCHES {
             return None;
         }
-        if at >= free && word_cut(text, range.start + at, old.len(), one_line).is_none() {
+        if (!separate || at >= free)
+            && word_cut(text, range.start + at, old.len(), one_line).is_none()
+        {
             whole.push(at);
             free = at + old.len();
         }
@@ -1990,7 +1993,7 @@ fn whole_words(text: &str, range: Range<usize>, old: &str) -> Option<Vec<usize>>
     Some(whole)
 }
 
-/// `COUNT_WHOLE_WORDS`: a count took only the whole-word matches of `old` in
+/// `WHOLE_WORDS_ONLY`: a target took only the whole-word matches of `old` in
 /// `range`, so `stayed` matches inside longer words are left; names the first.
 fn stayed_inside_words(
     base: &Snapshot,
@@ -2013,12 +2016,16 @@ fn stayed_inside_words(
         }
         None => format!("{stayed} others stayed"),
     };
+    let taken = match change.target {
+        Target::Exact { .. } => "`old` took its one whole-word match",
+        _ => "count took only the whole-word matches",
+    };
     let id: String = change.id.chars().take(QUOTED_ID_CHARS).collect();
     at(
         Some(&base.path),
         Some(change),
-        "COUNT_WHOLE_WORDS",
-        format!("Change {id}: count took only the whole-word matches, so {left}"),
+        "WHOLE_WORDS_ONLY",
+        format!("Change {id}: {taken}, so {left}"),
     )
 }
 

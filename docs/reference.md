@@ -231,7 +231,7 @@ forms:
 
 | Change | Contract |
 | --- | --- |
-| `{"old":"text","new":"…"}` | Exactly one occurrence in the original file, not starting or ending inside an ASCII word. |
+| `{"old":"text","new":"…"}` | Exactly one occurrence in the original file, not starting or ending inside an ASCII word; when more occur and exactly one of them cuts no word, that one. |
 | `{"old":"text","in":"r5","new":"…"}` | Exactly one occurrence contained in a disclosed span. |
 | `{"old":"text","in":[72,87],"new":"…"}` | Exactly one occurrence contained in lines 72-87, from line 72's start through line 87's terminator. |
 | `{"old":"text","count":3,"new":"…"}` | Exactly 3 non-overlapping, left-to-right occurrences in the whole file, or within `in`, inside words or not; when more occur and exactly 3 of them cut no word, those 3. |
@@ -332,13 +332,13 @@ cut, such as `Hauptstraße`, and an ASCII letter right after a backslash, as in
 the escape `\nRestart`, do not count, though `\_` and `\1` do; Han, kana, and
 other uncased scripts separate words, so `80` inside `端口为8080` is refused,
 and a cut between two digits is refused whatever letter follows, as `10` inside
-`100µs`. `count`, even 1, matches inside words, unless it numbers only the
-matches that cut no word: when longer names also hold `old`, as
-`MAX_RETRIES_PER_HOST` holds `MAX_RETRIES`, a `count` that equals the whole-word
-matches but not every match replaces just those, and a nonblocking
-`COUNT_WHOLE_WORDS` warning names the first match left and its line. A count that
-is neither gives the whole-word number in its `EXPECTED_COUNT_MISMATCH` advice too;
-the whole-word scan stops after 10,000 matches. An ambiguity message suggests
+`100µs`. `count`, even 1, matches inside words. When longer names also hold
+`old`, as `MAX_RETRIES_PER_HOST` holds `MAX_RETRIES`, an `old` with exactly one
+match that cuts no word takes that match, and a `count` that equals the
+whole-word matches but not every match replaces just those; a nonblocking
+`WHOLE_WORDS_ONLY` warning names the first match left and its line. A count
+that is neither gives the whole-word number in its `EXPECTED_COUNT_MISMATCH`
+advice too; the whole-word scan stops after 10,000 matches. An ambiguity message suggests
 `in` lines where a whole-word match is the only match in those whole lines, and
 otherwise says to add surrounding text, or that every match is inside a longer
 word; it examines at most 10,000 matches.

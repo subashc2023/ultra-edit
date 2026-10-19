@@ -14,13 +14,14 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ### Changed
 
-- A `count` that numbers only the whole-word matches of `old`, while longer
-  names also hold it, replaces just those: renaming `MAX_RETRIES` with a count
-  of its own uses no longer fails because `MAX_RETRIES_PER_HOST` holds it too.
-  A nonblocking `COUNT_WHOLE_WORDS` warning names the first match left inside a
-  longer word. A count of every match still replaces them all, and a count that
-  is neither now gives the whole-word number in its `EXPECTED_COUNT_MISMATCH`
-  advice as well.
+- Matches inside longer names no longer get in the way of a rename: an `old`
+  that occurs several times but exactly once as whole words takes that match,
+  and a `count` that numbers only the whole-word matches replaces just those, so
+  `MAX_RETRIES` is no longer refused because `MAX_RETRIES_PER_HOST` holds it
+  too. A nonblocking `WHOLE_WORDS_ONLY` warning names the first match left
+  inside a longer word. A count of every match still replaces them all, and a
+  count that is neither now gives the whole-word number in its
+  `EXPECTED_COUNT_MISMATCH` advice as well.
 - `in` beside `lines` or `after` is accepted when it holds the lines the target
   names, as `count: 1` is accepted anywhere; it is not stored. Any other `in`
   there, and any `in` on a `span`, is still refused while parsing.

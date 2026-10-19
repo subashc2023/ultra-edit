@@ -91,10 +91,10 @@ alias). A `path` file supports `old`, `count`, `in` with lines, `lines`, and
 
 | Intent | Change | Requirement |
 | --- | --- | --- |
-| Replace unique exact text anywhere in the file | `{"old":"a","new":"b"}` | Exactly one occurrence in the entire original file, on word boundaries. |
+| Replace unique exact text anywhere in the file | `{"old":"a","new":"b"}` | Exactly one occurrence in the entire original file, on word boundaries; matches inside longer names do not count when exactly one is whole (`WHOLE_WORDS_ONLY`). |
 | Replace unique exact text within some lines | `{"old":"a","new":"b","in":[72,87]}` | Exactly one occurrence wholly inside lines 72-87. |
 | Replace unique exact text inside an inspected span | `{"old":"a","new":"b","in":"selection"}` | The span belongs to this base; one occurrence inside it. |
-| Replace every occurrence | `{"old":"a","new":"b","count":3}` | Exactly 3 non-overlapping occurrences in the file, or in `in`, inside words or not; or, when more occur, exactly the 3 that cut no word, leaving those inside longer names (`COUNT_WHOLE_WORDS`). |
+| Replace every occurrence | `{"old":"a","new":"b","count":3}` | Exactly 3 non-overlapping occurrences in the file, or in `in`, inside words or not; or, when more occur, exactly the 3 that cut no word, leaving those inside longer names (`WHOLE_WORDS_ONLY`). |
 | Replace or delete whole lines | `{"lines":[40,42],"expect":["fn load(cfg) {","}"],"new":"..."}` | Lines exist; `expect` matches their first and last lines. `""` deletes them. |
 | Insert whole lines | `{"after":3,"expect":"use std::fs;","new":"use std::io;"}` | Line 3 exists; `expect` matches the lines ending at 3. `after:0` inserts at the top. |
 | Replace a disclosed line, selection, or match | `{"span":"m1","expect":"old text","new":"b"}` | The span belongs to this base; `expect` equals its bytes exactly. |
@@ -171,7 +171,7 @@ is `{"kind":"all","old":…,"expected":N}`, `span` is
 the same request ID.
 
 Search and `exact` ambiguity counts include overlapping starts: `aa` occurs twice in `aaa`.
-Ambiguous exact matches are errors. In `TARGET_AMBIGUOUS`, `actual` remains the
+Ambiguous exact matches are errors, unless exactly one of them cuts no word. In `TARGET_AMBIGUOUS`, `actual` remains the
 overlapping-start count; the message adds, in parentheses, the non-overlapping
 count for a corresponding `count` change in the same scope, and the lines of
 the first five starts: `found 6 overlapping starts (4 non-overlapping) at lines
