@@ -2743,6 +2743,197 @@ fn a_change_whose_old_holds_a_cr_stays_literal_so_crlf_converts_to_lf() {
     assert_eq!(plan.warnings[0].code, "EOL_ADAPTED");
 }
 
+/// Text typed from a rendered view, such as a task's prompt, has an ASCII space
+/// where the file may hold a no-break or thin one. An `old` found nowhere as
+/// written takes its one match with those spaces, and `new` keeps the file's
+/// spaces where it repeats `old`.
+#[test]
+fn an_old_with_ascii_spaces_matches_the_files_unicode_spaces() {
+    let text = "The default\nlimit is 10\u{a0}km; trails under 10\u{a0}km get a badge.\n";
+    let base = snapshot("guide.md".into(), text.into());
+    let plan = compile(
+        &request(&base, vec![exact("c", "limit is 10 km", "limit is 12 km")]),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(
+        plan.files[0].output,
+        "The default\nlimit is 12\u{a0}km; trails under 10\u{a0}km get a badge.\n"
+    );
+    assert_eq!(plan.files[0].replacements[0].text, "limit is 12\u{a0}km");
+    // The request keeps the text as written, so its derived ID is unchanged.
+    assert_eq!(plan.request.files[0].changes[0].text, "limit is 12 km");
+    assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+    assert_eq!(plan.warnings[0].code, "SPACES_ADAPTED");
+    assert_eq!(plan.warnings[0].change_id.as_deref(), Some("c"));
+    assert_eq!(
+        plan.warnings[0].message,
+        "Change c: a space in `old` matched this file's U+00A0, which `new` keeps where it repeats `old`"
+    );
+    let output = |text: &str, change: serde_json::Value| compiled(text, change).unwrap();
+    for space in ['\u{a0}', '\u{2007}', '\u{2009}', '\u{202f}'] {
+        // After and before the text `new` changes, beside ASCII spaces that stay.
+        assert_eq!(
+            output(
+                &format!("x = 10{space}km, y = 2{space}m\n"),
+                json!({"id":"w","old":"10 km, y = 2 m","new":"12 km, y = 2 m"}),
+            ),
+            format!("x = 12{space}km, y = 2{space}m\n")
+        );
+        assert_eq!(
+            output(
+                &format!("a 10{space}km long road\n"),
+                json!({"id":"w","old":"10 km long","new":"10 km wide"}),
+            ),
+            format!("a 10{space}km wide road\n")
+        );
+    }
+    // Only the scope's matches count.
+    assert_eq!(
+        output(
+            "10\u{a0}km\n10\u{a0}km\n",
+            json!({"id":"w","old":"10 km","new":"12 km","in":[2,2]}),
+        ),
+        "10\u{a0}km\n12\u{a0}km\n"
+    );
+    // Line endings and spaces adapt together.
+    let base = snapshot("crlf.md".into(), "a\r\nlimit is 10\u{202f}km\r\n".into());
+    let plan = compile(
+        &request(
+            &base,
+            vec![exact("c", "a\nlimit is 10 km", "A\nlimit is 12 km")],
+        ),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(plan.files[0].output, "A\r\nlimit is 12\u{202f}km\r\n");
+    let codes: Vec<_> = plan.warnings.iter().map(|w| w.code.as_str()).collect();
+    assert_eq!(codes, ["EOL_ADAPTED", "SPACES_ADAPTED"]);
+    // One warning names every change and space.
+    let base = snapshot("two.md".into(), "5\u{a0}m and 6\u{202f}kg\n".into());
+    let plan = compile(
+        &request(
+            &base,
+            vec![exact("a", "5 m", "7 m"), exact("b", "6 kg", "8 kg")],
+        ),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(plan.files[0].output, "7\u{a0}m and 8\u{202f}kg\n");
+    assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+    assert_eq!(
+        plan.warnings[0].message,
+        "Changes a, b: a space in `old` matched this file's U+00A0 or U+202F, which `new` keeps where it repeats `old`"
+    );
+}
+
+/// A match with Unicode spaces is refused as before, with near-miss candidates,
+/// unless it is the only one and `new` repeats the text around each space it
+/// adapts; an `old` holding such a space, a count, and an undo stay literal.
+#[test]
+fn a_unicode_space_match_is_refused_unless_unique_and_kept() {
+    let refused = |text: &str, change: Change| {
+        let base = snapshot("guide.md".into(), text.into());
+        let error = rejected(&base, change);
+        assert_eq!(error.code, "TARGET_NOT_FOUND", "{error:?}");
+        assert!(!error.candidates.is_empty(), "{error:?}");
+    };
+    // Two places match with Unicode spaces.
+    refused(
+        "limit is 10\u{a0}km\nlimit is 10\u{202f}km\n",
+        exact("c", "limit is 10 km", "limit is 12 km"),
+    );
+    // `new` changes the text around the space, so the space it means is unknown.
+    let text = "The default\nlimit is 10\u{a0}km here.\n";
+    for new in [
+        "limit is 12 miles",
+        "limit is 10km",
+        // Text inserted beside the space could go on either side of it.
+        "limit is 10 or 12 km",
+    ] {
+        refused(text, exact("c", "limit is 10 km", new));
+    }
+    // An `old` holding such a space was copied from the file and stays literal.
+    refused(
+        "1\u{a0}000 m and 10\u{a0}km\n",
+        exact("c", "1\u{a0}000 m and 10 km", "1\u{a0}000 m and 12 km"),
+    );
+    let count = Change {
+        id: "c".into(),
+        target: Target::All {
+            old: "limit is 10 km".into(),
+            scope: None,
+            expected: 1,
+            lines: None,
+        },
+        text: "limit is 12 km".into(),
+    };
+    refused(text, count);
+    let base = snapshot("guide.md".into(), text.into());
+    let literal = ultra_edit::compiler::compile_with(
+        &request(&base, vec![exact("c", "limit is 10 km", "limit is 12 km")]),
+        &bases(&base),
+        ultra_edit::compiler::Eol::Literal,
+    )
+    .unwrap_err();
+    assert_eq!(literal[0].code, "TARGET_NOT_FOUND");
+    // A match as written wins over one with Unicode spaces.
+    let base = snapshot("both.md".into(), "a 10 km\nb 10\u{a0}km\n".into());
+    let plan = compile(
+        &request(&base, vec![exact("c", "10 km", "12 km")]),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(plan.files[0].output, "a 12 km\nb 10\u{a0}km\n");
+    assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    // The match must not cut a word, as any single `old` must not.
+    let base = snapshot("cut.md".into(), "x = 110\u{a0}km\n".into());
+    assert_eq!(
+        rejected(&base, exact("c", "10 km", "12 km")).code,
+        "OLD_INSIDE_WORD"
+    );
+}
+
+#[test]
+fn a_spaces_warning_names_a_bounded_number_of_changes() {
+    let spaces = ['\u{a0}', '\u{2007}', '\u{2009}', '\u{202f}', '\u{a0}'];
+    let text: String = spaces
+        .iter()
+        .enumerate()
+        .map(|(index, space)| format!("v{index} = {index}{space}m\n"))
+        .collect();
+    let base = snapshot("units.txt".into(), text);
+    let long = "x".repeat(60);
+    let changes: Vec<_> = (0..spaces.len())
+        .map(|index| {
+            exact(
+                &format!("{long}{index}"),
+                &format!("= {index} m"),
+                &format!("= {index}0 m"),
+            )
+        })
+        .collect();
+    let plan = compile(&request(&base, changes), &bases(&base)).unwrap();
+    assert_eq!(
+        plan.files[0].output,
+        "v0 = 00\u{a0}m\nv1 = 10\u{2007}m\nv2 = 20\u{2009}m\nv3 = 30\u{202f}m\nv4 = 40\u{a0}m\n"
+    );
+    let warning = &plan.warnings[0];
+    assert_eq!(warning.code, "SPACES_ADAPTED");
+    assert!(
+        warning.message.contains(
+            ", 2 more: a space in `old` matched this file's U+00A0, U+2007, U+2009 or U+202F,"
+        ),
+        "{}",
+        warning.message
+    );
+    assert!(
+        warning.message.chars().count() <= 240,
+        "{}",
+        warning.message
+    );
+}
+
 /// A single `old` that starts or ends inside an ASCII word matched a longer name
 /// or number, which text written without reading the file does by accident.
 #[test]

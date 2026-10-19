@@ -431,9 +431,9 @@ the failed change ID, or submit a new request. If `text` is absent, read
 the retry reports `TARGET_AMBIGUOUS`.
 
 Replacement strings are literal UTF-8, including `$`, backslashes, tabs, Unicode
-forms, trailing spaces, and supplied newlines, with three deterministic
+forms, trailing spaces, and supplied newlines, with four deterministic
 exceptions that depend only on the base: line-target terminators and line-wise
-`expect`, above, and line-ending adaptation. In a base whose every line ending
+`expect`, above, and line-ending and space adaptation. In a base whose every line ending
 is CRLF (at least one CRLF, no bare LF, no lone CR), `old`, `new`, and `expect`
 text that holds LF but no CR is matched and written with CRLF, and the plan
 carries an `EOL_ADAPTED` warning naming those changes. Views such as native Read
@@ -445,6 +445,25 @@ mixed file. An undo restores recorded bytes without adaptation, and an undo's
 draft cannot be repaired (`INVALID_REFERENCE`): once the file holds the plan's
 output again, undo the plan under a new `request_id`, since an identical undo
 replays its recorded rejection.
+
+Rendered text, such as a task's prompt, shows a no-break or thin space as an
+ordinary one, so an `old` typed from it may hold an ASCII space where the file
+holds U+00A0, U+2007, U+2009, or U+202F. An `old` without `count` that occurs
+nowhere in its scope as written takes the one match it has there when each of
+its ASCII spaces may stand for one of those, and `new` is written with the
+file's spaces in the text it repeats from `old`, their common prefix and
+suffix: where the file holds U+00A0 before `km` in `limit is 10 km`, `old`
+`limit is 10 km` with `new` `limit is 12 km` writes `limit is 12 km` with
+U+00A0 before `km`. The match must be the only one, and each adapted space
+must lie in that repeated text; a space that an inserted or deleted part could
+sit on either side of, as when `limit is 10 km` becomes `limit is 10 or 12 km`,
+does not count as repeated. Otherwise the target fails as before with
+`TARGET_NOT_FOUND`, and a candidate's `text` gives the file's spaces to copy. A match as written always wins, and an
+`old` that holds one of these spaces stays literal. The plan carries a
+nonblocking `SPACES_ADAPTED` warning naming those changes and the spaces
+matched. Only a missed `old` with an ASCII space, in a file holding one of
+these spaces, pays for the search: one more pass over its scope.
+
 All undeclared bytes remain identical. Invalid UTF-8 is rejected explicitly; UTF-16 and other encodings are
 not decoded. No formatter, shell command, or model runs inside the engine.
 Ready plans and receipts carry nonblocking `NUL_BYTE` and `MIXED_LINE_ENDINGS`

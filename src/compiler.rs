@@ -33,8 +33,12 @@ const WORD_CHARS: usize = 40;
 /// Matches ambiguity advice examines for one alone in its lines, which bounds
 /// the word checks a long run of matches costs.
 const ADVISED_MATCHES: usize = 10_000;
-/// Change IDs an `EOL_ADAPTED` warning names before counting the rest.
+/// Change IDs an `EOL_ADAPTED` or `SPACES_ADAPTED` warning names before counting
+/// the rest.
 const ADAPTED_IDS: usize = 3;
+/// Unicode spaces an ASCII space in `old` may stand for: rendered text, such as a
+/// task's prompt, shows them as ordinary spaces, so text typed from it has one.
+const ADAPTED_SPACES: [char; 4] = ['\u{a0}', '\u{2007}', '\u{2009}', '\u{202f}'];
 
 struct Budget {
     spans_left: usize,
@@ -300,7 +304,8 @@ pub(crate) fn derived_replacement(
 }
 
 /// Whether `replacement` is what the compiler derives for `change` from `text`,
-/// with the change's text literal or adapted to an all-CRLF base. Line targets
+/// with the change's text literal or adapted to an all-CRLF base, and for an
+/// `exact` target, with the base's spaces that its `old` matched. Line targets
 /// are recomputed in full; other targets write their text unchanged.
 pub(crate) fn derives(
     text: &str,
@@ -312,7 +317,7 @@ pub(crate) fn derives(
     // A change kept literal by its `old` was never adapted.
     let crlf = *crlf.get_or_init(|| crlf_only(text)) && !literal(change);
     let adapted = adapt_eol(crlf, &change.text);
-    match change.target {
+    match &change.target {
         Target::Lines { .. } | Target::Insert { .. } => {
             let lines = lines.get_or_init(|| LineIndex::new(text));
             [change.text.as_str(), &adapted].into_iter().any(|written| {
@@ -324,10 +329,20 @@ pub(crate) fn derives(
                 )
             })
         }
-        _ => [change.text.as_str(), &adapted].into_iter().any(|written| {
-            let rest = written.len().saturating_sub(replacement.text.len());
-            kept_tail(text, replacement, replacement.end + rest, written)
-        }),
+        target => {
+            let fits = |written: &str| {
+                let rest = written.len().saturating_sub(replacement.text.len());
+                kept_tail(text, replacement, replacement.end + rest, written)
+            };
+            let spaced = || match target {
+                Target::Exact { old, .. } if adapts_spaces(old) => {
+                    let old = adapt_eol(crlf, old);
+                    kept_spaces(&old, spaced_at(text, replacement.start, &old)?, &adapted)
+                }
+                _ => None,
+            };
+            fits(&change.text) || fits(&adapted) || spaced().is_some_and(|written| fits(&written))
+        }
     }
 }
 
@@ -340,16 +355,19 @@ fn kept_tail(text: &str, replacement: &Replacement, end: usize, derived: &str) -
         && text.get(replacement.end..end) == derived.get(replacement.text.len()..)
 }
 
-/// How a compile treats LF-only text for an all-CRLF base.
+/// How a compile treats text typed from a view that hides bytes: LF-only text for
+/// an all-CRLF base, and an `old`'s ASCII spaces where the base has Unicode ones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Eol {
-    /// Writes CRLF, and says so with an `EOL_ADAPTED` warning.
+    /// Writes CRLF, and the base's spaces where an `old` matched them, saying so
+    /// with `EOL_ADAPTED` and `SPACES_ADAPTED` warnings.
     Adapt,
     /// Writes every byte as given, as an undo restoring recorded bytes must.
     Literal,
 }
 
-/// Plans `request` against its base snapshots, adapting line endings ([`Eol::Adapt`]).
+/// Plans `request` against its base snapshots, adapting line endings and spaces
+/// ([`Eol::Adapt`]).
 pub fn compile(
     request: &EditRequest,
     snapshots: &BTreeMap<String, Snapshot>,
@@ -570,6 +588,7 @@ pub fn compile_with(
             warn_output(&base.path, &output, &mut warnings);
             warn_moved(&base.path, &context.moved, &mut warnings);
             warn_adapted(&base.path, &context.adapted, &mut warnings);
+            warn_spaced(&base.path, &context.spaced, &mut warnings);
             // Neighbours are judged in the output, where an adjacent change's text
             // may stand beside this one instead of the original bytes.
             let mut edges = Vec::new();
@@ -790,32 +809,63 @@ fn warn_moved(path: &str, moved: &[Moved], warnings: &mut Vec<Diagnostic>) {
     }
 }
 
+/// Names the changes an adaptation warning is about: the first `ADAPTED_IDS`
+/// IDs, clipped, then how many more.
+fn adapted_changes(ids: &[&str]) -> String {
+    let mut named: Vec<String> = ids
+        .iter()
+        .take(ADAPTED_IDS)
+        .map(|id| id.chars().take(24).collect())
+        .collect();
+    if ids.len() > ADAPTED_IDS {
+        named.push(format!("{} more", ids.len() - ADAPTED_IDS));
+    }
+    let noun = if ids.len() == 1 { "Change" } else { "Changes" };
+    format!("{noun} {}", named.join(", "))
+}
+
 /// Says which changes had LF written as CRLF to match an all-CRLF file.
 fn warn_adapted(path: &str, adapted: &[&str], warnings: &mut Vec<Diagnostic>) {
     let Some(first) = adapted.first() else {
         return;
     };
-    let mut ids: Vec<String> = adapted
-        .iter()
-        .take(ADAPTED_IDS)
-        .map(|id| id.chars().take(24).collect())
-        .collect();
-    if adapted.len() > ADAPTED_IDS {
-        ids.push(format!("{} more", adapted.len() - ADAPTED_IDS));
-    }
     let mut warning = at(
         Some(path),
         None,
         "EOL_ADAPTED",
         format!(
-            "{} {}: this file ends every line with CRLF, so LF in {} text was matched and written as CRLF; text holding a \\r stays literal",
-            if adapted.len() == 1 {
-                "Change"
-            } else {
-                "Changes"
-            },
-            ids.join(", "),
+            "{}: this file ends every line with CRLF, so LF in {} text was matched and written as CRLF; text holding a \\r stays literal",
+            adapted_changes(adapted),
             if adapted.len() == 1 { "its" } else { "their" },
+        ),
+    );
+    warning.change_id = Some((*first).to_owned());
+    warnings.push(warning);
+}
+
+/// Says which changes matched the file's Unicode spaces for ASCII spaces in
+/// `old`, given with the text each matched, and which spaces those were.
+fn warn_spaced(path: &str, spaced: &[(&str, &str)], warnings: &mut Vec<Diagnostic>) {
+    let Some((first, _)) = spaced.first() else {
+        return;
+    };
+    let ids: Vec<&str> = spaced.iter().map(|(id, _)| *id).collect();
+    let spaces: Vec<String> = ADAPTED_SPACES
+        .iter()
+        .filter(|space| spaced.iter().any(|(_, found)| found.contains(**space)))
+        .map(|space| format!("U+{:04X}", u32::from(*space)))
+        .collect();
+    let spaces = match spaces.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
+        _ => spaces.concat(),
+    };
+    let mut warning = at(
+        Some(path),
+        None,
+        "SPACES_ADAPTED",
+        format!(
+            "{}: a space in `old` matched this file's {spaces}, which `new` keeps where it repeats `old`",
+            adapted_changes(&ids),
         ),
     );
     warning.change_id = Some((*first).to_owned());
@@ -1096,9 +1146,13 @@ struct FileContext<'a> {
     eol: Eol,
     lines: OnceCell<LineIndex>,
     crlf: OnceCell<bool>,
+    spaces: OnceCell<bool>,
     disclosed: OnceCell<HashSet<usize>>,
     /// Changes whose text was adapted to CRLF, in request order.
     adapted: Vec<&'a str>,
+    /// Changes whose `old` matched Unicode spaces for ASCII ones, with the text
+    /// each matched, in request order.
+    spaced: Vec<(&'a str, &'a str)>,
     /// Warnings for targets that took only whole-word matches, in request order.
     whole_words: Vec<Diagnostic>,
     /// The lines each line target addresses, which overlap advice names.
@@ -1133,8 +1187,10 @@ impl<'a> FileContext<'a> {
             eol,
             lines: OnceCell::new(),
             crlf: OnceCell::new(),
+            spaces: OnceCell::new(),
             disclosed: OnceCell::new(),
             adapted: Vec::new(),
+            spaced: Vec::new(),
             whole_words: Vec::new(),
             extents: HashMap::new(),
             restated: Vec::new(),
@@ -1166,6 +1222,14 @@ impl<'a> FileContext<'a> {
     /// Whether LF-only text is adapted for this base.
     fn crlf(&self) -> bool {
         self.eol == Eol::Adapt && *self.crlf.get_or_init(|| crlf_only(&self.base.text))
+    }
+
+    /// Whether an ASCII space in `old` may match a Unicode space in this base.
+    fn spaces(&self) -> bool {
+        self.eol == Eol::Adapt
+            && *self
+                .spaces
+                .get_or_init(|| self.base.text.contains(ADAPTED_SPACES))
     }
 
     fn lines(&self) -> &LineIndex {
@@ -1840,10 +1904,11 @@ fn restatement_message(
 }
 
 /// Resolves an `exact` or `all` target by searching its scope for `old`, adapted
-/// like `text` to the base's line endings.
-fn resolve_exact(
-    context: &mut FileContext,
-    change: &Change,
+/// like `text` to the base's line endings, and for an `exact` target found
+/// nowhere as written, to the base's Unicode spaces.
+fn resolve_exact<'a>(
+    context: &mut FileContext<'a>,
+    change: &'a Change,
     text: &str,
     replacements: &mut Vec<Replacement>,
     diagnostics: &mut Vec<Diagnostic>,
@@ -1912,6 +1977,18 @@ fn resolve_exact(
             actual - expected,
         ),
         _ => (actual, positions, 0),
+    };
+    // Text typed from a rendered view has an ASCII space where the file may hold
+    // a no-break or thin one: an `old` found nowhere as written takes its one
+    // match with those spaces, when `new` repeats the text around each of them.
+    let spaced = if exact && actual == 0 && adapts_spaces(old) && context.spaces() {
+        respaced(&base.text, start..end, old, text)
+    } else {
+        None
+    };
+    let (actual, positions, len, text) = match &spaced {
+        Some((position, found, written)) => (1, vec![*position], found.len(), written.as_str()),
+        None => (actual, positions, old.len(), text),
     };
     if actual != expected {
         let code = if actual == 0 {
@@ -1996,7 +2073,7 @@ fn resolve_exact(
     }
     if exact
         && let Some(&position) = positions.first()
-        && let Some(boundary) = word_cut(&base.text, start + position, old.len(), one_line(old))
+        && let Some(boundary) = word_cut(&base.text, start + position, len, one_line(old))
     {
         diagnostics.push(at(
             Some(&base.path),
@@ -2014,12 +2091,108 @@ fn resolve_exact(
         let warning = stayed_inside_words(base, change, start..end, old, stayed);
         context.whole_words.push(warning);
     }
+    if let Some((_, found, _)) = &spaced {
+        context.spaced.push((&change.id, found));
+    }
     replacements.extend(positions.into_iter().map(|position| Replacement {
         start: start + position,
-        end: start + position + old.len(),
+        end: start + position + len,
         text: text.to_owned(),
         change_id: change.id.clone(),
     }));
+}
+
+/// Whether an ASCII space in `old` may stand for one of `ADAPTED_SPACES`: it has
+/// one, and holds none of those, which text copied from the file would.
+fn adapts_spaces(old: &str) -> bool {
+    old.contains(' ') && !old.contains(ADAPTED_SPACES)
+}
+
+/// The one place in `range` where `old` matches with each ASCII space standing
+/// for one of `ADAPTED_SPACES`: its offset into the range, the text there, and
+/// `new` written as [`kept_spaces`] gives it. `None` when no place or several
+/// match, or a space to adapt lies in the text `new` changes.
+fn respaced<'t>(
+    text: &'t str,
+    range: Range<usize>,
+    old: &str,
+    new: &str,
+) -> Option<(usize, &'t str, String)> {
+    let scope = &text[range.clone()];
+    // One character for each of the scope's, so offsets map back by counting.
+    let read: String = scope
+        .chars()
+        .map(|ch| {
+            if ADAPTED_SPACES.contains(&ch) {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let matches = scan_occurrences(&read, old, 0, 1);
+    if matches.overlapping != 1 {
+        return None;
+    }
+    let skipped = read[..matches.positions[0]].chars().count();
+    let position = scope
+        .char_indices()
+        .nth(skipped)
+        .map_or(scope.len(), |(at, _)| at);
+    let found = spaced_at(text, range.start + position, old)?;
+    Some((position, found, kept_spaces(old, found, new)?))
+}
+
+/// The text from `start` that `old` matches one character for one, each of its
+/// ASCII spaces standing for itself or one of `ADAPTED_SPACES`.
+fn spaced_at<'t>(text: &'t str, start: usize, old: &str) -> Option<&'t str> {
+    let rest = text.get(start..)?;
+    let mut end = 0;
+    for wanted in old.chars() {
+        let found = rest[end..].chars().next()?;
+        if found != wanted && !(wanted == ' ' && ADAPTED_SPACES.contains(&found)) {
+            return None;
+        }
+        end += found.len_utf8();
+    }
+    Some(&rest[..end])
+}
+
+/// `new` with the text it repeats from `old`, their common prefix and suffix,
+/// spelled as `found`, the file's text that `old` matched; `None` when `found`
+/// differs from `old` between them, where `new` changes the text and the
+/// spaces meant there are unknown. Text that an insertion or deletion could sit
+/// on either side of, as ` b` added to `a b` could follow either `a` or `b`,
+/// counts as changed.
+fn kept_spaces(old: &str, found: &str, new: &str) -> Option<String> {
+    /// `text` cut after its first `head` characters and before its last `tail`.
+    fn cut(text: &str, head: usize, tail: usize) -> [&str; 3] {
+        let offset = |chars: usize| {
+            text.char_indices()
+                .nth(chars)
+                .map_or(text.len(), |(at, _)| at)
+        };
+        let (start, end) = (offset(head), offset(text.chars().count() - tail));
+        [&text[..start], &text[start..end], &text[end..]]
+    }
+    let shorter = old.chars().count().min(new.chars().count());
+    let prefix = old
+        .chars()
+        .zip(new.chars())
+        .take_while(|(was, now)| was == now)
+        .count();
+    let suffix = old
+        .chars()
+        .rev()
+        .zip(new.chars().rev())
+        .take_while(|(was, now)| was == now)
+        .count();
+    // Where the prefix and suffix overlap, only text kept at every split is kept.
+    let (head, tail) = (prefix.min(shorter - suffix), suffix.min(shorter - prefix));
+    let [_, changed, _] = cut(old, head, tail);
+    let [before, matched, after] = cut(found, head, tail);
+    let [_, written, _] = cut(new, head, tail);
+    (matched == changed).then(|| [before, written, after].concat())
 }
 
 /// Whether `old` holds text on at most one line, so the end of its match is

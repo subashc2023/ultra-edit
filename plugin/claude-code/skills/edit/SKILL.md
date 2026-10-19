@@ -22,10 +22,13 @@ exposed by this host.
   a relative path that would redirect a worktree edit to the parent checkout,
   and report files outside the root.
 - Replacement text is literal. Preserve intended Unicode, whitespace, and
-  newline bytes; no regex or formatting runs. One exception: in a file whose
+  newline bytes; no regex or formatting runs. Two exceptions: in a file whose
   lines all end in CRLF, which Read shows without `\r`, text holding LF but no
   CR is matched and written as CRLF, with an `EOL_ADAPTED` warning, unless the
-  change's `old` holds a `\r`.
+  change's `old` holds a `\r`; and an `old` without `count` found nowhere as
+  written takes its one match where the file holds a no-break or thin space
+  for its ASCII space, keeping the file's space where `new` repeats `old`, with
+  a `SPACES_ADAPTED` warning.
 - Omit `request_id` and change `id`. Identical arguments derive the same IDs, so
   after lost output, repeat the identical call: it returns the recorded result,
   marked `replayed: true`, without writing again. A `REPLAYED_FILE_CHANGED`
