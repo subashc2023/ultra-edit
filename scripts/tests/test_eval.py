@@ -737,7 +737,8 @@ class CommandTests(unittest.TestCase):
         self.assertIs(native["disableClaudeAiConnectors"], True)
         self.assertIs(native["syncClaudeAiPlugins"], False)
         self.assertEqual(
-            native["enabledPlugins"], {"ultra-edit@ultra-edit": False, "ultra-edit@skills-dir": False}
+            native["enabledPlugins"],
+            {"ultra-edit@ultra-edit": False, "ultra-edit@skills-dir": False, "plugin-authoring@builtin": False},
         )
         self.assertEqual(evaluation.build_settings("ultra-edit"), native)
         guard = evaluation.build_settings("native-guard", self.windows_guard)
@@ -1668,6 +1669,7 @@ class ArmRegistryTests(unittest.TestCase):
             {
                 "ultra-edit@ultra-edit": False,
                 "ultra-edit@skills-dir": False,
+                "plugin-authoring@builtin": False,
                 "cc-plugin-telemetry@builtin": False,
                 "other@market": False,
             },

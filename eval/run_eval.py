@@ -63,6 +63,9 @@ ULTRA_TOOL_PREFIX = "mcp__plugin_ultra-edit_ultra-edit__"
 ULTRA_PERMISSION_RULE = "mcp__plugin_ultra-edit_ultra-edit"
 # Installed copies that must not leak into any arm (marketplace and skills-dir).
 KNOWN_PLUGIN_IDS = ("ultra-edit@ultra-edit", "ultra-edit@skills-dir")
+# Built-in plugins that load in some sessions and not others: plugin-authoring rides the
+# tengu_plugin_hooks_modules GrowthBook flag (live payload or disk cache, so it varies per run).
+BUILTIN_PLUGIN_IDS = ("plugin-authoring@builtin",)
 GUARD_HOOK_ARGS = ("--claude-hook", "PreToolUse")
 GUARD_HOOK_TIMEOUT_S = 30
 # The plugin's matcher: the guard classifies Bash and PowerShell commands.
@@ -1808,7 +1811,7 @@ def build_settings(
         "syncClaudeAiPlugins": False,
         "syncClaudeAiSkills": False,
         "autoMemoryEnabled": False,
-        "enabledPlugins": {plugin_id: False for plugin_id in (*KNOWN_PLUGIN_IDS, *disabled_plugins)},
+        "enabledPlugins": {plugin_id: False for plugin_id in (*KNOWN_PLUGIN_IDS, *BUILTIN_PLUGIN_IDS, *disabled_plugins)},
     }
     if spec.guard_hook:
         if not guard_executable:

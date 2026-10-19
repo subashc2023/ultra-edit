@@ -179,7 +179,9 @@ leak into any arm. By default each run uses:
 - `--settings <run>/settings.json`: always loaded. It turns off claude.ai
   connectors, claude.ai plugin and skill sync, and auto memory, and disables
   installed copies of Ultra Edit (`ultra-edit@ultra-edit`,
-  `ultra-edit@skills-dir`) plus every `--disable-plugin ID` (repeatable; for
+  `ultra-edit@skills-dir`), the built-in `plugin-authoring@builtin` (it loads
+  only when a GrowthBook flag happens to be on, so it varies run to run),
+  plus every `--disable-plugin ID` (repeatable; for
   example a cloud environment's `cc-plugin-telemetry@builtin`). For
   `native-guard` it also holds the hook.
 - `--no-session-persistence`, plus these environment variables:

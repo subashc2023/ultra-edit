@@ -5,6 +5,19 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ## [Unreleased]
 
+### Changed
+
+- The Claude Code session card adds the fixes for the first-try rejections seen
+  in the Windows eval: prefer a short `old` to line numbers, take `count` from
+  Grep (it counts hits inside longer names too), never put `in` on `lines` or
+  `after`, give `expect` whole lines with their indentation, give Windows paths
+  natively, and join a neighbouring line into a blank or short `expect` part.
+
+### Fixed
+
+- Eval: every run disables the built-in `plugin-authoring@builtin` plugin,
+  which loaded in some runs depending on a GrowthBook flag.
+
 ## [0.4.0] - 2026-10-08
 
 ### Added
