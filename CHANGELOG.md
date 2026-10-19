@@ -60,8 +60,9 @@ All notable changes to Ultra Edit are documented here. Releases follow
   there, and any `in` on a `span`, is still refused while parsing.
 - The Claude Code session card adds the fixes for the first-try rejections seen
   in the Windows eval: prefer a short `old` to line numbers, take `count` from
-  Grep, give `expect` whole lines with their indentation, and join a
-  neighbouring line into a blank or short `expect` part.
+  Grep, give `expect` whole lines with their indentation and 8 or more visible
+  characters in all, so one part may be blank or `)`, and join a neighbouring
+  line into a part when the parts have fewer.
 
 ### Fixed
 
