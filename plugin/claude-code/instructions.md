@@ -10,9 +10,9 @@ Windows `C:\...`, not `/tmp`):
  {"after":1,"expect":"import os","new":"import re"},
  {"lines":[7,8],"expect":["def main():","    run()"],"new":"def main(argv):\n    run(argv)"}]}]}
 - `old` must occur exactly once, as whole words: add context, or limit it to
-  lines with `"in":[first,last]`. `"count":N` replaces N substring hits, also
-  inside longer names (`ID` in `ID_MAP`); to skip those, use one `old` per
-  site. Take N from Grep. Text quoted by the task needs no Read.
+  lines with `"in":[first,last]`. `"count":N` replaces N hits; when N counts
+  only whole words, hits inside longer names (`ID` in `ID_MAP`) stay. Take N
+  from Grep. Text quoted by the task needs no Read.
 - Prefer a short unique `old` to line numbers: lines shift, and long text
   may hide no-break spaces.
 - `lines:[a,b]` replaces whole lines (`"new":""` deletes them); `after:n`

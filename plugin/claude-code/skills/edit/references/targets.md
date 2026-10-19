@@ -94,7 +94,7 @@ alias). A `path` file supports `old`, `count`, `in` with lines, `lines`, and
 | Replace unique exact text anywhere in the file | `{"old":"a","new":"b"}` | Exactly one occurrence in the entire original file, on word boundaries. |
 | Replace unique exact text within some lines | `{"old":"a","new":"b","in":[72,87]}` | Exactly one occurrence wholly inside lines 72-87. |
 | Replace unique exact text inside an inspected span | `{"old":"a","new":"b","in":"selection"}` | The span belongs to this base; one occurrence inside it. |
-| Replace every occurrence | `{"old":"a","new":"b","count":3}` | Exactly 3 non-overlapping occurrences in the file, or in `in`, inside words or not. |
+| Replace every occurrence | `{"old":"a","new":"b","count":3}` | Exactly 3 non-overlapping occurrences in the file, or in `in`, inside words or not; or, when more occur, exactly the 3 that cut no word, leaving those inside longer names (`COUNT_WHOLE_WORDS`). |
 | Replace or delete whole lines | `{"lines":[40,42],"expect":["fn load(cfg) {","}"],"new":"..."}` | Lines exist; `expect` matches their first and last lines. `""` deletes them. |
 | Insert whole lines | `{"after":3,"expect":"use std::fs;","new":"use std::io;"}` | Line 3 exists; `expect` matches the lines ending at 3. `after:0` inserts at the top. |
 | Replace a disclosed line, selection, or match | `{"span":"m1","expect":"old text","new":"b"}` | The span belongs to this base; `expect` equals its bytes exactly. |

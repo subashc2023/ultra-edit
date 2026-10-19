@@ -603,6 +603,7 @@ pub fn compile_with(
                 }
             }
             warn_edges(&base.path, &output, edges, &mut edge_warnings);
+            warnings.extend(context.whole_words);
             PreparedFile {
                 base: base.clone(),
                 output,
@@ -1070,6 +1071,8 @@ struct FileContext<'a> {
     disclosed: OnceCell<HashSet<usize>>,
     /// Changes whose text was adapted to CRLF, in request order.
     adapted: Vec<&'a str>,
+    /// Warnings for counts that took only the whole-word matches, in request order.
+    whole_words: Vec<Diagnostic>,
     /// The lines each line target addresses, which overlap advice names.
     extents: HashMap<&'a str, Extent>,
     /// Insertions whose text starts by restating lines that they keep, refused
@@ -1090,6 +1093,7 @@ impl<'a> FileContext<'a> {
             crlf: OnceCell::new(),
             disclosed: OnceCell::new(),
             adapted: Vec::new(),
+            whole_words: Vec::new(),
             extents: HashMap::new(),
             restated: Vec::new(),
             trimmed: RefCell::new(HashMap::new()),
@@ -1714,7 +1718,7 @@ fn restatement_message(
 /// Resolves an `exact` or `all` target by searching its scope for `old`, adapted
 /// like `text` to the base's line endings.
 fn resolve_exact(
-    context: &FileContext,
+    context: &mut FileContext,
     change: &Change,
     text: &str,
     replacements: &mut Vec<Replacement>,
@@ -1767,6 +1771,23 @@ fn resolve_exact(
             matches.non_overlapping,
             matches.positions,
         )
+    };
+    // A count takes every match, but a caller renaming `MAX_RETRIES` counts its own
+    // uses, not those inside `MAX_RETRIES_PER_HOST`: a count that numbers just the
+    // matches cutting no word takes those, and a warning names what stayed. Whole-word
+    // matches never outnumber all matches, so only a count below them is checked.
+    let whole = if !exact && expected < actual {
+        whole_words(&base.text, start..end, old)
+    } else {
+        None
+    };
+    let (actual, positions, stayed) = match &whole {
+        Some(whole) if whole.len() == expected => (
+            expected,
+            whole.iter().copied().take(retained).collect(),
+            actual - expected,
+        ),
+        _ => (actual, positions, 0),
     };
     if actual != expected {
         let code = if actual == 0 {
@@ -1827,8 +1848,14 @@ fn resolve_exact(
             } else {
                 ""
             };
+            let words = whole.as_ref().map_or(0, Vec::len);
+            let words = if 0 < words && words < actual {
+                format!(" or to {words} for those not inside longer words")
+            } else {
+                String::new()
+            };
             format!(
-                "Expected {expected} occurrence(s), found {actual} at {noun} {}{more}; set count to {actual} to replace every one, or restrict `old` with \"in\":[first,last]",
+                "Expected {expected} occurrence(s), found {actual} at {noun} {}{more}; set count to {actual} to replace every one{words}, or restrict `old` with \"in\":[first,last]",
                 lines.join(", ")
             )
         } else {
@@ -1858,6 +1885,10 @@ fn resolve_exact(
     if !budget.reserve(actual, text) {
         diagnostics.push(resource_limit(base, change));
         return;
+    }
+    if stayed > 0 {
+        let warning = stayed_inside_words(base, change, start..end, old, stayed);
+        context.whole_words.push(warning);
     }
     replacements.extend(positions.into_iter().map(|position| Replacement {
         start: start + position,
@@ -1916,8 +1947,8 @@ fn word_cut(text: &str, start: usize, len: usize, one_line: bool) -> Option<usiz
         .find(|&at| joined(at) && (digits(at) || ascii(at)))
 }
 
-/// Names the ASCII word that `boundary` cuts, clipped, and its line.
-fn inside_word(text: &str, boundary: usize) -> String {
+/// The ASCII word that `boundary` cuts, clipped, and its line.
+fn cut_word(text: &str, boundary: usize) -> (&str, usize) {
     let word = |at: usize| {
         text.as_bytes()
             .get(at)
@@ -1930,10 +1961,64 @@ fn inside_word(text: &str, boundary: usize) -> String {
     while word(high) && high - boundary < WORD_CHARS {
         high += 1;
     }
-    let line = line_numbers(text, &[boundary])[0];
+    (&text[low..high], line_numbers(text, &[boundary])[0])
+}
+
+/// Names the ASCII word that `boundary` cuts and its line.
+fn inside_word(text: &str, boundary: usize) -> String {
+    let (word, line) = cut_word(text, boundary);
     format!(
-        "`old` matches inside the word `{}` at line {line}; give whole words, or add \"count\":1 to replace part of a word",
-        &text[low..high]
+        "`old` matches inside the word `{word}` at line {line}; give whole words, or add \"count\":1 to replace part of a word"
+    )
+}
+
+/// The left-to-right, non-overlapping matches of `old` in `range` that cut no word,
+/// as offsets into the range; `None` past `ADVISED_MATCHES` starts, which bounds the
+/// scan as it bounds ambiguity advice.
+fn whole_words(text: &str, range: Range<usize>, old: &str) -> Option<Vec<usize>> {
+    let one_line = one_line(old);
+    let (mut whole, mut free) = (Vec::new(), 0);
+    for (examined, at) in overlapping_starts(&text[range.clone()], old).enumerate() {
+        if examined == ADVISED_MATCHES {
+            return None;
+        }
+        if at >= free && word_cut(text, range.start + at, old.len(), one_line).is_none() {
+            whole.push(at);
+            free = at + old.len();
+        }
+    }
+    Some(whole)
+}
+
+/// `COUNT_WHOLE_WORDS`: a count took only the whole-word matches of `old` in
+/// `range`, so `stayed` matches inside longer words are left; names the first.
+fn stayed_inside_words(
+    base: &Snapshot,
+    change: &Change,
+    range: Range<usize>,
+    old: &str,
+    stayed: usize,
+) -> Diagnostic {
+    let one_line = one_line(old);
+    let first = base.text[range.clone()]
+        .match_indices(old)
+        .find_map(|(at, _)| word_cut(&base.text, range.start + at, old.len(), one_line))
+        .map(|boundary| cut_word(&base.text, boundary));
+    let left = match first {
+        Some((word, line)) if stayed == 1 => {
+            format!("the one inside `{word}` at line {line} stayed")
+        }
+        Some((word, line)) => {
+            format!("{stayed} inside longer words stayed, the first in `{word}` at line {line}")
+        }
+        None => format!("{stayed} others stayed"),
+    };
+    let id: String = change.id.chars().take(QUOTED_ID_CHARS).collect();
+    at(
+        Some(&base.path),
+        Some(change),
+        "COUNT_WHOLE_WORDS",
+        format!("Change {id}: count took only the whole-word matches, so {left}"),
     )
 }
 

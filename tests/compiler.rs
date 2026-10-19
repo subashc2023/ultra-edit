@@ -2770,6 +2770,52 @@ fn a_single_old_inside_a_word_is_refused_unless_counted() {
     );
 }
 
+/// A count of a name's own uses, while longer names also hold it, takes only the
+/// whole-word matches, as a rename means; a count of every match takes them all.
+#[test]
+fn a_count_of_whole_words_leaves_longer_names() {
+    let text = "MAX_RETRIES = 3\nMAX_RETRIES_PER_HOST = 2\nretry(MAX_RETRIES)\n";
+    let base = snapshot("settings.py".into(), text.into());
+    let count = |expected| Change {
+        id: "rename".into(),
+        target: Target::All {
+            old: "MAX_RETRIES".into(),
+            scope: None,
+            expected,
+            lines: None,
+        },
+        text: "RETRY_LIMIT".into(),
+    };
+    let plan = compile(&request(&base, vec![count(2)]), &bases(&base)).unwrap();
+    assert_eq!(
+        plan.files[0].output,
+        "RETRY_LIMIT = 3\nMAX_RETRIES_PER_HOST = 2\nretry(RETRY_LIMIT)\n"
+    );
+    assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+    assert_eq!(plan.warnings[0].code, "COUNT_WHOLE_WORDS");
+    assert_eq!(
+        plan.warnings[0].message,
+        "Change rename: count took only the whole-word matches, so the one inside `MAX_RETRIES_PER_HOST` at line 2 stayed"
+    );
+    let plan = compile(&request(&base, vec![count(3)]), &bases(&base)).unwrap();
+    assert_eq!(
+        plan.files[0].output,
+        "RETRY_LIMIT = 3\nRETRY_LIMIT_PER_HOST = 2\nretry(RETRY_LIMIT)\n"
+    );
+    assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    // A count that is neither gives both.
+    let error = rejected(&base, count(1));
+    assert_eq!(error.code, "EXPECTED_COUNT_MISMATCH");
+    assert_eq!(error.actual, Some(3));
+    assert!(
+        error.message.contains(
+            "set count to 3 to replace every one or to 2 for those not inside longer words"
+        ),
+        "{}",
+        error.message
+    );
+}
+
 fn compiled(text: &str, change: serde_json::Value) -> Result<String, Vec<Diagnostic>> {
     let base = snapshot("w.py".into(), text.into());
     let change: Change = serde_json::from_value(change).unwrap();

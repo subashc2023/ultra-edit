@@ -7,11 +7,18 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ### Changed
 
+- A `count` that numbers only the whole-word matches of `old`, while longer
+  names also hold it, replaces just those: renaming `MAX_RETRIES` with a count
+  of its own uses no longer fails because `MAX_RETRIES_PER_HOST` holds it too.
+  A nonblocking `COUNT_WHOLE_WORDS` warning names the first match left inside a
+  longer word. A count of every match still replaces them all, and a count that
+  is neither now gives the whole-word number in its `EXPECTED_COUNT_MISMATCH`
+  advice as well.
 - The Claude Code session card adds the fixes for the first-try rejections seen
   in the Windows eval: prefer a short `old` to line numbers, take `count` from
-  Grep (it counts hits inside longer names too), never put `in` on `lines` or
-  `after`, give `expect` whole lines with their indentation, give Windows paths
-  natively, and join a neighbouring line into a blank or short `expect` part.
+  Grep, never put `in` on `lines` or `after`, give `expect` whole lines with
+  their indentation, give Windows paths natively, and join a neighbouring line
+  into a blank or short `expect` part.
 
 ### Fixed
 
