@@ -480,6 +480,40 @@ fn a_missing_path_that_ends_like_a_workspace_file_names_it() {
     );
 }
 
+/// Git Bash's `pwd` prints `C:\x` as `/c/x` and the temporary directory as `/tmp`,
+/// so a path copied from it names the Windows file it stands for.
+#[cfg(windows)]
+#[test]
+fn a_git_bash_path_names_the_windows_file() {
+    let (dir, workspace) = setup(&[("docs/a.md", "one\n")]);
+    let posix = |path: &std::path::Path| path.to_str().unwrap().replace('\\', "/");
+    // TempDir is in the temporary directory, which Git Bash mounts as `/tmp`.
+    let tmp = |path: &std::path::Path| {
+        format!(
+            "/tmp/{}",
+            posix(path.strip_prefix(std::env::temp_dir()).unwrap())
+        )
+    };
+    let file = dir.path().join("docs").join("a.md");
+    let full = posix(&file);
+    let drive = format!("/{}{}", full[..1].to_ascii_lowercase(), &full[2..]);
+    for (spelling, old, new) in [(tmp(&file), "one", "two"), (drive, "two", "three")] {
+        receipt(
+            workspace
+                .edit(request(vec![at(&spelling, vec![exact(old, new)])]))
+                .unwrap(),
+        );
+    }
+    assert_eq!(read(&dir, "docs/a.md"), "three\n");
+    let missing = tmp(&dir.path().join("missing.md"));
+    let outcome = rejected(
+        workspace
+            .edit(request(vec![at(&missing, vec![exact("one", "1")])]))
+            .unwrap(),
+    );
+    assert_eq!(codes(&outcome), ["TARGET_MISSING"]);
+}
+
 #[test]
 fn a_file_without_path_or_base_is_rejected() {
     let (_dir, workspace) = setup(&[("a.txt", "one\n")]);

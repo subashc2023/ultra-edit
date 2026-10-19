@@ -5,6 +5,13 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ## [Unreleased]
 
+### Added
+
+- On Windows, a path that names no file as given but is spelled as Git Bash
+  prints it names the file it stands for: `/c/x` is `C:\x`, and `/tmp/x` is in
+  the user's temporary directory. A path copied from `pwd` in Claude Code's
+  Bash tool no longer fails with `TARGET_MISSING`.
+
 ### Changed
 
 - A `count` that numbers only the whole-word matches of `old`, while longer
@@ -19,8 +26,8 @@ All notable changes to Ultra Edit are documented here. Releases follow
   there, and any `in` on a `span`, is still refused while parsing.
 - The Claude Code session card adds the fixes for the first-try rejections seen
   in the Windows eval: prefer a short `old` to line numbers, take `count` from
-  Grep, give `expect` whole lines with their indentation, give Windows paths
-  natively, and join a neighbouring line into a blank or short `expect` part.
+  Grep, give `expect` whole lines with their indentation, and join a
+  neighbouring line into a blank or short `expect` part.
 
 ### Fixed
 

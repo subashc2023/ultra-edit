@@ -196,7 +196,10 @@ base is used and must be that file's snapshot (`SNAPSHOT_PATH_MISMATCH`). A path
 that cannot be read gets its own diagnostic, such as `TARGET_MISSING` or
 `PATH_OUTSIDE_WORKSPACE`, and nothing is written. A path file was never read
 through a snapshot, so no span of it was disclosed: a `span` or `in` span other
-than `r0`, the whole file, is `SPAN_NEEDS_BASE`. Path mode detects no change
+than `r0`, the whole file, is `SPAN_NEEDS_BASE`. On Windows, a path that names
+no file as given but is spelled as Git Bash prints it names the file it stands
+for: `/c/x` is `C:\x`, and `/tmp/x` is in the user's temporary directory, where
+Git for Windows mounts `/tmp`. Path mode detects no change
 made between your read and the call; the `old` text is the guard, as with
 native Edit, and line targets need `expect`. Paths are normalized lexically before IDs are derived: a leading
 workspace root, spelled as given at launch or in canonical form, is stripped and

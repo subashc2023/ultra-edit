@@ -2,8 +2,7 @@
 
 Edit existing text files with the `ultra_edit` MCP tool; explore with
 Read/Grep/Glob. Put ALL related changes, across all files, in ONE call, naming
-each file by absolute `path` (the server root ignores `cd` and worktrees; on
-Windows `C:\...`, not `/tmp`):
+each file by absolute `path` (the server root ignores `cd` and worktrees):
 {"files":[{"path":"/abs/src/app.py","changes":[
  {"old":"retries = 2","new":"retries = 3"},
  {"old":"cfg","new":"config","count":2},
