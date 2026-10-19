@@ -140,7 +140,7 @@ when another change also edits those lines, follow the message: drop them
 from `new` when the edits are in place, and otherwise send the one `lines`
 change it names in place of the changes on those lines. A `lines` replacement that gives lines twice
 duplicates them on purpose. `in` takes lines or a span ID, never literal
-text.
+text; beside `lines` or `after` it may only repeat the lines they name.
 
 `old` must start and end on word boundaries: a match that begins or ends
 inside an ASCII word or number, such as `retries = 2` inside `max_retries = 20`

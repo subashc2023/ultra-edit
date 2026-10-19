@@ -240,7 +240,9 @@ forms:
 
 `new` may be spelled `text`, but not both. A change gives exactly one of `old`,
 `span`, `lines`, or `after`; `count` and `in` apply only to `old`, and `expect`
-only to `span`, `lines`, and `after`. `lines` takes `[first,last]`, and `[12]`,
+only to `span`, `lines`, and `after`. Two that repeat what a target already says
+are accepted and not stored: `count: 1` on any target, and `in` lines beside
+`lines` or `after` that hold the lines the target names. `lines` takes `[first,last]`, and `[12]`,
 `12`, `"12"`, and `"12-14"` are read as `[12,12]` and `[12,14]`; `in` takes the same
 line forms or a span ID. A malformed change is refused while the arguments are
 parsed, with a message naming the accepted form, such as `lines takes numbers

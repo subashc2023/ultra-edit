@@ -329,10 +329,8 @@ impl TryFrom<ChangeInput> for Change {
             {
                 return Err("`count` is a positive occurrence count and needs `old`".into());
             }
-            if input.within.is_some() {
-                return Err(
-                    "`in` restricts `old`; it does not apply to span, lines, or after".into(),
-                );
+            if input.span.is_some() && input.within.is_some() {
+                return Err("`in` restricts `old`; it does not apply to span".into());
             }
         } else if input.expect.is_some() {
             return Err("`expect` guards span, lines, or after; with `old`, the old text is already the guard".into());
@@ -368,19 +366,20 @@ impl TryFrom<ChangeInput> for Change {
         } else if let Some(span) = input.span {
             Target::Span { span, expect }
         } else if let Some(lines) = input.lines {
+            let lines = lines_input(&lines)?;
+            repeated_lines(input.within, lines)?;
             Target::Lines {
-                lines: lines_input(&lines)?,
+                lines,
                 expect,
                 expect_last,
             }
         } else {
             let after = input.after.as_ref().and_then(serde_json::Value::as_u64);
-            Target::Insert {
-                after: after
-                    .and_then(|after| usize::try_from(after).ok())
-                    .ok_or("after takes a line number such as 12; 0 inserts before line 1")?,
-                expect,
-            }
+            let after = after
+                .and_then(|after| usize::try_from(after).ok())
+                .ok_or("after takes a line number such as 12; 0 inserts before line 1")?;
+            repeated_lines(input.within, [after, after])?;
+            Target::Insert { after, expect }
         };
         Ok(Self {
             id: input.id,
@@ -478,6 +477,24 @@ fn scope_input(value: serde_json::Value) -> Result<(Option<String>, Option<[usiz
             Some(line_pair(&value).ok_or(format!("`in` {LINES_FORM}"))?),
         )),
         _ => Err("`in` takes a span ID such as \"r12\" or lines like [72,87]".into()),
+    }
+}
+
+/// Accepts `in` beside `lines` or `after` when it holds the lines the target names
+/// (`first..=last`, or the line `after` keeps), as `count: 1` is accepted anywhere: it
+/// repeats what the target already says, so it is not stored.
+fn repeated_lines(
+    within: Option<serde_json::Value>,
+    [first, last]: [usize; 2],
+) -> Result<(), String> {
+    let Some(within) = within else {
+        return Ok(());
+    };
+    match scope_input(within)? {
+        (None, Some([low, high])) if low <= first && last <= high => Ok(()),
+        _ => {
+            Err("`in` restricts `old`; lines and after already name their lines, so drop it".into())
+        }
     }
 }
 
@@ -909,6 +926,24 @@ mod tests {
                 },
                 json!({"kind":"insert","after":0}),
             ),
+            // So is `in` holding the lines a line target names, which it repeats.
+            (
+                json!({"lines":[146,150],"new":"b","expect":"x","in":[146,150]}),
+                Target::Lines {
+                    lines: [146, 150],
+                    expect: Some("x".into()),
+                    expect_last: None,
+                },
+                json!({"kind":"lines","lines":[146,150],"expect":"x"}),
+            ),
+            (
+                json!({"after":12,"new":"b","expect":"x","in":"10-12"}),
+                Target::Insert {
+                    after: 12,
+                    expect: Some("x".into()),
+                },
+                json!({"kind":"insert","after":12,"expect":"x"}),
+            ),
         ] {
             let parsed = parse(input.clone()).unwrap();
             assert_eq!(parsed, change(target, "b"), "{input}");
@@ -999,8 +1034,20 @@ mod tests {
                 "`count` takes a whole number: how many times `old` occurs",
             ),
             (
+                json!({"span":"r1","in":[1,1],"new":"b"}),
+                "`in` restricts `old`; it does not apply to span",
+            ),
+            (
                 json!({"lines":[1,2],"in":"r1","new":"b"}),
-                "`in` restricts `old`; it does not apply to span, lines, or after",
+                "`in` restricts `old`; lines and after already name their lines, so drop it",
+            ),
+            (
+                json!({"lines":[1,2],"in":[2,3],"new":"b"}),
+                "`in` restricts `old`; lines and after already name their lines, so drop it",
+            ),
+            (
+                json!({"after":0,"in":[1,1],"new":"b"}),
+                "`in` restricts `old`; lines and after already name their lines, so drop it",
             ),
             (
                 json!({"old":"a","expect":"a","new":"b"}),

@@ -14,11 +14,13 @@ All notable changes to Ultra Edit are documented here. Releases follow
   longer word. A count of every match still replaces them all, and a count that
   is neither now gives the whole-word number in its `EXPECTED_COUNT_MISMATCH`
   advice as well.
+- `in` beside `lines` or `after` is accepted when it holds the lines the target
+  names, as `count: 1` is accepted anywhere; it is not stored. Any other `in`
+  there, and any `in` on a `span`, is still refused while parsing.
 - The Claude Code session card adds the fixes for the first-try rejections seen
   in the Windows eval: prefer a short `old` to line numbers, take `count` from
-  Grep, never put `in` on `lines` or `after`, give `expect` whole lines with
-  their indentation, give Windows paths natively, and join a neighbouring line
-  into a blank or short `expect` part.
+  Grep, give `expect` whole lines with their indentation, give Windows paths
+  natively, and join a neighbouring line into a blank or short `expect` part.
 
 ### Fixed
 
