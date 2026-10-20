@@ -2053,6 +2053,275 @@ fn blank_line_warnings_are_once_per_run_bounded_and_follow_edge_warnings() {
     assert_eq!(codes, ["NUL_BYTE", "WHITESPACE_EDGE", "BLANK_LINES_JOINED"]);
 }
 
+fn dropped_warnings(text: &str, changes: Vec<Change>) -> (String, Vec<Diagnostic>) {
+    let base = snapshot("dropped.py".into(), text.into());
+    let plan = compile(&request(&base, changes), &bases(&base)).unwrap();
+    let warnings = plan
+        .warnings
+        .into_iter()
+        .filter(|warning| warning.code == "BLANK_LINES_DROPPED")
+        .collect();
+    (plan.files[0].output.clone(), warnings)
+}
+
+#[test]
+fn blank_lines_dropped_around_a_change_warn_without_blocking() {
+    // The eval case, from `decode.py`: `old` takes the two blank lines above
+    // `parse` and one of the two below it, leaving one where both sides had two.
+    let (output, warnings) = dropped_warnings(
+        FUNCTIONS,
+        vec![exact("2.2", "\n\ndef parse():\n    return 2\n\n", "")],
+    );
+    assert_eq!(
+        output,
+        "def slug():\n    return 1\n\ndef chunked():\n    return 3\n"
+    );
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].change_id.as_deref(), Some("2.2"));
+    assert_eq!(warnings[0].file.as_deref(), Some("dropped.py"));
+    assert_eq!(
+        warnings[0].message,
+        "Change 2.2: the whitespace around its edge now holds a blank line, line 3; the file had 2 in a row around its start and 2 around its end"
+    );
+    for (change, run) in [
+        // The same lines deleted by number.
+        (
+            lines_change("lines", [3, 7], None, ""),
+            "a blank line, line 3",
+        ),
+        // Every blank line on both sides, and the line ending before them too.
+        (
+            exact("all", "\n\ndef parse():\n    return 2\n\n\n", ""),
+            "no blank line, between lines 2 and 3",
+        ),
+        (
+            exact("join", "\n\n\ndef parse():\n    return 2\n\n\n", ""),
+            "no line break, line 2",
+        ),
+        // `new` without the blank lines `old` starts or ends with.
+        (
+            exact(
+                "lead",
+                "\n\ndef parse():\n    return 2",
+                "def parse(text):\n    return 2",
+            ),
+            "no blank line, between lines 2 and 3",
+        ),
+        (
+            exact(
+                "tail",
+                "def parse():\n    return 2\n\n\n",
+                "def parse():\n    return 20\n",
+            ),
+            "no blank line, between lines 6 and 7",
+        ),
+    ] {
+        let (_, warnings) = dropped_warnings(FUNCTIONS, vec![change]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].message.ends_with(&format!(
+                "now holds {run}; the file had 2 in a row around its start and 2 around its end"
+            )),
+            "{}",
+            warnings[0].message
+        );
+    }
+}
+
+#[test]
+fn changes_that_keep_their_blank_runs_carry_no_dropped_blank_line_warning() {
+    for (text, change) in [
+        // The deletion the eval asked for, with its blank lines above or below.
+        (
+            FUNCTIONS,
+            exact("above", "\n\ndef parse():\n    return 2\n", ""),
+        ),
+        (
+            FUNCTIONS,
+            exact("below", "def parse():\n    return 2\n\n\n", ""),
+        ),
+        (FUNCTIONS, lines_change("lines", [5, 8], None, "")),
+        // The shorter side sets the count: a method ending a class has one blank
+        // line above it and two below.
+        (
+            "class A:\n    x = 1\n\n    def f(self):\n        pass\n\n\ndef g():\n    pass\n",
+            exact("method", "\n    def f(self):\n        pass\n\n", ""),
+        ),
+        // Text edits beside blank lines, insertions, and edits of blank lines alone.
+        (FUNCTIONS, exact("word", "return 2", "return 20")),
+        (FUNCTIONS, insert("between", 3, None, "x = 1")),
+        (FUNCTIONS, lines_change("blank", [3, 3], None, "")),
+        // Blank lines at the start or end of the file separate nothing.
+        (
+            FUNCTIONS,
+            exact("first", "def slug():\n    return 1\n\n", ""),
+        ),
+        (
+            FUNCTIONS,
+            exact("last", "\n\ndef chunked():\n    return 3\n", ""),
+        ),
+        ("a\n\n\nb\n\n\n", exact("end", "\n\nb\n\n", "")),
+        (FUNCTIONS, span_change("whole", "r0", "x = 1\n")),
+    ] {
+        let (_, warnings) = dropped_warnings(text, vec![change]);
+        assert!(warnings.is_empty(), "{text:?}: {warnings:?}");
+    }
+    // Nor do they when another change puts text before them.
+    for bom in ["", "\u{feff}"] {
+        let (output, warnings) = dropped_warnings(
+            &format!("{bom}\n\n{FUNCTIONS}"),
+            vec![
+                insert("top", 0, None, "import os"),
+                exact("first", "\n\ndef slug():\n    return 1\n\n", ""),
+            ],
+        );
+        assert_eq!(
+            output,
+            format!(
+                "{bom}import os\n\ndef parse():\n    return 2\n\n\ndef chunked():\n    return 3\n"
+            )
+        );
+        assert!(warnings.is_empty(), "{bom:?}: {warnings:?}");
+    }
+    // Nor do blank lines that another change leaves at the start of the file.
+    let (output, warnings) = dropped_warnings(
+        FUNCTIONS,
+        vec![
+            exact("first", "def slug():\n    return 1\n", ""),
+            exact("2.2", "\n\ndef parse():\n    return 2\n\n", ""),
+        ],
+    );
+    assert_eq!(output, "\ndef chunked():\n    return 3\n");
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn dropped_blank_lines_are_counted_as_read_numbers_lines() {
+    let eval = "\n\ndef parse():\n    return 2\n\n";
+    for (text, old, run) in [
+        // LF text matched to an all-CRLF file, and a file after a byte-order mark.
+        (
+            FUNCTIONS.replace('\n', "\r\n"),
+            eval,
+            "a blank line, line 3; the file had 2 in a row around its start and 2 around its end",
+        ),
+        (
+            format!("\u{feff}{FUNCTIONS}"),
+            eval,
+            "a blank line, line 3; the file had 2 in a row around its start and 2 around its end",
+        ),
+        // Longer runs, and sides of different lengths.
+        (
+            "a = 1\n\n\n\nb = 2\n\n\n\nc = 3\n".into(),
+            "\n\n\nb = 2\n\n",
+            "2 blank lines in a row, lines 2-3; the file had 3 in a row around its start and 3 around its end",
+        ),
+        (
+            "a = 1\n\n\n\nb = 2\n\n\nc = 3\n".into(),
+            "\n\n\nb = 2\n\n",
+            "a blank line, line 2; the file had 3 in a row around its start and 2 around its end",
+        ),
+        // A line of spaces is blank, and the next line's indentation starts it.
+        (
+            "class A:\n    x = 1\n    \n    def f(self):\n        pass\n    \n    def g(self):\n        pass\n".into(),
+            "    \n    def f(self):\n        pass\n    \n",
+            "no blank line, between lines 2 and 3; the file had 1 in a row around its start and 1 around its end",
+        ),
+    ] {
+        let (_, warnings) = dropped_warnings(&text, vec![exact("c", old, "")]);
+        assert_eq!(warnings.len(), 1, "{text:?}: {warnings:?}");
+        assert!(
+            warnings[0].message.ends_with(run),
+            "{text:?}: {}",
+            warnings[0].message
+        );
+    }
+}
+
+#[test]
+fn dropped_blank_line_warnings_are_once_per_run_bounded_and_follow_joined_ones() {
+    // Two deletions meeting in one run warn once, for the first.
+    let (output, warnings) = dropped_warnings(
+        "A\n\n\nB\n\n\nC\n\n\nD\n",
+        vec![
+            lines_change("b", [2, 5], None, ""),
+            lines_change("c", [7, 9], None, ""),
+        ],
+    );
+    assert_eq!(output, "A\n\nD\n");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0].change_id.as_deref(), Some("b"));
+    // A change without blank lines around both ends leaves the run it meets to
+    // the next change.
+    let (_, warnings) = dropped_warnings(
+        FUNCTIONS,
+        vec![
+            exact("word", "return 1", "return 10"),
+            exact("2.2", "\n\ndef parse():\n    return 2\n\n", ""),
+        ],
+    );
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0].change_id.as_deref(), Some("2.2"));
+    // Each run of a counted change warns, up to eight per file.
+    let text: String = (0..10)
+        .map(|index| format!("k{index}\n\nDROP\n\n"))
+        .collect();
+    let all = Change {
+        id: "all".into(),
+        target: Target::All {
+            old: "\nDROP\n\n".into(),
+            scope: Some("r0".into()),
+            expected: 10,
+            lines: None,
+        },
+        text: String::new(),
+    };
+    let (_, warnings) = dropped_warnings(&text, vec![all]);
+    assert_eq!(warnings.len(), 8);
+    assert!(
+        warnings[7].message.contains("between lines 8 and 9;"),
+        "{}",
+        warnings[7].message
+    );
+    // A long ID still fits what clients display.
+    let id = "i".repeat(300);
+    let (_, warnings) = dropped_warnings(FUNCTIONS, vec![lines_change(&id, [3, 7], None, "")]);
+    assert!(warnings[0].message.chars().count() <= 240);
+    assert_eq!(warnings[0].change_id.as_deref(), Some(id.as_str()));
+    // The warning follows the file's byte, whitespace-edge, and joined blank-line
+    // warnings, and precedes its final line break ones.
+    let base = snapshot("order.txt".into(), "a = b\n\nc\n\nd\0\n\nx\n\ny\n".into());
+    let plan = compile(
+        &request(
+            &base,
+            vec![
+                exact("edge", "= ", "="),
+                exact("joined", "c", ""),
+                exact("dropped", "\nx\n\n", ""),
+                insert("final", 9, None, "e\n"),
+            ],
+        ),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(plan.files[0].output, "a =b\n\n\n\nd\0\ny\ne\n");
+    let codes: Vec<_> = plan
+        .warnings
+        .iter()
+        .map(|warning| warning.code.as_str())
+        .collect();
+    assert_eq!(
+        codes,
+        [
+            "NUL_BYTE",
+            "WHITESPACE_EDGE",
+            "BLANK_LINES_JOINED",
+            "BLANK_LINES_DROPPED",
+            "FINAL_LINE_BREAK_KEPT"
+        ]
+    );
+}
+
 fn final_break_warnings(text: &str, changes: Vec<Change>) -> (String, Vec<Diagnostic>) {
     let base = snapshot("final.py".into(), text.into());
     let plan = compile(&request(&base, changes), &bases(&base)).unwrap();

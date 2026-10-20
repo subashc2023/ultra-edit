@@ -615,6 +615,14 @@ pub fn compile_with(
             }
             warn_edges(&base.path, &output, edges, &mut edge_warnings);
             warn_blank_runs(&base.path, &base.text, &output, &placed, &mut edge_warnings);
+            warn_dropped_blank_runs(
+                &base.path,
+                &base.text,
+                &output,
+                &replacements,
+                &placed,
+                &mut edge_warnings,
+            );
             warn_final_line_breaks(&base.path, &output, &placed, &targets, &mut edge_warnings);
             warnings.extend(context.whole_words);
             moves.extend(
@@ -665,7 +673,8 @@ const EDGE_WHITESPACE: [char; 4] = [' ', '\t', '\r', '\n'];
 /// short enough that the message fits the 240 characters clients display.
 const EDGE_CONTEXT_CHARS: usize = 40;
 /// `WHITESPACE_EDGE` warnings per file, each scanning its output line, and
-/// likewise `BLANK_LINES_JOINED` and `FINAL_LINE_BREAK_KEPT` warnings.
+/// likewise `BLANK_LINES_JOINED`, `BLANK_LINES_DROPPED` and
+/// `FINAL_LINE_BREAK_KEPT` warnings.
 const MAX_EDGE_WARNINGS: usize = 8;
 
 /// Finds the edges where an exact target's `old` and `new` agree on their outermost
@@ -866,6 +875,93 @@ fn warn_blank_runs(
     }
 }
 
+/// Warns where a change that removes text leaves fewer blank lines in a row
+/// around an edge than the file had around both of its ends, naming them as
+/// output lines: an `old` that takes the blank lines above a function and one
+/// below it leaves one too few. Blank lines at the start or end of the file
+/// separate nothing, so whitespace reaching either counts none, and a change
+/// that removes only whitespace, as an insertion does, is not judged. Each run
+/// is judged once, for the first change with blank lines around both ends that
+/// meets it, and the bytes are written as given. `placed` holds each
+/// replacement's output range, in order. A change beside text costs a byte on
+/// each side of each end; only the output's whitespace around the edges of a
+/// change judged is scanned, once per run.
+fn warn_dropped_blank_runs(
+    path: &str,
+    base: &str,
+    output: &str,
+    replacements: &[Replacement],
+    placed: &[(&str, Range<usize>)],
+    warnings: &mut Vec<Diagnostic>,
+) {
+    let around = |at| match whitespace_around(base, at) {
+        (stretch, true) => blank_lines(base, stretch).1,
+        _ => 0,
+    };
+    let mut measured: Option<usize> = None;
+    let (mut warned, mut line, mut cursor) = (0, 1, 0);
+    for (replacement, (id, range)) in replacements.iter().zip(placed) {
+        if base[replacement.start..replacement.end]
+            .trim_matches(EDGE_WHITESPACE)
+            .is_empty()
+        {
+            continue;
+        }
+        let (above, below) = (around(replacement.start), around(replacement.end));
+        let fewest = above.min(below);
+        if fewest == 0 {
+            continue;
+        }
+        for junction in [range.start, range.end] {
+            // An edge in the whitespace already measured meets the same run.
+            if measured.is_some_and(|end| junction <= end) {
+                continue;
+            }
+            let (stretch, between) = whitespace_around(output, junction);
+            measured = Some(stretch.end);
+            if !between {
+                continue;
+            }
+            let (first, count) = blank_lines(output, stretch.clone());
+            if count >= fewest {
+                continue;
+            }
+            if warned == MAX_EDGE_WARNINGS {
+                return;
+            }
+            warned += 1;
+            line += output.as_bytes()[cursor..first]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count();
+            cursor = first;
+            let run = match count {
+                // Without a blank line, `first` starts the next text's line.
+                0 if output[stretch.clone()].contains('\n') => {
+                    format!("no blank line, between lines {} and {line}", line - 1)
+                }
+                0 => format!("no line break, line {line}"),
+                1 => format!("a blank line, line {line}"),
+                _ => format!(
+                    "{count} blank lines in a row, lines {line}-{}",
+                    line + count - 1
+                ),
+            };
+            let shown: String = id.chars().take(QUOTED_ID_CHARS).collect();
+            let mut warning = at(
+                Some(path),
+                None,
+                "BLANK_LINES_DROPPED",
+                format!(
+                    "Change {shown}: the whitespace around its edge now holds {run}; the file had {above} in a row around its start and {below} around its end"
+                ),
+            );
+            warning.change_id = Some((*id).to_owned());
+            warnings.push(warning);
+        }
+    }
+}
+
 /// Characters a `FINAL_LINE_BREAK_KEPT` warning quotes of each line it names,
 /// short enough that the message fits the 240 characters clients display.
 const ENDING_CONTEXT_CHARS: usize = 32;
@@ -985,6 +1081,16 @@ fn longest_blank_run(text: &str) -> usize {
             (run, longest.max(run))
         })
         .1
+}
+
+/// The whitespace around byte `at` of `text`, and whether text stands on both
+/// sides of it, as it must for its blank lines to separate anything.
+fn whitespace_around(text: &str, at: usize) -> (Range<usize>, bool) {
+    let (before, after) = text.split_at(at);
+    let start = before.trim_end_matches(EDGE_WHITESPACE).len();
+    let end = text.len() - after.trim_start_matches(EDGE_WHITESPACE).len();
+    let top = if text.starts_with('\u{feff}') { 3 } else { 0 };
+    (start..end, start > top && end < text.len())
 }
 
 /// Names the lines each moved target gave and the lines it applied to. A stale
