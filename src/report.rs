@@ -1,4 +1,5 @@
 use crate::model::{CommitStatus, FileStatus, PreparedPlan, Receipt};
+use serde::Serialize;
 use serde_json::Value;
 use std::{borrow::Cow, fmt::Write};
 
@@ -166,6 +167,105 @@ pub fn receipt(receipt: &Receipt, max_lines: usize, max_chars: usize) -> String 
         );
     }
     report.output
+}
+
+/// A committed file's changed lines as they now read, numbered as Read numbers
+/// them, so a caller can confirm an edit and address later lines without reading
+/// the file again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ChangedLines {
+    pub path: String,
+    /// `"12 | body"` per line, without its ending; each changed region keeps one
+    /// line of context above and below.
+    pub lines: Vec<String>,
+    /// Lines left out once the response's bounds were reached.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub omitted: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+/// The lines each replacement wrote, with one line of context, for every
+/// committed file of `plan`, within `max_lines` lines of at most `max_chars`
+/// characters each.
+pub fn changed_lines(
+    plan: &PreparedPlan,
+    receipt: &Receipt,
+    max_lines: usize,
+    max_chars: usize,
+) -> Vec<ChangedLines> {
+    let mut remaining = max_lines;
+    let mut views = Vec::new();
+    for file in &plan.files {
+        let committed = receipt.files.iter().any(|outcome| {
+            outcome.path == file.base.path && outcome.status == FileStatus::Committed
+        });
+        if !committed || file.replacements.is_empty() {
+            continue;
+        }
+        let output = file.output.as_str();
+        let starts: Vec<usize> = std::iter::once(0)
+            .chain(output.match_indices('\n').map(|(at, _)| at + 1))
+            .filter(|&at| at < output.len() || at == 0)
+            .collect();
+        let count = starts.len();
+        // The 1-based line holding byte `at`; the end of the file is on the last line.
+        let line_of = |at: usize| starts.partition_point(|&start| start <= at).max(1);
+        let mut windows: Vec<(usize, usize)> = Vec::new();
+        let mut shift: isize = 0;
+        for replacement in &file.replacements {
+            let start = (replacement.start as isize + shift) as usize;
+            let end = start + replacement.text.len();
+            shift +=
+                replacement.text.len() as isize - (replacement.end - replacement.start) as isize;
+            let first = line_of(start);
+            // An empty replacement wrote no line: show the lines on either side.
+            let last = if end > start {
+                line_of(end - 1)
+            } else {
+                first - 1
+            };
+            let window = (first.saturating_sub(1).max(1), (last + 1).min(count));
+            match windows.last_mut() {
+                Some(previous) if window.0 <= previous.1 + 1 => {
+                    previous.1 = previous.1.max(window.1)
+                }
+                _ => windows.push(window),
+            }
+        }
+        let mut lines = Vec::new();
+        let mut omitted = 0;
+        for line in windows.into_iter().flat_map(|(first, last)| first..=last) {
+            if remaining == 0 || output.is_empty() {
+                omitted += usize::from(!output.is_empty());
+                continue;
+            }
+            let start = starts[line - 1];
+            let end = starts.get(line).copied().unwrap_or(output.len());
+            let body = output[start..end]
+                .trim_end_matches('\n')
+                .trim_end_matches('\r');
+            let body = if line == 1 {
+                body.trim_start_matches('\u{feff}')
+            } else {
+                body
+            };
+            let mut shown: String = body.chars().take(max_chars).collect();
+            if shown.len() < body.len() {
+                shown.push('…');
+            }
+            lines.push(format!("{line} | {shown}"));
+            remaining -= 1;
+        }
+        views.push(ChangedLines {
+            path: file.base.path.clone(),
+            lines,
+            omitted,
+        });
+    }
+    views
 }
 
 fn warnings(report: &mut BoundedReport, warnings: &[crate::Diagnostic]) {

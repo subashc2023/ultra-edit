@@ -161,6 +161,13 @@ preparation uses `kind: "ready"` or `"rejected"`, with `request_id`, `reference`
 derived ID when the call omitted one. A result returned for an already recorded
 request without a new commit attempt adds `replayed: true` (omitted otherwise),
 and its report begins with a replay notice; a replay never writes target files.
+A completed `ultra_edit` call that made a new commit attempt adds `changed`:
+for each committed file, `{path, lines, omitted?}`, where `lines` holds each
+changed region as it now reads, as `"12 | body"` with Read's line numbers and
+one line of context above and below. It holds at most 40 lines of at most 160
+characters in all, and `omitted` counts the lines left out. A replay, a
+`ultra_edit_commit`, and a receipt read later carry no `changed`, since the
+files may have changed since.
 Each of the first six compact diagnostics can carry up to three `candidates`,
 `{kind, line, end_line, text?, similarity?}`, for a missing `old` target or a
 failed span or line `expect`; full drafts carry them for every diagnostic. Receipt
@@ -285,7 +292,7 @@ The Python suite verifies deterministic target and multi-platform archives,
 launcher dispatch, required contents, hook entries, and permissions, version
 agreement, path safety, marketplace pinning, and checksums; it also tests the
 evaluation harness offline. Run the repository's configured Rust gates from
-[the README](../README.md#development). The complete tag and release procedure
+[Contributing](../CONTRIBUTING.md#checks). The complete tag and release procedure
 is in [Releasing](releasing.md). The adapter's process tests cover
 initialization and tool discovery, focused snapshot → edit → receipt, continued
 ranges, derived IDs and replay, near-miss candidates, literal bytes, stale

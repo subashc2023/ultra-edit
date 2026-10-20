@@ -2897,7 +2897,7 @@ fn undisclosed_lines_need_an_expect_that_reaches_the_last_line() {
         (
             ends_change("c", [3, 4], ["}", "}"], ""),
             "LINE_GUARD_WEAK",
-            "expect \"} }\" is short and matches 2 ranges in this file, from line 3, so a stale number could pick another; widen the range by a neighbouring line, repeating it in `new` and `expect`, or use `old`",
+            "expect \"} }\" is short and matches 2 ranges in this file, from line 3, so a stale number could pick another; widen the range to lines [2,4], repeating line 2 in `new` and `expect`, or use `old`",
         ),
         (
             insert("c", 0, Some("fn a() {"), "x"),
@@ -2913,7 +2913,11 @@ fn undisclosed_lines_need_an_expect_that_reaches_the_last_line() {
     }
     let error = rejected(&base, insert("c", 3, Some("}\n"), "x"));
     assert_eq!(error.code, "LINE_GUARD_WEAK");
-    assert!(error.message.contains("extend it with the lines above"));
+    assert!(
+        error.message.contains("give lines 1-3 as expect"),
+        "{}",
+        error.message
+    );
     // A short line that occurs once guards as well as a long one, as with `old`.
     for changes in [
         vec![lines_change("c", [2, 2], Some("    one();"), "    two();")],

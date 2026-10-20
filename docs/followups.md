@@ -88,7 +88,7 @@ The runnable regression coverage is in [reading tests](../tests/reading.rs),
 [compiler tests](../tests/compiler.rs), [workspace tests](../tests/workspace.rs),
 [storage tests](../src/storage.rs), [report tests](../tests/report.rs), and
 [MCP process tests](../tests/mcp.rs). Run the configured gates from
-[Development](../README.md#development); historical benchmark and Claude smoke
+[Contributing](../CONTRIBUTING.md#checks); historical benchmark and Claude smoke
 measurements remain documented separately and are not new measurements of these
 follow-ups.
 

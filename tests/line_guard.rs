@@ -1142,3 +1142,63 @@ fn other_changes_beside_many_restating_insertions_are_judged_quickly() {
         started.elapsed()
     );
 }
+
+/// A weak guard's advice names the fewest lines that would make it strong, by
+/// number only: the text must come from the caller's view, since the number the
+/// guard checks may be the stale one.
+#[test]
+fn weak_guard_advice_names_the_lines_to_add() {
+    // Fenced blocks guarded by their fences, as in the benchmark's misses.
+    let fences = spanless("# A\n```\nfn a() {}\n```\n# B\n```\nfn b() {}\n```\n");
+    let error = rejected(&fences, ends([6, 8], Some("```"), Some("```"), "x"));
+    assert_eq!(error.code, "LINE_GUARD_WEAK");
+    assert!(
+        error
+            .message
+            .contains("make its first part lines 6-7 (a part may hold several lines)"),
+        "{}",
+        error.message
+    );
+    assert!(!error.message.contains("fn b"), "{}", error.message);
+    // A part grown at the end when that needs fewer lines.
+    let tail = spanless("}\n}\nlong closing line\n}\n}\n}\nlong closing line\n}\n");
+    let error = rejected(&tail, ends([5, 8], Some("}"), Some("}"), "x"));
+    assert!(
+        error.message.contains("make its last part lines 7-8"),
+        "{}",
+        error.message
+    );
+    // An insertion after a blank line names the lines above to give.
+    let blanks = spanless("first text line\n\nsecond text line\n\n");
+    let error = rejected(&blanks, insert(2, Some(""), "x"));
+    assert!(
+        error.message.contains("give lines 1-2 as expect"),
+        "{}",
+        error.message
+    );
+    // A one-line range widens toward a neighbour with text.
+    let error = rejected(&blanks, ends([2, 2], Some(""), None, ""));
+    assert!(
+        error
+            .message
+            .contains("widen the range to lines [1,2], repeating line 1"),
+        "{}",
+        error.message
+    );
+    // With no line strong enough nearby, the advice stays general.
+    let short = spanless("}\n}\n}\n}\n");
+    let error = rejected(&short, ends([2, 2], Some("}"), None, ""));
+    assert!(
+        error
+            .message
+            .contains("widen the range by a neighbouring line"),
+        "{}",
+        error.message
+    );
+    for error in [
+        rejected(&fences, ends([6, 8], Some("```"), Some("```"), "x")),
+        rejected(&blanks, insert(2, Some(""), "x")),
+    ] {
+        assert!(error.message.chars().count() <= 240, "{}", error.message);
+    }
+}

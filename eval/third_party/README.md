@@ -27,7 +27,8 @@ python3 eval/run_eval.py --preflight --arm mcp-filesystem --arm desktop-commande
 ```
 
 The script needs Node.js 18+, npm, and Python 3.10+ (it uses `uv` when
-present). It installs the versions pinned in `package.json`,
+present); on Windows, run it with Git Bash (`bash eval/third_party/setup.sh`).
+It installs the versions pinned in `package.json`,
 `package-lock.json`, and `requirements.txt`, with npm install scripts disabled,
 so Desktop Commander's install-tracking script does not run. Pass another
 directory as the first argument and give the same directory to `run_eval.py
@@ -35,8 +36,8 @@ directory as the first argument and give the same directory to `run_eval.py
 
 Desktop Commander needs extra isolation:
 
-- Its arm sets `HOME` to `install/dc-home`, so it never reads or changes your own
-  `~/.claude-server-commander` configuration.
+- Its arm sets `HOME`, and `USERPROFILE` for Windows, to `install/dc-home`, so
+  it never reads or changes your own `~/.claude-server-commander` configuration.
 - `DESKTOP_COMMANDER_DISABLE_TELEMETRY=1` turns telemetry off.
 - Desktop Commander can append onboarding and feedback-survey messages to tool
   results, depending on remote feature flags and usage counters that all runs
@@ -71,7 +72,12 @@ Add an entry to `arms.json`:
 
 - `server_name`: the MCP server name; tools are `mcp__<server_name>__<tool>`.
 - `mcp_server`: a stdio server definition. `{repo}` is replaced by the run's
-  temporary repository and `{third_party_dir}` by the install directory.
+  temporary repository, `{third_party_dir}` by the install directory,
+  `{venv_bin}` by `venv/bin` (`venv/Scripts` on Windows), and `{exe}` by `.exe`
+  on Windows and nothing elsewhere. Claude Code starts the command without a
+  shell, which on Windows cannot run npm's extensionless `node_modules/.bin`
+  scripts: start a Node server as `node` with its package's entry script, and a
+  Python one as `{third_party_dir}/{venv_bin}/NAME{exe}`.
 - `edit_tools`: tool names counted as edit calls.
 - `required_tools`: tool names that must be listed at session start, or the run
   is marked `invalid`.
