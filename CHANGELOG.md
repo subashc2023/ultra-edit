@@ -136,6 +136,13 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 - Eval: every run disables the built-in `plugin-authoring@builtin` plugin,
   which loaded in some runs depending on a GrowthBook flag.
+- Eval: every prompt starts with `<!-- MARKER -->`, 8 hex digits that each
+  invocation draws afresh, so no run reads a task prompt another invocation
+  cached. The tenth Windows round started 24 minutes after the ninth: the
+  native arm's first repetitions read the ninth round's cached task prompts,
+  while Ultra Edit's, whose tool description had changed, paid to write theirs,
+  near 4% of Ultra Edit's cost over the round (1.01× native over all runs,
+  0.99× over the other two repetitions).
 
 ## [0.4.0] - 2026-10-08
 

@@ -1396,6 +1396,22 @@ class HarnessProcessTests(unittest.TestCase):
         self.assertIn("--setting-sources=", command["argv"])
 
     @unittest.skipUnless(HAS_GIT, "git is required")
+    def test_run_one_sends_the_prompt_after_the_invocation_marker(self):
+        task = evaluation.load_task(TASKS_DIR / "crlf-and-lf")
+        self.write_plan(task.expected)
+        for via in ("stdin", "arg"):
+            config = self.config(self.root / via)
+            config.prompt_via, config.prompt_marker = via, "0123abcd"
+            result = evaluation.run_one(config, evaluation.RunSpec(task, "native", 1))
+            self.assertEqual(result["outcome"], "pass", result)
+            log = json.loads(self.log_path.read_text(encoding="utf-8"))
+            sent = log["prompt"] if via == "stdin" else log["argv"][1]
+            self.assertEqual(sent, f"<!-- 0123abcd -->\n{task.prompt}", via)
+            command = json.loads((self.root / via / result["files"]["dir"] / "command.json").read_text(encoding="utf-8"))
+            self.assertEqual(command["prompt_marker"], "0123abcd")
+            self.assertNotIn(sent, command["argv"])
+
+    @unittest.skipUnless(HAS_GIT, "git is required")
     def test_run_one_detects_newline_damage_and_extra_files(self):
         task = evaluation.load_task(TASKS_DIR / "crlf-and-lf")
         damaged = dict(task.expected)
@@ -2568,6 +2584,28 @@ class ParallelAndThirdPartyRunTests(unittest.TestCase):
         self.assertEqual(sorted(manifest["arm_specs"]), ["native", "shell-sed"])
         self.assertEqual([entry["arms"] for entry in manifest["history"]], [["native"], ["shell-sed"]])
         self.assertEqual(sorted(r["arm"] for r in evaluation.load_records(out)), ["native", "shell-sed"])
+
+    def test_each_invocation_starts_every_prompt_with_its_own_marker(self):
+        # A task prompt cached by an earlier invocation is never read: without the marker, an
+        # arm whose tools and system prompt are unchanged would start with its task prompts
+        # cached while an arm whose build changed paid to write them.
+        self.write_plan()
+        out = self.root / "results"
+        markers = []
+        for extra in (("--out", str(out), "--reps", "2"), ("--resume", str(out), "--reps", "3")):
+            with mock.patch.dict(os.environ, self.env()), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(evaluation.main(self.main_args(out, *extra, "--no-warmup")), 0, output.getvalue())
+            markers.append(json.loads((out / "manifest.json").read_text(encoding="utf-8"))["prompt_marker"])
+        self.assertRegex(markers[0], "^[0-9a-f]{8}$")
+        self.assertNotEqual(markers[0], markers[1], "a resumed invocation draws its own marker")
+        manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual([entry["prompt_marker"] for entry in manifest["history"]], markers)
+        records = evaluation.load_records(out)
+        self.assertEqual(len(records), 6)
+        for record in records:
+            marker = markers[1 if record["rep"] == 3 else 0]
+            log = json.loads((self.logs / f"{record['run_id']}.json").read_text(encoding="utf-8"))
+            self.assertEqual(log["prompt"], f"<!-- {marker} -->\n{self.task.prompt}", record["run_id"])
 
     def test_main_rejects_an_unavailable_third_party_arm_before_paid_runs(self):
         self.write_plan()

@@ -68,6 +68,18 @@ measured right after it is. Each run records the Claude Code build and the
 Ultra Edit executable's SHA-256 it ran with, and `--resume` refuses to mix runs
 measured with different ones unless `--allow-drift` is given.
 
+Every prompt starts with the line `<!-- MARKER -->`, MARKER being 8 hex digits
+that each invocation draws afresh, `--resume` included (`prompt_marker` in
+`manifest.json` and each run's `command.json`). The prompt cache keeps a
+request's prefix, task prompt included, for an hour after its last use, so
+without the marker an arm whose tools and system prompt had not changed since
+the previous invocation began with its task prompts cached while an arm whose
+build had changed paid to write them: in the tenth Windows round, started 24
+minutes after the ninth, about 1,900 tokens per first-repetition Ultra Edit
+run, or near 4% of that arm's cost over the round. With it, each arm writes
+each task prompt once per invocation, an arm restarted by `--rerun-arm`
+included, and later repetitions read it.
+
 ### Third-party arms
 
 Third-party arms are defined in `third_party/arms.json`; installation and the
@@ -320,7 +332,7 @@ Each evaluation writes `eval/results/<UTC time>/` (ignored by Git):
   `runs.csv`: the same runs, one row each, scalar values only, with a fixed
   column order (lists and per-tool dictionaries stay in `runs.jsonl`);
   `manifest.json`: the configuration, every arm's specification, the Claude
-  Code version, and the harness commit.
+  Code version, the prompt marker, and the harness commit.
 - `runs/<task>__<arm>__r<n>/`: the raw `stream.jsonl`, `stderr.txt`, the exact
   `settings.json`, `command.json`, and (third-party arms) `mcp.json`,
   `result.json`, and `diff.txt` for wrong bytes. The diff renders each line as

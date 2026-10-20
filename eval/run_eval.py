@@ -24,6 +24,7 @@ import platform
 import posixpath
 import random
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -2102,6 +2103,7 @@ class Config:
     setting_sources: str = ""
     isolate_config: bool = False
     prompt_via: str = "stdin"
+    prompt_marker: str | None = None
     allowed_tools: tuple[str, ...] = DEFAULT_ALLOWED_TOOLS
     guard_matcher: str = DEFAULT_GUARD_MATCHER
     extra_settings: dict[str, Any] | None = None
@@ -2297,6 +2299,16 @@ def _write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=False) + "\n", encoding="utf-8")
 
 
+def marked_prompt(prompt: str, marker: str | None) -> str:
+    """The prompt as a run sends it: after a line holding the invocation's marker, if any.
+
+    The prompt cache serves an earlier request's prefix, through its task prompt, for about an
+    hour after that prefix was last used. Without the marker, an arm whose tools and system
+    prompt are unchanged since the last invocation finds its task prompts cached on their first
+    repetition, while an arm whose build changed pays to write them."""
+    return f"<!-- {marker} -->\n{prompt}" if marker else prompt
+
+
 def run_one(config: Config, spec: RunSpec) -> dict[str, Any]:
     run_dir = config.out_dir / "runs" / spec.run_id
     run_dir.mkdir(parents=True)
@@ -2328,6 +2340,7 @@ def run_one(config: Config, spec: RunSpec) -> dict[str, Any]:
             config_dir.mkdir()
         env, removed = build_env(base_env, config_dir)
         use_arg = config.prompt_via == "arg"
+        prompt = marked_prompt(spec.task.prompt, config.prompt_marker)
         mcp_path = None
         if arm.mcp_server is not None:
             mcp_path = (run_dir / "mcp.json").resolve()
@@ -2345,15 +2358,16 @@ def run_one(config: Config, spec: RunSpec) -> dict[str, Any]:
             effort=config.effort,
             setting_sources=config.setting_sources,
             allowed_tools=config.allowed_tools,
-            prompt=spec.task.prompt if use_arg else None,
+            prompt=prompt if use_arg else None,
             claude=config.claude,
         )
         _write_json(
             run_dir / "command.json",
             {
-                "argv": ["<prompt.md>" if use_arg and item == spec.task.prompt else item for item in argv],
+                "argv": ["<prompt.md>" if use_arg and item == prompt else item for item in argv],
                 "cwd": str(repo),
                 "prompt": f"{spec.task.name}/prompt.md via {'argument' if use_arg else 'stdin'}",
+                "prompt_marker": config.prompt_marker,
                 "env_set": {**CHILD_ENV, **({"CLAUDE_CONFIG_DIR": str(config_dir)} if config_dir else {})},
                 "env_removed": removed,
             },
@@ -2362,7 +2376,7 @@ def run_one(config: Config, spec: RunSpec) -> dict[str, Any]:
             argv,
             cwd=repo,
             env=env,
-            stdin_bytes=None if use_arg else spec.task.prompt.encode("utf-8"),
+            stdin_bytes=None if use_arg else prompt.encode("utf-8"),
             stdout_path=run_dir / "stream.jsonl",
             stderr_path=run_dir / "stderr.txt",
             timeout_s=config.timeout_s,
@@ -3197,6 +3211,7 @@ def _dry_run(
             _print(f"WARNING: {problem}")
     _print(f"results: {out_dir}")
     _print("each run: fresh temporary Git repository with the fixture committed; cwd = <temp>/repo")
+    _print("each prompt: the line <!-- MARKER --> before prompt.md, MARKER being 8 hex digits drawn per invocation")
     env, removed = build_env(os.environ)
     _print(f"child environment sets: {', '.join(f'{k}={v}' for k, v in CHILD_ENV.items())}")
     if removed:
@@ -3507,6 +3522,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             setting_sources=args.setting_sources,
             isolate_config=args.isolate_config,
             prompt_via=args.prompt_via,
+            # Drawn by every invocation, --resume included, so a rerun arm writes its task prompts again.
+            prompt_marker=secrets.token_hex(4),
             allowed_tools=tuple(filter(None, args.allowed_tools.split(","))),
             guard_matcher=args.guard_matcher,
             extra_settings=extra,
@@ -3729,7 +3746,17 @@ def resume_plan(
     return kept, todo
 
 
-INVOCATION_KEYS = ("created", "harness_commit", "claude", "plugin", "arms", "reps", "options", "environment")
+INVOCATION_KEYS = (
+    "created",
+    "harness_commit",
+    "claude",
+    "plugin",
+    "arms",
+    "reps",
+    "prompt_marker",
+    "options",
+    "environment",
+)
 
 
 def merge_manifest(previous: Mapping[str, Any], current: Mapping[str, Any]) -> dict[str, Any]:
@@ -3773,6 +3800,7 @@ def execute(
         "arms": list(arms),
         "arm_specs": {name: config.spec(name).to_json() for name in arms},
         "reps": args.reps,
+        "prompt_marker": config.prompt_marker,
         "options": {
             key: (str(value) if isinstance(value, Path) else value)
             for key, value in vars(args).items()
