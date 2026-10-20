@@ -86,15 +86,16 @@ target.
 ## Choose the replacement target
 
 Each change names one target and its literal replacement `new` (`text` is an
-alias). A `path` file supports `old`, `count`, `in` with lines, `lines`, and
-`after`; spans other than `r0` need a snapshot `base`.
+alias). A `path` file supports `old`, `count`, `all`, `in` with lines, `lines`,
+and `after`; spans other than `r0` need a snapshot `base`.
 
 | Intent | Change | Requirement |
 | --- | --- | --- |
-| Replace unique exact text anywhere in the file | `{"old":"a","new":"b"}` | Exactly one occurrence in the entire original file, on word boundaries. |
-| Replace unique exact text within some lines | `{"old":"a","new":"b","in":[72,87]}` | Exactly one occurrence wholly inside lines 72-87. |
+| Replace unique exact text anywhere in the file | `{"old":"a","new":"b"}` | Exactly one occurrence in the entire original file, on word boundaries; matches inside longer names do not count when exactly one is whole (`WHOLE_WORDS_ONLY`). |
+| Replace unique exact text within some lines | `{"old":"a","new":"b","in":[72,87]}` | Exactly one occurrence wholly inside lines 72-87; with none there, the one an unrestricted `old` would take, if `old` has 8 or more visible characters (`LINES_MOVED`). |
 | Replace unique exact text inside an inspected span | `{"old":"a","new":"b","in":"selection"}` | The span belongs to this base; one occurrence inside it. |
-| Replace every occurrence | `{"old":"a","new":"b","count":3}` | Exactly 3 non-overlapping occurrences in the file, or in `in`, inside words or not. |
+| Rename: replace every whole-word occurrence | `{"old":"a","new":"b","all":true}` | At least one non-overlapping occurrence that cuts no word in the file, or in `in`; each is replaced, and those inside longer names stay (`WHOLE_WORDS_ONLY`). |
+| Replace a counted number of occurrences | `{"old":"a","new":"b","count":3}` | Exactly 3 non-overlapping occurrences in the file, or in `in`, inside words or not; or, when more occur, exactly the 3 that cut no word, leaving those inside longer names (`WHOLE_WORDS_ONLY`). |
 | Replace or delete whole lines | `{"lines":[40,42],"expect":["fn load(cfg) {","}"],"new":"..."}` | Lines exist; `expect` matches their first and last lines. `""` deletes them. |
 | Insert whole lines | `{"after":3,"expect":"use std::fs;","new":"use std::io;"}` | Line 3 exists; `expect` matches the lines ending at 3. `after:0` inserts at the top. |
 | Replace a disclosed line, selection, or match | `{"span":"m1","expect":"old text","new":"b"}` | The span belongs to this base; `expect` equals its bytes exactly. |
@@ -107,9 +108,11 @@ shows after a final newline stands for the last line.
 A line target replaces whole lines, terminators included. Text that does not end
 in a line feed keeps the last replaced line's ending, so a CRLF file stays CRLF
 and a file without a final newline still lacks one; text that ends in a line
-feed is written as given. Deleting the last line of a file without a final
-newline also removes the line ending before it, so the file still lacks one.
-Inserted lines get the file's line ending the same way.
+feed is written as given, so `"x\n\n"` writes `x` and one blank line, not two,
+with a nonblocking `FINAL_LINE_BREAK_KEPT` warning naming the lines after it.
+Deleting the last line of a file without a final newline also removes the line
+ending before it, so the file still lacks one. Inserted lines get the file's
+line ending the same way.
 
 `expect` on `lines` and `after` is compared line by line, ignoring line endings.
 For `after`, it gives the lines ending at `after`. For `lines`, a string gives
@@ -124,13 +127,22 @@ what line numbers tell apart, so a long guard may repeat. Lines between the
 first and last parts are not compared, and a blank last line pins the end only
 weakly, so prefer lines with text as `[first, last]`: when the range ends in
 blank lines, the last part may name the text line just before them. `after:0`
-takes none. A mismatch is `EXPECTED_TEXT_MISMATCH`, and when the expected lines
-occur elsewhere the message gives the current range. A line past the end is
-`LINE_OUT_OF_RANGE`. On `span`, `expect` is byte-exact.
+takes none. When the lines given do not hold `expect`, an `expect` with 8 or
+more visible characters that reaches the end as a required one must, and holds
+at exactly one place where the whole change fits (both parts of a pair shifted
+together), moves the change there, with a nonblocking `LINES_MOVED` warning
+naming the lines given and used. Otherwise, or when the moved change would
+overlap another change, a mismatch is `EXPECTED_TEXT_MISMATCH`, and when the
+expected lines occur elsewhere the message gives the current range. A line past
+the end is `LINE_OUT_OF_RANGE`. On `span`, `expect` is byte-exact.
 
 Unrestricted `old` searches the complete original file even after a focused
-read. Empty `old` is rejected with `EMPTY_TARGET`; insert with `after` instead,
-and give `after` nonempty text (`EMPTY_INSERTION`). `after` keeps its line, so
+read. An `old` with 8 or more visible characters whose `in` lines hold no match,
+as lines from a stale read may not, applies at the one match an unrestricted
+`old` would take, with the same `LINES_MOVED` warning; otherwise it is
+`TARGET_NOT_FOUND`. Empty `old` is rejected with `EMPTY_TARGET`; insert with
+`after` instead, and give `after` nonempty text (`EMPTY_INSERTION`). `after`
+keeps its line, so
 text whose leading lines restate the lines ending at it is refused
 (`INSERT_REPEATS_LINE`, 8 or more visible characters in those lines) unless
 other changes in the call delete each of them, and any copied lines below,
@@ -140,7 +152,7 @@ when another change also edits those lines, follow the message: drop them
 from `new` when the edits are in place, and otherwise send the one `lines`
 change it names in place of the changes on those lines. A `lines` replacement that gives lines twice
 duplicates them on purpose. `in` takes lines or a span ID, never literal
-text.
+text; beside `lines` or `after` it may only repeat the lines they name.
 
 `old` must start and end on word boundaries: a match that begins or ends
 inside an ASCII word or number, such as `retries = 2` inside `max_retries = 20`
@@ -150,7 +162,20 @@ words, or add `"count":1` to replace part of a word on purpose. Words with
 cased non-ASCII letters near the cut (`Hauptstraße`) and letter escapes such
 as `\nRestart` are exempt, and an `old` with text on several lines may end
 inside a word; Han, kana, and other uncased scripts separate words, and a cut
-between two digits always counts.
+between two digits always counts. Where `old` begins or ends with a hyphenated
+name, such as the CSS class `btn-primary`, a hyphen continues that word, so
+`btn-primary` is inside `btn-primary-outline` and `--btn-primary-bg`; a word
+`old` begins or ends with as context keeps hyphens as separators.
+
+Rendered text shows a no-break or thin space (U+00A0, U+2007, U+2009, U+202F)
+as an ordinary one. An `old` without `count` that occurs nowhere as written
+takes its one match in scope where the file holds such a space for one of its
+ASCII spaces, if `new` repeats the text around each such space: `new` is then
+written with the file's spaces in that repeated text, with a nonblocking
+`SPACES_ADAPTED` warning. With a second such match, or a space in text that `new`
+changes, it stays `TARGET_NOT_FOUND`; copy the candidate's `text`, which holds
+the file's spaces, into `old` and write `new` with them. An `old` that holds one
+of these spaces stays literal.
 
 A line range `rA..rB` works as a `span` or `in` when the base disclosed every
 line from A to B, for instance across a range continued with another range. It
@@ -164,14 +189,15 @@ with an undisclosed line, and shapes such as `146-150` or `L146` are
 
 The verbose form `{"id":"…","target":{…},"text":"…"}` is still accepted and is
 how requests are stored: `old` is `{"kind":"exact","old":…,"scope":…}`, `count`
-is `{"kind":"all","old":…,"expected":N}`, `span` is
+is `{"kind":"all","old":…,"expected":N}`, `all` is
+`{"kind":"every","old":…}`, `span` is
 `{"kind":"span","span":…,"expect":…}`, `lines` is
 `{"kind":"lines","lines":[a,b],"expect":…,"expect_last":…}`, and `after` is
 `{"kind":"insert","after":n,"expect":…}`. Both spellings of one change derive
 the same request ID.
 
 Search and `exact` ambiguity counts include overlapping starts: `aa` occurs twice in `aaa`.
-Ambiguous exact matches are errors. In `TARGET_AMBIGUOUS`, `actual` remains the
+Ambiguous exact matches are errors, unless exactly one of them cuts no word. In `TARGET_AMBIGUOUS`, `actual` remains the
 overlapping-start count; the message adds, in parentheses, the non-overlapping
 count for a corresponding `count` change in the same scope, and the lines of
 the first five starts: `found 6 overlapping starts (4 non-overlapping) at lines

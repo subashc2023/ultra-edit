@@ -62,11 +62,16 @@ a custom configuration directory; Claude Code identifies that copy as
 For a session-only source test, use
 `claude --plugin-dir ABSOLUTE_PLUGIN_DIRECTORY`.
 The packaged `.mcp.json` runs `${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp` with
-the argument array `["--root", "${CLAUDE_PROJECT_DIR}", "--no-instructions"]`.
-`--no-instructions` leaves server instructions out of `initialize`, because the
-plugin's session card already gives the model the same routing; measured with
+the argument array `["--root", "${CLAUDE_PROJECT_DIR}", "--plugin-card"]`.
+`--plugin-card` leaves server instructions out of `initialize`, because the
+plugin's card already gives the model the same routing; measured with
 Claude Code 2.1.293, the duplicate cost about 280 tokens on every model call.
-Other hosts start the server without it and receive the instructions. The native launcher
+It also replaces the generic `ultra_edit` description with that card. Claude
+Code caches tool definitions across sessions but writes hook context anew in
+each one: measured with Claude Code 2.1.303, the card cost 788 uncached tokens
+per session as hook context. `--no-instructions` alone keeps the generic
+description. Other hosts start the server without either flag and receive the
+instructions. The native launcher
 resolves `.exe` on Windows. Hook entries point to the same executable with an
 explicit argument array, so they launch directly without a shell. `runtime/`
 keeps the binaries private; a plugin `bin/` directory would be added to Claude's
@@ -195,12 +200,15 @@ dispatcher, automatic reconciliation, or model-supplied workspace root.
 
 ## Instruction layout
 
-The [canonical routing policy](../plugin/claude-code/instructions.md) is loaded
-by the plugin's context [hooks](../plugin/claude-code/hooks/hooks.json).
-`SessionStart` has no matcher, so it covers every session start source,
-including startup, resume, clear, compaction, and fork. `SubagentStart` supplies
-the same policy to subagents. Claude Code receives this as context before the
-first prompt; an ordinary edit request requires no skill invocation. See the official
+The [canonical routing policy](../plugin/claude-code/instructions.md) is the
+`ultra_edit` description the plugin's server gives under `--plugin-card`, so
+main sessions and subagents receive it with the tool. The plugin's context
+[hooks](../plugin/claude-code/hooks/hooks.json) add a short context that routes
+edits to `ultra_edit` and its description. `SessionStart` has no matcher, so it
+covers every session start source, including startup, resume, clear,
+compaction, and fork. `SubagentStart` supplies the same context to subagents.
+Claude Code receives both before the first prompt; an ordinary edit request
+requires no skill invocation. See the official
 [hook context contract](https://code.claude.com/docs/en/hooks#add-context-for-claude).
 
 The policy requires direct Ultra Edit MCP calls for coordinated changes across

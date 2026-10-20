@@ -288,14 +288,12 @@ fn line_targets_in_a_path_file_need_a_strong_expect() {
         },
         text: "    start();".into(),
     };
-    // A path file was read through another view, so its line numbers may be stale.
+    // A path file was read through another view, so its line numbers may be
+    // stale, and a short expect found elsewhere does not show where they moved.
     for (change, code) in [
         (lines([2, 2], None), "LINE_GUARD_REQUIRED"),
         (lines([2, 3], Some("    run();")), "LINE_GUARD_REQUIRED"),
-        (
-            lines([2, 3], Some("    serve_forever();\n}")),
-            "EXPECTED_TEXT_MISMATCH",
-        ),
+        (lines([3, 3], Some("}")), "EXPECTED_TEXT_MISMATCH"),
     ] {
         let outcome = rejected(
             workspace
@@ -366,6 +364,119 @@ fn a_line_added_inside_a_range_since_the_read_is_caught_at_its_end() {
         read(&dir, "a.rs"),
         "fn keep() {}\nfn other() {}\nfn tail() {}\n"
     );
+}
+
+#[test]
+fn stale_line_numbers_commit_where_their_text_is() {
+    let backoff = "RETRY_BACKOFF_S = 0.5  # doubled after each failed attempt";
+    let timeout = "READ_TIMEOUT_S = 10.0  # waiting for the first byte";
+    let text = format!("RETRY_LIMIT = 3  # attempts per request\n{backoff}\n\n{timeout}\n");
+    let (dir, workspace) = setup(&[("settings.py", text.as_str())]);
+    // Another writer adds two lines above the lines, as the caller read them.
+    receipt(
+        workspace
+            .edit(request(vec![at(
+                "settings.py",
+                vec![exact(
+                    "RETRY_LIMIT = 3",
+                    "DEFAULT_REGION = \"eu-west-1\"\n\nRETRY_LIMIT = 3",
+                )],
+            )]))
+            .unwrap(),
+    );
+    let stale = request(vec![at(
+        "settings.py",
+        vec![
+            Change {
+                id: String::new(),
+                target: Target::Insert {
+                    after: 2,
+                    expect: Some(backoff.into()),
+                },
+                text: "RETRY_JITTER = True".into(),
+            },
+            Change {
+                id: String::new(),
+                target: Target::Lines {
+                    lines: [4, 4],
+                    expect: Some(timeout.into()),
+                    expect_last: None,
+                },
+                text: "READ_TIMEOUT_S = 20.0  # waiting for the first byte".into(),
+            },
+            Change {
+                id: String::new(),
+                target: Target::Exact {
+                    old: "RETRY_LIMIT = 3".into(),
+                    scope: None,
+                    lines: Some([1, 1]),
+                },
+                text: "RETRY_LIMIT = 5".into(),
+            },
+        ],
+    )]);
+    let (done, replayed) = receipt(workspace.edit(stale.clone()).unwrap());
+    assert_eq!(done.commit, CommitStatus::Committed);
+    assert!(!replayed);
+    assert_eq!(
+        read(&dir, "settings.py"),
+        format!(
+            "DEFAULT_REGION = \"eu-west-1\"\n\nRETRY_LIMIT = 5  # attempts per request\n{backoff}\nRETRY_JITTER = True\n\nREAD_TIMEOUT_S = 20.0  # waiting for the first byte\n"
+        )
+    );
+    let moved: Vec<&str> = done
+        .warnings
+        .iter()
+        .filter(|warning| warning.code == "LINES_MOVED")
+        .map(|warning| warning.message.as_str())
+        .collect();
+    assert_eq!(moved.len(), 3, "{:?}", done.warnings);
+    assert!(
+        moved[0]
+            .starts_with("Change 1.1: after:2 did not hold expect, which holds only at after:4"),
+        "{}",
+        moved[0]
+    );
+    assert!(
+        moved[1].starts_with(
+            "Change 1.2: lines:[4,4] did not hold expect, which holds only at lines:[6,6]"
+        ),
+        "{}",
+        moved[1]
+    );
+    assert!(
+        moved[2]
+            .starts_with("Change 1.3: in:[1,1] did not hold `old`, which occurs only at line 3"),
+        "{}",
+        moved[2]
+    );
+    // The stored plan names the lines it wrote, which its commit checked.
+    let Evidence::Plan(plan) = workspace.evidence(&done.plan_id).unwrap() else {
+        panic!("expected a plan");
+    };
+    let targets: Vec<&Target> = plan.request.files[0]
+        .changes
+        .iter()
+        .map(|change| &change.target)
+        .collect();
+    assert!(
+        matches!(
+            targets[..],
+            [
+                Target::Insert { after: 4, .. },
+                Target::Lines { lines: [6, 6], .. },
+                Target::Exact {
+                    lines: Some([3, 3]),
+                    ..
+                }
+            ]
+        ),
+        "{targets:?}"
+    );
+    // The identical call replays its recorded result.
+    let (again, replayed) = receipt(workspace.edit(stale).unwrap());
+    assert!(replayed);
+    assert_eq!(again.plan_id, done.plan_id);
 }
 
 #[test]
@@ -478,6 +589,40 @@ fn a_missing_path_that_ends_like_a_workspace_file_names_it() {
         )),
         "{message}"
     );
+}
+
+/// Git Bash's `pwd` prints `C:\x` as `/c/x` and the temporary directory as `/tmp`,
+/// so a path copied from it names the Windows file it stands for.
+#[cfg(windows)]
+#[test]
+fn a_git_bash_path_names_the_windows_file() {
+    let (dir, workspace) = setup(&[("docs/a.md", "one\n")]);
+    let posix = |path: &std::path::Path| path.to_str().unwrap().replace('\\', "/");
+    // TempDir is in the temporary directory, which Git Bash mounts as `/tmp`.
+    let tmp = |path: &std::path::Path| {
+        format!(
+            "/tmp/{}",
+            posix(path.strip_prefix(std::env::temp_dir()).unwrap())
+        )
+    };
+    let file = dir.path().join("docs").join("a.md");
+    let full = posix(&file);
+    let drive = format!("/{}{}", full[..1].to_ascii_lowercase(), &full[2..]);
+    for (spelling, old, new) in [(tmp(&file), "one", "two"), (drive, "two", "three")] {
+        receipt(
+            workspace
+                .edit(request(vec![at(&spelling, vec![exact(old, new)])]))
+                .unwrap(),
+        );
+    }
+    assert_eq!(read(&dir, "docs/a.md"), "three\n");
+    let missing = tmp(&dir.path().join("missing.md"));
+    let outcome = rejected(
+        workspace
+            .edit(request(vec![at(&missing, vec![exact("one", "1")])]))
+            .unwrap(),
+    );
+    assert_eq!(codes(&outcome), ["TARGET_MISSING"]);
 }
 
 #[test]

@@ -1068,7 +1068,7 @@ pub fn normalize_paths(mut request: EditRequest, roots: &[&Path]) -> EditRequest
 fn needs_base(target: &Target) -> Option<&str> {
     let span = match target {
         Target::Exact { scope, .. } => scope.as_deref()?,
-        Target::All { scope, .. } => scope.as_deref()?,
+        Target::All { scope, .. } | Target::Every { scope, .. } => scope.as_deref()?,
         Target::Span { span, .. } => span.as_str(),
         Target::Lines { .. } | Target::Insert { .. } => return None,
     };

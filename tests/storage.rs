@@ -969,3 +969,57 @@ fn derived_line_replacements_are_recomputed_before_commit() {
     assert_eq!(receipt.commit, CommitStatus::Committed);
     assert_eq!(fs::read(&target).expect("read"), b"a\r\nB\r\nC\r\n");
 }
+
+#[test]
+fn space_adapted_replacements_are_recomputed_before_commit() {
+    let directory = tempfile::tempdir().expect("directory");
+    let target = directory.path().join("guide.md");
+    fs::write(&target, "limit is 10\u{a0}km\n").expect("fixture");
+    let storage = Storage::open(directory.path()).expect("storage");
+    let _lock = storage.lock().expect("lock");
+    let snapshot = compiler::snapshot(
+        storage
+            .resolve(Path::new("guide.md"))
+            .expect("resolve")
+            .to_string_lossy()
+            .into_owned(),
+        storage.read(Path::new("guide.md")).expect("read"),
+    );
+    let request = EditRequest {
+        request_id: "spaced".into(),
+        files: vec![FileRequest {
+            path: None,
+            base: snapshot.id.clone(),
+            changes: vec![Change {
+                id: "c".into(),
+                target: Target::Exact {
+                    old: "limit is 10 km".into(),
+                    scope: None,
+                    lines: None,
+                },
+                text: "limit is 12 km".into(),
+            }],
+        }],
+    };
+    let snapshots = BTreeMap::from([(snapshot.id.clone(), snapshot)]);
+    let plan = compiler::compile(&request, &snapshots).expect("compile");
+    assert_eq!(plan.files[0].replacements[0].text, "limit is 12\u{a0}km");
+    // Another space than the one `old` matched is not what the compiler derives.
+    let mut altered = plan.clone();
+    altered.files[0].replacements[0].text = "limit is 12\u{2009}km".into();
+    altered.files[0].output = "limit is 12\u{2009}km\n".into();
+    assert_eq!(
+        storage.commit(&altered).expect_err("altered").code,
+        "INVALID_PLAN"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).expect("read"),
+        "limit is 10\u{a0}km\n"
+    );
+    let receipt = storage.commit(&plan).expect("commit");
+    assert_eq!(receipt.commit, CommitStatus::Committed);
+    assert_eq!(
+        fs::read_to_string(&target).expect("read"),
+        "limit is 12\u{a0}km\n"
+    );
+}

@@ -178,7 +178,11 @@ pub(crate) fn find_target(
 /// `exact` candidates here lie outside the target's scope. A `whitespace`
 /// candidate that equals `needle` once its CRLFs become LF gets a line-ending
 /// hint: text copied from a view that hides `\r` never matches a CRLF file.
-pub(crate) fn not_found(expected: usize, needle: &str, candidates: &[Candidate]) -> String {
+pub(crate) fn not_found(
+    expected: impl std::fmt::Display,
+    needle: &str,
+    candidates: &[Candidate],
+) -> String {
     match candidates.first() {
         Some(first) if first.kind == CandidateKind::Exact => format!(
             "Expected {expected} occurrence(s) in the scope, found 0; the text is outside it, first at {}. Use a scope that contains the intended occurrence {REPAIR}.",

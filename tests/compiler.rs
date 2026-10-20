@@ -1822,6 +1822,682 @@ fn edge_warnings_judge_neighbours_in_the_output_not_the_original() {
     );
 }
 
+fn blank_warnings(text: &str, changes: Vec<Change>) -> (String, Vec<Diagnostic>) {
+    let base = snapshot("blank.py".into(), text.into());
+    let plan = compile(&request(&base, changes), &bases(&base)).unwrap();
+    let warnings = plan
+        .warnings
+        .into_iter()
+        .filter(|warning| warning.code == "BLANK_LINES_JOINED")
+        .collect();
+    (plan.files[0].output.clone(), warnings)
+}
+
+/// Functions two blank lines apart, as in the eval's `utils.py`.
+const FUNCTIONS: &str =
+    "def slug():\n    return 1\n\n\ndef parse():\n    return 2\n\n\ndef chunked():\n    return 3\n";
+
+#[test]
+fn whitespace_joined_into_a_longer_blank_run_warns_without_blocking() {
+    // The eval case: `old` takes the blank lines above `parse` but stops before
+    // its last line ending, so that line ending joins the two blank lines below.
+    let (output, warnings) = blank_warnings(
+        FUNCTIONS,
+        vec![exact("1.3", "\n\ndef parse():\n    return 2", "")],
+    );
+    assert_eq!(
+        output,
+        "def slug():\n    return 1\n\n\n\ndef chunked():\n    return 3\n"
+    );
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].change_id.as_deref(), Some("1.3"));
+    assert_eq!(warnings[0].file.as_deref(), Some("blank.py"));
+    assert_eq!(
+        warnings[0].message,
+        "Change 1.3: the whitespace around its edge now holds 3 blank lines in a row, lines 3-5; the file had at most 2"
+    );
+    // Deleting only the function's lines joins both pairs, and an insertion that
+    // starts with blank lines after one adds to it.
+    for (change, run) in [
+        (
+            lines_change("lines", [5, 6], None, ""),
+            "4 blank lines in a row, lines 3-6",
+        ),
+        (
+            insert("after", 7, None, "\n\ndef extra():\n    return 4"),
+            "3 blank lines in a row, lines 7-9",
+        ),
+        // Deleting a line's text leaves its indentation, a blank line too.
+        (
+            exact("indent", "return 2", ""),
+            "3 blank lines in a row, lines 6-8",
+        ),
+        // Blank lines `new` ends with meet the file's own below `old`.
+        (
+            exact("tail", "    return 2\n", "    return 2\n\n\n\n"),
+            "5 blank lines in a row, lines 7-11",
+        ),
+    ] {
+        let (_, warnings) = blank_warnings(FUNCTIONS, vec![change]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0]
+                .message
+                .ends_with(&format!("now holds {run}; the file had at most 2")),
+            "{}",
+            warnings[0].message
+        );
+    }
+}
+
+#[test]
+fn edits_that_leave_no_longer_blank_run_carry_no_blank_line_warning() {
+    for (text, change) in [
+        // The deletion the eval asked for, with its blank lines above or below.
+        (
+            FUNCTIONS,
+            exact("above", "\n\ndef parse():\n    return 2\n", ""),
+        ),
+        (
+            FUNCTIONS,
+            exact("below", "def parse():\n    return 2\n\n\n", ""),
+        ),
+        (FUNCTIONS, lines_change("lines", [3, 6], None, "")),
+        // Text beside blank lines, and whole lines after them, stay as they were.
+        (FUNCTIONS, exact("word", "return 2", "return 20")),
+        (
+            FUNCTIONS,
+            lines_change("line", [5, 5], None, "def parse(text):"),
+        ),
+        (FUNCTIONS, insert("between", 3, None, "x = 1")),
+        // A change's own blank lines beside text join nothing, as in a rewrite.
+        (FUNCTIONS, span_change("whole", "r0", "\n\n\nx = 1\n\n\n\n")),
+        (
+            FUNCTIONS,
+            exact("own", "    return 2\n\n\n", "    return 2\n\n\n\n"),
+        ),
+        (
+            FUNCTIONS,
+            exact("lead", "\n    return 3", "\n\n\n\n    return 3"),
+        ),
+        // Joined spaces hold no line ending, and an emptied file no line.
+        ("total = a + b\n", exact("plus", "+", "")),
+        ("only\n", exact("all", "only\n", "")),
+    ] {
+        let (_, warnings) = blank_warnings(text, vec![change]);
+        assert!(warnings.is_empty(), "{text:?}: {warnings:?}");
+    }
+}
+
+#[test]
+fn a_run_no_longer_than_one_the_file_already_had_carries_no_warning() {
+    // Three blank lines already stand before `TAIL`, so three more add nothing new.
+    let text = format!("{FUNCTIONS}\n\n\nTAIL = 4\n");
+    let (output, warnings) = blank_warnings(
+        &text,
+        vec![exact("1.3", "\n\ndef parse():\n    return 2", "")],
+    );
+    assert!(output.contains("return 1\n\n\n\ndef chunked"));
+    assert!(warnings.is_empty(), "{warnings:?}");
+    // So does a run right after a byte-order mark.
+    let (_, warnings) = blank_warnings("\u{feff}\n\n\nA\n\nB\n\nC\n", vec![exact("b", "B", "")]);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    // One more than that still warns, measured against the file's longest run.
+    let (_, warnings) = blank_warnings(&text, vec![lines_change("lines", [5, 6], None, "")]);
+    assert_eq!(
+        warnings[0].message,
+        "Change lines: the whitespace around its edge now holds 4 blank lines in a row, lines 3-6; the file had at most 3"
+    );
+}
+
+#[test]
+fn blank_runs_are_counted_as_read_numbers_lines() {
+    for (text, old, run) in [
+        // LF text matched to an all-CRLF file.
+        (
+            FUNCTIONS.replace('\n', "\r\n"),
+            "\n\ndef parse():\n    return 2",
+            "3 blank lines in a row, lines 3-5; the file had at most 2",
+        ),
+        // At the start of the file, after a byte-order mark, and at its end.
+        (
+            "# Title\n\nText\n".into(),
+            "# Title",
+            "2 blank lines in a row, lines 1-2; the file had at most 1",
+        ),
+        (
+            "\u{feff}# Title\n\nText\n".into(),
+            "# Title",
+            "2 blank lines in a row, lines 1-2; the file had at most 1",
+        ),
+        (
+            "Text\n\n    end".into(),
+            "end",
+            "2 blank lines in a row, lines 2-3; the file had at most 1",
+        ),
+        // The indentation of the line after a run starts that line.
+        (
+            "class A:\n    x = 1\n\n    y = 2\n\n    z = 3\n".into(),
+            "y = 2",
+            "3 blank lines in a row, lines 3-5; the file had at most 1",
+        ),
+        // A file with no blank line.
+        (
+            "a\nb\nc\n".into(),
+            "b",
+            "a blank line, line 2; the file had none",
+        ),
+    ] {
+        let (_, warnings) = blank_warnings(&text, vec![exact("c", old, "")]);
+        assert_eq!(warnings.len(), 1, "{text:?}: {warnings:?}");
+        assert!(
+            warnings[0].message.ends_with(run),
+            "{text:?}: {}",
+            warnings[0].message
+        );
+    }
+}
+
+#[test]
+fn blank_line_warnings_are_once_per_run_bounded_and_follow_edge_warnings() {
+    // Two deletions meeting in one run warn once, for the first.
+    let (output, warnings) = blank_warnings(
+        "a\n\nb\nc\n\nd\n",
+        vec![exact("b", "b\n", ""), exact("c", "c", "")],
+    );
+    assert_eq!(output, "a\n\n\n\nd\n");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0].change_id.as_deref(), Some("b"));
+    // Each run of a counted change warns, up to eight per file.
+    let text: String = (0..10)
+        .map(|index| format!("k{index}\n\nDROP\n\n"))
+        .collect();
+    let all = Change {
+        id: "all".into(),
+        target: Target::All {
+            old: "DROP\n".into(),
+            scope: Some("r0".into()),
+            expected: 10,
+            lines: None,
+        },
+        text: String::new(),
+    };
+    let (_, warnings) = blank_warnings(&text, vec![all]);
+    assert_eq!(warnings.len(), 8);
+    assert!(
+        warnings[7].message.contains("lines 23-24;"),
+        "{}",
+        warnings[7].message
+    );
+    // A long ID still fits what clients display.
+    let id = "i".repeat(300);
+    let (_, warnings) = blank_warnings(FUNCTIONS, vec![lines_change(&id, [5, 6], None, "")]);
+    assert!(warnings[0].message.chars().count() <= 240);
+    assert_eq!(warnings[0].change_id.as_deref(), Some(id.as_str()));
+    // The warning follows the plan's byte and whitespace-edge warnings.
+    let base = snapshot("order.txt".into(), "a = b\n\nc\n\nd\0\n".into());
+    let plan = compile(
+        &request(
+            &base,
+            vec![exact("edge", "= ", "="), exact("blank", "c", "")],
+        ),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(plan.files[0].output, "a =b\n\n\n\nd\0\n");
+    let codes: Vec<_> = plan
+        .warnings
+        .iter()
+        .map(|warning| warning.code.as_str())
+        .collect();
+    assert_eq!(codes, ["NUL_BYTE", "WHITESPACE_EDGE", "BLANK_LINES_JOINED"]);
+}
+
+fn dropped_warnings(text: &str, changes: Vec<Change>) -> (String, Vec<Diagnostic>) {
+    let base = snapshot("dropped.py".into(), text.into());
+    let plan = compile(&request(&base, changes), &bases(&base)).unwrap();
+    let warnings = plan
+        .warnings
+        .into_iter()
+        .filter(|warning| warning.code == "BLANK_LINES_DROPPED")
+        .collect();
+    (plan.files[0].output.clone(), warnings)
+}
+
+#[test]
+fn blank_lines_dropped_around_a_change_warn_without_blocking() {
+    // The eval case, from `decode.py`: `old` takes the two blank lines above
+    // `parse` and one of the two below it, leaving one where both sides had two.
+    let (output, warnings) = dropped_warnings(
+        FUNCTIONS,
+        vec![exact("2.2", "\n\ndef parse():\n    return 2\n\n", "")],
+    );
+    assert_eq!(
+        output,
+        "def slug():\n    return 1\n\ndef chunked():\n    return 3\n"
+    );
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].change_id.as_deref(), Some("2.2"));
+    assert_eq!(warnings[0].file.as_deref(), Some("dropped.py"));
+    assert_eq!(
+        warnings[0].message,
+        "Change 2.2: the whitespace around its edge now holds a blank line, line 3; the file had 2 in a row around its start and 2 around its end"
+    );
+    for (change, run) in [
+        // The same lines deleted by number.
+        (
+            lines_change("lines", [3, 7], None, ""),
+            "a blank line, line 3",
+        ),
+        // Every blank line on both sides, and the line ending before them too.
+        (
+            exact("all", "\n\ndef parse():\n    return 2\n\n\n", ""),
+            "no blank line, between lines 2 and 3",
+        ),
+        (
+            exact("join", "\n\n\ndef parse():\n    return 2\n\n\n", ""),
+            "no line break, line 2",
+        ),
+        // `new` without the blank lines `old` starts or ends with.
+        (
+            exact(
+                "lead",
+                "\n\ndef parse():\n    return 2",
+                "def parse(text):\n    return 2",
+            ),
+            "no blank line, between lines 2 and 3",
+        ),
+        (
+            exact(
+                "tail",
+                "def parse():\n    return 2\n\n\n",
+                "def parse():\n    return 20\n",
+            ),
+            "no blank line, between lines 6 and 7",
+        ),
+    ] {
+        let (_, warnings) = dropped_warnings(FUNCTIONS, vec![change]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].message.ends_with(&format!(
+                "now holds {run}; the file had 2 in a row around its start and 2 around its end"
+            )),
+            "{}",
+            warnings[0].message
+        );
+    }
+}
+
+#[test]
+fn changes_that_keep_their_blank_runs_carry_no_dropped_blank_line_warning() {
+    for (text, change) in [
+        // The deletion the eval asked for, with its blank lines above or below.
+        (
+            FUNCTIONS,
+            exact("above", "\n\ndef parse():\n    return 2\n", ""),
+        ),
+        (
+            FUNCTIONS,
+            exact("below", "def parse():\n    return 2\n\n\n", ""),
+        ),
+        (FUNCTIONS, lines_change("lines", [5, 8], None, "")),
+        // The shorter side sets the count: a method ending a class has one blank
+        // line above it and two below.
+        (
+            "class A:\n    x = 1\n\n    def f(self):\n        pass\n\n\ndef g():\n    pass\n",
+            exact("method", "\n    def f(self):\n        pass\n\n", ""),
+        ),
+        // Text edits beside blank lines, insertions, and edits of blank lines alone.
+        (FUNCTIONS, exact("word", "return 2", "return 20")),
+        (FUNCTIONS, insert("between", 3, None, "x = 1")),
+        (FUNCTIONS, lines_change("blank", [3, 3], None, "")),
+        // Blank lines at the start or end of the file separate nothing.
+        (
+            FUNCTIONS,
+            exact("first", "def slug():\n    return 1\n\n", ""),
+        ),
+        (
+            FUNCTIONS,
+            exact("last", "\n\ndef chunked():\n    return 3\n", ""),
+        ),
+        ("a\n\n\nb\n\n\n", exact("end", "\n\nb\n\n", "")),
+        (FUNCTIONS, span_change("whole", "r0", "x = 1\n")),
+    ] {
+        let (_, warnings) = dropped_warnings(text, vec![change]);
+        assert!(warnings.is_empty(), "{text:?}: {warnings:?}");
+    }
+    // Nor do they when another change puts text before them.
+    for bom in ["", "\u{feff}"] {
+        let (output, warnings) = dropped_warnings(
+            &format!("{bom}\n\n{FUNCTIONS}"),
+            vec![
+                insert("top", 0, None, "import os"),
+                exact("first", "\n\ndef slug():\n    return 1\n\n", ""),
+            ],
+        );
+        assert_eq!(
+            output,
+            format!(
+                "{bom}import os\n\ndef parse():\n    return 2\n\n\ndef chunked():\n    return 3\n"
+            )
+        );
+        assert!(warnings.is_empty(), "{bom:?}: {warnings:?}");
+    }
+    // Nor do blank lines that another change leaves at the start of the file.
+    let (output, warnings) = dropped_warnings(
+        FUNCTIONS,
+        vec![
+            exact("first", "def slug():\n    return 1\n", ""),
+            exact("2.2", "\n\ndef parse():\n    return 2\n\n", ""),
+        ],
+    );
+    assert_eq!(output, "\ndef chunked():\n    return 3\n");
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn dropped_blank_lines_are_counted_as_read_numbers_lines() {
+    let eval = "\n\ndef parse():\n    return 2\n\n";
+    for (text, old, run) in [
+        // LF text matched to an all-CRLF file, and a file after a byte-order mark.
+        (
+            FUNCTIONS.replace('\n', "\r\n"),
+            eval,
+            "a blank line, line 3; the file had 2 in a row around its start and 2 around its end",
+        ),
+        (
+            format!("\u{feff}{FUNCTIONS}"),
+            eval,
+            "a blank line, line 3; the file had 2 in a row around its start and 2 around its end",
+        ),
+        // Longer runs, and sides of different lengths.
+        (
+            "a = 1\n\n\n\nb = 2\n\n\n\nc = 3\n".into(),
+            "\n\n\nb = 2\n\n",
+            "2 blank lines in a row, lines 2-3; the file had 3 in a row around its start and 3 around its end",
+        ),
+        (
+            "a = 1\n\n\n\nb = 2\n\n\nc = 3\n".into(),
+            "\n\n\nb = 2\n\n",
+            "a blank line, line 2; the file had 3 in a row around its start and 2 around its end",
+        ),
+        // A line of spaces is blank, and the next line's indentation starts it.
+        (
+            "class A:\n    x = 1\n    \n    def f(self):\n        pass\n    \n    def g(self):\n        pass\n".into(),
+            "    \n    def f(self):\n        pass\n    \n",
+            "no blank line, between lines 2 and 3; the file had 1 in a row around its start and 1 around its end",
+        ),
+    ] {
+        let (_, warnings) = dropped_warnings(&text, vec![exact("c", old, "")]);
+        assert_eq!(warnings.len(), 1, "{text:?}: {warnings:?}");
+        assert!(
+            warnings[0].message.ends_with(run),
+            "{text:?}: {}",
+            warnings[0].message
+        );
+    }
+}
+
+#[test]
+fn dropped_blank_line_warnings_are_once_per_run_bounded_and_follow_joined_ones() {
+    // Two deletions meeting in one run warn once, for the first.
+    let (output, warnings) = dropped_warnings(
+        "A\n\n\nB\n\n\nC\n\n\nD\n",
+        vec![
+            lines_change("b", [2, 5], None, ""),
+            lines_change("c", [7, 9], None, ""),
+        ],
+    );
+    assert_eq!(output, "A\n\nD\n");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0].change_id.as_deref(), Some("b"));
+    // A change without blank lines around both ends leaves the run it meets to
+    // the next change.
+    let (_, warnings) = dropped_warnings(
+        FUNCTIONS,
+        vec![
+            exact("word", "return 1", "return 10"),
+            exact("2.2", "\n\ndef parse():\n    return 2\n\n", ""),
+        ],
+    );
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0].change_id.as_deref(), Some("2.2"));
+    // Each run of a counted change warns, up to eight per file.
+    let text: String = (0..10)
+        .map(|index| format!("k{index}\n\nDROP\n\n"))
+        .collect();
+    let all = Change {
+        id: "all".into(),
+        target: Target::All {
+            old: "\nDROP\n\n".into(),
+            scope: Some("r0".into()),
+            expected: 10,
+            lines: None,
+        },
+        text: String::new(),
+    };
+    let (_, warnings) = dropped_warnings(&text, vec![all]);
+    assert_eq!(warnings.len(), 8);
+    assert!(
+        warnings[7].message.contains("between lines 8 and 9;"),
+        "{}",
+        warnings[7].message
+    );
+    // A long ID still fits what clients display.
+    let id = "i".repeat(300);
+    let (_, warnings) = dropped_warnings(FUNCTIONS, vec![lines_change(&id, [3, 7], None, "")]);
+    assert!(warnings[0].message.chars().count() <= 240);
+    assert_eq!(warnings[0].change_id.as_deref(), Some(id.as_str()));
+    // The warning follows the file's byte, whitespace-edge, and joined blank-line
+    // warnings, and precedes its final line break ones.
+    let base = snapshot("order.txt".into(), "a = b\n\nc\n\nd\0\n\nx\n\ny\n".into());
+    let plan = compile(
+        &request(
+            &base,
+            vec![
+                exact("edge", "= ", "="),
+                exact("joined", "c", ""),
+                exact("dropped", "\nx\n\n", ""),
+                insert("final", 9, None, "e\n"),
+            ],
+        ),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(plan.files[0].output, "a =b\n\n\n\nd\0\ny\ne\n");
+    let codes: Vec<_> = plan
+        .warnings
+        .iter()
+        .map(|warning| warning.code.as_str())
+        .collect();
+    assert_eq!(
+        codes,
+        [
+            "NUL_BYTE",
+            "WHITESPACE_EDGE",
+            "BLANK_LINES_JOINED",
+            "BLANK_LINES_DROPPED",
+            "FINAL_LINE_BREAK_KEPT"
+        ]
+    );
+}
+
+fn final_break_warnings(text: &str, changes: Vec<Change>) -> (String, Vec<Diagnostic>) {
+    let base = snapshot("final.py".into(), text.into());
+    let plan = compile(&request(&base, changes), &bases(&base)).unwrap();
+    let warnings = plan
+        .warnings
+        .into_iter()
+        .filter(|warning| warning.code == "FINAL_LINE_BREAK_KEPT")
+        .collect();
+    (plan.files[0].output.clone(), warnings)
+}
+
+/// A line and the two blank lines before a constant, as in the eval's `handlers.py`.
+const LOGGER: &str = "logger = get_logger()\n\n\nDEFAULT_TIMEOUT_S = 30\n";
+
+#[test]
+fn line_target_text_ending_in_a_line_break_names_what_follows_its_last_line() {
+    // The eval case: `new` lists the moved class and the two blank lines after it
+    // joined by line breaks, so its final line break ends the first blank line.
+    let moved = "logger = get_logger()\n\n\nclass RetryPolicy:\n    pass\n\n";
+    let (output, warnings) =
+        final_break_warnings(LOGGER, vec![lines_change("1.3", [1, 3], None, moved)]);
+    assert_eq!(
+        output,
+        "logger = get_logger()\n\n\nclass RetryPolicy:\n    pass\n\nDEFAULT_TIMEOUT_S = 30\n"
+    );
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].change_id.as_deref(), Some("1.3"));
+    assert_eq!(warnings[0].file.as_deref(), Some("final.py"));
+    assert_eq!(
+        warnings[0].message,
+        "Change 1.3: `new` ends in a line break, so no line ending is added after it: line 5 \"    pass\" is followed by a blank line, then line 7 \"DEFAULT_TIMEOUT_S = 30\""
+    );
+    for (change, follows) in [
+        // Inserted text, as in the eval run that inserted after the blank lines.
+        (
+            insert("after", 3, None, "class RetryPolicy:\n    pass\n\n"),
+            "line 5 \"    pass\" is followed by a blank line, then line 7 \"DEFAULT_TIMEOUT_S = 30\"",
+        ),
+        // One line break leaves no blank line before the next line.
+        (
+            insert("direct", 3, None, "class RetryPolicy:\n    pass\n"),
+            "line 5 \"    pass\" is followed directly by line 6 \"DEFAULT_TIMEOUT_S = 30\"",
+        ),
+        // The count takes in the file's own blank lines after the change.
+        (
+            lines_change("more", [1, 1], None, "log = 1\n\n\n"),
+            "line 1 \"log = 1\" is followed by 4 blank lines, then line 6 \"DEFAULT_TIMEOUT_S = 30\"",
+        ),
+        // At the end of the file.
+        (
+            lines_change("end", [4, 4], None, "DEFAULT_TIMEOUT_S = 60\n"),
+            "line 4 \"DEFAULT_TIMEOUT_S = 60\" ends the file",
+        ),
+        (
+            insert("tail", 4, None, "TAIL = 1\n\n"),
+            "line 5 \"TAIL = 1\" is followed by a blank line, then the end of the file",
+        ),
+    ] {
+        let (_, warnings) = final_break_warnings(LOGGER, vec![change]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].message.ends_with(follows),
+            "{}",
+            warnings[0].message
+        );
+    }
+}
+
+#[test]
+fn line_targets_without_a_final_line_break_and_literal_targets_carry_no_final_break_warning() {
+    for change in [
+        // Shorthand text without a final line break gets the line's own.
+        lines_change("joined", [1, 1], None, "log = 1"),
+        insert("joined", 3, None, "class RetryPolicy:\n    pass"),
+        lines_change("deleted", [2, 3], None, ""),
+        // Blank lines alone name no line.
+        insert("blank", 1, None, "\n"),
+        lines_change("blank", [2, 2], None, "\n"),
+        // `old` and span text is placed exactly, with no line ending added.
+        exact(
+            "old",
+            "DEFAULT_TIMEOUT_S = 30\n",
+            "DEFAULT_TIMEOUT_S = 60\n",
+        ),
+        span_change("whole", "r0", "x = 1\n\n"),
+    ] {
+        let (_, warnings) = final_break_warnings(LOGGER, vec![change]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+}
+
+#[test]
+fn final_break_warnings_number_lines_as_read_does_and_are_bounded() {
+    // LF text adapted to an all-CRLF file, quoted without its CR.
+    let (output, warnings) = final_break_warnings(
+        &LOGGER.replace('\n', "\r\n"),
+        vec![insert("crlf", 3, None, "class RetryPolicy:\n    pass\n\n")],
+    );
+    assert!(output.contains("    pass\r\n\r\nDEFAULT"), "{output:?}");
+    assert!(
+        warnings[0].message.ends_with(
+            "line 5 \"    pass\" is followed by a blank line, then line 7 \"DEFAULT_TIMEOUT_S = 30\""
+        ),
+        "{}",
+        warnings[0].message
+    );
+    // A byte-order mark is not part of the first line's text.
+    let (_, warnings) = final_break_warnings(
+        "\u{feff}a = 1\nb = 2\n",
+        vec![lines_change("bom", [1, 1], None, "a = 2\n")],
+    );
+    assert!(
+        warnings[0]
+            .message
+            .ends_with("line 1 \"a = 2\" is followed directly by line 2 \"b = 2\""),
+        "{}",
+        warnings[0].message
+    );
+    // Each such change warns, up to eight per file.
+    let changes = (1..=10)
+        .map(|line| {
+            lines_change(
+                &format!("c{line}"),
+                [line, line],
+                None,
+                &format!("line {line}!\n"),
+            )
+        })
+        .collect();
+    let (_, warnings) = final_break_warnings(&numbered(10), changes);
+    assert_eq!(warnings.len(), 8);
+    assert!(
+        warnings[7].message.contains("line 8 \"line 8!\""),
+        "{}",
+        warnings[7].message
+    );
+    // A long ID and a long line still fit what clients display.
+    let id = "i".repeat(300);
+    let long = format!("{}\n\n", "x".repeat(300));
+    let (_, warnings) = final_break_warnings(LOGGER, vec![lines_change(&id, [1, 1], None, &long)]);
+    assert!(
+        warnings[0].message.chars().count() <= 240,
+        "{}",
+        warnings[0].message
+    );
+    assert_eq!(warnings[0].change_id.as_deref(), Some(id.as_str()));
+    // The warning follows the file's byte, whitespace-edge, and blank-line warnings.
+    let base = snapshot("order.txt".into(), "a = b\n\nc\n\nd\0\n".into());
+    let plan = compile(
+        &request(
+            &base,
+            vec![
+                exact("edge", "= ", "="),
+                exact("blank", "c", ""),
+                insert("final", 5, None, "e\n"),
+            ],
+        ),
+        &bases(&base),
+    )
+    .unwrap();
+    let codes: Vec<_> = plan
+        .warnings
+        .iter()
+        .map(|warning| warning.code.as_str())
+        .collect();
+    assert_eq!(
+        codes,
+        [
+            "NUL_BYTE",
+            "WHITESPACE_EDGE",
+            "BLANK_LINES_JOINED",
+            "FINAL_LINE_BREAK_KEPT"
+        ]
+    );
+}
+
 #[test]
 fn a_span_range_over_inconsistent_line_offsets_is_rejected_not_sliced() {
     // A tampered snapshot whose line 2 lies before line 1 must not reach a
@@ -2064,32 +2740,73 @@ fn line_expect_compares_whole_lines_ignoring_line_endings() {
                 .contains(&format!("setting_7 = 7{eol}    added{eol}    setting_8"))
         );
     }
-    // A shifted line number points to where the expected lines are.
+    // A shifted line number applies where its strong expect is, and says so.
     let base = spanless(&settings(12, "\n"));
-    let error = rejected(
-        &base,
-        lines_change("c", [5, 5], Some("    setting_6 = 6"), "x"),
-    );
-    assert_eq!(error.code, "EXPECTED_TEXT_MISMATCH");
+    let plan = compile(
+        &request(
+            &base,
+            vec![lines_change("c", [5, 5], Some("    setting_6 = 6"), "x")],
+        ),
+        &bases(&base),
+    )
+    .unwrap();
     assert_eq!(
-        error.candidates,
+        plan.files[0].output,
+        settings(12, "\n").replace("    setting_6 = 6\n", "x\n")
+    );
+    assert_eq!(
+        (
+            plan.warnings[0].code.as_str(),
+            plan.warnings[0].message.as_str()
+        ),
+        (
+            "LINES_MOVED",
+            "Change c: lines:[5,5] did not hold expect, which holds only at lines:[6,6], so the change applied there; reread the file before more line edits"
+        )
+    );
+    // A moved range keeps its length.
+    let plan = compile(
+        &request(
+            &base,
+            vec![ends_change(
+                "c",
+                [4, 6],
+                ["    setting_5 = 5", "    setting_7 = 7"],
+                "x",
+            )],
+        ),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(
+        plan.files[0].output,
+        settings(12, "\n").replace(
+            "    setting_5 = 5\n    setting_6 = 6\n    setting_7 = 7\n",
+            "x\n"
+        )
+    );
+    // Where another change edits the new place, the shifted line is refused, and
+    // the message points to where the expected lines are.
+    let errors = compile(
+        &request(
+            &base,
+            vec![
+                lines_change("c", [5, 5], Some("    setting_6 = 6"), "x"),
+                exact("o", "setting_6 = 6", "setting_6 = 7"),
+            ],
+        ),
+        &bases(&base),
+    )
+    .unwrap_err();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].code, "EXPECTED_TEXT_MISMATCH");
+    assert_eq!(
+        errors[0].candidates,
         [candidate(CandidateKind::Exact, (6, 6), "    setting_6 = 6")]
     );
     assert_eq!(
-        error.message,
+        errors[0].message,
         "Line 5 holds \"    setting_5 = 5\", not expect; it is at line 6, so use lines [6,6] if the whole range moved (ultra_edit_repair can replace just this change)."
-    );
-    // The new range for a moved head keeps the range's length.
-    let error = rejected(
-        &base,
-        ends_change("c", [4, 6], ["    setting_5 = 5", "    setting_7 = 7"], "x"),
-    );
-    assert!(
-        error
-            .message
-            .contains("it is at line 5, so use lines [5,7] if the whole range moved"),
-        "{}",
-        error.message
     );
     // A line added inside the range moves its end, which the last lines catch.
     let mut grown: Vec<String> = settings(12, "\n").lines().map(str::to_owned).collect();
@@ -2337,6 +3054,22 @@ fn a_range_ending_in_blank_lines_may_guard_the_text_before_them() {
     )
     .unwrap();
     assert_eq!(plan.files[0].output, "intro\n\n## Next\n");
+    // Numbered before two lines were added above, the range moves to lines 3-7,
+    // where its tail is checked the same way.
+    let plan = compile(
+        &request(
+            &base,
+            vec![range(
+                [1, 5],
+                "## Legacy export",
+                "position must skip the owner column.",
+            )],
+        ),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(plan.files[0].output, "intro\n\n## Next\n");
+    assert_eq!(plan.warnings[0].code, "LINES_MOVED");
     for change in [
         // The tail must be the last text in the range, not text further up.
         range([3, 7], "## Legacy export", "body"),
@@ -2686,6 +3419,197 @@ fn a_change_whose_old_holds_a_cr_stays_literal_so_crlf_converts_to_lf() {
     assert_eq!(plan.warnings[0].code, "EOL_ADAPTED");
 }
 
+/// Text typed from a rendered view, such as a task's prompt, has an ASCII space
+/// where the file may hold a no-break or thin one. An `old` found nowhere as
+/// written takes its one match with those spaces, and `new` keeps the file's
+/// spaces where it repeats `old`.
+#[test]
+fn an_old_with_ascii_spaces_matches_the_files_unicode_spaces() {
+    let text = "The default\nlimit is 10\u{a0}km; trails under 10\u{a0}km get a badge.\n";
+    let base = snapshot("guide.md".into(), text.into());
+    let plan = compile(
+        &request(&base, vec![exact("c", "limit is 10 km", "limit is 12 km")]),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(
+        plan.files[0].output,
+        "The default\nlimit is 12\u{a0}km; trails under 10\u{a0}km get a badge.\n"
+    );
+    assert_eq!(plan.files[0].replacements[0].text, "limit is 12\u{a0}km");
+    // The request keeps the text as written, so its derived ID is unchanged.
+    assert_eq!(plan.request.files[0].changes[0].text, "limit is 12 km");
+    assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+    assert_eq!(plan.warnings[0].code, "SPACES_ADAPTED");
+    assert_eq!(plan.warnings[0].change_id.as_deref(), Some("c"));
+    assert_eq!(
+        plan.warnings[0].message,
+        "Change c: a space in `old` matched this file's U+00A0, which `new` keeps where it repeats `old`"
+    );
+    let output = |text: &str, change: serde_json::Value| compiled(text, change).unwrap();
+    for space in ['\u{a0}', '\u{2007}', '\u{2009}', '\u{202f}'] {
+        // After and before the text `new` changes, beside ASCII spaces that stay.
+        assert_eq!(
+            output(
+                &format!("x = 10{space}km, y = 2{space}m\n"),
+                json!({"id":"w","old":"10 km, y = 2 m","new":"12 km, y = 2 m"}),
+            ),
+            format!("x = 12{space}km, y = 2{space}m\n")
+        );
+        assert_eq!(
+            output(
+                &format!("a 10{space}km long road\n"),
+                json!({"id":"w","old":"10 km long","new":"10 km wide"}),
+            ),
+            format!("a 10{space}km wide road\n")
+        );
+    }
+    // Only the scope's matches count.
+    assert_eq!(
+        output(
+            "10\u{a0}km\n10\u{a0}km\n",
+            json!({"id":"w","old":"10 km","new":"12 km","in":[2,2]}),
+        ),
+        "10\u{a0}km\n12\u{a0}km\n"
+    );
+    // Line endings and spaces adapt together.
+    let base = snapshot("crlf.md".into(), "a\r\nlimit is 10\u{202f}km\r\n".into());
+    let plan = compile(
+        &request(
+            &base,
+            vec![exact("c", "a\nlimit is 10 km", "A\nlimit is 12 km")],
+        ),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(plan.files[0].output, "A\r\nlimit is 12\u{202f}km\r\n");
+    let codes: Vec<_> = plan.warnings.iter().map(|w| w.code.as_str()).collect();
+    assert_eq!(codes, ["EOL_ADAPTED", "SPACES_ADAPTED"]);
+    // One warning names every change and space.
+    let base = snapshot("two.md".into(), "5\u{a0}m and 6\u{202f}kg\n".into());
+    let plan = compile(
+        &request(
+            &base,
+            vec![exact("a", "5 m", "7 m"), exact("b", "6 kg", "8 kg")],
+        ),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(plan.files[0].output, "7\u{a0}m and 8\u{202f}kg\n");
+    assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+    assert_eq!(
+        plan.warnings[0].message,
+        "Changes a, b: a space in `old` matched this file's U+00A0 or U+202F, which `new` keeps where it repeats `old`"
+    );
+}
+
+/// A match with Unicode spaces is refused as before, with near-miss candidates,
+/// unless it is the only one and `new` repeats the text around each space it
+/// adapts; an `old` holding such a space, a count, and an undo stay literal.
+#[test]
+fn a_unicode_space_match_is_refused_unless_unique_and_kept() {
+    let refused = |text: &str, change: Change| {
+        let base = snapshot("guide.md".into(), text.into());
+        let error = rejected(&base, change);
+        assert_eq!(error.code, "TARGET_NOT_FOUND", "{error:?}");
+        assert!(!error.candidates.is_empty(), "{error:?}");
+    };
+    // Two places match with Unicode spaces.
+    refused(
+        "limit is 10\u{a0}km\nlimit is 10\u{202f}km\n",
+        exact("c", "limit is 10 km", "limit is 12 km"),
+    );
+    // `new` changes the text around the space, so the space it means is unknown.
+    let text = "The default\nlimit is 10\u{a0}km here.\n";
+    for new in [
+        "limit is 12 miles",
+        "limit is 10km",
+        // Text inserted beside the space could go on either side of it.
+        "limit is 10 or 12 km",
+    ] {
+        refused(text, exact("c", "limit is 10 km", new));
+    }
+    // An `old` holding such a space was copied from the file and stays literal.
+    refused(
+        "1\u{a0}000 m and 10\u{a0}km\n",
+        exact("c", "1\u{a0}000 m and 10 km", "1\u{a0}000 m and 12 km"),
+    );
+    let count = Change {
+        id: "c".into(),
+        target: Target::All {
+            old: "limit is 10 km".into(),
+            scope: None,
+            expected: 1,
+            lines: None,
+        },
+        text: "limit is 12 km".into(),
+    };
+    refused(text, count);
+    let base = snapshot("guide.md".into(), text.into());
+    let literal = ultra_edit::compiler::compile_with(
+        &request(&base, vec![exact("c", "limit is 10 km", "limit is 12 km")]),
+        &bases(&base),
+        ultra_edit::compiler::Eol::Literal,
+    )
+    .unwrap_err();
+    assert_eq!(literal[0].code, "TARGET_NOT_FOUND");
+    // A match as written wins over one with Unicode spaces.
+    let base = snapshot("both.md".into(), "a 10 km\nb 10\u{a0}km\n".into());
+    let plan = compile(
+        &request(&base, vec![exact("c", "10 km", "12 km")]),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(plan.files[0].output, "a 12 km\nb 10\u{a0}km\n");
+    assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    // The match must not cut a word, as any single `old` must not.
+    let base = snapshot("cut.md".into(), "x = 110\u{a0}km\n".into());
+    assert_eq!(
+        rejected(&base, exact("c", "10 km", "12 km")).code,
+        "OLD_INSIDE_WORD"
+    );
+}
+
+#[test]
+fn a_spaces_warning_names_a_bounded_number_of_changes() {
+    let spaces = ['\u{a0}', '\u{2007}', '\u{2009}', '\u{202f}', '\u{a0}'];
+    let text: String = spaces
+        .iter()
+        .enumerate()
+        .map(|(index, space)| format!("v{index} = {index}{space}m\n"))
+        .collect();
+    let base = snapshot("units.txt".into(), text);
+    let long = "x".repeat(60);
+    let changes: Vec<_> = (0..spaces.len())
+        .map(|index| {
+            exact(
+                &format!("{long}{index}"),
+                &format!("= {index} m"),
+                &format!("= {index}0 m"),
+            )
+        })
+        .collect();
+    let plan = compile(&request(&base, changes), &bases(&base)).unwrap();
+    assert_eq!(
+        plan.files[0].output,
+        "v0 = 00\u{a0}m\nv1 = 10\u{2007}m\nv2 = 20\u{2009}m\nv3 = 30\u{202f}m\nv4 = 40\u{a0}m\n"
+    );
+    let warning = &plan.warnings[0];
+    assert_eq!(warning.code, "SPACES_ADAPTED");
+    assert!(
+        warning.message.contains(
+            ", 2 more: a space in `old` matched this file's U+00A0, U+2007, U+2009 or U+202F,"
+        ),
+        "{}",
+        warning.message
+    );
+    assert!(
+        warning.message.chars().count() <= 240,
+        "{}",
+        warning.message
+    );
+}
+
 /// A single `old` that starts or ends inside an ASCII word matched a longer name
 /// or number, which text written without reading the file does by accident.
 #[test]
@@ -2756,9 +3680,9 @@ fn a_single_old_inside_a_word_is_refused_unless_counted() {
             "{old:?} in {text:?}"
         );
     }
-    // Ambiguity advice points at the whole-word match a single `old` may take.
+    // Ambiguity advice points at a whole-word match a single `old` may take.
     let errors = output(
-        "max_retries = 20\nretries = 2\n",
+        "max_retries = 20\nretries = 2\nretries = 2\n",
         exact("w", "retries = 2", "x"),
     )
     .unwrap_err();
@@ -2768,6 +3692,208 @@ fn a_single_old_inside_a_word_is_refused_unless_counted() {
         "{}",
         errors[0].message
     );
+}
+
+/// An `old` that occurs once as whole words, or a count of a name's own uses, while
+/// longer names also hold it, takes only the whole-word matches, as a rename means;
+/// a count of every match takes them all.
+#[test]
+fn whole_word_matches_leave_longer_names() {
+    let base = snapshot(
+        "settings.py".into(),
+        "MAX_RETRIES = 3\nMAX_RETRIES_PER_HOST = 2\n".into(),
+    );
+    let plan = compile(
+        &request(&base, vec![exact("rename", "MAX_RETRIES", "RETRY_LIMIT")]),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(
+        plan.files[0].output,
+        "RETRY_LIMIT = 3\nMAX_RETRIES_PER_HOST = 2\n"
+    );
+    assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+    assert_eq!(plan.warnings[0].code, "WHOLE_WORDS_ONLY");
+    assert_eq!(
+        plan.warnings[0].message,
+        "Change rename: `old` took its one whole-word match, so the one inside `MAX_RETRIES_PER_HOST` at line 2 stayed"
+    );
+    let text = "MAX_RETRIES = 3\nMAX_RETRIES_PER_HOST = 2\nretry(MAX_RETRIES)\n";
+    let base = snapshot("settings.py".into(), text.into());
+    // Two whole-word matches are still ambiguous.
+    let error = rejected(&base, exact("rename", "MAX_RETRIES", "RETRY_LIMIT"));
+    assert_eq!(error.code, "TARGET_AMBIGUOUS");
+    let count = |expected| Change {
+        id: "rename".into(),
+        target: Target::All {
+            old: "MAX_RETRIES".into(),
+            scope: None,
+            expected,
+            lines: None,
+        },
+        text: "RETRY_LIMIT".into(),
+    };
+    let plan = compile(&request(&base, vec![count(2)]), &bases(&base)).unwrap();
+    assert_eq!(
+        plan.files[0].output,
+        "RETRY_LIMIT = 3\nMAX_RETRIES_PER_HOST = 2\nretry(RETRY_LIMIT)\n"
+    );
+    assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+    assert_eq!(plan.warnings[0].code, "WHOLE_WORDS_ONLY");
+    assert_eq!(
+        plan.warnings[0].message,
+        "Change rename: count took only the whole-word matches, so the one inside `MAX_RETRIES_PER_HOST` at line 2 stayed"
+    );
+    let plan = compile(&request(&base, vec![count(3)]), &bases(&base)).unwrap();
+    assert_eq!(
+        plan.files[0].output,
+        "RETRY_LIMIT = 3\nRETRY_LIMIT_PER_HOST = 2\nretry(RETRY_LIMIT)\n"
+    );
+    assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+    // A count that is neither gives both.
+    let error = rejected(&base, count(1));
+    assert_eq!(error.code, "EXPECTED_COUNT_MISMATCH");
+    assert_eq!(error.actual, Some(3));
+    assert!(
+        error.message.contains(
+            "set count to 3 to replace every one or to 2 for those not inside longer words"
+        ),
+        "{}",
+        error.message
+    );
+}
+
+/// `all` takes every whole-word match of `old`, however many, as a rename means,
+/// and leaves longer names, which a warning names.
+#[test]
+fn all_takes_every_whole_word_match_and_leaves_longer_names() {
+    let plan = |text: &str, change: serde_json::Value| {
+        let base = snapshot("settings.py".into(), text.into());
+        let change: Change = serde_json::from_value(change).unwrap();
+        compile(&request(&base, vec![change]), &bases(&base))
+    };
+    let rename = json!({"id":"rename","old":"MAX_RETRIES","new":"RETRY_LIMIT","all":true});
+    let text = "MAX_RETRIES = 3\nMAX_RETRIES_PER_HOST = 2\nretry(MAX_RETRIES)\n";
+    let renamed = plan(text, rename.clone()).unwrap();
+    assert_eq!(
+        renamed.files[0].output,
+        "RETRY_LIMIT = 3\nMAX_RETRIES_PER_HOST = 2\nretry(RETRY_LIMIT)\n"
+    );
+    assert_eq!(renamed.warnings.len(), 1, "{:?}", renamed.warnings);
+    assert_eq!(renamed.warnings[0].code, "WHOLE_WORDS_ONLY");
+    assert_eq!(
+        renamed.warnings[0].message,
+        "Change rename: `all` took only the whole-word matches, so the one inside `MAX_RETRIES_PER_HOST` at line 2 stayed"
+    );
+    // One match is enough; with no longer names there is nothing to warn about.
+    let one = plan("MAX_RETRIES = 3\n", rename.clone()).unwrap();
+    assert_eq!(one.files[0].output, "RETRY_LIMIT = 3\n");
+    assert!(one.warnings.is_empty(), "{:?}", one.warnings);
+    // `in` limits it to those lines.
+    let scoped = plan(
+        "MAX_RETRIES = 3\nretry(MAX_RETRIES)\nlog(MAX_RETRIES)\n",
+        json!({"id":"rename","old":"MAX_RETRIES","new":"RETRY_LIMIT","all":true,"in":[2,3]}),
+    )
+    .unwrap();
+    assert_eq!(
+        scoped.files[0].output,
+        "MAX_RETRIES = 3\nretry(RETRY_LIMIT)\nlog(RETRY_LIMIT)\n"
+    );
+    // A match inside a longer name alone is no whole-word match.
+    let base = snapshot("pool.py".into(), "MAX_RETRIES_PER_HOST = 2\n".into());
+    let change: Change = serde_json::from_value(rename.clone()).unwrap();
+    let error = rejected(&base, change);
+    assert_eq!(error.code, "TARGET_NOT_FOUND");
+    assert_eq!(
+        error.message,
+        "No whole-word match: all 1 are inside longer words, the first in `MAX_RETRIES_PER_HOST` at line 1; set count to 1 to replace inside words"
+    );
+    // Nor is text the file lacks.
+    let base = snapshot("pool.py".into(), "retries = 2\n".into());
+    let change: Change = serde_json::from_value(rename).unwrap();
+    assert_eq!(rejected(&base, change).code, "TARGET_NOT_FOUND");
+}
+
+/// In an `old` that joins words with a hyphen, as a CSS class does, a hyphen
+/// continues a word around its matches too, so a longer hyphenated name, a
+/// custom property, or an attribute that holds the class name keeps it.
+#[test]
+fn a_hyphenated_old_is_whole_only_outside_longer_hyphenated_names() {
+    let text = concat!(
+        ".btn-primary:hover, .btn-primary-outline { color: var(--btn-primary-fg); }\n",
+        "<a class=\"btn btn-primary\" data-btn-primary-label=\"Go\" aria-describedby=\"btn-primary-help\">\n",
+    );
+    let base = snapshot("buttons.html".into(), text.into());
+    let change: Change = serde_json::from_value(
+        json!({"id":"rename","old":"btn-primary","new":"btn-accent","all":true}),
+    )
+    .unwrap();
+    let plan = compile(&request(&base, vec![change]), &bases(&base)).unwrap();
+    assert_eq!(
+        plan.files[0].output,
+        concat!(
+            ".btn-accent:hover, .btn-primary-outline { color: var(--btn-primary-fg); }\n",
+            "<a class=\"btn btn-accent\" data-btn-primary-label=\"Go\" aria-describedby=\"btn-primary-help\">\n",
+        )
+    );
+    assert_eq!(
+        plan.warnings[0].message,
+        "Change rename: `all` took only the whole-word matches, so 4 inside longer words stayed, the first in `btn-primary-outline` at line 1"
+    );
+    // A single `old` takes its one whole match the same way,
+    let base = snapshot(
+        "b.css".into(),
+        ".btn-primary {}\n.btn-primary-outline {}\n".into(),
+    );
+    let plan = compile(
+        &request(&base, vec![exact("c", "btn-primary", "btn-accent")]),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(
+        plan.files[0].output,
+        ".btn-accent {}\n.btn-primary-outline {}\n"
+    );
+    // and is refused where its only match is inside a longer hyphenated name.
+    let base = snapshot("b.css".into(), "x\n.btn-primary-outline {}\n".into());
+    let error = rejected(&base, exact("c", "btn-primary", "btn-accent"));
+    assert_eq!(error.code, "OLD_INSIDE_WORD");
+    assert!(
+        error.message.contains("`btn-primary-outline` at line 2"),
+        "{}",
+        error.message
+    );
+    // A word `old` begins or ends with as context keeps hyphens as separators,
+    // even when `old` also holds a hyphenated name, as the eval's
+    // `btn btn-primary" aria` did, cut from `aria-describedby`.
+    let base = snapshot(
+        "r.html".into(),
+        "<a class=\"btn btn-primary\" aria-describedby=\"help\">\n".into(),
+    );
+    let plan = compile(
+        &request(
+            &base,
+            vec![exact(
+                "c",
+                "btn btn-primary\" aria",
+                "btn btn-accent\" aria",
+            )],
+        ),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(
+        plan.files[0].output,
+        "<a class=\"btn btn-accent\" aria-describedby=\"help\">\n"
+    );
+    // An `old` with no hyphen between words keeps a hyphen a separator.
+    let base = snapshot("b.css".into(), ".btn-primary {}\n".into());
+    let plan = compile(
+        &request(&base, vec![exact("c", "primary", "accent")]),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(plan.files[0].output, ".btn-accent {}\n");
 }
 
 fn compiled(text: &str, change: serde_json::Value) -> Result<String, Vec<Diagnostic>> {
@@ -2877,8 +4003,16 @@ fn ambiguity_advice_names_lines_that_hold_one_whole_word_match() {
             json!({"id":"w","old":old,"new":new,"in":range}),
         ))
     };
-    let section =
-        "[default]\nmax_retries = 3\ntimeout = 30\n\n[upload]\nretries = 3\ntimeout = 30\n";
+    // A lone whole-word match is taken without advice, so each case below holds two.
+    assert_eq!(
+        compiled(
+            "MAX_RETRIES = 3\nRETRIES = 3\n",
+            json!({"id":"w","old":"RETRIES = 3\n","new":"RETRIES = 5\n"}),
+        )
+        .unwrap(),
+        "MAX_RETRIES = 3\nRETRIES = 5\n"
+    );
+    let section = "[default]\nmax_retries = 3\ntimeout = 30\n\n[upload]\nretries = 3\ntimeout = 30\n\n[sync]\nretries = 3\ntimeout = 30\n";
     assert_eq!(
         follow(
             section,
@@ -2887,24 +4021,27 @@ fn ambiguity_advice_names_lines_that_hold_one_whole_word_match() {
         )
         .unwrap()
         .unwrap(),
-        "[default]\nmax_retries = 3\ntimeout = 30\n\n[upload]\nretries = 5\ntimeout = 60\n"
+        section.replacen(
+            "\nretries = 3\ntimeout = 30",
+            "\nretries = 5\ntimeout = 60",
+            1
+        )
     );
     assert_eq!(
         follow(
-            "MAX_RETRIES = 3\nRETRIES = 3\n",
+            "MAX_RETRIES = 3\nRETRIES = 3\nRETRIES = 3\n",
             "RETRIES = 3\n",
             "RETRIES = 5\n"
         )
         .unwrap()
         .unwrap(),
-        "MAX_RETRIES = 3\nRETRIES = 5\n"
+        "MAX_RETRIES = 3\nRETRIES = 5\nRETRIES = 3\n"
     );
     // The whole-word match past the five lines shown is found.
-    let late =
-        "a_retries = 2\nb_retries = 2\nc_retries = 2\nd_retries = 2\ne_retries = 2\nretries = 2\n";
+    let late = "a_retries = 2\nb_retries = 2\nc_retries = 2\nd_retries = 2\ne_retries = 2\nretries = 2\nretries = 2\n";
     assert_eq!(
         follow(late, "retries = 2", "retries = 3").unwrap().unwrap(),
-        late.replace("\nretries = 2", "\nretries = 3")
+        late.replacen("\nretries = 2", "\nretries = 3", 1)
     );
     // No whole-word match: the message says so and names no lines.
     let errors = compiled(

@@ -216,7 +216,13 @@ impl Storage {
 
     pub fn resolve(&self, path: &Path) -> Result<PathBuf, Error> {
         let requested = self.root.join(path);
-        let path = fs::canonicalize(&requested).map_err(|error| {
+        let canonical = fs::canonicalize(&requested).or_else(|error| {
+            // Git Bash's `pwd` prints `C:\x` as `/c/x`, and a model may copy that.
+            msys_path(path)
+                .and_then(|msys| fs::canonicalize(msys).ok())
+                .ok_or(error)
+        });
+        let path = canonical.map_err(|error| {
             let mut error = target_error(&requested, error);
             if error.code == "TARGET_MISSING"
                 && let Some(near) = self.ending_like(path)
@@ -1573,6 +1579,30 @@ fn target_error(path: &Path, error: io::Error) -> Error {
             "Path contains characters the platform cannot represent",
         ),
         _ => Error::new("IO_ERROR", format!("{display}: {error}")),
+    }
+}
+
+/// On Windows, the file a Git Bash path names, which Windows reads from the
+/// current drive's root: `/c/x` is `C:\x`, and `/tmp/x` is in the user's temporary
+/// directory, as Git for Windows mounts it. `None` elsewhere and for other paths.
+fn msys_path(path: &Path) -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let mut parts = path.components();
+    if parts.next() != Some(Component::RootDir) {
+        return None;
+    }
+    let Some(Component::Normal(first)) = parts.next() else {
+        return None;
+    };
+    let rest = parts.as_path();
+    match first.to_str()? {
+        "tmp" => Some(std::env::temp_dir().join(rest)),
+        drive if drive.len() == 1 && drive.as_bytes()[0].is_ascii_alphabetic() => {
+            Some(PathBuf::from(format!("{}:\\", drive.to_ascii_uppercase())).join(rest))
+        }
+        _ => None,
     }
 }
 

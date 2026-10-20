@@ -15,6 +15,7 @@ and pairs each arm with the baseline on the same tasks.
 
 import json
 import math
+import os
 import random
 import statistics
 import sys
@@ -29,7 +30,10 @@ BASELINES = ("native", "ultra-edit")
 def load(specs):
     records = []
     for spec in specs:
-        directory, _, suffix = spec.partition(":")
+        # Set the drive aside first so the colon in `C:\...` is not read as the separator.
+        drive, rest = os.path.splitdrive(spec)
+        directory, _, suffix = rest.partition(":")
+        directory = drive + directory
         for line in (Path(directory) / "runs.jsonl").read_text(encoding="utf-8").splitlines():
             if line.strip():
                 r = json.loads(line)

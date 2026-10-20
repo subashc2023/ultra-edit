@@ -196,7 +196,10 @@ base is used and must be that file's snapshot (`SNAPSHOT_PATH_MISMATCH`). A path
 that cannot be read gets its own diagnostic, such as `TARGET_MISSING` or
 `PATH_OUTSIDE_WORKSPACE`, and nothing is written. A path file was never read
 through a snapshot, so no span of it was disclosed: a `span` or `in` span other
-than `r0`, the whole file, is `SPAN_NEEDS_BASE`. Path mode detects no change
+than `r0`, the whole file, is `SPAN_NEEDS_BASE`. On Windows, a path that names
+no file as given but is spelled as Git Bash prints it names the file it stands
+for: `/c/x` is `C:\x`, and `/tmp/x` is in the user's temporary directory, where
+Git for Windows mounts `/tmp`. Path mode detects no change
 made between your read and the call; the `old` text is the guard, as with
 native Edit, and line targets need `expect`. Paths are normalized lexically before IDs are derived: a leading
 workspace root, spelled as given at launch or in canonical form, is stripped and
@@ -228,10 +231,11 @@ forms:
 
 | Change | Contract |
 | --- | --- |
-| `{"old":"text","new":"…"}` | Exactly one occurrence in the original file, not starting or ending inside an ASCII word. |
+| `{"old":"text","new":"…"}` | Exactly one occurrence in the original file, not starting or ending inside an ASCII word; when more occur and exactly one of them cuts no word, that one. |
 | `{"old":"text","in":"r5","new":"…"}` | Exactly one occurrence contained in a disclosed span. |
-| `{"old":"text","in":[72,87],"new":"…"}` | Exactly one occurrence contained in lines 72-87, from line 72's start through line 87's terminator. |
-| `{"old":"text","count":3,"new":"…"}` | Exactly 3 non-overlapping, left-to-right occurrences in the whole file, or within `in`, inside words or not. |
+| `{"old":"text","in":[72,87],"new":"…"}` | Exactly one occurrence contained in lines 72-87, from line 72's start through line 87's terminator; with none there, the one occurrence an unrestricted `old` would take, if `old` has at least 8 non-whitespace characters (`LINES_MOVED`). |
+| `{"old":"text","count":3,"new":"…"}` | Exactly 3 non-overlapping, left-to-right occurrences in the whole file, or within `in`, inside words or not; when more occur and exactly 3 of them cut no word, those 3. |
+| `{"old":"text","all":true,"new":"…"}` | Every non-overlapping, left-to-right occurrence that cuts no word, in the whole file or within `in`, at least one, as a rename needs; occurrences inside longer names stay, and a `WHOLE_WORDS_ONLY` warning names the first. |
 | `{"span":"r5","new":"…"}` | Replace that span with literal `new`. |
 | `{"span":"r5","expect":"old line","new":"…"}` | Replace only if the selected original bytes equal `expect` exactly. |
 | `{"span":"r12..r18","new":"…"}` | Replace a run of disclosed lines, from the start of line 12's body to the end of line 18's. |
@@ -239,8 +243,11 @@ forms:
 | `{"after":12,"expect":"…","new":"…"}` | Insert whole lines after line 12; `after:0` inserts at the top, after a BOM. |
 
 `new` may be spelled `text`, but not both. A change gives exactly one of `old`,
-`span`, `lines`, or `after`; `count` and `in` apply only to `old`, and `expect`
-only to `span`, `lines`, and `after`. `lines` takes `[first,last]`, and `[12]`,
+`span`, `lines`, or `after`; `count`, `all`, and `in` apply only to `old`, with
+`count` or `all` but not both, and `expect` only to `span`, `lines`, and
+`after`. Three that repeat what a target already says are accepted and not
+stored: `count: 1` on any target, `all: false`, and `in` lines beside `lines`
+or `after` that hold the lines the target names. `lines` takes `[first,last]`, and `[12]`,
 `12`, `"12"`, and `"12-14"` are read as `[12,12]` and `[12,14]`; `in` takes the same
 line forms or a span ID. A malformed change is refused while the arguments are
 parsed, with a message naming the accepted form, such as `lines takes numbers
@@ -249,8 +256,9 @@ like [146,150]; span IDs such as r146..r150 go in `span``.
 The verbose form `{"id":"…","target":{…},"text":"…"}` is still accepted, and it
 is the canonical form that plans, drafts, and receipts store: `old` is
 `{"kind":"exact","old":…,"scope":…}`, `count` is
-`{"kind":"all","old":…,"scope":…,"expected":N}` with `scope` optional, `in`
-lines are a `"lines":[a,b]` field of either, `span` is
+`{"kind":"all","old":…,"scope":…,"expected":N}` with `scope` optional, `all` is
+`{"kind":"every","old":…,"scope":…}` with `scope` optional, `in` lines are a
+`"lines":[a,b]` field of any of them, `span` is
 `{"kind":"span","span":…,"expect":…}`, `lines` is
 `{"kind":"lines","lines":[a,b],"expect":…,"expect_last":…}`, and `after` is
 `{"kind":"insert","after":n,"expect":…}`. Every spelling of one change derives
@@ -290,10 +298,19 @@ numbers tell apart, so they are accepted. For a range that ends at the file's
 last line, the ranges one line longer and shorter are checked too, since Read's
 empty last line keeps such a range's end through a one-line shift. Lines between
 the first and last parts are not compared: a blank or repeated last line pins
-the range's end only weakly, so prefer lines with text as `[first, last]`. `after:0` takes none. A mismatch is
-`EXPECTED_TEXT_MISMATCH`: the message quotes the addressed lines and, when the
-expected lines occur elsewhere, gives the current range, and the diagnostic
-carries them as `exact` candidates, or near misses as below. `after` with empty
+the range's end only weakly, so prefer lines with text as `[first, last]`. `after:0` takes none.
+When the stated lines do not hold `expect`, the change applies where it holds,
+if it holds at exactly one place where the whole target fits and is strong: it
+has at least 8 non-whitespace characters and reaches the target's end as a
+required `expect` must (for `lines`, every line or the pair, both parts shifted
+together and checked there as at the stated lines). A number that went stale
+since the read, or was miscounted, then edits only lines that hold `expect`. A
+nonblocking `LINES_MOVED` warning names the lines given and the lines used, and
+the stored plan records the lines used. Otherwise, and
+when the moved target would conflict with another change in the request, a
+mismatch is `EXPECTED_TEXT_MISMATCH`: the message quotes the addressed lines
+and, when the expected lines occur elsewhere, gives the current range, and the
+diagnostic carries them as `exact` candidates, or near misses as below. `after` with empty
 text is `EMPTY_INSERTION`. `after` keeps line `after`, so text that starts by
 restating it is `INSERT_REPEATS_LINE`: its leading lines equal the lines ending
 at `after`, compared without trailing whitespace, as when `expect` or the lines
@@ -327,10 +344,34 @@ cut, such as `Hauptstraße`, and an ASCII letter right after a backslash, as in
 the escape `\nRestart`, do not count, though `\_` and `\1` do; Han, kana, and
 other uncased scripts separate words, so `80` inside `端口为8080` is refused,
 and a cut between two digits is refused whatever letter follows, as `10` inside
-`100µs`. `count`, even 1, matches inside words. An ambiguity message suggests
+`100µs`. Where `old` begins or ends with a name that joins words with a
+hyphen, as the CSS class `btn-primary` or the YAML key `max-retries` does, a
+hyphen continues the word at that end of a match too: `btn-primary` is cut
+inside `btn-primary-outline`, `--btn-primary-bg`, and `data-btn-primary-label`,
+while a word `old` begins or ends with as context, as in
+`btn btn-primary" aria` before `aria-describedby`, keeps hyphens as
+separators. `count`, even 1, matches inside words. When longer names also hold
+`old`, as `MAX_RETRIES_PER_HOST` holds `MAX_RETRIES`, an `old` with exactly one
+match that cuts no word takes that match, a `count` that equals the
+whole-word matches but not every match replaces just those, and `all` takes
+every whole-word match; a nonblocking `WHOLE_WORDS_ONLY` warning names the
+first match left and its line. An `all` with no match that cuts no word is
+`TARGET_NOT_FOUND`, naming the first longer word when matches lie inside
+longer words. A count
+that is neither gives the whole-word number in its `EXPECTED_COUNT_MISMATCH`
+advice too; the whole-word scan stops after 10,000 matches. An ambiguity message suggests
 `in` lines where a whole-word match is the only match in those whole lines, and
 otherwise says to add surrounding text, or that every match is inside a longer
 word; it examines at most 10,000 matches.
+
+An `old` without `count` whose `in` lines hold no occurrence, as lines from a
+stale read or a miscount may not, applies where line targets would move to: the
+one occurrence an unrestricted `old` would take, its only one in the file or
+its only one that cuts no word, when `old` has at least 8 non-whitespace
+characters. A nonblocking `LINES_MOVED` warning names the `in` lines given and
+the lines the occurrence spans, and the stored plan records those as its `in`.
+Shorter text, several such occurrences, a span `in`, and a moved change that
+would conflict with another change in the request stay `TARGET_NOT_FOUND`.
 
 A span ID is a disclosed ID such as `r5`, `selection`, or `m2`, or a line range
 `rA..rB`, never literal source text. A line range is accepted wherever a span ID
@@ -411,9 +452,9 @@ the failed change ID, or submit a new request. If `text` is absent, read
 the retry reports `TARGET_AMBIGUOUS`.
 
 Replacement strings are literal UTF-8, including `$`, backslashes, tabs, Unicode
-forms, trailing spaces, and supplied newlines, with three deterministic
+forms, trailing spaces, and supplied newlines, with four deterministic
 exceptions that depend only on the base: line-target terminators and line-wise
-`expect`, above, and line-ending adaptation. In a base whose every line ending
+`expect`, above, and line-ending and space adaptation. In a base whose every line ending
 is CRLF (at least one CRLF, no bare LF, no lone CR), `old`, `new`, and `expect`
 text that holds LF but no CR is matched and written with CRLF, and the plan
 carries an `EOL_ADAPTED` warning naming those changes. Views such as native Read
@@ -425,6 +466,25 @@ mixed file. An undo restores recorded bytes without adaptation, and an undo's
 draft cannot be repaired (`INVALID_REFERENCE`): once the file holds the plan's
 output again, undo the plan under a new `request_id`, since an identical undo
 replays its recorded rejection.
+
+Rendered text, such as a task's prompt, shows a no-break or thin space as an
+ordinary one, so an `old` typed from it may hold an ASCII space where the file
+holds U+00A0, U+2007, U+2009, or U+202F. An `old` without `count` that occurs
+nowhere in its scope as written takes the one match it has there when each of
+its ASCII spaces may stand for one of those, and `new` is written with the
+file's spaces in the text it repeats from `old`, their common prefix and
+suffix: where the file holds U+00A0 before `km` in `limit is 10 km`, `old`
+`limit is 10 km` with `new` `limit is 12 km` writes `limit is 12 km` with
+U+00A0 before `km`. The match must be the only one, and each adapted space
+must lie in that repeated text; a space that an inserted or deleted part could
+sit on either side of, as when `limit is 10 km` becomes `limit is 10 or 12 km`,
+does not count as repeated. Otherwise the target fails as before with
+`TARGET_NOT_FOUND`, and a candidate's `text` gives the file's spaces to copy. A match as written always wins, and an
+`old` that holds one of these spaces stays literal. The plan carries a
+nonblocking `SPACES_ADAPTED` warning naming those changes and the spaces
+matched. Only a missed `old` with an ASCII space, in a file holding one of
+these spaces, pays for the search: one more pass over its scope.
+
 All undeclared bytes remain identical. Invalid UTF-8 is rejected explicitly; UTF-16 and other encodings are
 not decoded. No formatter, shell command, or model runs inside the engine.
 Ready plans and receipts carry nonblocking `NUL_BYTE` and `MIXED_LINE_ENDINGS`
@@ -444,6 +504,48 @@ flagged. The message quotes the resulting line, as in `line 2 now reads
 at most eight per file. The bytes are still written exactly as given. These
 warnings follow every `NUL_BYTE` and `MIXED_LINE_ENDINGS` warning of the plan, so
 the six warnings a compact response shows never trade one of those for this lint.
+
+A nonblocking `BLANK_LINES_JOINED` warning flags a change of any kind that has
+whitespace on both sides of an edge, where that whitespace now holds more blank
+lines in a row than the file had anywhere, as when an `old` takes the two blank
+lines above a function but stops before its last line ending, which joins the
+two below into three. A blank line holds only spaces, tabs, and its line
+ending, and lines are numbered as Read numbers them. Beside a deletion, the
+start or end of the file counts as whitespace. Blank lines that only a change's
+own text holds, inside it or at an edge beside text or the start or end of the
+file, are not flagged, so a whole-file rewrite or an undo never is. The message
+names the output lines, as in `Change 1.3: the whitespace around its edge now
+holds 3 blank lines in a row, lines 33-35; the file had at most 2`, once per run
+and at most eight per file, after that file's `WHITESPACE_EDGE` warnings. The
+bytes are still written exactly as given.
+
+A nonblocking `BLANK_LINES_DROPPED` warning flags a change that removes text
+and leaves fewer blank lines in a row around an edge than the file had around
+both of its ends, as when an `old` takes the two blank lines above a function
+and one of the two below it, which leaves one where each side had two. The
+file's runs are those in the whitespace around where the change starts and
+where it ends, including whitespace the change removes, and the shorter one
+sets the count to keep: deleting a method that ends a class, with one blank
+line above it and two below, may leave one. Blank lines at the start or end of
+the file separate nothing, so whitespace that reaches either counts none, and
+a change that removes only whitespace, as an insertion or an edit of blank
+lines alone does, is not judged. The message names the output lines, as in
+`Change 2.2: the whitespace around its edge now holds a blank line, line 116;
+the file had 2 in a row around its start and 2 around its end`, once per run
+and at most eight per file, after that file's `BLANK_LINES_JOINED` warnings.
+The bytes are still written exactly as given.
+
+A nonblocking `FINAL_LINE_BREAK_KEPT` warning flags a `lines` or `after` change
+whose `new` ends in a line feed. A line target adds a line ending only to text
+that lacks one, so this text is written as given, and text that lists its lines
+joined by line feeds comes out one blank line short: `"x\n\n"` writes `x` and
+one blank line, not two. The message names the text's last line, the blank
+lines after it, and the line after those, as in ``Change 1.3: `new` ends in a
+line break, so no line ending is added after it: line 67 "        )" is
+followed by a blank line, then line 69 "DEFAULT_TIMEOUT_S = 30"``, at most eight
+per file, after that file's `BLANK_LINES_DROPPED` warnings. Text of blank lines
+alone is not flagged, nor is `old` or span text, which is placed exactly. The
+bytes are still written exactly as given.
 
 ## Preview, repair, retry, and undo
 
@@ -594,6 +696,8 @@ one on the same workspace. State written by 0.3.0 also loads, re-serializes byte
 Records of requests that use `path`, `lines`, `after`, `in` with lines, or
 `count` without `in` have shapes 0.3.x cannot read; a 0.3.x binary reports
 `STORE_CORRUPT` for them and its pruning refuses before deleting anything.
+Records of requests that use `all` have a shape that earlier releases cannot
+read: they report `STORE_CORRUPT` for them, and their pruning refuses.
 
 To review reclaimable storage, run `prune-snapshots 604800` for snapshots older
 than seven days. The JSON result lists `eligible` snapshot IDs and their

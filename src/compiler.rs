@@ -33,8 +33,12 @@ const WORD_CHARS: usize = 40;
 /// Matches ambiguity advice examines for one alone in its lines, which bounds
 /// the word checks a long run of matches costs.
 const ADVISED_MATCHES: usize = 10_000;
-/// Change IDs an `EOL_ADAPTED` warning names before counting the rest.
+/// Change IDs an `EOL_ADAPTED` or `SPACES_ADAPTED` warning names before counting
+/// the rest.
 const ADAPTED_IDS: usize = 3;
+/// Unicode spaces an ASCII space in `old` may stand for: rendered text, such as a
+/// task's prompt, shows them as ordinary spaces, so text typed from it has one.
+const ADAPTED_SPACES: [char; 4] = ['\u{a0}', '\u{2007}', '\u{2009}', '\u{202f}'];
 
 struct Budget {
     spans_left: usize,
@@ -222,7 +226,9 @@ fn adapts(text: &str) -> bool {
 /// as when converting CRLF to LF.
 fn literal(change: &Change) -> bool {
     match &change.target {
-        Target::Exact { old, .. } | Target::All { old, .. } => old.contains('\r'),
+        Target::Exact { old, .. } | Target::All { old, .. } | Target::Every { old, .. } => {
+            old.contains('\r')
+        }
         Target::Span { expect, .. } => expect
             .as_deref()
             .is_some_and(|expect| expect.contains('\r')),
@@ -300,7 +306,8 @@ pub(crate) fn derived_replacement(
 }
 
 /// Whether `replacement` is what the compiler derives for `change` from `text`,
-/// with the change's text literal or adapted to an all-CRLF base. Line targets
+/// with the change's text literal or adapted to an all-CRLF base, and for an
+/// `exact` target, with the base's spaces that its `old` matched. Line targets
 /// are recomputed in full; other targets write their text unchanged.
 pub(crate) fn derives(
     text: &str,
@@ -312,7 +319,7 @@ pub(crate) fn derives(
     // A change kept literal by its `old` was never adapted.
     let crlf = *crlf.get_or_init(|| crlf_only(text)) && !literal(change);
     let adapted = adapt_eol(crlf, &change.text);
-    match change.target {
+    match &change.target {
         Target::Lines { .. } | Target::Insert { .. } => {
             let lines = lines.get_or_init(|| LineIndex::new(text));
             [change.text.as_str(), &adapted].into_iter().any(|written| {
@@ -324,10 +331,20 @@ pub(crate) fn derives(
                 )
             })
         }
-        _ => [change.text.as_str(), &adapted].into_iter().any(|written| {
-            let rest = written.len().saturating_sub(replacement.text.len());
-            kept_tail(text, replacement, replacement.end + rest, written)
-        }),
+        target => {
+            let fits = |written: &str| {
+                let rest = written.len().saturating_sub(replacement.text.len());
+                kept_tail(text, replacement, replacement.end + rest, written)
+            };
+            let spaced = || match target {
+                Target::Exact { old, .. } if adapts_spaces(old) => {
+                    let old = adapt_eol(crlf, old);
+                    kept_spaces(&old, spaced_at(text, replacement.start, &old)?, &adapted)
+                }
+                _ => None,
+            };
+            fits(&change.text) || fits(&adapted) || spaced().is_some_and(|written| fits(&written))
+        }
     }
 }
 
@@ -340,16 +357,19 @@ fn kept_tail(text: &str, replacement: &Replacement, end: usize, derived: &str) -
         && text.get(replacement.end..end) == derived.get(replacement.text.len()..)
 }
 
-/// How a compile treats LF-only text for an all-CRLF base.
+/// How a compile treats text typed from a view that hides bytes: LF-only text for
+/// an all-CRLF base, and an `old`'s ASCII spaces where the base has Unicode ones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Eol {
-    /// Writes CRLF, and says so with an `EOL_ADAPTED` warning.
+    /// Writes CRLF, and the base's spaces where an `old` matched them, saying so
+    /// with `EOL_ADAPTED` and `SPACES_ADAPTED` warnings.
     Adapt,
     /// Writes every byte as given, as an undo restoring recorded bytes must.
     Literal,
 }
 
-/// Plans `request` against its base snapshots, adapting line endings ([`Eol::Adapt`]).
+/// Plans `request` against its base snapshots, adapting line endings and spaces
+/// ([`Eol::Adapt`]).
 pub fn compile(
     request: &EditRequest,
     snapshots: &BTreeMap<String, Snapshot>,
@@ -471,6 +491,7 @@ pub fn compile_with(
                 &mut budget,
             );
         }
+        keep_moves_apart(&mut context, &mut replacements, &mut diagnostics);
         refuse_restatements(&context, &replacements, &mut diagnostics);
         replacements.sort_by(|left, right| {
             (left.start, left.end, &left.change_id).cmp(&(right.start, right.end, &right.change_id))
@@ -484,22 +505,7 @@ pub fn compile_with(
                 if right.start > left.end {
                     break;
                 }
-                // Boundary insertions also conflict, so there is one explicit ordering
-                // policy, except beside a deletion, where either order gives the same text.
-                let insertion = |replacement: &Replacement| replacement.start == replacement.end;
-                let deletion = |replacement: &Replacement| {
-                    replacement.start < replacement.end && replacement.text.is_empty()
-                };
-                let conflict = if (insertion(left) && deletion(right))
-                    || (deletion(left) && insertion(right))
-                {
-                    right.start < left.end && left.start < right.start
-                } else if insertion(left) || insertion(right) {
-                    right.start <= left.end
-                } else {
-                    right.start < left.end
-                };
-                if conflict {
+                if conflicts(left, right) {
                     if overlap_count == MAX_OVERLAP_DIAGNOSTICS {
                         diagnostics.push(at(Some(&base.path), None, "RESOURCE_LIMIT", format!("More than {MAX_OVERLAP_DIAGNOSTICS} overlap diagnostics; remaining conflict discovery stopped")));
                         overlap_limit_reached = true;
@@ -561,6 +567,7 @@ pub fn compile_with(
     // Edge warnings follow every byte warning, so the few a compact response
     // shows never trade a NUL or mixed line ending for a whitespace lint.
     let mut edge_warnings = Vec::new();
+    let mut moves = HashMap::new();
     let files = resolved
         .into_iter()
         .map(|(context, replacements, changes)| {
@@ -581,19 +588,23 @@ pub fn compile_with(
             }
             output.push_str(&base.text[cursor..]);
             warn_output(&base.path, &output, &mut warnings);
+            warn_moved(&base.path, &context.moved, &mut warnings);
             warn_adapted(&base.path, &context.adapted, &mut warnings);
+            warn_spaced(&base.path, &context.spaced, &mut warnings);
             // Neighbours are judged in the output, where an adjacent change's text
             // may stand beside this one instead of the original bytes.
             let mut edges = Vec::new();
-            for (id, range) in placed {
+            for (id, range) in &placed {
                 if let Some(change) = targets.get(id) {
                     let old = match &change.target {
-                        Target::Exact { old, .. } | Target::All { old, .. } => old,
+                        Target::Exact { old, .. }
+                        | Target::All { old, .. }
+                        | Target::Every { old, .. } => old,
                         _ => continue,
                     };
                     let crlf = context.crlf() && !literal(change);
                     let (old, new) = (adapt_eol(crlf, old), adapt_eol(crlf, &change.text));
-                    for edge in whitespace_edges(&output, &range, &old, &new) {
+                    for edge in whitespace_edges(&output, range, &old, &new) {
                         let junction = match edge {
                             Edge::DropsTrailing | Edge::AddsTrailing => range.end,
                             Edge::DropsLeading | Edge::AddsLeading => range.start,
@@ -603,6 +614,23 @@ pub fn compile_with(
                 }
             }
             warn_edges(&base.path, &output, edges, &mut edge_warnings);
+            warn_blank_runs(&base.path, &base.text, &output, &placed, &mut edge_warnings);
+            warn_dropped_blank_runs(
+                &base.path,
+                &base.text,
+                &output,
+                &replacements,
+                &placed,
+                &mut edge_warnings,
+            );
+            warn_final_line_breaks(&base.path, &output, &placed, &targets, &mut edge_warnings);
+            warnings.extend(context.whole_words);
+            moves.extend(
+                context
+                    .moved
+                    .into_iter()
+                    .map(|moved| (moved.change.id.as_str(), moved.target)),
+            );
             PreparedFile {
                 base: base.clone(),
                 output,
@@ -612,9 +640,18 @@ pub fn compile_with(
         })
         .collect();
     warnings.append(&mut edge_warnings);
+    // The plan records the lines each moved target applies to, so a stored
+    // plan's line targets still derive its replacements and its `in` lines hold
+    // its matches.
+    let mut request = request.clone();
+    for change in request.files.iter_mut().flat_map(|file| &mut file.changes) {
+        if let Some(target) = moves.remove(change.id.as_str()) {
+            change.target = target;
+        }
+    }
     Ok(PreparedPlan {
         id: new_id("p"),
-        request: request.clone(),
+        request,
         files,
         warnings,
     })
@@ -635,7 +672,9 @@ const EDGE_WHITESPACE: [char; 4] = [' ', '\t', '\r', '\n'];
 /// Characters a `WHITESPACE_EDGE` warning quotes on each side of the junction,
 /// short enough that the message fits the 240 characters clients display.
 const EDGE_CONTEXT_CHARS: usize = 40;
-/// `WHITESPACE_EDGE` warnings per file; each one scans its output line.
+/// `WHITESPACE_EDGE` warnings per file, each scanning its output line, and
+/// likewise `BLANK_LINES_JOINED`, `BLANK_LINES_DROPPED` and
+/// `FINAL_LINE_BREAK_KEPT` warnings.
 const MAX_EDGE_WARNINGS: usize = 8;
 
 /// Finds the edges where an exact target's `old` and `new` agree on their outermost
@@ -761,32 +800,400 @@ fn warn_edges(
     }
 }
 
+/// Warns where whitespace on both sides of a change's edge holds more blank lines
+/// in a row than `base` had anywhere, naming them as output lines: an `old` that
+/// takes the blank lines above a block but stops before its last line ending
+/// leaves one too many. The start or end of the file stands in for whitespace
+/// beside a deletion, which can blank the line it cuts there too. Each run is
+/// warned once, for the first change meeting it, and the bytes are written as
+/// given. An edge beside text costs a byte on each side; only the whitespace
+/// around an edge is scanned, and the base once, when an edge joins whitespace.
+fn warn_blank_runs(
+    path: &str,
+    base: &str,
+    output: &str,
+    placed: &[(&str, Range<usize>)],
+    warnings: &mut Vec<Diagnostic>,
+) {
+    let top = if output.starts_with('\u{feff}') { 3 } else { 0 };
+    let longest = OnceCell::new();
+    let mut measured: Option<usize> = None;
+    let (mut warned, mut line, mut cursor) = (0, 1, 0);
+    for (id, range) in placed {
+        let deletion = range.is_empty();
+        for junction in [range.start, range.end] {
+            let (before, after) = output.split_at(junction);
+            // An edge in the whitespace already measured meets the same run.
+            if measured.is_some_and(|end| junction <= end)
+                || !(before.ends_with(EDGE_WHITESPACE) || (deletion && junction == top))
+                || !(after.starts_with(EDGE_WHITESPACE) || (deletion && after.is_empty()))
+            {
+                continue;
+            }
+            let start = before.trim_end_matches(EDGE_WHITESPACE).len();
+            let end = output.len() - after.trim_start_matches(EDGE_WHITESPACE).len();
+            measured = Some(end);
+            let (first, count) = blank_lines(output, start..end);
+            let most = *longest.get_or_init(|| longest_blank_run(base));
+            if count <= most {
+                continue;
+            }
+            if warned == MAX_EDGE_WARNINGS {
+                return;
+            }
+            warned += 1;
+            line += output.as_bytes()[cursor..first]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count();
+            cursor = first;
+            let run = if count == 1 {
+                format!("a blank line, line {line}")
+            } else {
+                format!(
+                    "{count} blank lines in a row, lines {line}-{}",
+                    line + count - 1
+                )
+            };
+            let had = if most == 0 {
+                "none".to_owned()
+            } else {
+                format!("at most {most}")
+            };
+            let shown: String = id.chars().take(24).collect();
+            let mut warning = at(
+                Some(path),
+                None,
+                "BLANK_LINES_JOINED",
+                format!(
+                    "Change {shown}: the whitespace around its edge now holds {run}; the file had {had}"
+                ),
+            );
+            warning.change_id = Some((*id).to_owned());
+            warnings.push(warning);
+        }
+    }
+}
+
+/// Warns where a change that removes text leaves fewer blank lines in a row
+/// around an edge than the file had around both of its ends, naming them as
+/// output lines: an `old` that takes the blank lines above a function and one
+/// below it leaves one too few. Blank lines at the start or end of the file
+/// separate nothing, so whitespace reaching either counts none, and a change
+/// that removes only whitespace, as an insertion does, is not judged. Each run
+/// is judged once, for the first change with blank lines around both ends that
+/// meets it, and the bytes are written as given. `placed` holds each
+/// replacement's output range, in order. A change beside text costs a byte on
+/// each side of each end; only the output's whitespace around the edges of a
+/// change judged is scanned, once per run.
+fn warn_dropped_blank_runs(
+    path: &str,
+    base: &str,
+    output: &str,
+    replacements: &[Replacement],
+    placed: &[(&str, Range<usize>)],
+    warnings: &mut Vec<Diagnostic>,
+) {
+    let around = |at| match whitespace_around(base, at) {
+        (stretch, true) => blank_lines(base, stretch).1,
+        _ => 0,
+    };
+    let mut measured: Option<usize> = None;
+    let (mut warned, mut line, mut cursor) = (0, 1, 0);
+    for (replacement, (id, range)) in replacements.iter().zip(placed) {
+        if base[replacement.start..replacement.end]
+            .trim_matches(EDGE_WHITESPACE)
+            .is_empty()
+        {
+            continue;
+        }
+        let (above, below) = (around(replacement.start), around(replacement.end));
+        let fewest = above.min(below);
+        if fewest == 0 {
+            continue;
+        }
+        for junction in [range.start, range.end] {
+            // An edge in the whitespace already measured meets the same run.
+            if measured.is_some_and(|end| junction <= end) {
+                continue;
+            }
+            let (stretch, between) = whitespace_around(output, junction);
+            measured = Some(stretch.end);
+            if !between {
+                continue;
+            }
+            let (first, count) = blank_lines(output, stretch.clone());
+            if count >= fewest {
+                continue;
+            }
+            if warned == MAX_EDGE_WARNINGS {
+                return;
+            }
+            warned += 1;
+            line += output.as_bytes()[cursor..first]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count();
+            cursor = first;
+            let run = match count {
+                // Without a blank line, `first` starts the next text's line.
+                0 if output[stretch.clone()].contains('\n') => {
+                    format!("no blank line, between lines {} and {line}", line - 1)
+                }
+                0 => format!("no line break, line {line}"),
+                1 => format!("a blank line, line {line}"),
+                _ => format!(
+                    "{count} blank lines in a row, lines {line}-{}",
+                    line + count - 1
+                ),
+            };
+            let shown: String = id.chars().take(QUOTED_ID_CHARS).collect();
+            let mut warning = at(
+                Some(path),
+                None,
+                "BLANK_LINES_DROPPED",
+                format!(
+                    "Change {shown}: the whitespace around its edge now holds {run}; the file had {above} in a row around its start and {below} around its end"
+                ),
+            );
+            warning.change_id = Some((*id).to_owned());
+            warnings.push(warning);
+        }
+    }
+}
+
+/// Characters a `FINAL_LINE_BREAK_KEPT` warning quotes of each line it names,
+/// short enough that the message fits the 240 characters clients display.
+const ENDING_CONTEXT_CHARS: usize = 32;
+
+/// Warns where a `lines` or `after` change's text ends in a line break. A line
+/// target adds a line ending only to text that lacks one, so this text is written
+/// as given, and text that lists its lines joined by line breaks, as shorthand
+/// examples do, comes out one blank line short: `"x\n\n"` leaves one blank line
+/// after `x`, not two. The message names the text's last line, the blank lines
+/// after it, and the line after those, at most eight per file. Text of blank
+/// lines alone names no line and is not flagged. The bytes are still written
+/// exactly as given.
+fn warn_final_line_breaks(
+    path: &str,
+    output: &str,
+    placed: &[(&str, Range<usize>)],
+    targets: &HashMap<&str, &Change>,
+    warnings: &mut Vec<Diagnostic>,
+) {
+    let top = if output.starts_with('\u{feff}') { 3 } else { 0 };
+    let (mut warned, mut line, mut cursor) = (0, 1, 0);
+    for (id, range) in placed {
+        let Some(change) = targets.get(id) else {
+            continue;
+        };
+        let end = range.start
+            + output[range.clone()]
+                .trim_end_matches(EDGE_WHITESPACE)
+                .len();
+        if !matches!(change.target, Target::Lines { .. } | Target::Insert { .. })
+            || !change.text.ends_with('\n')
+            || end == range.start
+        {
+            continue;
+        }
+        if warned == MAX_EDGE_WARNINGS {
+            return;
+        }
+        warned += 1;
+        line += output.as_bytes()[cursor..end]
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count();
+        cursor = end;
+        let rest = &output[end..];
+        let next = end + rest.len() - rest.trim_start_matches(EDGE_WHITESPACE).len();
+        let (_, blank) = blank_lines(output, end..next);
+        let start = output[..end].rfind('\n').map_or(top, |index| index + 1);
+        let last = candidates::quoted(&output[start..end], ENDING_CONTEXT_CHARS);
+        let then = if next < output.len() {
+            let start = output[..next].rfind('\n').map_or(top, |index| index + 1);
+            let stop = output[next..]
+                .find('\n')
+                .map_or(output.len(), |index| next + index);
+            let text = &output[start..stop];
+            format!(
+                "line {} {}",
+                line + output[end..next].matches('\n').count(),
+                candidates::quoted(
+                    text.strip_suffix('\r').unwrap_or(text),
+                    ENDING_CONTEXT_CHARS
+                )
+            )
+        } else {
+            "the end of the file".to_owned()
+        };
+        let follows = match blank {
+            0 if next < output.len() => format!("is followed directly by {then}"),
+            0 => "ends the file".to_owned(),
+            1 => format!("is followed by a blank line, then {then}"),
+            count => format!("is followed by {count} blank lines, then {then}"),
+        };
+        let shown: String = change.id.chars().take(QUOTED_ID_CHARS).collect();
+        warnings.push(at(
+            Some(path),
+            Some(change),
+            "FINAL_LINE_BREAK_KEPT",
+            format!(
+                "Change {shown}: `new` ends in a line break, so no line ending is added after it: line {line} {last} {follows}"
+            ),
+        ));
+    }
+}
+
+/// The blank lines, numbered as Read numbers lines, inside the whitespace
+/// `stretch` of `text`: the byte where the first starts, and how many there are.
+/// Each line ending in the stretch starts a line, and so does a stretch that
+/// starts the file; the last line started is blank only if no text follows it.
+fn blank_lines(text: &str, stretch: Range<usize>) -> (usize, usize) {
+    let whitespace = &text[stretch.clone()];
+    // An empty file has no line to be blank.
+    let top =
+        !whitespace.is_empty() && stretch.start == if text.starts_with('\u{feff}') { 3 } else { 0 };
+    let first = match whitespace.find('\n') {
+        Some(index) if !top => stretch.start + index + 1,
+        _ => stretch.start,
+    };
+    let starts = usize::from(top) + whitespace.matches('\n').count();
+    // The last line started holds text, or is the empty line Read shows after a
+    // final line ending, unless the stretch runs to the end of the file without one.
+    let open = whitespace.ends_with('\n') || stretch.end < text.len();
+    (first, starts.saturating_sub(usize::from(open)))
+}
+
+/// The most blank lines in a row in `text`, as Read numbers lines; an empty file,
+/// as in [`blank_lines`], has none.
+fn longest_blank_run(text: &str) -> usize {
+    text.strip_prefix('\u{feff}')
+        .unwrap_or(text)
+        .split_inclusive('\n')
+        .fold((0, 0), |(run, longest), line| {
+            let run = if line.trim_start_matches(EDGE_WHITESPACE).is_empty() {
+                run + 1
+            } else {
+                0
+            };
+            (run, longest.max(run))
+        })
+        .1
+}
+
+/// The whitespace around byte `at` of `text`, and whether text stands on both
+/// sides of it, as it must for its blank lines to separate anything.
+fn whitespace_around(text: &str, at: usize) -> (Range<usize>, bool) {
+    let (before, after) = text.split_at(at);
+    let start = before.trim_end_matches(EDGE_WHITESPACE).len();
+    let end = text.len() - after.trim_start_matches(EDGE_WHITESPACE).len();
+    let top = if text.starts_with('\u{feff}') { 3 } else { 0 };
+    (start..end, start > top && end < text.len())
+}
+
+/// Names the lines each moved target gave and the lines it applied to. A stale
+/// read or a miscount put them there, so other numbers from it may be off.
+fn warn_moved(path: &str, moved: &[Moved], warnings: &mut Vec<Diagnostic>) {
+    let place = |target: &Target| match target {
+        Target::Lines {
+            lines: [first, last],
+            ..
+        } => format!("lines:[{first},{last}]"),
+        Target::Insert { after, .. } => format!("after:{after}"),
+        Target::Exact {
+            lines: Some([first, last]),
+            ..
+        } => format!("in:[{first},{last}]"),
+        Target::Exact { .. } | Target::All { .. } | Target::Every { .. } | Target::Span { .. } => {
+            String::new()
+        }
+    };
+    for moved in moved {
+        let id: String = moved.change.id.chars().take(QUOTED_ID_CHARS).collect();
+        let given = place(&moved.change.target);
+        let message = match moved.target {
+            // An `old` names the lines its match spans.
+            Target::Exact {
+                lines: Some([first, last]),
+                ..
+            } => {
+                let used = if first == last {
+                    format!("line {first}")
+                } else {
+                    format!("lines {first}-{last}")
+                };
+                format!(
+                    "Change {id}: {given} did not hold `old`, which occurs only at {used}, so the change applied there; reread the file before more line edits"
+                )
+            }
+            _ => format!(
+                "Change {id}: {given} did not hold expect, which holds only at {}, so the change applied there; reread the file before more line edits",
+                place(&moved.target)
+            ),
+        };
+        warnings.push(at(Some(path), Some(moved.change), "LINES_MOVED", message));
+    }
+}
+
+/// Names the changes an adaptation warning is about: the first `ADAPTED_IDS`
+/// IDs, clipped, then how many more.
+fn adapted_changes(ids: &[&str]) -> String {
+    let mut named: Vec<String> = ids
+        .iter()
+        .take(ADAPTED_IDS)
+        .map(|id| id.chars().take(24).collect())
+        .collect();
+    if ids.len() > ADAPTED_IDS {
+        named.push(format!("{} more", ids.len() - ADAPTED_IDS));
+    }
+    let noun = if ids.len() == 1 { "Change" } else { "Changes" };
+    format!("{noun} {}", named.join(", "))
+}
+
 /// Says which changes had LF written as CRLF to match an all-CRLF file.
 fn warn_adapted(path: &str, adapted: &[&str], warnings: &mut Vec<Diagnostic>) {
     let Some(first) = adapted.first() else {
         return;
     };
-    let mut ids: Vec<String> = adapted
-        .iter()
-        .take(ADAPTED_IDS)
-        .map(|id| id.chars().take(24).collect())
-        .collect();
-    if adapted.len() > ADAPTED_IDS {
-        ids.push(format!("{} more", adapted.len() - ADAPTED_IDS));
-    }
     let mut warning = at(
         Some(path),
         None,
         "EOL_ADAPTED",
         format!(
-            "{} {}: this file ends every line with CRLF, so LF in {} text was matched and written as CRLF; text holding a \\r stays literal",
-            if adapted.len() == 1 {
-                "Change"
-            } else {
-                "Changes"
-            },
-            ids.join(", "),
+            "{}: this file ends every line with CRLF, so LF in {} text was matched and written as CRLF; text holding a \\r stays literal",
+            adapted_changes(adapted),
             if adapted.len() == 1 { "its" } else { "their" },
+        ),
+    );
+    warning.change_id = Some((*first).to_owned());
+    warnings.push(warning);
+}
+
+/// Says which changes matched the file's Unicode spaces for ASCII spaces in
+/// `old`, given with the text each matched, and which spaces those were.
+fn warn_spaced(path: &str, spaced: &[(&str, &str)], warnings: &mut Vec<Diagnostic>) {
+    let Some((first, _)) = spaced.first() else {
+        return;
+    };
+    let ids: Vec<&str> = spaced.iter().map(|(id, _)| *id).collect();
+    let spaces: Vec<String> = ADAPTED_SPACES
+        .iter()
+        .filter(|space| spaced.iter().any(|(_, found)| found.contains(**space)))
+        .map(|space| format!("U+{:04X}", u32::from(*space)))
+        .collect();
+    let spaces = match spaces.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
+        _ => spaces.concat(),
+    };
+    let mut warning = at(
+        Some(path),
+        None,
+        "SPACES_ADAPTED",
+        format!(
+            "{}: a space in `old` matched this file's {spaces}, which `new` keeps where it repeats `old`",
+            adapted_changes(&ids),
         ),
     );
     warning.change_id = Some((*first).to_owned());
@@ -855,6 +1262,7 @@ fn validate_target(change: &Change, path: Option<&str>, diagnostics: &mut Vec<Di
             }
             (Some(old), scope.as_ref(), lines.as_ref())
         }
+        Target::Every { old, scope, lines } => (Some(old), scope.as_ref(), lines.as_ref()),
         Target::Span { span, .. } => (None, Some(span), None),
         Target::Lines { lines, .. } => (None, None, Some(lines)),
         Target::Insert { .. } => {
@@ -1067,9 +1475,15 @@ struct FileContext<'a> {
     eol: Eol,
     lines: OnceCell<LineIndex>,
     crlf: OnceCell<bool>,
+    spaces: OnceCell<bool>,
     disclosed: OnceCell<HashSet<usize>>,
     /// Changes whose text was adapted to CRLF, in request order.
     adapted: Vec<&'a str>,
+    /// Changes whose `old` matched Unicode spaces for ASCII ones, with the text
+    /// each matched, in request order.
+    spaced: Vec<(&'a str, &'a str)>,
+    /// Warnings for targets that took only whole-word matches, in request order.
+    whole_words: Vec<Diagnostic>,
     /// The lines each line target addresses, which overlap advice names.
     extents: HashMap<&'a str, Extent>,
     /// Insertions whose text starts by restating lines that they keep, refused
@@ -1079,6 +1493,20 @@ struct FileContext<'a> {
     /// whitespace, and its visible characters, so the run search reads a line
     /// once however many insertions compare it.
     trimmed: RefCell<HashMap<usize, (usize, usize)>>,
+    /// Targets applied where their guard or `old` holds instead of at their
+    /// stated lines, in request order.
+    moved: Vec<Moved<'a>>,
+}
+
+/// A line target whose stated lines do not hold its guard, or an `old` whose
+/// `in` lines hold no match, applied at the one other place where it holds.
+struct Moved<'a> {
+    change: &'a Change,
+    /// The target with the lines it applies to, which the plan records.
+    target: Target,
+    /// What the stated lines get, given instead when the moved target would
+    /// conflict with another change.
+    refusal: Diagnostic,
 }
 
 impl<'a> FileContext<'a> {
@@ -1088,12 +1516,24 @@ impl<'a> FileContext<'a> {
             eol,
             lines: OnceCell::new(),
             crlf: OnceCell::new(),
+            spaces: OnceCell::new(),
             disclosed: OnceCell::new(),
             adapted: Vec::new(),
+            spaced: Vec::new(),
+            whole_words: Vec::new(),
             extents: HashMap::new(),
             restated: Vec::new(),
             trimmed: RefCell::new(HashMap::new()),
+            moved: Vec::new(),
         }
+    }
+
+    /// The target a change applies: its own, or the one its guard moved it to.
+    fn target(&self, change: &'a Change) -> &Target {
+        self.moved
+            .iter()
+            .find(|moved| moved.change.id == change.id)
+            .map_or(&change.target, |moved| &moved.target)
     }
 
     /// Line `number`'s body without trailing whitespace, and its visible
@@ -1111,6 +1551,14 @@ impl<'a> FileContext<'a> {
     /// Whether LF-only text is adapted for this base.
     fn crlf(&self) -> bool {
         self.eol == Eol::Adapt && *self.crlf.get_or_init(|| crlf_only(&self.base.text))
+    }
+
+    /// Whether an ASCII space in `old` may match a Unicode space in this base.
+    fn spaces(&self) -> bool {
+        self.eol == Eol::Adapt
+            && *self
+                .spaces
+                .get_or_init(|| self.base.text.contains(ADAPTED_SPACES))
     }
 
     fn lines(&self) -> &LineIndex {
@@ -1155,7 +1603,7 @@ impl<'a> FileContext<'a> {
         let lines = self.lines();
         let total = lines.count();
         let advice = match change.target {
-            Target::Exact { .. } | Target::All { .. } => {
+            Target::Exact { .. } | Target::All { .. } | Target::Every { .. } => {
                 format!("end `in` by line {total} or drop it to search the whole file")
             }
             _ if lines.body(1).start == self.base.text.len() => {
@@ -1220,6 +1668,60 @@ fn merge_kept_overlaps(text: &str, replacements: &mut [Replacement]) {
     }
 }
 
+/// Whether two replacements, `left` sorted first, conflict. Boundary insertions
+/// also conflict, so there is one explicit ordering policy, except beside a
+/// deletion, where either order gives the same text.
+fn conflicts(left: &Replacement, right: &Replacement) -> bool {
+    let insertion = |replacement: &Replacement| replacement.start == replacement.end;
+    let deletion = |replacement: &Replacement| {
+        replacement.start < replacement.end && replacement.text.is_empty()
+    };
+    if (insertion(left) && deletion(right)) || (deletion(left) && insertion(right)) {
+        right.start < left.end && left.start < right.start
+    } else if insertion(left) || insertion(right) {
+        right.start <= left.end
+    } else {
+        right.start < left.end
+    }
+}
+
+/// Refuses each moved target whose replacement conflicts with another
+/// change's, as its stated lines are refused: the other changes were placed
+/// without knowing of the move. Each moved target is compared with every
+/// replacement, at most `MAX_CHANGES` times `MAX_REPLACEMENTS` comparisons.
+fn keep_moves_apart(
+    context: &mut FileContext,
+    replacements: &mut Vec<Replacement>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let clashes = |id: &str| {
+        replacements
+            .iter()
+            .filter(|own| own.change_id == id)
+            .any(|own| {
+                replacements.iter().any(|other| {
+                    let (left, right) = if (own.start, own.end) <= (other.start, other.end) {
+                        (own, other)
+                    } else {
+                        (other, own)
+                    };
+                    other.change_id != id && conflicts(left, right)
+                })
+            })
+    };
+    let (refused, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut context.moved)
+        .into_iter()
+        .partition(|moved| clashes(&moved.change.id));
+    context.moved = kept;
+    for moved in refused {
+        replacements.retain(|replacement| replacement.change_id != moved.change.id);
+        context
+            .restated
+            .retain(|restated| restated.change.id != moved.change.id);
+        diagnostics.push(moved.refusal);
+    }
+}
+
 fn combine_advice(left: Option<&Extent>, right: Option<&Extent>) -> String {
     let takes = |extent: Option<&Extent>| {
         matches!(
@@ -1273,7 +1775,9 @@ fn resolve_change<'a>(
     let text = adapt_eol(crlf, &change.text);
     let adapted = matches!(text, Cow::Owned(_))
         || match &change.target {
-            Target::Exact { old, .. } | Target::All { old, .. } => crlf && adapts(old),
+            Target::Exact { old, .. } | Target::All { old, .. } | Target::Every { old, .. } => {
+                crlf && adapts(old)
+            }
             Target::Span { expect, .. } => crlf && expect.as_deref().is_some_and(adapts),
             Target::Lines { .. } | Target::Insert { .. } => false,
         };
@@ -1334,7 +1838,7 @@ fn resolve_change<'a>(
             }
             (Guard::Above { line }, (expect, &None))
         }
-        Target::Exact { .. } | Target::All { .. } => {
+        Target::Exact { .. } | Target::All { .. } | Target::Every { .. } => {
             resolve_exact(context, change, &text, replacements, diagnostics, budget);
             return;
         }
@@ -1344,18 +1848,37 @@ fn resolve_change<'a>(
         head: expect.as_deref(),
         tail: expect_last.as_deref(),
     };
-    if !line_guard(context, change, guard, expect, diagnostics, budget) {
-        return;
-    }
+    let (guard, moved) = match line_guard(context, change, guard, expect, diagnostics, budget) {
+        Placed::Stated => (guard, None),
+        Placed::Refused => return,
+        Placed::Moved { guard, refusal } => {
+            let mut target = change.target.clone();
+            match (&mut target, guard) {
+                (Target::Lines { lines, .. }, Guard::Prefix { first, last }) => {
+                    *lines = [first, last];
+                }
+                (Target::Insert { after, .. }, Guard::Above { line }) => *after = line,
+                _ => {}
+            }
+            let moved = Moved {
+                change,
+                target,
+                refusal,
+            };
+            (guard, Some(moved))
+        }
+    };
     if let Guard::Above { line } = guard
         && let Some(restated) = restated_lines(change, context, line, &text)
     {
         context.restated.push(restated);
     }
-    let found = derived_replacement(&base.text, context.lines(), &change.target, &text);
+    let target = moved.as_ref().map_or(&change.target, |moved| &moved.target);
+    let found = derived_replacement(&base.text, context.lines(), target, &text);
     let Some((range, written)) = found else {
         return;
     };
+    context.moved.extend(moved);
     let extent = match guard {
         Guard::Prefix { first, last } => Extent::Lines {
             first,
@@ -1497,7 +2020,7 @@ fn refuse_restatements(
                 merged_lines(context, replacements, change, [first, last], &touching);
             Advice::Merge(low, high, partial)
         };
-        let Target::Insert { after, .. } = change.target else {
+        let Target::Insert { after, .. } = *context.target(change) else {
             continue;
         };
         let mut diagnostic = at(
@@ -1711,25 +2234,29 @@ fn restatement_message(
     }
 }
 
-/// Resolves an `exact` or `all` target by searching its scope for `old`, adapted
-/// like `text` to the base's line endings.
-fn resolve_exact(
-    context: &FileContext,
-    change: &Change,
+/// Resolves an `exact`, `all`, or `every` target by searching its scope for `old`,
+/// adapted like `text` to the base's line endings, and for an `exact` target found
+/// nowhere as written, to the base's Unicode spaces. An `exact` target whose `in`
+/// lines hold no match applies where [`moved_old`] places it, if anywhere.
+fn resolve_exact<'a>(
+    context: &mut FileContext<'a>,
+    change: &'a Change,
     text: &str,
     replacements: &mut Vec<Replacement>,
     diagnostics: &mut Vec<Diagnostic>,
     budget: &mut Budget,
 ) {
     let base = context.base;
+    // How many matches the target needs; `every` takes however many cut no word.
     let (old, scope, lines, expected) = match &change.target {
-        Target::Exact { old, scope, lines } => (old, scope.as_deref(), lines, 1),
+        Target::Exact { old, scope, lines } => (old, scope.as_deref(), lines, Some(1)),
         Target::All {
             old,
             scope,
             expected,
             lines,
-        } => (old, scope.as_deref(), lines, *expected),
+        } => (old, scope.as_deref(), lines, Some(*expected)),
+        Target::Every { old, scope, lines } => (old, scope.as_deref(), lines, None),
         Target::Span { .. } | Target::Lines { .. } | Target::Insert { .. } => return,
     };
     let old = adapt_eol(context.crlf(), old);
@@ -1742,13 +2269,18 @@ fn resolve_exact(
             }),
         None => scope_range(base, change, scope, diagnostics),
     };
-    if old.is_empty() || expected == 0 || (scope.is_some() && lines.is_some()) {
+    if old.is_empty() || expected == Some(0) || (scope.is_some() && lines.is_some()) {
         return;
     }
     let Some((start, end)) = range else {
         return;
     };
     let old = old.as_ref();
+    let Some(expected) = expected else {
+        let found = resolve_every(context, change, old, start..end, text, diagnostics, budget);
+        replacements.extend(found);
+        return;
+    };
     let retained = expected.min(budget.spans_left);
     let exact = matches!(change.target, Target::Exact { .. });
     let (actual, non_overlapping, positions) = if matches!(change.target, Target::All { .. }) {
@@ -1767,6 +2299,35 @@ fn resolve_exact(
             matches.non_overlapping,
             matches.positions,
         )
+    };
+    // Every match counts, but a caller renaming `MAX_RETRIES` means its own uses, not
+    // those inside `MAX_RETRIES_PER_HOST`: an `old` with one match that cuts no word,
+    // or a count that numbers just those, takes them, and a warning names what stayed.
+    // Whole-word matches never outnumber all matches, so only fewer are checked.
+    let whole = if expected < actual {
+        whole_words(&base.text, start..end, old, !exact)
+    } else {
+        None
+    };
+    let (actual, positions, stayed) = match &whole {
+        Some(whole) if whole.len() == expected => (
+            expected,
+            whole.iter().copied().take(retained).collect(),
+            actual - expected,
+        ),
+        _ => (actual, positions, 0),
+    };
+    // Text typed from a rendered view has an ASCII space where the file may hold
+    // a no-break or thin one: an `old` found nowhere as written takes its one
+    // match with those spaces, when `new` repeats the text around each of them.
+    let spaced = if exact && actual == 0 && adapts_spaces(old) && context.spaces() {
+        respaced(&base.text, start..end, old, text)
+    } else {
+        None
+    };
+    let (actual, positions, len, text) = match &spaced {
+        Some((position, found, written)) => (1, vec![*position], found.len(), written.as_str()),
+        None => (actual, positions, old.len(), text),
     };
     if actual != expected {
         let code = if actual == 0 {
@@ -1827,8 +2388,14 @@ fn resolve_exact(
             } else {
                 ""
             };
+            let words = whole.as_ref().map_or(0, Vec::len);
+            let words = if 0 < words && words < actual {
+                format!(" or to {words} for those not inside longer words")
+            } else {
+                String::new()
+            };
             format!(
-                "Expected {expected} occurrence(s), found {actual} at {noun} {}{more}; set count to {actual} to replace every one, or restrict `old` with \"in\":[first,last]",
+                "Expected {expected} occurrence(s), found {actual} at {noun} {}{more}; set count to {actual} to replace every one{words}, or restrict `old` with \"in\":[first,last]",
                 lines.join(", ")
             )
         } else {
@@ -1840,18 +2407,40 @@ fn resolve_exact(
         diagnostic.expected = Some(expected);
         diagnostic.actual = Some(actual);
         diagnostic.candidates = found;
+        if exact
+            && actual == 0
+            && lines.is_some()
+            && let Some((position, target)) = moved_old(context, change, old)
+        {
+            if !budget.reserve(1, text) {
+                diagnostics.push(resource_limit(base, change));
+                return;
+            }
+            replacements.push(Replacement {
+                start: position,
+                end: position + old.len(),
+                text: text.to_owned(),
+                change_id: change.id.clone(),
+            });
+            context.moved.push(Moved {
+                change,
+                target,
+                refusal: diagnostic,
+            });
+            return;
+        }
         diagnostics.push(diagnostic);
         return;
     }
     if exact
         && let Some(&position) = positions.first()
-        && let Some(boundary) = word_cut(&base.text, start + position, old.len(), one_line(old))
+        && let Some(cut) = word_cut(&base.text, start + position, len, Edges::of(old))
     {
         diagnostics.push(at(
             Some(&base.path),
             Some(change),
             "OLD_INSIDE_WORD",
-            inside_word(&base.text, boundary),
+            inside_word(&base.text, cut),
         ));
         return;
     }
@@ -1859,12 +2448,210 @@ fn resolve_exact(
         diagnostics.push(resource_limit(base, change));
         return;
     }
+    if stayed > 0 {
+        let warning = stayed_inside_words(base, change, start..end, old, stayed);
+        context.whole_words.push(warning);
+    }
+    if let Some((_, found, _)) = &spaced {
+        context.spaced.push((&change.id, found));
+    }
     replacements.extend(positions.into_iter().map(|position| Replacement {
         start: start + position,
-        end: start + position + old.len(),
+        end: start + position + len,
         text: text.to_owned(),
         change_id: change.id.clone(),
     }));
+}
+
+/// Resolves an `every` target: each non-overlapping match of `old` in `range`
+/// that cuts no word, left to right, at least one. Matches inside longer names
+/// stay, and a warning names the first of them. Returns no replacements when
+/// it pushes a diagnostic.
+fn resolve_every<'a>(
+    context: &mut FileContext<'a>,
+    change: &'a Change,
+    old: &str,
+    range: Range<usize>,
+    text: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+    budget: &mut Budget,
+) -> Vec<Replacement> {
+    let base = context.base;
+    // Past `ADVISED_MATCHES` starts the plan could not hold the replacements either.
+    let Some(whole) = whole_words(&base.text, range.clone(), old, true) else {
+        diagnostics.push(resource_limit(base, change));
+        return Vec::new();
+    };
+    let actual = base.text[range.clone()].match_indices(old).count();
+    if whole.is_empty() {
+        let found = if actual == 0 {
+            budget.candidates(|search| {
+                candidates::find_target(search, &base.text, range.clone(), old)
+            })
+        } else {
+            Vec::new()
+        };
+        let message = match first_cut(&base.text, range.clone(), old) {
+            Some((word, line)) => format!(
+                "No whole-word match: all {actual} are inside longer words, the first in `{word}` at line {line}; set count to {actual} to replace inside words"
+            ),
+            None if !found.is_empty() => candidates::not_found("at least 1", old, &found),
+            None => "Expected at least 1 occurrence, found 0 and nothing similar; read the file again and copy `old` exactly from it".to_owned(),
+        };
+        let mut diagnostic = at(Some(&base.path), Some(change), "TARGET_NOT_FOUND", message);
+        diagnostic.actual = Some(0);
+        diagnostic.candidates = found;
+        diagnostics.push(diagnostic);
+        return Vec::new();
+    }
+    if !budget.reserve(whole.len(), text) {
+        diagnostics.push(resource_limit(base, change));
+        return Vec::new();
+    }
+    let stayed = actual.saturating_sub(whole.len());
+    if stayed > 0 {
+        let warning = stayed_inside_words(base, change, range.clone(), old, stayed);
+        context.whole_words.push(warning);
+    }
+    whole
+        .into_iter()
+        .map(|position| Replacement {
+            start: range.start + position,
+            end: range.start + position + old.len(),
+            text: text.to_owned(),
+            change_id: change.id.clone(),
+        })
+        .collect()
+}
+
+/// Where an `exact` `old` applies when its `in` lines hold no match, as lines
+/// from a stale read or a miscount may not, with the target naming the lines it
+/// applies to: the match an unscoped `old` would take, the only one in the file
+/// or the only whole-word one, cutting no word. Like a moved line target's guard,
+/// `old` needs `MIN_GUARD_CHARS` visible characters, so short text that occurs
+/// once by chance is not taken for the text the lines meant.
+fn moved_old(context: &FileContext, change: &Change, old: &str) -> Option<(usize, Target)> {
+    let text = &context.base.text;
+    if visible(old) < MIN_GUARD_CHARS {
+        return None;
+    }
+    let scan = scan_occurrences(text, old, 0, 1);
+    let position = match scan.overlapping {
+        0 => return None,
+        1 => scan.positions[0],
+        _ => match whole_words(text, 0..text.len(), old, false)?[..] {
+            [position] => position,
+            _ => return None,
+        },
+    };
+    if word_cut(text, position, old.len(), Edges::of(old)).is_some() {
+        return None;
+    }
+    let lines = context.lines();
+    let first = lines.line_of(position);
+    // A match that starts in a leading BOM is in no line's scope.
+    if position < lines.body(first).start {
+        return None;
+    }
+    let last = lines.line_of(position + old.len() - 1);
+    let mut target = change.target.clone();
+    if let Target::Exact { lines, .. } = &mut target {
+        *lines = Some([first, last]);
+    }
+    Some((position, target))
+}
+
+/// Whether an ASCII space in `old` may stand for one of `ADAPTED_SPACES`: it has
+/// one, and holds none of those, which text copied from the file would.
+fn adapts_spaces(old: &str) -> bool {
+    old.contains(' ') && !old.contains(ADAPTED_SPACES)
+}
+
+/// The one place in `range` where `old` matches with each ASCII space standing
+/// for one of `ADAPTED_SPACES`: its offset into the range, the text there, and
+/// `new` written as [`kept_spaces`] gives it. `None` when no place or several
+/// match, or a space to adapt lies in the text `new` changes.
+fn respaced<'t>(
+    text: &'t str,
+    range: Range<usize>,
+    old: &str,
+    new: &str,
+) -> Option<(usize, &'t str, String)> {
+    let scope = &text[range.clone()];
+    // One character for each of the scope's, so offsets map back by counting.
+    let read: String = scope
+        .chars()
+        .map(|ch| {
+            if ADAPTED_SPACES.contains(&ch) {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect();
+    let matches = scan_occurrences(&read, old, 0, 1);
+    if matches.overlapping != 1 {
+        return None;
+    }
+    let skipped = read[..matches.positions[0]].chars().count();
+    let position = scope
+        .char_indices()
+        .nth(skipped)
+        .map_or(scope.len(), |(at, _)| at);
+    let found = spaced_at(text, range.start + position, old)?;
+    Some((position, found, kept_spaces(old, found, new)?))
+}
+
+/// The text from `start` that `old` matches one character for one, each of its
+/// ASCII spaces standing for itself or one of `ADAPTED_SPACES`.
+fn spaced_at<'t>(text: &'t str, start: usize, old: &str) -> Option<&'t str> {
+    let rest = text.get(start..)?;
+    let mut end = 0;
+    for wanted in old.chars() {
+        let found = rest[end..].chars().next()?;
+        if found != wanted && !(wanted == ' ' && ADAPTED_SPACES.contains(&found)) {
+            return None;
+        }
+        end += found.len_utf8();
+    }
+    Some(&rest[..end])
+}
+
+/// `new` with the text it repeats from `old`, their common prefix and suffix,
+/// spelled as `found`, the file's text that `old` matched; `None` when `found`
+/// differs from `old` between them, where `new` changes the text and the
+/// spaces meant there are unknown. Text that an insertion or deletion could sit
+/// on either side of, as ` b` added to `a b` could follow either `a` or `b`,
+/// counts as changed.
+fn kept_spaces(old: &str, found: &str, new: &str) -> Option<String> {
+    /// `text` cut after its first `head` characters and before its last `tail`.
+    fn cut(text: &str, head: usize, tail: usize) -> [&str; 3] {
+        let offset = |chars: usize| {
+            text.char_indices()
+                .nth(chars)
+                .map_or(text.len(), |(at, _)| at)
+        };
+        let (start, end) = (offset(head), offset(text.chars().count() - tail));
+        [&text[..start], &text[start..end], &text[end..]]
+    }
+    let shorter = old.chars().count().min(new.chars().count());
+    let prefix = old
+        .chars()
+        .zip(new.chars())
+        .take_while(|(was, now)| was == now)
+        .count();
+    let suffix = old
+        .chars()
+        .rev()
+        .zip(new.chars().rev())
+        .take_while(|(was, now)| was == now)
+        .count();
+    // Where the prefix and suffix overlap, only text kept at every split is kept.
+    let (head, tail) = (prefix.min(shorter - suffix), suffix.min(shorter - prefix));
+    let [_, changed, _] = cut(old, head, tail);
+    let [before, matched, after] = cut(found, head, tail);
+    let [_, written, _] = cut(new, head, tail);
+    (matched == changed).then(|| [before, written, after].concat())
 }
 
 /// Whether `old` holds text on at most one line, so the end of its match is
@@ -1876,9 +2663,51 @@ fn one_line(old: &str) -> bool {
         .is_none()
 }
 
-/// Where a match of `old` at `start` cuts an ASCII word, such as `retries = 2`
-/// inside `max_retries = 20`: text written without reading the file can match
-/// a longer name or number by accident. Only the start of an `old` with text on
+/// How the ends of a match of `old` meet the words around it.
+#[derive(Clone, Copy)]
+struct Edges {
+    /// Whether the end is judged as well as the start, for an `old` with text
+    /// on one line ([`one_line`]).
+    end: bool,
+    /// Whether a hyphen continues the word at the start, and at the end, of a
+    /// match: where `old` begins or ends with a name that joins words with
+    /// one, as the CSS class `btn-primary` or the YAML key `max-retries` does.
+    /// That name is one word, so neither `btn-primary-outline` nor
+    /// `--btn-primary-bg` holds `btn-primary` as a whole word, while other
+    /// words `old` begins or ends with, given as context, keep hyphens as
+    /// separators.
+    hyphens: [bool; 2],
+}
+
+impl Edges {
+    fn of(old: &str) -> Self {
+        let named = |name: &[u8]| {
+            name.windows(3)
+                .any(|bytes| bytes[1] == b'-' && ascii_word(bytes[0]) && ascii_word(bytes[2]))
+        };
+        let bytes = old.as_bytes();
+        let name = |byte: &&u8| ascii_word(**byte) || **byte == b'-';
+        let first = bytes.iter().take_while(name).count();
+        let last = bytes.iter().rev().take_while(name).count();
+        Self {
+            end: one_line(old),
+            hyphens: [named(&bytes[..first]), named(&bytes[bytes.len() - last..])],
+        }
+    }
+
+    /// Whether `byte` is part of a word around the start or end of a match.
+    fn word(self, byte: u8, at_end: bool) -> bool {
+        ascii_word(byte) || (self.hyphens[usize::from(at_end)] && byte == b'-')
+    }
+}
+
+fn ascii_word(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// Where a match at `start` cuts an ASCII word, such as `retries = 2` inside
+/// `max_retries = 20`: text written without reading the file can match a
+/// longer name or number by accident. Only the start of an `old` with text on
 /// several lines counts, since its last line may end on part of a name as
 /// context; blank lines around one line of text do not make it span lines. A
 /// word holding
@@ -1886,17 +2715,16 @@ fn one_line(old: &str) -> bool {
 /// `Hauptstraße`, is prose that callers cut to avoid typing them, while uncased
 /// scripts such as Han separate words; a cut between two digits is a number
 /// cut whatever follows, as in `100µs`. A letter after a backslash, as in
-/// `\nRestart`, is an escape, but `\_` or `\1` is not.
-fn word_cut(text: &str, start: usize, len: usize, one_line: bool) -> Option<usize> {
+/// `\nRestart`, is an escape, but `\_` or `\1` is not. Returns the cut and
+/// whether a hyphen continues the word there.
+fn word_cut(text: &str, start: usize, len: usize, edges: Edges) -> Option<(usize, bool)> {
     let bytes = text.as_bytes();
-    let word = |at: usize| {
-        bytes
-            .get(at)
-            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-    };
     let escape =
         |at: usize| at >= 2 && bytes[at - 2] == b'\\' && bytes[at - 1].is_ascii_alphabetic();
-    let joined = |at: usize| at > 0 && word(at - 1) && word(at) && !escape(at);
+    let joined = |at: usize, at_end: bool| {
+        let word = |at: usize| bytes.get(at).is_some_and(|byte| edges.word(*byte, at_end));
+        at > 0 && word(at - 1) && word(at) && !escape(at)
+    };
     let letter = |ch: &char| {
         *ch == '_' || ch.is_ascii_alphanumeric() || ch.is_lowercase() || ch.is_uppercase()
     };
@@ -1910,18 +2738,20 @@ fn word_cut(text: &str, start: usize, len: usize, one_line: bool) -> Option<usiz
             .all(|ch| ch.is_ascii())
     };
     let digits = |at: usize| bytes[at - 1].is_ascii_digit() && bytes[at].is_ascii_digit();
-    let end = one_line.then_some(start + len);
-    std::iter::once(start)
+    let end = edges.end.then_some((start + len, true));
+    std::iter::once((start, false))
         .chain(end)
-        .find(|&at| joined(at) && (digits(at) || ascii(at)))
+        .find(|&(at, at_end)| joined(at, at_end) && (digits(at) || ascii(at)))
+        .map(|(at, at_end)| (at, edges.hyphens[usize::from(at_end)]))
 }
 
-/// Names the ASCII word that `boundary` cuts, clipped, and its line.
-fn inside_word(text: &str, boundary: usize) -> String {
+/// The ASCII word that `boundary` cuts, clipped, and its line; a hyphen
+/// continues it when `hyphens`.
+fn cut_word(text: &str, (boundary, hyphens): (usize, bool)) -> (&str, usize) {
     let word = |at: usize| {
         text.as_bytes()
             .get(at)
-            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .is_some_and(|byte| ascii_word(*byte) || (hyphens && *byte == b'-'))
     };
     let (mut low, mut high) = (boundary, boundary);
     while low > 0 && word(low - 1) && boundary - low < WORD_CHARS {
@@ -1930,10 +2760,76 @@ fn inside_word(text: &str, boundary: usize) -> String {
     while word(high) && high - boundary < WORD_CHARS {
         high += 1;
     }
-    let line = line_numbers(text, &[boundary])[0];
+    (&text[low..high], line_numbers(text, &[boundary])[0])
+}
+
+/// Names the ASCII word that a cut cuts and its line.
+fn inside_word(text: &str, cut: (usize, bool)) -> String {
+    let (word, line) = cut_word(text, cut);
     format!(
-        "`old` matches inside the word `{}` at line {line}; give whole words, or add \"count\":1 to replace part of a word",
-        &text[low..high]
+        "`old` matches inside the word `{word}` at line {line}; give whole words, or add \"count\":1 to replace part of a word"
+    )
+}
+
+/// The left-to-right matches of `old` in `range` that cut no word, as offsets into
+/// the range, skipping ones that overlap an earlier match when `separate`, as a
+/// count replaces them; `None` past `ADVISED_MATCHES` starts, which bounds the scan
+/// as it bounds ambiguity advice.
+fn whole_words(text: &str, range: Range<usize>, old: &str, separate: bool) -> Option<Vec<usize>> {
+    let edges = Edges::of(old);
+    let (mut whole, mut free) = (Vec::new(), 0);
+    for (examined, at) in overlapping_starts(&text[range.clone()], old).enumerate() {
+        if examined == ADVISED_MATCHES {
+            return None;
+        }
+        if (!separate || at >= free) && word_cut(text, range.start + at, old.len(), edges).is_none()
+        {
+            whole.push(at);
+            free = at + old.len();
+        }
+    }
+    Some(whole)
+}
+
+/// The word that the first match of `old` in `range` to cut one cuts, and its line.
+fn first_cut<'t>(text: &'t str, range: Range<usize>, old: &str) -> Option<(&'t str, usize)> {
+    let edges = Edges::of(old);
+    text[range.clone()]
+        .match_indices(old)
+        .find_map(|(at, _)| word_cut(text, range.start + at, old.len(), edges))
+        .map(|cut| cut_word(text, cut))
+}
+
+/// `WHOLE_WORDS_ONLY`: a target took only the whole-word matches of `old` in
+/// `range`, so `stayed` matches inside longer words are left; names the first.
+fn stayed_inside_words(
+    base: &Snapshot,
+    change: &Change,
+    range: Range<usize>,
+    old: &str,
+    stayed: usize,
+) -> Diagnostic {
+    let first = first_cut(&base.text, range, old);
+    let left = match first {
+        Some((word, line)) if stayed == 1 => {
+            format!("the one inside `{word}` at line {line} stayed")
+        }
+        Some((word, line)) => {
+            format!("{stayed} inside longer words stayed, the first in `{word}` at line {line}")
+        }
+        None => format!("{stayed} others stayed"),
+    };
+    let taken = match change.target {
+        Target::Exact { .. } => "`old` took its one whole-word match",
+        Target::Every { .. } => "`all` took only the whole-word matches",
+        _ => "count took only the whole-word matches",
+    };
+    let id: String = change.id.chars().take(QUOTED_ID_CHARS).collect();
+    at(
+        Some(&base.path),
+        Some(change),
+        "WHOLE_WORDS_ONLY",
+        format!("Change {id}: {taken}, so {left}"),
     )
 }
 
@@ -1956,12 +2852,12 @@ fn advice(lines: &LineIndex, text: &str, range: Range<usize>, old: &str) -> Ambi
     // A final line feed ends the match's last line, which `in` already includes.
     let spanned = old.strip_suffix('\n').unwrap_or(old).matches('\n').count();
     let (mut previous, mut whole, mut examined) = (None, false, 0);
-    let one_line = one_line(old);
+    let edges = Edges::of(old);
     while examined < ADVISED_MATCHES
         && let Some(at) = starts.next()
     {
         examined += 1;
-        if word_cut(text, at, old.len(), one_line).is_none() {
+        if word_cut(text, at, old.len(), edges).is_none() {
             whole = true;
             let first = lines.line_of(at);
             let last = first + spanned;
@@ -2051,13 +2947,27 @@ struct Expect<'a> {
     tail: Option<&'a str>,
 }
 
+/// Where a line target's guard lets it apply.
+enum Placed {
+    /// At the stated lines.
+    Stated,
+    /// Nowhere; diagnostics say why.
+    Refused,
+    /// At the one other place where the guard holds; `refusal` is what the
+    /// stated lines get.
+    Moved { guard: Guard, refusal: Diagnostic },
+}
+
 /// Checks a line target's `expect`. Unless the base disclosed every addressed line,
 /// line numbers from elsewhere may be stale, so one is required: for `lines`, it
 /// must reach the range's last line, either by giving every line or by giving the
 /// last lines too, and it must have `MIN_GUARD_CHARS` visible characters or match
 /// this place alone, so a shifted number cannot find the same short text elsewhere.
-/// Comparing line by line, ignoring line endings, lets text copied from a view
-/// that hides `\r` guard CRLF lines.
+/// When the stated lines do not hold it, a guard that reaches the target's end
+/// with `MIN_GUARD_CHARS` visible characters places the target where it holds,
+/// if that is exactly one place: a stale or miscounted number then applies only
+/// to text the guard matches. Comparing line by line, ignoring line endings, lets
+/// text copied from a view that hides `\r` guard CRLF lines.
 fn line_guard(
     context: &FileContext,
     change: &Change,
@@ -2065,19 +2975,19 @@ fn line_guard(
     expect: Expect,
     diagnostics: &mut Vec<Diagnostic>,
     budget: &mut Budget,
-) -> bool {
+) -> Placed {
     let base = context.base;
     let lines = context.lines();
     let reject = |diagnostics: &mut Vec<Diagnostic>, code: &str, message: String| {
         diagnostics.push(at(Some(&base.path), Some(change), code, message));
-        false
+        Placed::Refused
     };
     let head = expect.head.map(expected_lines).unwrap_or_default();
     let tail = expect.tail.map(expected_lines).unwrap_or_default();
     let (addressed, extent) = match guard {
         Guard::Above { line: 0 } => {
             if head.iter().all(|piece| piece.is_empty()) {
-                return true;
+                return Placed::Stated;
             }
             return reject(
                 diagnostics,
@@ -2188,15 +3098,12 @@ fn line_guard(
                 Guard::Above { .. } => format!("use after:{}", start + head.len() - 1),
             },
         );
-        return mismatch_at(
-            context,
-            change,
-            head_start,
-            head.len(),
-            "expect",
-            rest,
-            diagnostics,
-        );
+        let refusal = mismatch_at(context, change, head_start, head.len(), "expect", rest);
+        if reaches_end && let Some(guard) = moved(context, guard, &head, &tail) {
+            return Placed::Moved { guard, refusal };
+        }
+        diagnostics.push(refusal);
+        return Placed::Refused;
     }
     // Where the tail guard ends: the range's last line or, when the range ends in
     // blank lines and the tail names the text before them, that text's line.
@@ -2239,15 +3146,15 @@ fn line_guard(
             |start| format!("the range is [{first},{}]", start + tail.len() - 1),
         );
         let tail_start = last + 1 - tail.len();
-        return mismatch_at(
+        diagnostics.push(mismatch_at(
             context,
             change,
             tail_start,
             tail.len(),
             "the expected last lines",
             rest,
-            diagnostics,
-        );
+        ));
+        return Placed::Refused;
     }
     // A line that both the head and the tail check is evidence once.
     let overlap = match guard {
@@ -2262,7 +3169,7 @@ fn line_guard(
         .map(|piece| piece.chars().filter(|ch| !ch.is_whitespace()).count())
         .sum();
     if !required || visible >= MIN_GUARD_CHARS {
-        return true;
+        return Placed::Stated;
     }
     // A short guard, such as a blank line or `}`, must match this place alone: one
     // that matches elsewhere too could still match after the file shifted.
@@ -2342,7 +3249,64 @@ fn line_guard(
             ),
         );
     }
-    true
+    Placed::Stated
+}
+
+/// The one place other than the stated lines where a guard that reaches the
+/// target's end, with `MIN_GUARD_CHARS` visible characters, holds as it would at
+/// the stated lines, and the whole target fits: for `lines`, its first and last
+/// lines there together, shifted alike.
+fn moved(context: &FileContext, guard: Guard, head: &[&str], tail: &[&str]) -> Option<Guard> {
+    let (base, lines) = (context.base, context.lines());
+    let count = lines.count();
+    let matches_at = |start: usize, pieces: &[&str]| {
+        pieces
+            .iter()
+            .enumerate()
+            .all(|(offset, piece)| base.text[lines.body(start + offset)] == **piece)
+    };
+    let shown = |pieces: &[&str]| pieces.iter().map(|piece| visible(piece)).sum::<usize>();
+    let places: Vec<Guard> = match guard {
+        Guard::Prefix { first, last } => {
+            let extent = last - first + 1;
+            // A line that both the head and the tail check is evidence once.
+            let overlap = (head.len() + tail.len()).saturating_sub(extent);
+            if shown(head) + shown(&tail[overlap.min(tail.len())..]) < MIN_GUARD_CHARS {
+                return None;
+            }
+            (1..=(count + 1).saturating_sub(extent))
+                .filter(|&start| {
+                    let end = start + extent - 1;
+                    matches_at(start, head)
+                        && (tail.is_empty()
+                            || matches_at(end + 1 - tail.len(), tail)
+                            || before_blank_end(context, start, end, head, tail)
+                                .is_some_and(|line| matches_at(line + 1 - tail.len(), tail)))
+                })
+                .take(2)
+                .map(|start| Guard::Prefix {
+                    first: start,
+                    last: start + extent - 1,
+                })
+                .collect()
+        }
+        Guard::Above { .. } => {
+            if shown(head) < MIN_GUARD_CHARS {
+                return None;
+            }
+            (1..=(count + 1).saturating_sub(head.len()))
+                .filter(|&start| matches_at(start, head))
+                .take(2)
+                .map(|start| Guard::Above {
+                    line: start + head.len() - 1,
+                })
+                .collect()
+        }
+    };
+    match places[..] {
+        [place] => Some(place),
+        _ => None,
+    }
 }
 
 /// Advice and candidates for guarded lines that are not where the target says:
@@ -2405,7 +3369,7 @@ fn before_blank_end(
     (visible >= MIN_GUARD_CHARS).then_some(end)
 }
 
-/// Pushes `EXPECTED_TEXT_MISMATCH` quoting the `count` lines from `start`.
+/// `EXPECTED_TEXT_MISMATCH` quoting the `count` lines from `start`.
 fn mismatch_at(
     context: &FileContext,
     change: &Change,
@@ -2413,8 +3377,7 @@ fn mismatch_at(
     count: usize,
     wanted: &str,
     (rest, found): (String, Vec<Candidate>),
-    diagnostics: &mut Vec<Diagnostic>,
-) -> bool {
+) -> Diagnostic {
     let (base, lines) = (context.base, context.lines());
     let end = start + count - 1;
     let actual = &base.text[lines.body(start).start..lines.body(end).end];
@@ -2430,8 +3393,7 @@ fn mismatch_at(
         candidates::line_mismatch(&subject, actual, wanted, &rest),
     );
     diagnostic.candidates = found;
-    diagnostics.push(diagnostic);
-    false
+    diagnostic
 }
 
 /// Advice and candidates for line-wise text found nowhere as whole lines.

@@ -5,6 +5,145 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ## [Unreleased]
 
+### Added
+
+- `"all": true` on an `old` change replaces every non-overlapping occurrence
+  of `old` that cuts no word, at least one, in the file or within `in`, as a
+  rename needs, without counting them first. Occurrences inside longer names
+  stay, and a nonblocking `WHOLE_WORDS_ONLY` warning names the first; with no
+  whole-word occurrence the change is `TARGET_NOT_FOUND`. `count` and `all`
+  exclude each other, and `all: false` is accepted and not stored. Plans store
+  the target as `{"kind":"every",...}`, which earlier releases report as
+  `STORE_CORRUPT`. In round 8 of the Windows eval, Ultra Edit cost 95% more than
+  native edits on `rename-css-class` and 53% more on `rename-constant`: native
+  runs rewrote the files with `sed -i`, an inline script, or a PowerShell
+  rewrite, while Ultra Edit runs wrote one change per line, up to 6,514 output
+  tokens. One call with an `"all": true` change per file now commits each
+  task's expected output.
+- On Windows, a path that names no file as given but is spelled as Git Bash
+  prints it names the file it stands for: `/c/x` is `C:\x`, and `/tmp/x` is in
+  the user's temporary directory. A path copied from `pwd` in Claude Code's
+  Bash tool no longer fails with `TARGET_MISSING`.
+- An `old` without `count` that occurs nowhere as written takes its one match
+  where the file holds a no-break or thin space (U+00A0, U+2007, U+2009, or
+  U+202F) for one of its ASCII spaces, since rendered text such as a task's
+  prompt shows those as ordinary spaces. `new` is written with the file's
+  spaces in the text it repeats from `old`, their common prefix and suffix, and
+  a nonblocking `SPACES_ADAPTED` warning names the changes and spaces. A second
+  such match, an adapted space in text `new` changes or that an inserted or
+  deleted part could sit on either side of, an `old` that holds one of these
+  spaces, `count`, and undo keep the previous behaviour. In the round-three
+  Windows eval, one `unicode-quotes` run typed an ordinary space in
+  `limit is 10 km` where the file holds U+00A0 and was rejected; replayed
+  against the task's files, that first call now commits the expected output.
+- A nonblocking `BLANK_LINES_JOINED` warning names the output lines where a
+  change's edge has whitespace on both sides that now holds more blank lines in
+  a row than the file had anywhere, as when an `old` takes the blank lines above
+  a function but stops before its last line ending. Beside a deletion, the start
+  or end of the file counts as whitespace. Bytes are still written as given, and
+  the warnings follow each file's `WHITESPACE_EDGE` warnings, at most eight per
+  file. One Windows eval run committed three blank lines where its file never
+  had more than two, with no warning; replayed, that call now carries this one.
+  No eval task's expected files hold a longer run of blank lines than its
+  fixture files, so no single correct edit of one triggers it.
+- A nonblocking `BLANK_LINES_DROPPED` warning names the output lines where a
+  change that removes text leaves fewer blank lines in a row around an edge
+  than the file had around both of its ends, as when an `old` takes the blank
+  lines above a function and one of those below it. Blank lines at the start
+  or end of the file separate nothing, so whitespace reaching either counts
+  none, and a change that removes only whitespace, such as an insertion, is not
+  judged. Bytes are still written as given, and the warnings follow each file's
+  `BLANK_LINES_JOINED` warnings, at most eight per file. The Windows eval's
+  ninth round had one wrong Ultra Edit result: a deletion in `decode.py` left
+  one blank line where both sides had two, with no warning; replayed, that call
+  now carries this one. Replaying the first nine rounds' 361 `ultra_edit` calls
+  changes three other outcomes, each only by this warning on a call that left
+  a blank line out, which its run then found and restored, once over three
+  more calls. No eval task's correct edit, planned from its fixture, triggers
+  it.
+- A nonblocking `FINAL_LINE_BREAK_KEPT` warning flags a `lines` or `after`
+  change whose `new` ends in a line feed, which is written as given, and names
+  the text's last line, the blank lines after it, and the next line. Text that
+  lists its lines joined by line feeds, as the session card's examples do, comes
+  out one blank line short: `"x\n\n"` writes `x` and one blank line, not two.
+  Text of blank lines alone is not flagged. Bytes are still written as given,
+  and the warnings follow each file's `BLANK_LINES_JOINED` warnings, at most
+  eight per file. Of the eight line targets in the Windows eval whose `new`
+  ended in a line feed, seven were a blank line short of the task's layout and
+  the eighth was a model's correction of one; one of the seven made the fifth
+  round's only wrong result.
+
+### Changed
+
+- Where `old` begins or ends with a name that joins words with a hyphen, as
+  the CSS class `btn-primary` does, a hyphen continues the word at that end of
+  a match, for the exact-once rule, `count`'s whole-word matches, and `all`
+  alike: `btn-primary` is no longer whole inside `btn-primary-outline`,
+  `--btn-primary-bg`, or `data-btn-primary-label`. A word `old` begins or ends
+  with as context keeps hyphens as separators. Replayed with this rule, the 278
+  recorded `ultra_edit` calls of the Windows eval's first eight rounds keep
+  their outcomes, apart from parse errors that now list `all` among the
+  accepted fields, but one: a `rename-css-class` call refused for three
+  ambiguous `old`s now commits the bytes its run's corrected second call wrote.
+- The Claude Code plugin starts the server with the new `--plugin-card` flag,
+  which sends no server instructions, as `--no-instructions` does, and gives
+  the plugin's routing card as the `ultra_edit` description. The session and
+  subagent hooks now add only a short context that routes edits to
+  `ultra_edit` and its description. Claude Code caches tool definitions across
+  sessions but writes hook context anew in each: measured in the first API call
+  of a Windows eval session with Claude Code 2.1.303, the plugin's uncached
+  tokens fell from 1,184 to 489, and its cached ones rose from 919 to 1,554.
+  `--no-instructions` alone keeps the generic description.
+- A `lines` or `after` change whose lines no longer hold its `expect`, because
+  the file changed since it was read or the lines were miscounted, now applies
+  where `expect` holds instead of being refused: when `expect` has 8 or more
+  visible characters, reaches the change's end as a required one must, and
+  holds at exactly one place where the whole change fits, both parts of a
+  `[first, last]` pair shifted together. A nonblocking `LINES_MOVED` warning
+  names the lines given and the lines used, and the stored plan records the
+  lines used. A shorter `expect`, one that holds at several places, parts that
+  moved apart, and a moved change that would overlap another change in the
+  request are still refused with `EXPECTED_TEXT_MISMATCH`. Six first-try
+  rejections in the Windows eval were of this kind.
+- An `old` without `count` whose `in` lines hold no occurrence, for the same
+  reasons, now applies at the one occurrence an unrestricted `old` would take,
+  its only one in the file or its only one that cuts no word, when `old` has 8
+  or more visible characters. The same `LINES_MOVED` warning names the `in`
+  lines given and the lines used, and the stored plan records the lines used.
+  Shorter text, several such occurrences, a span `in`, and a moved change that
+  would overlap another change in the request are still refused with
+  `TARGET_NOT_FOUND`. In the sixth round of the Windows eval, one
+  `edit-while-file-changes` run gave each `old` an `in` from its first Read, and
+  the other writer then added four lines above them; replayed against the
+  changed file, that rejected first call now commits the expected output.
+- Matches inside longer names no longer get in the way of a rename: an `old`
+  that occurs several times but exactly once as whole words takes that match,
+  and a `count` that numbers only the whole-word matches replaces just those, so
+  `MAX_RETRIES` is no longer refused because `MAX_RETRIES_PER_HOST` holds it
+  too. A nonblocking `WHOLE_WORDS_ONLY` warning names the first match left
+  inside a longer word. A count of every match still replaces them all, and a
+  count that is neither now gives the whole-word number in its
+  `EXPECTED_COUNT_MISMATCH` advice as well.
+- `in` beside `lines` or `after` is accepted when it holds the lines the target
+  names, as `count: 1` is accepted anywhere; it is not stored. Any other `in`
+  there, and any `in` on a `span`, is still refused while parsing.
+- The Claude Code session card adds the fixes for the first-try rejections seen
+  in the Windows eval: prefer a short `old` to line numbers, take `count` from
+  Grep, give `expect` whole lines with their indentation, and join a
+  neighbouring line into a blank or short `expect` part.
+
+### Fixed
+
+- Eval: every run disables the built-in `plugin-authoring@builtin` plugin,
+  which loaded in some runs depending on a GrowthBook flag.
+- Eval: every prompt starts with `<!-- MARKER -->`, 8 hex digits that each
+  invocation draws afresh, so no run reads a task prompt another invocation
+  cached. The tenth Windows round started 24 minutes after the ninth: the
+  native arm's first repetitions read the ninth round's cached task prompts,
+  while Ultra Edit's, whose tool description had changed, paid to write theirs,
+  near 4% of Ultra Edit's cost over the round (1.01× native over all runs,
+  0.99× over the other two repetitions).
+
 ## [0.4.0] - 2026-10-08
 
 ### Added

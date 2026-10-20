@@ -115,10 +115,11 @@ claude --plugin-dir "$(Resolve-Path -LiteralPath './plugin/claude-code')"
 
 `--plugin-dir` loads this local plugin for the session. Its `.mcp.json` points to
 `${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp` and supplies
-`["--root", "${CLAUDE_PROJECT_DIR}", "--no-instructions"]` as separate
-arguments; the session card carries the routing that server instructions would
-repeat. Claude Code substitutes
-the plugin and project roots; Windows native launch resolves the `.exe` suffix.
+`["--root", "${CLAUDE_PROJECT_DIR}", "--plugin-card"]` as separate
+arguments: the server sends no instructions and gives the routing card as the
+`ultra_edit` description, which Claude Code caches with the tool list. Claude
+Code substitutes the plugin and project roots; Windows native launch resolves
+the `.exe` suffix.
 The hooks use the same private executable with explicit argument arrays, so hook
 launches do not pass through a shell. The server canonicalizes its root
 once. The plugin directory and later shell working directories do not select
@@ -144,8 +145,10 @@ source-copy procedure is separate from the versioned marketplace cache.
 
 ## Automatic routing context
 
-The [canonical instructions](../../../instructions.md) require direct Ultra Edit
-MCP calls for coordinated edits to two or more existing UTF-8 files. They forbid
+The [canonical instructions](../../../instructions.md), given as the
+`ultra_edit` description, and the short context the session and subagent hooks
+add require direct Ultra Edit MCP calls for coordinated edits to two or more
+existing UTF-8 files. They forbid
 writing file contents through Bash heredocs, generated-content redirection,
 inline editing scripts, and shell-piped edit JSON. Existing files are edited
 with Ultra Edit, without a prior Read when the exact text is known; native Write

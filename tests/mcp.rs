@@ -33,8 +33,10 @@ impl Client {
     }
 
     fn connect_after_prefix(command: &mut Command, malformed_prefix: bool) -> Self {
-        // The plugin's server leaves routing to its session card.
-        let instructed = !command.get_args().any(|arg| arg == "--no-instructions");
+        // The plugin's server leaves routing to its card.
+        let instructed = !command
+            .get_args()
+            .any(|arg| arg == "--no-instructions" || arg == "--plugin-card");
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -202,6 +204,7 @@ fn startup_requires_explicit_root_and_keeps_protocol_stdout_clean() {
         vec!["--root", "missing-workspace"],
         vec!["--root", ".", "--no-instruction"],
         vec!["--root", ".", "--no-instructions", "extra"],
+        vec!["--root", ".", "--plugin-card", "--no-instructions"],
         vec!["--help", "extra"],
         vec!["--claude-context"],
         vec!["--claude-context", "Bash"],
@@ -1091,14 +1094,11 @@ fn bundled_plugin_launches_hooks_and_mcp_without_path_lookup() {
         let context = value["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap();
-        assert_eq!(
-            context,
-            include_str!("../plugin/claude-code/instructions.md")
-        );
-        assert!(
-            context.len() < 10_000,
-            "Claude clips oversized hook context"
-        );
+        // Hook context is written anew in every session, so it only routes edits;
+        // the card itself is the cached ultra_edit description, checked below.
+        assert!(context.contains("`ultra_edit` MCP tool"), "{context}");
+        assert!(context.contains("through the shell"), "{context}");
+        assert!(context.len() <= 400, "{} bytes: {context}", context.len());
         assert!(fs::read_dir(root.path()).unwrap().next().is_none());
     }
     let guards = configuration["hooks"]["PreToolUse"].as_array().unwrap();
@@ -1152,12 +1152,28 @@ fn bundled_plugin_launches_hooks_and_mcp_without_path_lookup() {
     let mut client = Client::connect(executable(&configuration["mcpServers"]["ultra-edit"]));
     assert_eq!(client.rpc("ping", json!({}))["result"], json!({}));
     let listed = client.rpc("tools/list", json!({}));
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    let edit = tools
+        .iter()
+        .find(|tool| tool["name"] == "ultra_edit")
+        .unwrap();
+    assert_eq!(
+        edit["description"],
+        include_str!("../plugin/claude-code/instructions.md")
+    );
+    assert_eq!(edit["_meta"]["anthropic/alwaysLoad"], true);
+    // Claude Code clips an always-loaded tool's description at 16,384 characters.
+    assert!(edit["description"].as_str().unwrap().chars().count() <= 16_384);
+    // The other tools keep their generic descriptions.
+    let repair = tools
+        .iter()
+        .find(|tool| tool["name"] == "ultra_edit_repair")
+        .unwrap();
     assert!(
-        listed["result"]["tools"]
-            .as_array()
+        repair["description"]
+            .as_str()
             .unwrap()
-            .iter()
-            .any(|tool| tool["name"] == "ultra_edit")
+            .starts_with("Advanced: replace existing change IDs")
     );
     client.close();
 }

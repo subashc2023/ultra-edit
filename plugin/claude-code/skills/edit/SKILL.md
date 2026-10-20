@@ -5,8 +5,9 @@ description: Ultra Edit recovery and advanced use; ordinary edits need only the 
 
 # Ultra Edit
 
-The plugin loads its [routing card](../../instructions.md) automatically in main
-sessions and subagents; invoking this skill is not a prerequisite for an edit.
+The plugin gives its [routing card](../../instructions.md) as the `ultra_edit`
+description, in main sessions and subagents alike; invoking this skill is not a
+prerequisite for an edit.
 Explicit user instructions and host permissions take precedence; report
 conflicting editing guidance or unavailable tools rather than silently switching
 routes. Never carry file contents or edit JSON through Bash heredocs,
@@ -22,10 +23,13 @@ exposed by this host.
   a relative path that would redirect a worktree edit to the parent checkout,
   and report files outside the root.
 - Replacement text is literal. Preserve intended Unicode, whitespace, and
-  newline bytes; no regex or formatting runs. One exception: in a file whose
+  newline bytes; no regex or formatting runs. Two exceptions: in a file whose
   lines all end in CRLF, which Read shows without `\r`, text holding LF but no
   CR is matched and written as CRLF, with an `EOL_ADAPTED` warning, unless the
-  change's `old` holds a `\r`.
+  change's `old` holds a `\r`; and an `old` without `count` found nowhere as
+  written takes its one match where the file holds a no-break or thin space
+  for its ASCII space, keeping the file's space where `new` repeats `old`, with
+  a `SPACES_ADAPTED` warning.
 - Omit `request_id` and change `id`. Identical arguments derive the same IDs, so
   after lost output, repeat the identical call: it returns the recorded result,
   marked `replayed: true`, without writing again. A `REPLAYED_FILE_CHANGED`
@@ -55,17 +59,25 @@ exposed by this host.
    ```
 
    `old` must occur exactly once in the file, starting and ending on word
-   boundaries (`OLD_INSIDE_WORD` otherwise); add neighbouring text until it
-   does, or restrict it to whole lines with `"in": [first, last]`. With
-   `"count": N` it replaces exactly N non-overlapping occurrences, inside words
-   too. `lines`
+   boundaries (`OLD_INSIDE_WORD` otherwise), not counting matches inside longer
+   names when exactly one is whole; add neighbouring text until it does, or
+   restrict it to whole lines with `"in": [first, last]`. For a rename,
+   `"all": true` replaces every whole-word occurrence, at least one, and leaves
+   those inside longer names, hyphenated ones such as `btn-primary-outline`
+   included. With `"count": N` it replaces exactly N non-overlapping
+   occurrences, inside words too; when N counts only the whole-word ones,
+   matches inside longer names stay (`WHOLE_WORDS_ONLY` names them). `lines`
    replaces whole lines by Read's numbers (`""` deletes them; text without a
    final newline keeps the last line's ending) and `after: n` inserts whole lines
    after line n (0 is the top). Both need `expect`, compared without line
    endings: line n's current text, line a's for a one-line range, or
    `[line a, line b]` (or every line) for a longer one, with 8 or more visible
-   characters or text found nowhere else in the file, so a stale line number is
-   rejected, not applied.
+   characters or text found nowhere else in the file. A stale line number never
+   edits other text: when the lines given do not hold `expect`, an `expect` with
+   8 or more visible characters that holds at exactly one other place moves the
+   change there, as does an `old` that long that its `in` lines miss but that
+   occurs once in the file, with a `LINES_MOVED` warning; anything else is
+   rejected.
 3. Inspect the outcome. A rejection wrote nothing; its diagnostics can list
    `candidates` with the current text and lines. Copy an `exact` or `whitespace`
    candidate's `text` verbatim into `old`, confirm a `similar` one is the

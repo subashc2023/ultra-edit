@@ -137,9 +137,13 @@ writing twice.
 }
 ```
 
-`old` must occur exactly once, as whole words (or `count` times, which may
-match inside words), and `lines`/`after` address whole lines by Read's numbers,
-guarded by `expect`, so a stale line number is rejected instead of applied. Span targets on an immutable snapshot from
+`old` must occur exactly once, as whole words (with `"all": true`, every
+whole-word occurrence, as a rename needs; or `count` times, which may match
+inside words), and `lines`/`after` address whole lines by Read's numbers,
+guarded by `expect`, so a stale line number never edits other text: a long
+`expect` that holds at exactly one other place moves the change there, as does a
+long `old` found once outside its `in` lines, with a `LINES_MOVED` warning, and
+anything else is rejected. Span targets on an immutable snapshot from
 `ultra_edit_snapshot` (`r12` for line 12, `m1` for a search match) remain for
 files too large to Read.
 
@@ -156,7 +160,9 @@ snapshot, keeping its spans. Receipts report `committed`, `partial`,
 `not_committed`, or `outcome_unknown` per file; nothing outside the declared
 targets changes, including line endings, BOMs, and trailing whitespace. Text is
 literal, except that a file whose lines all end in CRLF gets CRLF for the LF in
-text copied from a view that hides `\r`.
+text copied from a view that hides `\r`, and an `old` typed with an ordinary
+space where the file holds a no-break or thin one takes its one such match,
+keeping the file's space where `new` repeats `old`.
 
 The [skill](plugin/claude-code/skills/edit/SKILL.md) and its references describe
 the MCP tools; the [reference](docs/reference.md) covers the full CLI and engine
@@ -266,19 +272,21 @@ claude --plugin-dir /absolute/path/to/ultra-edit/plugin/claude-code
 ```
 
 The plugin starts `${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp` with the
-arguments `["--root", "${CLAUDE_PROJECT_DIR}", "--no-instructions"]`, since its
-session card carries the routing the server instructions would repeat; hook commands run the same
+arguments `["--root", "${CLAUDE_PROJECT_DIR}", "--plugin-card"]`: the server then
+sends no instructions and gives its routing card as the `ultra_edit` description,
+which Claude Code caches with the tool list; hook commands run the same
 executable with their own argument arrays, without a shell. The root is fixed for
 that server and is not a tool argument.
 
-The [canonical instructions](plugin/claude-code/instructions.md) load through
+The [canonical instructions](plugin/claude-code/instructions.md) are that card.
 `SessionStart` hooks on startup, resume, clear, compaction, and fork, plus
-`SubagentStart` for delegated work. They tell Claude to **always use Ultra Edit
+`SubagentStart` for delegated work, add a short context that routes edits to
+`ultra_edit` and its description. Together they tell Claude to **always use Ultra Edit
 for coordinated edits to two or more existing UTF-8 files**, to edit existing
 files with Ultra Edit, even without reading them first when the exact text is
 known, to use Write for new files, and to report unavailable tools instead of
 falling back to shell writes. No slash command is required;
-`/ultra-edit:edit` loads optional workflow detail. Inspect the exact context
+`/ultra-edit:edit` loads optional workflow detail. Inspect the exact hook context
 without starting a server:
 
 ```text

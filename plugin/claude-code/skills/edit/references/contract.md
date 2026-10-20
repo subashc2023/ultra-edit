@@ -29,13 +29,18 @@ normally.
 Every change is resolved against its original base. Planning errors reject the
 entire batch. Undeclared bytes remain identical. Replacement strings are literal
 UTF-8, with no regex expansion, Unicode normalization, shell, formatter, or model
-execution. Three deterministic exceptions derive bytes from the base alone:
+execution. Four deterministic exceptions derive bytes from the base alone:
 `lines` and `after` text without a final line feed takes the replaced line's
-ending; line-target `expect` ignores line endings; and in a base whose every
+ending; line-target `expect` ignores line endings; in a base whose every
 line ends in CRLF, `old`, `new`, and `expect` text holding LF but no CR is
 matched and written as CRLF, with an `EOL_ADAPTED` warning, because views such
 as native Read hide the CR. Text holding a CR, every text of a change whose
-`old` or span `expect` holds one, and every other base stay literal.
+`old` or span `expect` holds one, and every other base stay literal. And an
+`old` without `count` found nowhere as written takes its one match where the
+file holds a no-break or thin space (U+00A0, U+2007, U+2009, U+202F) for an
+ASCII space of `old`, if `new` repeats the text around each such space; `new`
+is written with the file's spaces there, with a `SPACES_ADAPTED` warning,
+because rendered text shows those spaces as ordinary ones.
 Candidate outputs containing NUL or both CRLF and bare LF receive nonblocking
 `NUL_BYTE` or `MIXED_LINE_ENDINGS` warnings. This includes existing conditions
 retained in the candidate; warnings do not change bytes or reject the request.
