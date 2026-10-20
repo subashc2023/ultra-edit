@@ -5,6 +5,8 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-20
+
 ### Added
 
 - `"all": true` on an `old` change replaces every non-overlapping occurrence
@@ -464,6 +466,7 @@ All notable changes to Ultra Edit are documented here. Releases follow
 - A self-hosted Claude Code marketplace package with SHA-256 verification and
   GitHub build-provenance attestations.
 
+[0.5.0]: https://github.com/subashc2023/ultra-edit/releases/tag/v0.5.0
 [0.4.0]: https://github.com/subashc2023/ultra-edit/releases/tag/v0.4.0
 [0.3.0]: https://github.com/subashc2023/ultra-edit/releases/tag/v0.3.0
 [0.2.0]: https://github.com/subashc2023/ultra-edit/releases/tag/v0.2.0
