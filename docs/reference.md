@@ -290,7 +290,9 @@ since its line numbers come from another view and may be stale. A required
 `expect` must reach the range's last line, by giving every line or the pair, so
 a line added or removed inside the range is caught. It needs at least 8
 non-whitespace characters in all, or must match this place alone
-(`LINE_GUARD_WEAK` names the others): a short guard such as a `}` or blank line
+(`LINE_GUARD_WEAK` names the others, and the fewest lines by number that would
+make the guard strong, never their text, since the number may be the stale
+part): a short guard such as a `}` or blank line
 that also matches elsewhere could still match after the file shifts, while a
 short one that matches once cannot without also matching the moved lines.
 Repeated long lines, such as `port = 8080` in many service blocks, are what line

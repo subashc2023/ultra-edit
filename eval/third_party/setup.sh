@@ -3,8 +3,15 @@
 # arms.json. Usage: eval/third_party/setup.sh [INSTALL_DIR]
 # The default INSTALL_DIR is eval/third_party/install, which run_eval.py uses
 # unless --third-party-dir says otherwise. Needs Node.js 18+, npm, and Python 3.10+
-# (uv is used when present).
+# (uv is used when present). On Windows, run it with Git Bash.
 set -euo pipefail
+
+# python3 where it runs; a Windows install often has only python, and python3 may be
+# the Microsoft Store's placeholder, which exists but fails.
+python=python3
+if ! python3 -c "" >/dev/null 2>&1; then
+  python=python
+fi
 
 here="$(cd "$(dirname "$0")" && pwd)"
 dest="${1:-$here/install}"
@@ -20,10 +27,19 @@ cp "$here/package.json" "$here/package-lock.json" "$dest/"
 echo "installing Python servers into $dest/venv"
 if command -v uv >/dev/null 2>&1; then
   uv venv --quiet --allow-existing "$dest/venv"
-  uv pip install --quiet --python "$dest/venv/bin/python" -r "$here/requirements.txt"
 else
-  python3 -m venv "$dest/venv"
-  "$dest/venv/bin/python" -m pip install --quiet -r "$here/requirements.txt"
+  "$python" -m venv "$dest/venv"
+fi
+# A virtual environment keeps its programs in bin/, or Scripts/ with .exe names on
+# Windows; arms.json names them with {venv_bin} and {exe}.
+venv_python="$dest/venv/bin/python"
+if [[ ! -d "$dest/venv/bin" ]]; then
+  venv_python="$dest/venv/Scripts/python.exe"
+fi
+if command -v uv >/dev/null 2>&1; then
+  uv pip install --quiet --python "$venv_python" -r "$here/requirements.txt"
+else
+  "$venv_python" -m pip install --quiet -r "$here/requirements.txt"
 fi
 
 # Desktop Commander keeps its state under $HOME/.claude-server-commander. The
@@ -32,7 +48,7 @@ fi
 # and the arm passes --no-onboarding.
 dc_config="$dest/dc-home/.claude-server-commander"
 mkdir -p "$dc_config"
-python3 - "$dc_config/config.json" <<'PY'
+"$python" - "$dc_config/config.json" <<'PY'
 import json, sys
 path = sys.argv[1]
 try:
@@ -61,7 +77,7 @@ PY
 # each start the same download into the shared cache.
 if [[ "${ULTRA_EDIT_EVAL_SKIP_CHROME:-0}" != "1" ]]; then
   echo "warming Desktop Commander's Chrome cache (set ULTRA_EDIT_EVAL_SKIP_CHROME=1 to skip)"
-  python3 "$here/warm_desktop_commander.py" "$dest"
+  "$python" "$here/warm_desktop_commander.py" "$dest"
 fi
 
 echo "third-party servers installed in $dest"
