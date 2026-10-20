@@ -25,18 +25,27 @@ use ultra_edit::{Workspace, mcp::McpServer, shell_guard};
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 const INVALID_TOOL_CALL: &str =
     "Invalid params: tools/call requires {name, arguments?} with object arguments";
-const CLAUDE_CONTEXT: &str = include_str!("../../plugin/claude-code/instructions.md");
+/// The plugin's routing card, which `--plugin-card` makes the `ultra_edit` description.
+const CLAUDE_CARD: &str = include_str!("../../plugin/claude-code/instructions.md");
+/// What the plugin's context hooks add to every session and subagent. Claude Code
+/// writes hook context anew each time but caches tool definitions, so this only
+/// routes edits and leaves the rules to the card in the tool description.
+const CLAUDE_CONTEXT: &str = "# Ultra Edit\n\nEdit existing text files with the `ultra_edit` MCP tool, \
+following its description: put ALL related changes, across all files, in ONE call. Never write \
+project files through the shell; a hook denies it. Use Write for new files.\n";
 
 fn main() -> ExitCode {
     let arguments = env::args_os().skip(1).collect::<Vec<_>>();
     if arguments.len() == 1 && (arguments[0] == "--help" || arguments[0] == "-h") {
         println!(
-            "ultra-edit-mcp {}\nUsage: ultra-edit-mcp --root WORKSPACE [--no-instructions]\n\
+            "ultra-edit-mcp {}\nUsage: ultra-edit-mcp --root WORKSPACE [--no-instructions | --plugin-card]\n\
              Or: ultra-edit-mcp --claude-context SessionStart|SubagentStart\n\
              Or: ultra-edit-mcp --claude-hook PreToolUse\n\n\
              Serve MCP over stdio inside one fixed existing workspace.\n\
              --no-instructions sends no server instructions, for a host that already gives the\n\
-             model the same routing, such as the Claude Code plugin's session card.\n\
+             model the same routing.\n\
+             --plugin-card also describes ultra_edit with the Claude Code plugin's routing card,\n\
+             which the host caches with its tool list; the plugin starts the server this way.\n\
              JSON-RPC lines are limited to 16 MiB. Protocol output uses stdout; errors use stderr.\n\
              Cancellation or disconnection does not imply rollback; query receipts before retrying.\n\
              --claude-context prints plugin hook JSON and exits without opening a workspace.\n\
@@ -87,12 +96,16 @@ fn main() -> ExitCode {
         guard_shell_writes();
         return ExitCode::SUCCESS;
     }
-    let instructions = match &arguments[..] {
-        [root, _] if root == "--root" => true,
-        [root, _, flag] if root == "--root" && flag == "--no-instructions" => false,
+    let flag = match &arguments[..] {
+        [root, _] if root == "--root" => None,
+        [root, _, flag]
+            if root == "--root" && (flag == "--no-instructions" || flag == "--plugin-card") =>
+        {
+            Some(flag)
+        }
         _ => {
             eprintln!(
-                "Usage: ultra-edit-mcp --root WORKSPACE [--no-instructions] (or --claude-context EVENT / --claude-hook EVENT / --help / --version)"
+                "Usage: ultra-edit-mcp --root WORKSPACE [--no-instructions | --plugin-card] (or --claude-context EVENT / --claude-hook EVENT / --help / --version)"
             );
             return ExitCode::from(2);
         }
@@ -115,10 +128,12 @@ fn main() -> ExitCode {
         }
     };
     let server = McpServer::new(workspace);
-    let server = if instructions {
-        server
-    } else {
-        server.without_instructions()
+    let server = match flag {
+        None => server,
+        Some(flag) if flag == "--no-instructions" => server.without_instructions(),
+        Some(_) => server
+            .without_instructions()
+            .with_edit_description(CLAUDE_CARD),
     };
     match runtime.block_on(serve(server)) {
         Ok(()) => ExitCode::SUCCESS,

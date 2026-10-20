@@ -47,6 +47,15 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ### Changed
 
+- The Claude Code plugin starts the server with the new `--plugin-card` flag,
+  which sends no server instructions, as `--no-instructions` does, and gives
+  the plugin's routing card as the `ultra_edit` description. The session and
+  subagent hooks now add only a short context that routes edits to
+  `ultra_edit` and its description. Claude Code caches tool definitions across
+  sessions but writes hook context anew in each: measured in the first API call
+  of a Windows eval session with Claude Code 2.1.303, the plugin's uncached
+  tokens fell from 1,184 to 489, and its cached ones rose from 919 to 1,554.
+  `--no-instructions` alone keeps the generic description.
 - A `lines` or `after` change whose lines no longer hold its `expect`, because
   the file changed since it was read or the lines were miscounted, now applies
   where `expect` holds instead of being refused: when `expect` has 8 or more

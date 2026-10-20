@@ -5,8 +5,9 @@ description: Ultra Edit recovery and advanced use; ordinary edits need only the 
 
 # Ultra Edit
 
-The plugin loads its [routing card](../../instructions.md) automatically in main
-sessions and subagents; invoking this skill is not a prerequisite for an edit.
+The plugin gives its [routing card](../../instructions.md) as the `ultra_edit`
+description, in main sessions and subagents alike; invoking this skill is not a
+prerequisite for an edit.
 Explicit user instructions and host permissions take precedence; report
 conflicting editing guidance or unavailable tools rather than silently switching
 routes. Never carry file contents or edit JSON through Bash heredocs,

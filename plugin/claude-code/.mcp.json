@@ -3,7 +3,7 @@
     "ultra-edit": {
       "type": "stdio",
       "command": "${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp",
-      "args": ["--root", "${CLAUDE_PROJECT_DIR}", "--no-instructions"]
+      "args": ["--root", "${CLAUDE_PROJECT_DIR}", "--plugin-card"]
     }
   }
 }

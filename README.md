@@ -271,19 +271,21 @@ claude --plugin-dir /absolute/path/to/ultra-edit/plugin/claude-code
 ```
 
 The plugin starts `${CLAUDE_PLUGIN_ROOT}/runtime/ultra-edit-mcp` with the
-arguments `["--root", "${CLAUDE_PROJECT_DIR}", "--no-instructions"]`, since its
-session card carries the routing the server instructions would repeat; hook commands run the same
+arguments `["--root", "${CLAUDE_PROJECT_DIR}", "--plugin-card"]`: the server then
+sends no instructions and gives its routing card as the `ultra_edit` description,
+which Claude Code caches with the tool list; hook commands run the same
 executable with their own argument arrays, without a shell. The root is fixed for
 that server and is not a tool argument.
 
-The [canonical instructions](plugin/claude-code/instructions.md) load through
+The [canonical instructions](plugin/claude-code/instructions.md) are that card.
 `SessionStart` hooks on startup, resume, clear, compaction, and fork, plus
-`SubagentStart` for delegated work. They tell Claude to **always use Ultra Edit
+`SubagentStart` for delegated work, add a short context that routes edits to
+`ultra_edit` and its description. Together they tell Claude to **always use Ultra Edit
 for coordinated edits to two or more existing UTF-8 files**, to edit existing
 files with Ultra Edit, even without reading them first when the exact text is
 known, to use Write for new files, and to report unavailable tools instead of
 falling back to shell writes. No slash command is required;
-`/ultra-edit:edit` loads optional workflow detail. Inspect the exact context
+`/ultra-edit:edit` loads optional workflow detail. Inspect the exact hook context
 without starting a server:
 
 ```text

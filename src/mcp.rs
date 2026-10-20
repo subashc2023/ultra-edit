@@ -161,6 +161,16 @@ impl McpServer {
         self
     }
 
+    /// Describes `ultra_edit` with `description` in place of its generic text. The
+    /// Claude Code plugin gives its routing card here: a host caches tool
+    /// definitions across sessions, while hook context is written anew in each.
+    pub fn with_edit_description(mut self, description: &'static str) -> Self {
+        if let Some(route) = self.tool_router.map.get_mut("ultra_edit") {
+            route.attr.description = Some(description.into());
+        }
+        self
+    }
+
     async fn operate(
         &self,
         recovery: Recovery,
