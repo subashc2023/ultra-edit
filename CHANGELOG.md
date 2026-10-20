@@ -46,6 +46,21 @@ All notable changes to Ultra Edit are documented here. Releases follow
   had more than two, with no warning; replayed, that call now carries this one.
   No eval task's expected files hold a longer run of blank lines than its
   fixture files, so no single correct edit of one triggers it.
+- A nonblocking `BLANK_LINES_DROPPED` warning names the output lines where a
+  change that removes text leaves fewer blank lines in a row around an edge
+  than the file had around both of its ends, as when an `old` takes the blank
+  lines above a function and one of those below it. Blank lines at the start
+  or end of the file separate nothing, so whitespace reaching either counts
+  none, and a change that removes only whitespace, such as an insertion, is not
+  judged. Bytes are still written as given, and the warnings follow each file's
+  `BLANK_LINES_JOINED` warnings, at most eight per file. The Windows eval's
+  ninth round had one wrong Ultra Edit result: a deletion in `decode.py` left
+  one blank line where both sides had two, with no warning; replayed, that call
+  now carries this one. Replaying the first nine rounds' 361 `ultra_edit` calls
+  changes three other outcomes, each only by this warning on a call that left
+  a blank line out, which its run then found and restored, once over three
+  more calls. No eval task's correct edit, planned from its fixture, triggers
+  it.
 - A nonblocking `FINAL_LINE_BREAK_KEPT` warning flags a `lines` or `after`
   change whose `new` ends in a line feed, which is written as given, and names
   the text's last line, the blank lines after it, and the next line. Text that

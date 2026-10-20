@@ -519,6 +519,22 @@ holds 3 blank lines in a row, lines 33-35; the file had at most 2`, once per run
 and at most eight per file, after that file's `WHITESPACE_EDGE` warnings. The
 bytes are still written exactly as given.
 
+A nonblocking `BLANK_LINES_DROPPED` warning flags a change that removes text
+and leaves fewer blank lines in a row around an edge than the file had around
+both of its ends, as when an `old` takes the two blank lines above a function
+and one of the two below it, which leaves one where each side had two. The
+file's runs are those in the whitespace around where the change starts and
+where it ends, including whitespace the change removes, and the shorter one
+sets the count to keep: deleting a method that ends a class, with one blank
+line above it and two below, may leave one. Blank lines at the start or end of
+the file separate nothing, so whitespace that reaches either counts none, and
+a change that removes only whitespace, as an insertion or an edit of blank
+lines alone does, is not judged. The message names the output lines, as in
+`Change 2.2: the whitespace around its edge now holds a blank line, line 116;
+the file had 2 in a row around its start and 2 around its end`, once per run
+and at most eight per file, after that file's `BLANK_LINES_JOINED` warnings.
+The bytes are still written exactly as given.
+
 A nonblocking `FINAL_LINE_BREAK_KEPT` warning flags a `lines` or `after` change
 whose `new` ends in a line feed. A line target adds a line ending only to text
 that lacks one, so this text is written as given, and text that lists its lines
@@ -527,7 +543,7 @@ one blank line, not two. The message names the text's last line, the blank
 lines after it, and the line after those, as in ``Change 1.3: `new` ends in a
 line break, so no line ending is added after it: line 67 "        )" is
 followed by a blank line, then line 69 "DEFAULT_TIMEOUT_S = 30"``, at most eight
-per file, after that file's `BLANK_LINES_JOINED` warnings. Text of blank lines
+per file, after that file's `BLANK_LINES_DROPPED` warnings. Text of blank lines
 alone is not flagged, nor is `old` or span text, which is placed exactly. The
 bytes are still written exactly as given.
 
