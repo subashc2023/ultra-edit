@@ -150,9 +150,10 @@ The [evaluation harness](eval/README.md) runs each task in a fresh, isolated
 headless Claude Code session and scores the exact final bytes of every file.
 Its 23 tasks are small repositories of 1 to 10 files: 14 state the exact text
 to change, 8 describe the change and leave finding the sites to the model, and
-in one another writer edits a file mid-session. Every round ran on Linux with
-Claude Code 2.1.294; Sonnet ran each task 3 times per route and Haiku twice.
-Cost is the geometric mean of per-task cost ratios against native Claude Code.
+in one another writer edits a file mid-session. The rounds in the first table
+ran on Linux with Claude Code 2.1.294; Sonnet ran each task 3 times per route
+and Haiku twice. Cost is the geometric mean of per-task cost ratios against
+native Claude Code.
 
 | Task set | Ultra Edit | Native | Native, shell writes blocked |
 | --- | --- | --- | --- |
@@ -162,9 +163,33 @@ Cost is the geometric mean of per-task cost ratios against native Claude Code.
 | Another writer changes a file mid-edit | 3/3 exact, 0.71x | 3/3, 1.00x | 3/3, 0.88x |
 | All 23 tasks on Haiku | 46/46 exact, 1.09x | 46/46, 1.00x | 44/46, 1.21x |
 
+### Windows
+
+Four more rounds ran all 23 tasks on Windows 11 on 2026-10-19 and 20, with
+Claude Code 2.1.303 and Sonnet 5.5, 3 times each, comparing Ultra Edit with
+native Claude Code. They ran development builds between 0.4.0 and 0.5.0. The
+last round, whose prompts carry a marker drawn per run so that no run reuses
+another's cached prompt, gave:
+
+| | Ultra Edit | Native |
+| --- | --- | --- |
+| Exact final bytes | 69/69 | 68/69 |
+| Right on the first try | 65/69 | 63/69 |
+| Cost | 1.00x (0.97-1.04) | 1.00x |
+| Turns | 0.64x (0.60-0.69) | 1.00x |
+| Tool calls | 0.59x (0.55-0.65) | 1.00x |
+| Output tokens | 0.95x (0.91-0.99) | 1.00x |
+
+Over all four rounds, Ultra Edit was exact in 275 of 276 runs and native in
+272 (p = 0.37), and right on the first try in 252 and 249. Native wrote
+through the shell in 142 of its 276 runs, and none of those ended wrong; all
+four of its wrong results were written with Edit. Ultra Edit's one wrong
+result deleted a function with an `old` that also took one of the two blank
+lines below it, which the server now flags as `BLANK_LINES_DROPPED`.
+
 ### Failure rates
 
-Pooled over every round:
+Pooled over the Linux rounds:
 
 | | Ultra Edit | Native | Native, shell writes blocked |
 | --- | --- | --- | --- |
@@ -212,13 +237,15 @@ and the gap to native with shell writes blocked, 8 wrong in 111, is significant
 
 ### Context and cost
 
-- **Fixed overhead:** about 2.0k tokens on every API call, mostly the session
-  card (1.9 KB) and the `ultra_edit` schema (2.2 KB), which loads up front so
-  an edit needs no `ToolSearch` round trip. The prompt cache serves both after
-  the first call, and the snapshot and recovery tools stay deferred until used.
+- **Fixed overhead:** about 2.0k tokens on every API call (2.1k in the last
+  Windows round), mostly the `ultra_edit` description, which is the routing
+  card, and its schema. Both load up front so an edit needs no `ToolSearch`
+  round trip. The prompt cache serves them after the first call, and the
+  snapshot and recovery tools stay deferred until used.
 - **Fewer, larger calls:** on Sonnet's exact-text tasks, Ultra Edit runs took
   0.75x native's turns and 0.72x its tool calls; on Haiku, across all tasks,
-  0.54x and 0.49x, with 0.91x the context tokens but 1.16x the output tokens.
+  0.54x and 0.49x, with 0.91x the context tokens but 1.16x the output tokens;
+  on Windows, across all tasks, 0.64x and 0.59x at the same cost.
   Each change restates its text: a 29-site CSS rename was 3.1k output tokens as
   one `ultra_edit` call and 0.8k as native's one `perl` regex. In the 1.22x
   intent-level round, the two renames and a function move, after which the
@@ -231,14 +258,15 @@ and the gap to native with shell writes blocked, 8 wrong in 111, is significant
 - **No re-read after an edit:** after a multi-hunk batch, the model ran
   `git diff` or Read again in about half the Ultra Edit runs, against 2 of 12
   native runs. A committed call now returns the changed lines with their new
-  numbers instead; the rounds above predate it.
+  numbers instead; the Linux rounds predate it.
 - **Steadier cost:** on the exact-text tasks, cost varied about half as much
   across repetitions as native's (mean coefficient of variation 0.05-0.06,
   against 0.10).
 
 ### Not yet measured
 
-- Windows, where the shell route is expected to fail, and Opus.
+- Opus, Haiku on Windows, and the shell, shell-guard, and third-party routes
+  on Windows.
 - Large repositories and long sessions, including compaction. The fixtures are
   1 to 10 files, most under 200 lines.
 - Permission prompts, other plugins, and `CLAUDE.md` files: runs use isolated
@@ -254,7 +282,7 @@ separately.
 | | Native Edit | Ultra Edit |
 | --- | --- | --- |
 | Several files | One call per file | One all-or-nothing call |
-| Repeated text | `replace_all` | An exact occurrence count |
+| Repeated text | `replace_all` | `"all"` for every whole-word occurrence, or an exact count |
 | File changed since read | Refused if modified since Read | Old text matched against current bytes; line targets guarded by `expect` |
 | Old text almost matches | Not found | Up to three near matches, quoted |
 | After the edit | Claude Code tracks file state | Changed lines returned with new numbers |

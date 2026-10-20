@@ -146,9 +146,8 @@ time is not an equivalent performance baseline.
 
 ## Model-level results
 
-Every round below ran on Linux. None has run on Windows yet, where Claude
-Code's Bash tool corrupts command payloads and the shell routes are expected
-to fail.
+The rounds below ran on Linux, except those under
+[Windows results](#windows-results).
 
 A model-level comparison runs the same edit tasks through each route. The
 [evaluation harness](../eval/README.md) runs 23 fixture tasks, including
@@ -326,6 +325,48 @@ arms with the same settings, 3 repetitions each:
   anchor had moved to line 23. `expect` refused the batch, the message named
   line 23, and the next call committed. The other Ultra Edit miss was an `old`
   that also matched inside `WEBHOOK_RETRY_LIMIT`.
+
+## Windows results
+
+Four rounds ran all 23 tasks on Windows 11 under `native` and `ultra-edit`,
+with Claude Code 2.1.303, `claude-sonnet-5-5`, and 3 repetitions each: 552
+runs, none invalid. Each ran a development build between 0.4.0 and 0.5.0.
+Prompts in the first three could repeat across repetitions, so an arm whose
+build did not change could reuse the prompt cache of an earlier round; the
+last round starts every prompt with a marker drawn per invocation, so its
+costs are the ones to compare.
+
+| Round | Correct, `native` | Correct, `ultra-edit` | First try, `native` | First try, `ultra-edit` |
+| --- | --- | --- | --- | --- |
+| 2026-10-19 23:39 | 69/69 | 69/69 | 63/69 | 64/69 |
+| 2026-10-20 01:10 | 68/69 | 68/69 | 64/69 | 60/69 |
+| 2026-10-20 02:14 | 67/69 | 69/69 | 59/69 | 63/69 |
+| 2026-10-20 03:56 | 68/69 | 69/69 | 63/69 | 65/69 |
+
+In the last round, against `native`, with 95% bootstrap intervals,
+`ultra-edit` cost 1.00x (0.97-1.04), with 0.96x (0.90-1.01) the context
+tokens, 0.95x (0.91-0.99) the output tokens, 0.64x (0.60-0.69) the turns, and
+0.59x (0.55-0.65) the tool calls. Its first API call carried 2.1k more context
+tokens than native's, 24.9k against 22.8k. Cost varied less across repetitions,
+a mean coefficient of variation of 0.09 against 0.13.
+
+- Claude Code's Bash tool on Windows strips a level of backslash escaping, so
+  the shell routes were expected to fail. `native` wrote through the shell in
+  142 of 276 runs, and every one of those runs ended with the expected bytes.
+  Its four wrong results were all Edit slips, on four different tasks.
+- `ultra-edit`'s one wrong result, on `collapse-feature-flag`, deleted
+  `_decode_legacy` with an `old` that took the two blank lines above the
+  function and one of the two below, leaving one blank line where both sides
+  had two. That committed without a warning; `BLANK_LINES_DROPPED` now flags
+  it. In the last round the warning fired accurately but saved no calls: the
+  model's own Read or `git diff` caught the same drops.
+- The last round's four `ultra-edit` first-try misses wrote nothing: a stale
+  `lines` range whose `expect` refusal named the right end line, a blank
+  `expect` refused as `LINE_GUARD_WEAK`, and two calls whose JSON Claude Code
+  could not parse. Each run finished exact.
+- Over the four rounds, 1 wrong of 276 against 4 gives p = 0.37, and on the
+  first try 24 misses against 27, p = 0.77: on Windows the two routes are not
+  distinguishable on correctness at this size.
 
 ## Pooled failure rates
 
