@@ -86,15 +86,16 @@ target.
 ## Choose the replacement target
 
 Each change names one target and its literal replacement `new` (`text` is an
-alias). A `path` file supports `old`, `count`, `in` with lines, `lines`, and
-`after`; spans other than `r0` need a snapshot `base`.
+alias). A `path` file supports `old`, `count`, `all`, `in` with lines, `lines`,
+and `after`; spans other than `r0` need a snapshot `base`.
 
 | Intent | Change | Requirement |
 | --- | --- | --- |
 | Replace unique exact text anywhere in the file | `{"old":"a","new":"b"}` | Exactly one occurrence in the entire original file, on word boundaries; matches inside longer names do not count when exactly one is whole (`WHOLE_WORDS_ONLY`). |
 | Replace unique exact text within some lines | `{"old":"a","new":"b","in":[72,87]}` | Exactly one occurrence wholly inside lines 72-87; with none there, the one an unrestricted `old` would take, if `old` has 8 or more visible characters (`LINES_MOVED`). |
 | Replace unique exact text inside an inspected span | `{"old":"a","new":"b","in":"selection"}` | The span belongs to this base; one occurrence inside it. |
-| Replace every occurrence | `{"old":"a","new":"b","count":3}` | Exactly 3 non-overlapping occurrences in the file, or in `in`, inside words or not; or, when more occur, exactly the 3 that cut no word, leaving those inside longer names (`WHOLE_WORDS_ONLY`). |
+| Rename: replace every whole-word occurrence | `{"old":"a","new":"b","all":true}` | At least one non-overlapping occurrence that cuts no word in the file, or in `in`; each is replaced, and those inside longer names stay (`WHOLE_WORDS_ONLY`). |
+| Replace a counted number of occurrences | `{"old":"a","new":"b","count":3}` | Exactly 3 non-overlapping occurrences in the file, or in `in`, inside words or not; or, when more occur, exactly the 3 that cut no word, leaving those inside longer names (`WHOLE_WORDS_ONLY`). |
 | Replace or delete whole lines | `{"lines":[40,42],"expect":["fn load(cfg) {","}"],"new":"..."}` | Lines exist; `expect` matches their first and last lines. `""` deletes them. |
 | Insert whole lines | `{"after":3,"expect":"use std::fs;","new":"use std::io;"}` | Line 3 exists; `expect` matches the lines ending at 3. `after:0` inserts at the top. |
 | Replace a disclosed line, selection, or match | `{"span":"m1","expect":"old text","new":"b"}` | The span belongs to this base; `expect` equals its bytes exactly. |
@@ -161,7 +162,10 @@ words, or add `"count":1` to replace part of a word on purpose. Words with
 cased non-ASCII letters near the cut (`Hauptstraße`) and letter escapes such
 as `\nRestart` are exempt, and an `old` with text on several lines may end
 inside a word; Han, kana, and other uncased scripts separate words, and a cut
-between two digits always counts.
+between two digits always counts. Where `old` begins or ends with a hyphenated
+name, such as the CSS class `btn-primary`, a hyphen continues that word, so
+`btn-primary` is inside `btn-primary-outline` and `--btn-primary-bg`; a word
+`old` begins or ends with as context keeps hyphens as separators.
 
 Rendered text shows a no-break or thin space (U+00A0, U+2007, U+2009, U+202F)
 as an ordinary one. An `old` without `count` that occurs nowhere as written
@@ -185,7 +189,8 @@ with an undisclosed line, and shapes such as `146-150` or `L146` are
 
 The verbose form `{"id":"…","target":{…},"text":"…"}` is still accepted and is
 how requests are stored: `old` is `{"kind":"exact","old":…,"scope":…}`, `count`
-is `{"kind":"all","old":…,"expected":N}`, `span` is
+is `{"kind":"all","old":…,"expected":N}`, `all` is
+`{"kind":"every","old":…}`, `span` is
 `{"kind":"span","span":…,"expect":…}`, `lines` is
 `{"kind":"lines","lines":[a,b],"expect":…,"expect_last":…}`, and `after` is
 `{"kind":"insert","after":n,"expect":…}`. Both spellings of one change derive

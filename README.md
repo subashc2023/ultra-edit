@@ -137,8 +137,9 @@ writing twice.
 }
 ```
 
-`old` must occur exactly once, as whole words (or `count` times, which may
-match inside words), and `lines`/`after` address whole lines by Read's numbers,
+`old` must occur exactly once, as whole words (with `"all": true`, every
+whole-word occurrence, as a rename needs; or `count` times, which may match
+inside words), and `lines`/`after` address whole lines by Read's numbers,
 guarded by `expect`, so a stale line number never edits other text: a long
 `expect` that holds at exactly one other place moves the change there, as does a
 long `old` found once outside its `in` lines, with a `LINES_MOVED` warning, and

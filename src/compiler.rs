@@ -226,7 +226,9 @@ fn adapts(text: &str) -> bool {
 /// as when converting CRLF to LF.
 fn literal(change: &Change) -> bool {
     match &change.target {
-        Target::Exact { old, .. } | Target::All { old, .. } => old.contains('\r'),
+        Target::Exact { old, .. } | Target::All { old, .. } | Target::Every { old, .. } => {
+            old.contains('\r')
+        }
         Target::Span { expect, .. } => expect
             .as_deref()
             .is_some_and(|expect| expect.contains('\r')),
@@ -595,7 +597,9 @@ pub fn compile_with(
             for (id, range) in &placed {
                 if let Some(change) = targets.get(id) {
                     let old = match &change.target {
-                        Target::Exact { old, .. } | Target::All { old, .. } => old,
+                        Target::Exact { old, .. }
+                        | Target::All { old, .. }
+                        | Target::Every { old, .. } => old,
                         _ => continue,
                     };
                     let crlf = context.crlf() && !literal(change);
@@ -996,7 +1000,9 @@ fn warn_moved(path: &str, moved: &[Moved], warnings: &mut Vec<Diagnostic>) {
             lines: Some([first, last]),
             ..
         } => format!("in:[{first},{last}]"),
-        Target::Exact { .. } | Target::All { .. } | Target::Span { .. } => String::new(),
+        Target::Exact { .. } | Target::All { .. } | Target::Every { .. } | Target::Span { .. } => {
+            String::new()
+        }
     };
     for moved in moved {
         let id: String = moved.change.id.chars().take(QUOTED_ID_CHARS).collect();
@@ -1150,6 +1156,7 @@ fn validate_target(change: &Change, path: Option<&str>, diagnostics: &mut Vec<Di
             }
             (Some(old), scope.as_ref(), lines.as_ref())
         }
+        Target::Every { old, scope, lines } => (Some(old), scope.as_ref(), lines.as_ref()),
         Target::Span { span, .. } => (None, Some(span), None),
         Target::Lines { lines, .. } => (None, None, Some(lines)),
         Target::Insert { .. } => {
@@ -1490,7 +1497,7 @@ impl<'a> FileContext<'a> {
         let lines = self.lines();
         let total = lines.count();
         let advice = match change.target {
-            Target::Exact { .. } | Target::All { .. } => {
+            Target::Exact { .. } | Target::All { .. } | Target::Every { .. } => {
                 format!("end `in` by line {total} or drop it to search the whole file")
             }
             _ if lines.body(1).start == self.base.text.len() => {
@@ -1662,7 +1669,9 @@ fn resolve_change<'a>(
     let text = adapt_eol(crlf, &change.text);
     let adapted = matches!(text, Cow::Owned(_))
         || match &change.target {
-            Target::Exact { old, .. } | Target::All { old, .. } => crlf && adapts(old),
+            Target::Exact { old, .. } | Target::All { old, .. } | Target::Every { old, .. } => {
+                crlf && adapts(old)
+            }
             Target::Span { expect, .. } => crlf && expect.as_deref().is_some_and(adapts),
             Target::Lines { .. } | Target::Insert { .. } => false,
         };
@@ -1723,7 +1732,7 @@ fn resolve_change<'a>(
             }
             (Guard::Above { line }, (expect, &None))
         }
-        Target::Exact { .. } | Target::All { .. } => {
+        Target::Exact { .. } | Target::All { .. } | Target::Every { .. } => {
             resolve_exact(context, change, &text, replacements, diagnostics, budget);
             return;
         }
@@ -2119,8 +2128,8 @@ fn restatement_message(
     }
 }
 
-/// Resolves an `exact` or `all` target by searching its scope for `old`, adapted
-/// like `text` to the base's line endings, and for an `exact` target found
+/// Resolves an `exact`, `all`, or `every` target by searching its scope for `old`,
+/// adapted like `text` to the base's line endings, and for an `exact` target found
 /// nowhere as written, to the base's Unicode spaces. An `exact` target whose `in`
 /// lines hold no match applies where [`moved_old`] places it, if anywhere.
 fn resolve_exact<'a>(
@@ -2132,14 +2141,16 @@ fn resolve_exact<'a>(
     budget: &mut Budget,
 ) {
     let base = context.base;
+    // How many matches the target needs; `every` takes however many cut no word.
     let (old, scope, lines, expected) = match &change.target {
-        Target::Exact { old, scope, lines } => (old, scope.as_deref(), lines, 1),
+        Target::Exact { old, scope, lines } => (old, scope.as_deref(), lines, Some(1)),
         Target::All {
             old,
             scope,
             expected,
             lines,
-        } => (old, scope.as_deref(), lines, *expected),
+        } => (old, scope.as_deref(), lines, Some(*expected)),
+        Target::Every { old, scope, lines } => (old, scope.as_deref(), lines, None),
         Target::Span { .. } | Target::Lines { .. } | Target::Insert { .. } => return,
     };
     let old = adapt_eol(context.crlf(), old);
@@ -2152,13 +2163,18 @@ fn resolve_exact<'a>(
             }),
         None => scope_range(base, change, scope, diagnostics),
     };
-    if old.is_empty() || expected == 0 || (scope.is_some() && lines.is_some()) {
+    if old.is_empty() || expected == Some(0) || (scope.is_some() && lines.is_some()) {
         return;
     }
     let Some((start, end)) = range else {
         return;
     };
     let old = old.as_ref();
+    let Some(expected) = expected else {
+        let found = resolve_every(context, change, old, start..end, text, diagnostics, budget);
+        replacements.extend(found);
+        return;
+    };
     let retained = expected.min(budget.spans_left);
     let exact = matches!(change.target, Target::Exact { .. });
     let (actual, non_overlapping, positions) = if matches!(change.target, Target::All { .. }) {
@@ -2312,13 +2328,13 @@ fn resolve_exact<'a>(
     }
     if exact
         && let Some(&position) = positions.first()
-        && let Some(boundary) = word_cut(&base.text, start + position, len, one_line(old))
+        && let Some(cut) = word_cut(&base.text, start + position, len, Edges::of(old))
     {
         diagnostics.push(at(
             Some(&base.path),
             Some(change),
             "OLD_INSIDE_WORD",
-            inside_word(&base.text, boundary),
+            inside_word(&base.text, cut),
         ));
         return;
     }
@@ -2341,6 +2357,67 @@ fn resolve_exact<'a>(
     }));
 }
 
+/// Resolves an `every` target: each non-overlapping match of `old` in `range`
+/// that cuts no word, left to right, at least one. Matches inside longer names
+/// stay, and a warning names the first of them. Returns no replacements when
+/// it pushes a diagnostic.
+fn resolve_every<'a>(
+    context: &mut FileContext<'a>,
+    change: &'a Change,
+    old: &str,
+    range: Range<usize>,
+    text: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+    budget: &mut Budget,
+) -> Vec<Replacement> {
+    let base = context.base;
+    // Past `ADVISED_MATCHES` starts the plan could not hold the replacements either.
+    let Some(whole) = whole_words(&base.text, range.clone(), old, true) else {
+        diagnostics.push(resource_limit(base, change));
+        return Vec::new();
+    };
+    let actual = base.text[range.clone()].match_indices(old).count();
+    if whole.is_empty() {
+        let found = if actual == 0 {
+            budget.candidates(|search| {
+                candidates::find_target(search, &base.text, range.clone(), old)
+            })
+        } else {
+            Vec::new()
+        };
+        let message = match first_cut(&base.text, range.clone(), old) {
+            Some((word, line)) => format!(
+                "No whole-word match: all {actual} are inside longer words, the first in `{word}` at line {line}; set count to {actual} to replace inside words"
+            ),
+            None if !found.is_empty() => candidates::not_found("at least 1", old, &found),
+            None => "Expected at least 1 occurrence, found 0 and nothing similar; read the file again and copy `old` exactly from it".to_owned(),
+        };
+        let mut diagnostic = at(Some(&base.path), Some(change), "TARGET_NOT_FOUND", message);
+        diagnostic.actual = Some(0);
+        diagnostic.candidates = found;
+        diagnostics.push(diagnostic);
+        return Vec::new();
+    }
+    if !budget.reserve(whole.len(), text) {
+        diagnostics.push(resource_limit(base, change));
+        return Vec::new();
+    }
+    let stayed = actual.saturating_sub(whole.len());
+    if stayed > 0 {
+        let warning = stayed_inside_words(base, change, range.clone(), old, stayed);
+        context.whole_words.push(warning);
+    }
+    whole
+        .into_iter()
+        .map(|position| Replacement {
+            start: range.start + position,
+            end: range.start + position + old.len(),
+            text: text.to_owned(),
+            change_id: change.id.clone(),
+        })
+        .collect()
+}
+
 /// Where an `exact` `old` applies when its `in` lines hold no match, as lines
 /// from a stale read or a miscount may not, with the target naming the lines it
 /// applies to: the match an unscoped `old` would take, the only one in the file
@@ -2361,7 +2438,7 @@ fn moved_old(context: &FileContext, change: &Change, old: &str) -> Option<(usize
             _ => return None,
         },
     };
-    if word_cut(text, position, old.len(), one_line(old)).is_some() {
+    if word_cut(text, position, old.len(), Edges::of(old)).is_some() {
         return None;
     }
     let lines = context.lines();
@@ -2480,9 +2557,51 @@ fn one_line(old: &str) -> bool {
         .is_none()
 }
 
-/// Where a match of `old` at `start` cuts an ASCII word, such as `retries = 2`
-/// inside `max_retries = 20`: text written without reading the file can match
-/// a longer name or number by accident. Only the start of an `old` with text on
+/// How the ends of a match of `old` meet the words around it.
+#[derive(Clone, Copy)]
+struct Edges {
+    /// Whether the end is judged as well as the start, for an `old` with text
+    /// on one line ([`one_line`]).
+    end: bool,
+    /// Whether a hyphen continues the word at the start, and at the end, of a
+    /// match: where `old` begins or ends with a name that joins words with
+    /// one, as the CSS class `btn-primary` or the YAML key `max-retries` does.
+    /// That name is one word, so neither `btn-primary-outline` nor
+    /// `--btn-primary-bg` holds `btn-primary` as a whole word, while other
+    /// words `old` begins or ends with, given as context, keep hyphens as
+    /// separators.
+    hyphens: [bool; 2],
+}
+
+impl Edges {
+    fn of(old: &str) -> Self {
+        let named = |name: &[u8]| {
+            name.windows(3)
+                .any(|bytes| bytes[1] == b'-' && ascii_word(bytes[0]) && ascii_word(bytes[2]))
+        };
+        let bytes = old.as_bytes();
+        let name = |byte: &&u8| ascii_word(**byte) || **byte == b'-';
+        let first = bytes.iter().take_while(name).count();
+        let last = bytes.iter().rev().take_while(name).count();
+        Self {
+            end: one_line(old),
+            hyphens: [named(&bytes[..first]), named(&bytes[bytes.len() - last..])],
+        }
+    }
+
+    /// Whether `byte` is part of a word around the start or end of a match.
+    fn word(self, byte: u8, at_end: bool) -> bool {
+        ascii_word(byte) || (self.hyphens[usize::from(at_end)] && byte == b'-')
+    }
+}
+
+fn ascii_word(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// Where a match at `start` cuts an ASCII word, such as `retries = 2` inside
+/// `max_retries = 20`: text written without reading the file can match a
+/// longer name or number by accident. Only the start of an `old` with text on
 /// several lines counts, since its last line may end on part of a name as
 /// context; blank lines around one line of text do not make it span lines. A
 /// word holding
@@ -2490,17 +2609,16 @@ fn one_line(old: &str) -> bool {
 /// `Hauptstraße`, is prose that callers cut to avoid typing them, while uncased
 /// scripts such as Han separate words; a cut between two digits is a number
 /// cut whatever follows, as in `100µs`. A letter after a backslash, as in
-/// `\nRestart`, is an escape, but `\_` or `\1` is not.
-fn word_cut(text: &str, start: usize, len: usize, one_line: bool) -> Option<usize> {
+/// `\nRestart`, is an escape, but `\_` or `\1` is not. Returns the cut and
+/// whether a hyphen continues the word there.
+fn word_cut(text: &str, start: usize, len: usize, edges: Edges) -> Option<(usize, bool)> {
     let bytes = text.as_bytes();
-    let word = |at: usize| {
-        bytes
-            .get(at)
-            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-    };
     let escape =
         |at: usize| at >= 2 && bytes[at - 2] == b'\\' && bytes[at - 1].is_ascii_alphabetic();
-    let joined = |at: usize| at > 0 && word(at - 1) && word(at) && !escape(at);
+    let joined = |at: usize, at_end: bool| {
+        let word = |at: usize| bytes.get(at).is_some_and(|byte| edges.word(*byte, at_end));
+        at > 0 && word(at - 1) && word(at) && !escape(at)
+    };
     let letter = |ch: &char| {
         *ch == '_' || ch.is_ascii_alphanumeric() || ch.is_lowercase() || ch.is_uppercase()
     };
@@ -2514,18 +2632,20 @@ fn word_cut(text: &str, start: usize, len: usize, one_line: bool) -> Option<usiz
             .all(|ch| ch.is_ascii())
     };
     let digits = |at: usize| bytes[at - 1].is_ascii_digit() && bytes[at].is_ascii_digit();
-    let end = one_line.then_some(start + len);
-    std::iter::once(start)
+    let end = edges.end.then_some((start + len, true));
+    std::iter::once((start, false))
         .chain(end)
-        .find(|&at| joined(at) && (digits(at) || ascii(at)))
+        .find(|&(at, at_end)| joined(at, at_end) && (digits(at) || ascii(at)))
+        .map(|(at, at_end)| (at, edges.hyphens[usize::from(at_end)]))
 }
 
-/// The ASCII word that `boundary` cuts, clipped, and its line.
-fn cut_word(text: &str, boundary: usize) -> (&str, usize) {
+/// The ASCII word that `boundary` cuts, clipped, and its line; a hyphen
+/// continues it when `hyphens`.
+fn cut_word(text: &str, (boundary, hyphens): (usize, bool)) -> (&str, usize) {
     let word = |at: usize| {
         text.as_bytes()
             .get(at)
-            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .is_some_and(|byte| ascii_word(*byte) || (hyphens && *byte == b'-'))
     };
     let (mut low, mut high) = (boundary, boundary);
     while low > 0 && word(low - 1) && boundary - low < WORD_CHARS {
@@ -2537,9 +2657,9 @@ fn cut_word(text: &str, boundary: usize) -> (&str, usize) {
     (&text[low..high], line_numbers(text, &[boundary])[0])
 }
 
-/// Names the ASCII word that `boundary` cuts and its line.
-fn inside_word(text: &str, boundary: usize) -> String {
-    let (word, line) = cut_word(text, boundary);
+/// Names the ASCII word that a cut cuts and its line.
+fn inside_word(text: &str, cut: (usize, bool)) -> String {
+    let (word, line) = cut_word(text, cut);
     format!(
         "`old` matches inside the word `{word}` at line {line}; give whole words, or add \"count\":1 to replace part of a word"
     )
@@ -2550,20 +2670,28 @@ fn inside_word(text: &str, boundary: usize) -> String {
 /// count replaces them; `None` past `ADVISED_MATCHES` starts, which bounds the scan
 /// as it bounds ambiguity advice.
 fn whole_words(text: &str, range: Range<usize>, old: &str, separate: bool) -> Option<Vec<usize>> {
-    let one_line = one_line(old);
+    let edges = Edges::of(old);
     let (mut whole, mut free) = (Vec::new(), 0);
     for (examined, at) in overlapping_starts(&text[range.clone()], old).enumerate() {
         if examined == ADVISED_MATCHES {
             return None;
         }
-        if (!separate || at >= free)
-            && word_cut(text, range.start + at, old.len(), one_line).is_none()
+        if (!separate || at >= free) && word_cut(text, range.start + at, old.len(), edges).is_none()
         {
             whole.push(at);
             free = at + old.len();
         }
     }
     Some(whole)
+}
+
+/// The word that the first match of `old` in `range` to cut one cuts, and its line.
+fn first_cut<'t>(text: &'t str, range: Range<usize>, old: &str) -> Option<(&'t str, usize)> {
+    let edges = Edges::of(old);
+    text[range.clone()]
+        .match_indices(old)
+        .find_map(|(at, _)| word_cut(text, range.start + at, old.len(), edges))
+        .map(|cut| cut_word(text, cut))
 }
 
 /// `WHOLE_WORDS_ONLY`: a target took only the whole-word matches of `old` in
@@ -2575,11 +2703,7 @@ fn stayed_inside_words(
     old: &str,
     stayed: usize,
 ) -> Diagnostic {
-    let one_line = one_line(old);
-    let first = base.text[range.clone()]
-        .match_indices(old)
-        .find_map(|(at, _)| word_cut(&base.text, range.start + at, old.len(), one_line))
-        .map(|boundary| cut_word(&base.text, boundary));
+    let first = first_cut(&base.text, range, old);
     let left = match first {
         Some((word, line)) if stayed == 1 => {
             format!("the one inside `{word}` at line {line} stayed")
@@ -2591,6 +2715,7 @@ fn stayed_inside_words(
     };
     let taken = match change.target {
         Target::Exact { .. } => "`old` took its one whole-word match",
+        Target::Every { .. } => "`all` took only the whole-word matches",
         _ => "count took only the whole-word matches",
     };
     let id: String = change.id.chars().take(QUOTED_ID_CHARS).collect();
@@ -2621,12 +2746,12 @@ fn advice(lines: &LineIndex, text: &str, range: Range<usize>, old: &str) -> Ambi
     // A final line feed ends the match's last line, which `in` already includes.
     let spanned = old.strip_suffix('\n').unwrap_or(old).matches('\n').count();
     let (mut previous, mut whole, mut examined) = (None, false, 0);
-    let one_line = one_line(old);
+    let edges = Edges::of(old);
     while examined < ADVISED_MATCHES
         && let Some(at) = starts.next()
     {
         examined += 1;
-        if word_cut(text, at, old.len(), one_line).is_none() {
+        if word_cut(text, at, old.len(), edges).is_none() {
             whole = true;
             let first = lines.line_of(at);
             let last = first + spanned;

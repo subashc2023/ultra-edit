@@ -235,6 +235,7 @@ forms:
 | `{"old":"text","in":"r5","new":"…"}` | Exactly one occurrence contained in a disclosed span. |
 | `{"old":"text","in":[72,87],"new":"…"}` | Exactly one occurrence contained in lines 72-87, from line 72's start through line 87's terminator; with none there, the one occurrence an unrestricted `old` would take, if `old` has at least 8 non-whitespace characters (`LINES_MOVED`). |
 | `{"old":"text","count":3,"new":"…"}` | Exactly 3 non-overlapping, left-to-right occurrences in the whole file, or within `in`, inside words or not; when more occur and exactly 3 of them cut no word, those 3. |
+| `{"old":"text","all":true,"new":"…"}` | Every non-overlapping, left-to-right occurrence that cuts no word, in the whole file or within `in`, at least one, as a rename needs; occurrences inside longer names stay, and a `WHOLE_WORDS_ONLY` warning names the first. |
 | `{"span":"r5","new":"…"}` | Replace that span with literal `new`. |
 | `{"span":"r5","expect":"old line","new":"…"}` | Replace only if the selected original bytes equal `expect` exactly. |
 | `{"span":"r12..r18","new":"…"}` | Replace a run of disclosed lines, from the start of line 12's body to the end of line 18's. |
@@ -242,10 +243,11 @@ forms:
 | `{"after":12,"expect":"…","new":"…"}` | Insert whole lines after line 12; `after:0` inserts at the top, after a BOM. |
 
 `new` may be spelled `text`, but not both. A change gives exactly one of `old`,
-`span`, `lines`, or `after`; `count` and `in` apply only to `old`, and `expect`
-only to `span`, `lines`, and `after`. Two that repeat what a target already says
-are accepted and not stored: `count: 1` on any target, and `in` lines beside
-`lines` or `after` that hold the lines the target names. `lines` takes `[first,last]`, and `[12]`,
+`span`, `lines`, or `after`; `count`, `all`, and `in` apply only to `old`, with
+`count` or `all` but not both, and `expect` only to `span`, `lines`, and
+`after`. Three that repeat what a target already says are accepted and not
+stored: `count: 1` on any target, `all: false`, and `in` lines beside `lines`
+or `after` that hold the lines the target names. `lines` takes `[first,last]`, and `[12]`,
 `12`, `"12"`, and `"12-14"` are read as `[12,12]` and `[12,14]`; `in` takes the same
 line forms or a span ID. A malformed change is refused while the arguments are
 parsed, with a message naming the accepted form, such as `lines takes numbers
@@ -254,8 +256,9 @@ like [146,150]; span IDs such as r146..r150 go in `span``.
 The verbose form `{"id":"…","target":{…},"text":"…"}` is still accepted, and it
 is the canonical form that plans, drafts, and receipts store: `old` is
 `{"kind":"exact","old":…,"scope":…}`, `count` is
-`{"kind":"all","old":…,"scope":…,"expected":N}` with `scope` optional, `in`
-lines are a `"lines":[a,b]` field of either, `span` is
+`{"kind":"all","old":…,"scope":…,"expected":N}` with `scope` optional, `all` is
+`{"kind":"every","old":…,"scope":…}` with `scope` optional, `in` lines are a
+`"lines":[a,b]` field of any of them, `span` is
 `{"kind":"span","span":…,"expect":…}`, `lines` is
 `{"kind":"lines","lines":[a,b],"expect":…,"expect_last":…}`, and `after` is
 `{"kind":"insert","after":n,"expect":…}`. Every spelling of one change derives
@@ -341,11 +344,20 @@ cut, such as `Hauptstraße`, and an ASCII letter right after a backslash, as in
 the escape `\nRestart`, do not count, though `\_` and `\1` do; Han, kana, and
 other uncased scripts separate words, so `80` inside `端口为8080` is refused,
 and a cut between two digits is refused whatever letter follows, as `10` inside
-`100µs`. `count`, even 1, matches inside words. When longer names also hold
+`100µs`. Where `old` begins or ends with a name that joins words with a
+hyphen, as the CSS class `btn-primary` or the YAML key `max-retries` does, a
+hyphen continues the word at that end of a match too: `btn-primary` is cut
+inside `btn-primary-outline`, `--btn-primary-bg`, and `data-btn-primary-label`,
+while a word `old` begins or ends with as context, as in
+`btn btn-primary" aria` before `aria-describedby`, keeps hyphens as
+separators. `count`, even 1, matches inside words. When longer names also hold
 `old`, as `MAX_RETRIES_PER_HOST` holds `MAX_RETRIES`, an `old` with exactly one
-match that cuts no word takes that match, and a `count` that equals the
-whole-word matches but not every match replaces just those; a nonblocking
-`WHOLE_WORDS_ONLY` warning names the first match left and its line. A count
+match that cuts no word takes that match, a `count` that equals the
+whole-word matches but not every match replaces just those, and `all` takes
+every whole-word match; a nonblocking `WHOLE_WORDS_ONLY` warning names the
+first match left and its line. An `all` with no match that cuts no word is
+`TARGET_NOT_FOUND`, naming the first longer word when matches lie inside
+longer words. A count
 that is neither gives the whole-word number in its `EXPECTED_COUNT_MISMATCH`
 advice too; the whole-word scan stops after 10,000 matches. An ambiguity message suggests
 `in` lines where a whole-word match is the only match in those whole lines, and
@@ -668,6 +680,8 @@ one on the same workspace. State written by 0.3.0 also loads, re-serializes byte
 Records of requests that use `path`, `lines`, `after`, `in` with lines, or
 `count` without `in` have shapes 0.3.x cannot read; a 0.3.x binary reports
 `STORE_CORRUPT` for them and its pruning refuses before deleting anything.
+Records of requests that use `all` have a shape that earlier releases cannot
+read: they report `STORE_CORRUPT` for them, and their pruning refuses.
 
 To review reclaimable storage, run `prune-snapshots 604800` for snapshots older
 than seven days. The JSON result lists `eligible` snapshot IDs and their

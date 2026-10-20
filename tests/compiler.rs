@@ -3494,6 +3494,139 @@ fn whole_word_matches_leave_longer_names() {
     );
 }
 
+/// `all` takes every whole-word match of `old`, however many, as a rename means,
+/// and leaves longer names, which a warning names.
+#[test]
+fn all_takes_every_whole_word_match_and_leaves_longer_names() {
+    let plan = |text: &str, change: serde_json::Value| {
+        let base = snapshot("settings.py".into(), text.into());
+        let change: Change = serde_json::from_value(change).unwrap();
+        compile(&request(&base, vec![change]), &bases(&base))
+    };
+    let rename = json!({"id":"rename","old":"MAX_RETRIES","new":"RETRY_LIMIT","all":true});
+    let text = "MAX_RETRIES = 3\nMAX_RETRIES_PER_HOST = 2\nretry(MAX_RETRIES)\n";
+    let renamed = plan(text, rename.clone()).unwrap();
+    assert_eq!(
+        renamed.files[0].output,
+        "RETRY_LIMIT = 3\nMAX_RETRIES_PER_HOST = 2\nretry(RETRY_LIMIT)\n"
+    );
+    assert_eq!(renamed.warnings.len(), 1, "{:?}", renamed.warnings);
+    assert_eq!(renamed.warnings[0].code, "WHOLE_WORDS_ONLY");
+    assert_eq!(
+        renamed.warnings[0].message,
+        "Change rename: `all` took only the whole-word matches, so the one inside `MAX_RETRIES_PER_HOST` at line 2 stayed"
+    );
+    // One match is enough; with no longer names there is nothing to warn about.
+    let one = plan("MAX_RETRIES = 3\n", rename.clone()).unwrap();
+    assert_eq!(one.files[0].output, "RETRY_LIMIT = 3\n");
+    assert!(one.warnings.is_empty(), "{:?}", one.warnings);
+    // `in` limits it to those lines.
+    let scoped = plan(
+        "MAX_RETRIES = 3\nretry(MAX_RETRIES)\nlog(MAX_RETRIES)\n",
+        json!({"id":"rename","old":"MAX_RETRIES","new":"RETRY_LIMIT","all":true,"in":[2,3]}),
+    )
+    .unwrap();
+    assert_eq!(
+        scoped.files[0].output,
+        "MAX_RETRIES = 3\nretry(RETRY_LIMIT)\nlog(RETRY_LIMIT)\n"
+    );
+    // A match inside a longer name alone is no whole-word match.
+    let base = snapshot("pool.py".into(), "MAX_RETRIES_PER_HOST = 2\n".into());
+    let change: Change = serde_json::from_value(rename.clone()).unwrap();
+    let error = rejected(&base, change);
+    assert_eq!(error.code, "TARGET_NOT_FOUND");
+    assert_eq!(
+        error.message,
+        "No whole-word match: all 1 are inside longer words, the first in `MAX_RETRIES_PER_HOST` at line 1; set count to 1 to replace inside words"
+    );
+    // Nor is text the file lacks.
+    let base = snapshot("pool.py".into(), "retries = 2\n".into());
+    let change: Change = serde_json::from_value(rename).unwrap();
+    assert_eq!(rejected(&base, change).code, "TARGET_NOT_FOUND");
+}
+
+/// In an `old` that joins words with a hyphen, as a CSS class does, a hyphen
+/// continues a word around its matches too, so a longer hyphenated name, a
+/// custom property, or an attribute that holds the class name keeps it.
+#[test]
+fn a_hyphenated_old_is_whole_only_outside_longer_hyphenated_names() {
+    let text = concat!(
+        ".btn-primary:hover, .btn-primary-outline { color: var(--btn-primary-fg); }\n",
+        "<a class=\"btn btn-primary\" data-btn-primary-label=\"Go\" aria-describedby=\"btn-primary-help\">\n",
+    );
+    let base = snapshot("buttons.html".into(), text.into());
+    let change: Change = serde_json::from_value(
+        json!({"id":"rename","old":"btn-primary","new":"btn-accent","all":true}),
+    )
+    .unwrap();
+    let plan = compile(&request(&base, vec![change]), &bases(&base)).unwrap();
+    assert_eq!(
+        plan.files[0].output,
+        concat!(
+            ".btn-accent:hover, .btn-primary-outline { color: var(--btn-primary-fg); }\n",
+            "<a class=\"btn btn-accent\" data-btn-primary-label=\"Go\" aria-describedby=\"btn-primary-help\">\n",
+        )
+    );
+    assert_eq!(
+        plan.warnings[0].message,
+        "Change rename: `all` took only the whole-word matches, so 4 inside longer words stayed, the first in `btn-primary-outline` at line 1"
+    );
+    // A single `old` takes its one whole match the same way,
+    let base = snapshot(
+        "b.css".into(),
+        ".btn-primary {}\n.btn-primary-outline {}\n".into(),
+    );
+    let plan = compile(
+        &request(&base, vec![exact("c", "btn-primary", "btn-accent")]),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(
+        plan.files[0].output,
+        ".btn-accent {}\n.btn-primary-outline {}\n"
+    );
+    // and is refused where its only match is inside a longer hyphenated name.
+    let base = snapshot("b.css".into(), "x\n.btn-primary-outline {}\n".into());
+    let error = rejected(&base, exact("c", "btn-primary", "btn-accent"));
+    assert_eq!(error.code, "OLD_INSIDE_WORD");
+    assert!(
+        error.message.contains("`btn-primary-outline` at line 2"),
+        "{}",
+        error.message
+    );
+    // A word `old` begins or ends with as context keeps hyphens as separators,
+    // even when `old` also holds a hyphenated name, as the eval's
+    // `btn btn-primary" aria` did, cut from `aria-describedby`.
+    let base = snapshot(
+        "r.html".into(),
+        "<a class=\"btn btn-primary\" aria-describedby=\"help\">\n".into(),
+    );
+    let plan = compile(
+        &request(
+            &base,
+            vec![exact(
+                "c",
+                "btn btn-primary\" aria",
+                "btn btn-accent\" aria",
+            )],
+        ),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(
+        plan.files[0].output,
+        "<a class=\"btn btn-accent\" aria-describedby=\"help\">\n"
+    );
+    // An `old` with no hyphen between words keeps a hyphen a separator.
+    let base = snapshot("b.css".into(), ".btn-primary {}\n".into());
+    let plan = compile(
+        &request(&base, vec![exact("c", "primary", "accent")]),
+        &bases(&base),
+    )
+    .unwrap();
+    assert_eq!(plan.files[0].output, ".btn-accent {}\n");
+}
+
 fn compiled(text: &str, change: serde_json::Value) -> Result<String, Vec<Diagnostic>> {
     let base = snapshot("w.py".into(), text.into());
     let change: Change = serde_json::from_value(change).unwrap();

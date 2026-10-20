@@ -7,6 +7,19 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ### Added
 
+- `"all": true` on an `old` change replaces every non-overlapping occurrence
+  of `old` that cuts no word, at least one, in the file or within `in`, as a
+  rename needs, without counting them first. Occurrences inside longer names
+  stay, and a nonblocking `WHOLE_WORDS_ONLY` warning names the first; with no
+  whole-word occurrence the change is `TARGET_NOT_FOUND`. `count` and `all`
+  exclude each other, and `all: false` is accepted and not stored. Plans store
+  the target as `{"kind":"every",...}`, which earlier releases report as
+  `STORE_CORRUPT`. In round 8 of the Windows eval, Ultra Edit cost 95% more than
+  native edits on `rename-css-class` and 53% more on `rename-constant`: native
+  runs rewrote the files with `sed -i`, an inline script, or a PowerShell
+  rewrite, while Ultra Edit runs wrote one change per line, up to 6,514 output
+  tokens. One call with an `"all": true` change per file now commits each
+  task's expected output.
 - On Windows, a path that names no file as given but is spelled as Git Bash
   prints it names the file it stands for: `/c/x` is `C:\x`, and `/tmp/x` is in
   the user's temporary directory. A path copied from `pwd` in Claude Code's
@@ -47,6 +60,16 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ### Changed
 
+- Where `old` begins or ends with a name that joins words with a hyphen, as
+  the CSS class `btn-primary` does, a hyphen continues the word at that end of
+  a match, for the exact-once rule, `count`'s whole-word matches, and `all`
+  alike: `btn-primary` is no longer whole inside `btn-primary-outline`,
+  `--btn-primary-bg`, or `data-btn-primary-label`. A word `old` begins or ends
+  with as context keeps hyphens as separators. Replayed with this rule, the 278
+  recorded `ultra_edit` calls of the Windows eval's first eight rounds keep
+  their outcomes, apart from parse errors that now list `all` among the
+  accepted fields, but one: a `rename-css-class` call refused for three
+  ambiguous `old`s now commits the bytes its run's corrected second call wrote.
 - The Claude Code plugin starts the server with the new `--plugin-card` flag,
   which sends no server instructions, as `--no-instructions` does, and gives
   the plugin's routing card as the `ultra_edit` description. The session and

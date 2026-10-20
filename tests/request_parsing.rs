@@ -39,7 +39,7 @@ fn a_change_error_that_starts_with_change_keeps_the_colon_after_its_position() {
         ),
         (
             json!({"old":"a","target":{"kind":"exact","old":"a","scope":null},"text":"b"}),
-            "change mixes verbose `target` with shorthand fields (old/span/lines/after/in/count/expect); use one form",
+            "change mixes verbose `target` with shorthand fields (old/span/lines/after/in/count/all/expect); use one form",
         ),
     ];
     for (change, message) in cases {
@@ -61,7 +61,7 @@ fn errors_are_numbered_from_one_and_nested_under_their_file() {
         edit_error(
             json!({"files":[{"path":"a","changes":[]},{"path":"b","changes":[{"bogus":1}]}]})
         ),
-        "file 2, change 1: unknown field `bogus`, expected one of `id`, `old`, `new`, `text`, `count`, `in`, `span`, `lines`, `after`, `expect`, `target`"
+        "file 2, change 1: unknown field `bogus`, expected one of `id`, `old`, `new`, `text`, `count`, `all`, `in`, `span`, `lines`, `after`, `expect`, `target`"
     );
     assert_eq!(
         edit_error(json!({"files":[{"path":"a","changes":null}]})),

@@ -151,6 +151,18 @@ pub enum Target {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         lines: Option<[usize; 2]>,
     },
+    /// Every non-overlapping occurrence of `old` that cuts no word, at least one, as
+    /// a rename means; occurrences inside longer names stay.
+    Every {
+        old: String,
+        /// A disclosed span ID such as selection or r0; omit to search the whole
+        /// stored file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
+        /// Whole lines `[first, last]` to search instead of a span scope.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lines: Option<[usize; 2]>,
+    },
     Span {
         /// A span ID disclosed by this exact base snapshot; never infer it from another read.
         span: String,
@@ -192,6 +204,7 @@ pub struct ChangeInput {
     new: Option<String>,
     text: Option<String>,
     count: Option<serde_json::Value>,
+    all: Option<serde_json::Value>,
     #[serde(rename = "in")]
     within: Option<serde_json::Value>,
     span: Option<String>,
@@ -295,9 +308,10 @@ impl TryFrom<ChangeInput> for Change {
             let shorthand = !selectors.is_empty()
                 || input.within.is_some()
                 || input.count.is_some()
+                || input.all.is_some()
                 || input.expect.is_some();
             if shorthand {
-                return Err("change mixes verbose `target` with shorthand fields (old/span/lines/after/in/count/expect); use one form".into());
+                return Err("change mixes verbose `target` with shorthand fields (old/span/lines/after/in/count/all/expect); use one form".into());
             }
             let text = text.ok_or("verbose change needs `text` (the replacement; \"\" deletes)")?;
             return Ok(Self {
@@ -320,6 +334,7 @@ impl TryFrom<ChangeInput> for Change {
                 ));
             }
         }
+        let all = all_input(input.all.as_ref())?;
         if input.old.is_none() {
             // `count: 1` asks for what every other target already does.
             if input
@@ -328,6 +343,11 @@ impl TryFrom<ChangeInput> for Change {
                 .is_some_and(|count| count.as_u64() != Some(1))
             {
                 return Err("`count` is a positive occurrence count and needs `old`".into());
+            }
+            if all {
+                return Err(
+                    "`all` replaces every whole-word occurrence of `old`; it needs `old`".into(),
+                );
             }
             if input.span.is_some() && input.within.is_some() {
                 return Err("`in` restricts `old`; it does not apply to span".into());
@@ -354,14 +374,18 @@ impl TryFrom<ChangeInput> for Change {
                 Some(within) => scope_input(within)?,
                 None => (None, None),
             };
-            match input.count {
-                Some(count) => Target::All {
+            match (input.count, all) {
+                (Some(_), true) => {
+                    return Err("give `count` or `all`, not both: `all` takes every whole-word occurrence, however many".into());
+                }
+                (Some(count), false) => Target::All {
                     old,
                     scope,
                     expected: count_input(&count)?,
                     lines,
                 },
-                None => Target::Exact { old, scope, lines },
+                (None, true) => Target::Every { old, scope, lines },
+                (None, false) => Target::Exact { old, scope, lines },
             }
         } else if let Some(span) = input.span {
             Target::Span { span, expect }
@@ -498,11 +522,21 @@ fn repeated_lines(
     }
 }
 
+/// Reads `all`: `true` takes every whole-word occurrence of `old`, and `false` says
+/// what leaving it out does, so it is accepted and not stored.
+fn all_input(value: Option<&serde_json::Value>) -> Result<bool, String> {
+    match value {
+        None | Some(serde_json::Value::Bool(false)) => Ok(false),
+        Some(serde_json::Value::Bool(true)) => Ok(true),
+        Some(_) => Err("`all` takes true: replace every whole-word occurrence of `old`".into()),
+    }
+}
+
 fn count_input(value: &serde_json::Value) -> Result<usize, String> {
     match value.as_u64().map(usize::try_from) {
         Some(Ok(0)) => Err("`count` must be at least 1: how many times `old` occurs".into()),
         Some(Ok(count)) => Ok(count),
-        _ => Err("`count` takes a whole number: how many times `old` occurs".into()),
+        _ => Err("`count` takes a whole number: how many times `old` occurs; \"all\":true takes every whole-word occurrence".into()),
     }
 }
 
@@ -527,6 +561,7 @@ impl schemars::JsonSchema for Change {
                 "old": {"type": "string"},
                 "new": {"type": "string"},
                 "count": {"type": "integer", "minimum": 1},
+                "all": {"type": "boolean"},
                 "in": {"anyOf": [pair, {"type": "string"}]},
                 "lines": lines,
                 "after": {"type": "integer", "minimum": 0},
@@ -892,6 +927,30 @@ mod tests {
                 json!({"kind":"all","old":"a","scope":"selection","expected":2}),
             ),
             (
+                json!({"old":"a","new":"b","all":true}),
+                Target::Every {
+                    old: "a".into(),
+                    scope: None,
+                    lines: None,
+                },
+                json!({"kind":"every","old":"a"}),
+            ),
+            (
+                json!({"old":"a","new":"b","all":true,"in":[3,9]}),
+                Target::Every {
+                    old: "a".into(),
+                    scope: None,
+                    lines: Some([3, 9]),
+                },
+                json!({"kind":"every","old":"a","lines":[3,9]}),
+            ),
+            // `all: false` says what leaving it out does, so it is not stored.
+            (
+                json!({"old":"a","new":"b","all":false}),
+                exact(None, None),
+                json!({"kind":"exact","old":"a","scope":null}),
+            ),
+            (
                 json!({"span":"r2..r4","new":"b","expect":"x"}),
                 Target::Span {
                     span: "r2..r4".into(),
@@ -995,7 +1054,11 @@ mod tests {
         for (input, message) in [
             (
                 json!({"target":{"kind":"exact","old":"a"},"old":"a","text":"b"}),
-                "change mixes verbose `target` with shorthand fields (old/span/lines/after/in/count/expect); use one form",
+                "change mixes verbose `target` with shorthand fields (old/span/lines/after/in/count/all/expect); use one form",
+            ),
+            (
+                json!({"target":{"kind":"exact","old":"a"},"all":true,"text":"b"}),
+                "change mixes verbose `target` with shorthand fields (old/span/lines/after/in/count/all/expect); use one form",
             ),
             (
                 json!({"target":{"kind":"exact","old":"a"}}),
@@ -1031,7 +1094,19 @@ mod tests {
             ),
             (
                 json!({"old":"a","count":"all","new":"b"}),
-                "`count` takes a whole number: how many times `old` occurs",
+                "`count` takes a whole number: how many times `old` occurs; \"all\":true takes every whole-word occurrence",
+            ),
+            (
+                json!({"old":"a","count":2,"all":true,"new":"b"}),
+                "give `count` or `all`, not both: `all` takes every whole-word occurrence, however many",
+            ),
+            (
+                json!({"lines":[1,1],"expect":"line one","all":true,"new":"b"}),
+                "`all` replaces every whole-word occurrence of `old`; it needs `old`",
+            ),
+            (
+                json!({"old":"a","all":"yes","new":"b"}),
+                "`all` takes true: replace every whole-word occurrence of `old`",
             ),
             (
                 json!({"span":"r1","in":[1,1],"new":"b"}),
@@ -1097,7 +1172,8 @@ mod tests {
             "{unknown}"
         );
         for field in [
-            "id", "old", "new", "text", "count", "in", "span", "lines", "after", "expect", "target",
+            "id", "old", "new", "text", "count", "all", "in", "span", "lines", "after", "expect",
+            "target",
         ] {
             assert!(unknown.contains(&format!("`{field}`")), "{unknown}");
         }
@@ -1180,10 +1256,11 @@ mod tests {
         assert_eq!(
             fields,
             [
-                "after", "count", "expect", "id", "in", "lines", "new", "old", "span"
+                "after", "all", "count", "expect", "id", "in", "lines", "new", "old", "span"
             ]
         );
         assert!(schema.get("required").is_none());
         assert_eq!(schema["properties"]["count"]["minimum"], 1);
+        assert_eq!(schema["properties"]["all"]["type"], "boolean");
     }
 }
