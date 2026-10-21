@@ -70,9 +70,11 @@ measured right after it is. Each run records the Claude Code build and the
 Ultra Edit executable's SHA-256 it ran with, and `--resume` refuses to mix runs
 measured with different ones unless `--allow-drift` is given.
 
-Every prompt starts with the line `<!-- MARKER -->`, MARKER being 8 hex digits
-that each invocation draws afresh, `--resume` included (`prompt_marker` in
-`manifest.json` and each run's `command.json`). The prompt cache keeps a
+Every prompt starts with the line `<!-- MARKER -->`. MARKER is 8 hex digits,
+the start of the SHA-256 of the invocation's own marker, which each invocation
+draws afresh, `--resume` included (`prompt_marker` in `manifest.json`),
+followed by a space and the arm's name; each run's `command.json` records the
+MARKER it sent. The prompt cache keeps a
 request's prefix, task prompt included, for a while after its last use: an hour
 in the Windows rounds through the eleventh, which ran logged in, and five
 minutes from the twelfth, which ran with `ANTHROPIC_API_KEY`. Without the
@@ -85,15 +87,16 @@ prompt once per invocation, an arm restarted by `--rerun-arm` included, and
 later repetitions read it while the entry lasts; repetitions run a whole pass
 of tasks apart, so with five-minute entries every run writes its own.
 
-The marker is the same for every arm, so arms whose requests match through the
-task prompt still share its cache entry. In the twelfth Windows round
-(2026-10-21 00:26), `native` and `ultra-edit-deferred` sent the same tools,
-system prompt, and task prompt, so in each task's repetition whichever ran
-first wrote it and the other read it: 39 `native` runs and 30
-`ultra-edit-deferred` runs read another arm's entry. Charged as cache writes,
-those reads lift `native`'s mean cost from $0.0524 to $0.0551 and
-`ultra-edit`'s cost ratio against it from 1.08 to 1.03. Compare such arms only
-on runs that wrote their task prompt, or reprice those reads.
+Through the thirteenth Windows round, MARKER was the invocation's own marker,
+the same for every arm, so arms whose requests matched through the task prompt
+shared its cache entry. In the twelfth (2026-10-21 00:26), `native` and
+`ultra-edit-deferred` sent the same tools, system prompt, and task prompt, so
+in each task's repetition whichever ran first wrote it and the other read it:
+39 `native` runs and 30 `ultra-edit-deferred` runs read another arm's entry.
+Charged as cache writes, those reads lift `native`'s mean cost from $0.0524 to
+$0.0551 and `ultra-edit`'s cost ratio against it from 1.08 to 1.03. In those
+rounds, compare such arms only on runs that wrote their task prompt, or reprice
+those reads.
 
 ### Third-party arms
 

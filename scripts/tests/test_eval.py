@@ -1416,9 +1416,11 @@ class HarnessProcessTests(unittest.TestCase):
         self.assertIn("--setting-sources=", command["argv"])
 
     @unittest.skipUnless(HAS_GIT, "git is required")
-    def test_run_one_sends_the_prompt_after_the_invocation_marker(self):
+    def test_run_one_sends_the_prompt_after_its_arm_marker(self):
         task = evaluation.load_task(TASKS_DIR / "crlf-and-lf")
         self.write_plan(task.expected)
+        marker = evaluation.arm_marker("0123abcd", "native")
+        self.assertRegex(marker, "^[0-9a-f]{8}$")
         for via in ("stdin", "arg"):
             config = self.config(self.root / via)
             config.prompt_via, config.prompt_marker = via, "0123abcd"
@@ -1426,9 +1428,9 @@ class HarnessProcessTests(unittest.TestCase):
             self.assertEqual(result["outcome"], "pass", result)
             log = json.loads(self.log_path.read_text(encoding="utf-8"))
             sent = log["prompt"] if via == "stdin" else log["argv"][1]
-            self.assertEqual(sent, f"<!-- 0123abcd -->\n{task.prompt}", via)
+            self.assertEqual(sent, f"<!-- {marker} -->\n{task.prompt}", via)
             command = json.loads((self.root / via / result["files"]["dir"] / "command.json").read_text(encoding="utf-8"))
-            self.assertEqual(command["prompt_marker"], "0123abcd")
+            self.assertEqual(command["prompt_marker"], marker)
             self.assertNotIn(sent, command["argv"])
 
     @unittest.skipUnless(HAS_GIT, "git is required")
@@ -2655,10 +2657,11 @@ class ParallelAndThirdPartyRunTests(unittest.TestCase):
         self.assertEqual([entry["arms"] for entry in manifest["history"]], [["native"], ["shell-sed"]])
         self.assertEqual(sorted(r["arm"] for r in evaluation.load_records(out)), ["native", "shell-sed"])
 
-    def test_each_invocation_starts_every_prompt_with_its_own_marker(self):
-        # A task prompt cached by an earlier invocation is never read: without the marker, an
-        # arm whose tools and system prompt are unchanged would start with its task prompts
-        # cached while an arm whose build changed paid to write them.
+    def test_each_invocation_and_arm_starts_every_prompt_with_its_own_marker(self):
+        # A task prompt cached by an earlier invocation or another arm is never read: without
+        # the marker, an arm whose tools and system prompt are unchanged would start with its
+        # task prompts cached while an arm whose build changed paid to write them, and arms
+        # whose tools and system prompt match would read each other's.
         self.write_plan()
         out = self.root / "results"
         markers = []
@@ -2672,10 +2675,13 @@ class ParallelAndThirdPartyRunTests(unittest.TestCase):
         self.assertEqual([entry["prompt_marker"] for entry in manifest["history"]], markers)
         records = evaluation.load_records(out)
         self.assertEqual(len(records), 6)
+        sent = set()
         for record in records:
-            marker = markers[1 if record["rep"] == 3 else 0]
+            marker = evaluation.arm_marker(markers[1 if record["rep"] == 3 else 0], record["arm"])
             log = json.loads((self.logs / f"{record['run_id']}.json").read_text(encoding="utf-8"))
             self.assertEqual(log["prompt"], f"<!-- {marker} -->\n{self.task.prompt}", record["run_id"])
+            sent.add(marker)
+        self.assertEqual(len(sent), 4, "each arm of each invocation sends its own marker")
 
     def test_main_rejects_an_unavailable_third_party_arm_before_paid_runs(self):
         self.write_plan()

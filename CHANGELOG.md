@@ -78,6 +78,15 @@ All notable changes to Ultra Edit are documented here. Releases follow
   range's last line but a line inside it, such as the one before a closing
   fence or parenthesis, or the neighbour below it.
 
+### Fixed
+
+- Eval: each arm's prompts start with a marker of their own, hashed from the
+  invocation's marker and the arm's name, so arms whose tools and system prompt
+  match no longer read each other's cached task prompts. In the twelfth Windows
+  round, 39 `native` runs read a task prompt that an `ultra-edit-deferred` run
+  had cached, which put `ultra-edit`'s cost at 1.08x `native`'s rather than
+  1.03x.
+
 ## [0.5.0] - 2026-10-20
 
 ### Added

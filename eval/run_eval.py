@@ -2336,13 +2336,23 @@ def _write_json(path: Path, value: Any) -> None:
 
 
 def marked_prompt(prompt: str, marker: str | None) -> str:
-    """The prompt as a run sends it: after a line holding the invocation's marker, if any.
+    """The prompt as a run sends it: after a line holding its arm's marker, if any.
 
-    The prompt cache serves an earlier request's prefix, through its task prompt, for about an
-    hour after that prefix was last used. Without the marker, an arm whose tools and system
-    prompt are unchanged since the last invocation finds its task prompts cached on their first
-    repetition, while an arm whose build changed pays to write them."""
+    The prompt cache serves an earlier request's prefix, through its task prompt, for a while
+    after that prefix was last used (an hour logged in, five minutes with an API key). Without
+    the marker, an arm whose tools and system prompt are unchanged since the last invocation
+    finds its task prompts cached on their first repetition, while an arm whose build changed
+    pays to write them."""
     return f"<!-- {marker} -->\n{prompt}" if marker else prompt
+
+
+def arm_marker(marker: str | None, arm: str) -> str | None:
+    """The invocation's marker for one arm: the first 8 hex digits of SHA-256 over both.
+
+    Arms whose tools and system prompt match, such as `native` and `ultra-edit-deferred`, would
+    otherwise send the same request through the task prompt, and whichever ran a task first
+    would write the cache entry the other read. Hashed, the marker does not show the arm."""
+    return hashlib.sha256(f"{marker} {arm}".encode("utf-8")).hexdigest()[:8] if marker else None
 
 
 def run_one(config: Config, spec: RunSpec) -> dict[str, Any]:
@@ -2377,7 +2387,8 @@ def run_one(config: Config, spec: RunSpec) -> dict[str, Any]:
         env, removed = build_env(base_env, config_dir)
         env.update(arm.env)
         use_arg = config.prompt_via == "arg"
-        prompt = marked_prompt(spec.task.prompt, config.prompt_marker)
+        marker = arm_marker(config.prompt_marker, spec.arm)
+        prompt = marked_prompt(spec.task.prompt, marker)
         mcp_path = None
         if arm.mcp_server is not None:
             mcp_path = (run_dir / "mcp.json").resolve()
@@ -2404,7 +2415,7 @@ def run_one(config: Config, spec: RunSpec) -> dict[str, Any]:
                 "argv": ["<prompt.md>" if use_arg and item == prompt else item for item in argv],
                 "cwd": str(repo),
                 "prompt": f"{spec.task.name}/prompt.md via {'argument' if use_arg else 'stdin'}",
-                "prompt_marker": config.prompt_marker,
+                "prompt_marker": marker,
                 "env_set": {
                     **CHILD_ENV,
                     **({"CLAUDE_CONFIG_DIR": str(config_dir)} if config_dir else {}),
@@ -3252,7 +3263,7 @@ def _dry_run(
             _print(f"WARNING: {problem}")
     _print(f"results: {out_dir}")
     _print("each run: fresh temporary Git repository with the fixture committed; cwd = <temp>/repo")
-    _print("each prompt: the line <!-- MARKER --> before prompt.md, MARKER being 8 hex digits drawn per invocation")
+    _print("each prompt: the line <!-- MARKER --> before prompt.md, MARKER being 8 hex digits per invocation and arm")
     env, removed = build_env(os.environ)
     _print(f"child environment sets: {', '.join(f'{k}={v}' for k, v in CHILD_ENV.items())}")
     if removed:
