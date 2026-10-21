@@ -464,7 +464,7 @@ fn suggested_ranges_are_ranges_that_can_be_followed() {
         ends([1, 4], Some("head one\nhead two"), Some("head one"), ""),
     );
     assert!(
-        !error.message.contains("the range is [1,1]"),
+        !error.message.contains("use lines [1,1]"),
         "{}",
         error.message
     );
@@ -557,7 +557,7 @@ fn line_guard_boundaries_behave_as_intended() {
     assert!(
         error
             .message
-            .contains("it is at line 3, so the range is [2,3]")
+            .contains("it is at line 3, so use lines [2,3] if the range ends there")
     );
     assert_eq!(
         outcome(&base, ends([2, 3], Some("fn remove_me() {"), Some("}"), "")).unwrap(),

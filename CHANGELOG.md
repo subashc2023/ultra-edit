@@ -18,19 +18,39 @@ All notable changes to Ultra Edit are documented here. Releases follow
   blank `expect` and is still refused, as `LINE_GUARD_WEAK`.
 - The plugin card states the line guard as the server checks it, 8 or more
   visible characters in the whole `expect` rather than in each part, so the
-  text at one end of a range can carry a blank line at the other, and tells
-  `after` to anchor on a text line, with blank lines in `new`. In those rounds,
-  Ultra Edit runs sent a blank `expect` with `after` ten times, between
-  functions or sections, and every one was refused, eight as
+  text at one end of a range can carry a blank line at the other, and its
+  example anchors an `after` on a function's last line, `"    return sum(xs)"`,
+  with the blank lines that come before the inserted function in `new`. In
+  those rounds, Ultra Edit runs sent a blank `expect` with `after` ten times,
+  between functions or sections, and every one was refused, eight as
   `LINE_GUARD_WEAK`. A card showing `["return ok",""]` for `after` instead cut
   blank-line rejections in 20 runs of move-function-between-modules and
   replace-function-body to two, from ten in those tasks' 30 earlier runs, but
   five of its nine failed calls gave a `lines` range with blank ends an
   `expect` item that was neither its first nor its last line, as if the list
-  held neighbours, as that example's does. With this card, the same 20 runs
-  gave such an item once, though three of the ten move-function-between-modules
-  runs still anchored `after` on a blank line. To stay within 2,048 bytes, the
-  card drops its heading and shortens its replay note.
+  held neighbours, as that example's does. With the rule stated in words
+  instead, the same 20 runs gave such an item once, but three of the ten
+  move-function-between-modules runs still anchored `after` on a blank line. To
+  stay within 2,048 bytes, the card drops its heading and shortens its replay
+  note.
+- A change takes what callers add to a deletion: `delete: true`, or
+  `delete_line: true`, beside the `"new":""` of an `old`, `span`, or `lines`
+  change, which it repeats, and fields whose names begin with `_`, as JSON's
+  conventional comments do, as notes. Neither is stored, so the request ID is
+  unchanged. A null `new` deletes as `""` does, and is refused with `after`;
+  any other field a change does not take is still refused. In the 17 recorded
+  eval rounds, all ten such refusals of Ultra Edit calls were a correct deletion
+  of one line in move-function-between-modules with one addition (`delete`
+  three times, `delete_line` once, `_` four times, `_note` once, and a null
+  `new` once), and each cost its run a call. Replayed, all ten commit and leave
+  every file they touch as the task expects.
+- When the last lines of a `lines` change's `expect` are found where its range
+  does not end, the refusal offers the range that ends there as a condition,
+  `use lines [a,b] if the range ends there`, rather than stating `the range is
+  [a,b]`. Of the 14 such refusals in Ultra Edit runs of those rounds, 11 named a
+  range that would have cut the wrong lines: the last `expect` item was not the
+  range's last line but a line inside it, such as the one before a closing
+  fence or parenthesis, or the neighbour below it.
 
 ## [0.5.0] - 2026-10-20
 

@@ -2828,7 +2828,7 @@ fn line_expect_compares_whole_lines_ignoring_line_endings() {
     assert_eq!(error.code, "EXPECTED_TEXT_MISMATCH");
     assert_eq!(
         error.message,
-        "Line 8 holds \"    setting_7 = 7\", not the expected last lines; it is at line 9, so the range is [5,9] (ultra_edit_repair can replace just this change)."
+        "Line 8 holds \"    setting_7 = 7\", not the expected last lines; it is at line 9, so use lines [5,9] if the range ends there (ultra_edit_repair can replace just this change)."
     );
     assert_eq!(
         error.candidates,

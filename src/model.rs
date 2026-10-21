@@ -196,13 +196,14 @@ pub enum Target {
 /// alias of `new`. Fields that are not plain strings are read as JSON values so a
 /// mistake gets a message that teaches the accepted form.
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ChangeInput {
     #[serde(default)]
     id: String,
     old: Option<String>,
-    new: Option<String>,
-    text: Option<String>,
+    #[serde(default, deserialize_with = "nullable")]
+    new: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    text: Option<Option<String>>,
     count: Option<serde_json::Value>,
     all: Option<serde_json::Value>,
     #[serde(rename = "in")]
@@ -211,8 +212,62 @@ pub struct ChangeInput {
     lines: Option<serde_json::Value>,
     after: Option<serde_json::Value>,
     expect: Option<serde_json::Value>,
+    /// `true` beside a deleting `"new": ""`, which it repeats, as callers sometimes
+    /// add to a deletion; like `count: 1`, it is accepted and not stored.
+    #[serde(alias = "delete_line")]
+    delete: Option<serde_json::Value>,
     #[serde(default, deserialize_with = "verbose_target")]
     target: Option<Target>,
+    /// Refuses every other field but notes, as `deny_unknown_fields` would; serde
+    /// supports that attribute only without `flatten`.
+    #[serde(flatten)]
+    _notes: Notes,
+}
+
+/// The fields a change takes, as an unknown field's refusal lists them.
+const CHANGE_FIELDS: &[&str] = &[
+    "id", "old", "new", "text", "count", "all", "in", "span", "lines", "after", "expect", "target",
+];
+
+/// A change's fields that [`ChangeInput`] does not name. Those whose names begin
+/// with `_`, as JSON's conventional comments do, are notes and are ignored, since
+/// no field's name does; callers add them, such as `"_": ""` after a deletion's
+/// `new`. Any other is refused with the fields a change takes.
+struct Notes;
+
+impl<'de> Deserialize<'de> for Notes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Fields;
+        impl<'de> serde::de::Visitor<'de> for Fields {
+            type Value = Notes;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a change's fields")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Notes, A::Error> {
+                while let Some(name) = map.next_key::<String>()? {
+                    if !name.starts_with('_') {
+                        return Err(serde::de::Error::unknown_field(&name, CHANGE_FIELDS));
+                    }
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+                Ok(Notes)
+            }
+        }
+        deserializer.deserialize_map(Fields)
+    }
+}
+
+/// Reads `new` or `text` so that JSON null, which callers write for no text, is
+/// told apart from a missing field.
+fn nullable<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 /// Reads a verbose `target` directly, so serde still rejects duplicate keys in it.
@@ -295,6 +350,21 @@ impl TryFrom<ChangeInput> for Change {
             (Some(text), None) | (None, Some(text)) => Some(text),
             (None, None) => None,
         };
+        let inserts = input.after.is_some() || matches!(input.target, Some(Target::Insert { .. }));
+        // A null `new` is no text, so it deletes as "" does; an insertion has none.
+        let text = match text {
+            Some(None) if inserts => {
+                return Err("after inserts `new`, so give it as text, not null".into());
+            }
+            text => text.map(Option::unwrap_or_default),
+        };
+        if input.delete.is_some()
+            && (input.delete != Some(serde_json::Value::Bool(true))
+                || text.as_deref() != Some("")
+                || inserts)
+        {
+            return Err(DELETE_FORM.into());
+        }
         let selectors: Vec<&str> = [
             ("old", input.old.is_some()),
             ("span", input.span.is_some()),
@@ -414,6 +484,8 @@ impl TryFrom<ChangeInput> for Change {
 }
 
 const EXPECT_FORM: &str = "`expect` takes the current text as a string, or as an array of lines: for lines [first line, last line], for after the lines ending there";
+
+const DELETE_FORM: &str = "`delete: true` only repeats `\"new\":\"\"`, which deletes what old, span, or lines name; drop it and give `new`";
 
 /// Reads an array `expect` of a lines target: two strings are its first and last
 /// lines; any other number of strings are its lines in order, joined.
@@ -1050,6 +1122,33 @@ mod tests {
     }
 
     #[test]
+    fn a_deletion_may_say_so_twice_and_a_change_may_carry_notes() {
+        // What callers have added to a deletion; none of it is stored.
+        let deletion = parse(json!({"lines":[9,9],"expect":"import re","new":""})).unwrap();
+        for input in [
+            json!({"lines":[9,9],"expect":"import re","new":"","delete":true}),
+            json!({"lines":[9,9],"expect":"import re","new":"","delete_line":true}),
+            json!({"lines":[9,9],"expect":"import re","new":null}),
+            json!({"lines":[9,9],"expect":"import re","text":null}),
+            json!({"lines":[9,9],"expect":"import re","new":"","_":""}),
+            json!({"lines":[9,9],"expect":"import re","new":"","_":0}),
+            json!({"lines":[9,9],"expect":"import re","new":"","_note":{"why":"unused"}}),
+        ] {
+            assert_eq!(parse(input.clone()).unwrap(), deletion, "{input}");
+        }
+        assert_eq!(
+            parse(json!({"old":"a","new":"b","_why":"typo"})).unwrap(),
+            parse(json!({"old":"a","new":"b"})).unwrap()
+        );
+        // A field that is not a note is still refused.
+        let unknown = parse(json!({"old":"a","new":"b","note":""})).unwrap_err();
+        assert!(
+            unknown.starts_with("unknown field `note`, expected one of"),
+            "{unknown}"
+        );
+    }
+
+    #[test]
     fn malformed_changes_are_rejected_with_the_accepted_form() {
         for (input, message) in [
             (
@@ -1071,6 +1170,20 @@ mod tests {
             (
                 json!({"old":"a","new":"b","text":"c"}),
                 "give `new` or `text`, not both",
+            ),
+            (json!({"old":"a","new":"b","delete":true}), DELETE_FORM),
+            (json!({"old":"a","delete":true}), DELETE_FORM),
+            (
+                json!({"lines":[1,1],"expect":"line one","new":"","delete":"yes"}),
+                DELETE_FORM,
+            ),
+            (
+                json!({"after":1,"expect":"line one","new":"","delete":true}),
+                DELETE_FORM,
+            ),
+            (
+                json!({"after":1,"expect":"line one","new":null}),
+                "after inserts `new`, so give it as text, not null",
             ),
             (
                 json!({"new":"b"}),
@@ -1245,6 +1358,10 @@ mod tests {
             error.starts_with("invalid `target`: duplicate field `old`"),
             "{error}"
         );
+        let error = serde_json::from_str::<Change>(r#"{"old":"keep","old":"drop","new":"b"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("duplicate field `old`"), "{error}");
     }
 
     #[test]

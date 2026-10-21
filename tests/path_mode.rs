@@ -365,7 +365,7 @@ fn a_line_added_inside_a_range_since_the_read_is_caught_at_its_end() {
     assert!(
         outcome.diagnostics[0]
             .message
-            .contains("it is at line 7, so the range is [3,7]"),
+            .contains("it is at line 7, so use lines [3,7] if the range ends there"),
         "{}",
         outcome.diagnostics[0].message
     );

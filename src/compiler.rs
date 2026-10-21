@@ -3152,7 +3152,14 @@ fn line_guard(
             tail.len(),
             budget,
             expect.tail,
-            |start| format!("the range is [{first},{}]", start + tail.len() - 1),
+            // A condition, not a finding: callers more often give a line inside the
+            // range, or the neighbour below it, as its last lines than miscount it.
+            |start| {
+                format!(
+                    "use lines [{first},{}] if the range ends there",
+                    start + tail.len() - 1
+                )
+            },
         );
         let tail_start = last + 1 - tail.len();
         diagnostics.push(mismatch_at(

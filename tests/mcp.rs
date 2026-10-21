@@ -2264,7 +2264,7 @@ fn the_routing_cards_example_commits_through_the_server_by_path() {
     let file = root.path().join("src").join("app.py");
     fs::write(
         &file,
-        "import os\n\nretries = 2\ncfg = load(cfg)\n\n\ndef main():\n    run()\n",
+        "import os\n\nretries = 2\ncfg = load(cfg)\n\n\ndef main():\n    run()\n\n\ndef total(xs):\n    return sum(xs)\n",
     )
     .unwrap();
     let mut example: Value = serde_json::from_str(&card[start..end]).unwrap();
@@ -2274,7 +2274,7 @@ fn the_routing_cards_example_commits_through_the_server_by_path() {
     assert_eq!(done["commit"], "committed", "{done}");
     assert_eq!(
         fs::read_to_string(&file).unwrap(),
-        "import os\nimport re\n\nretries = 3\nconfig = load(config)\n\n\ndef main(argv):\n    run(argv)\n"
+        "import os\nimport re\n\nretries = 3\nconfig = load(config)\n\n\ndef main(argv):\n    run(argv)\n\n\ndef total(xs):\n    return sum(xs)\n\n\ndef g():\n    pass\n"
     );
     // The edited lines come back as they now read, so no Read or diff is needed.
     // The path is the canonical one, as `/private/var` for macOS's `/var`.
@@ -2296,7 +2296,13 @@ fn the_routing_cards_example_commits_through_the_server_by_path() {
             "6 | ",
             "7 | ",
             "8 | def main(argv):",
-            "9 |     run(argv)"
+            "9 |     run(argv)",
+            "10 | ",
+            "13 |     return sum(xs)",
+            "14 | ",
+            "15 | ",
+            "16 | def g():",
+            "17 |     pass"
         ])
     );
     assert!(done["report"].as_str().unwrap().len() + done["changed"].to_string().len() < 1_000);

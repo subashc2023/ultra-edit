@@ -242,12 +242,16 @@ forms:
 | `{"lines":[12,18],"expect":["…","…"],"new":"…"}` | Replace whole lines 12-18, terminators included; `""` deletes them. |
 | `{"after":12,"expect":"…","new":"…"}` | Insert whole lines after line 12; `after:0` inserts at the top, after a BOM. |
 
-`new` may be spelled `text`, but not both. A change gives exactly one of `old`,
-`span`, `lines`, or `after`; `count`, `all`, and `in` apply only to `old`, with
-`count` or `all` but not both, and `expect` only to `span`, `lines`, and
-`after`. Three that repeat what a target already says are accepted and not
-stored: `count: 1` on any target, `all: false`, and `in` lines beside `lines`
-or `after` that hold the lines the target names. `lines` takes `[first,last]`, and `[12]`,
+`new` may be spelled `text`, but not both; a null `new` is no text, so it
+deletes as `""` does, and is refused with `after`. A change gives exactly one of
+`old`, `span`, `lines`, or `after`; `count`, `all`, and `in` apply only to
+`old`, with `count` or `all` but not both, and `expect` only to `span`,
+`lines`, and `after`. Four that repeat what a change already says are accepted
+and not stored: `count: 1` on any target, `all: false`, `in` lines beside
+`lines` or `after` that hold the lines the target names, and `delete: true`, or
+`delete_line: true`, beside the `"new":""` of an `old`, `span`, or `lines`
+change. Fields whose names begin with `_` are notes, ignored and not stored; a
+change refuses any other field it does not take. `lines` takes `[first,last]`, and `[12]`,
 `12`, `"12"`, and `"12-14"` are read as `[12,12]` and `[12,14]`; `in` takes the same
 line forms or a span ID. A malformed change is refused while the arguments are
 parsed, with a message naming the accepted form, such as `lines takes numbers
