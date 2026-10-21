@@ -328,16 +328,17 @@ arms with the same settings, 3 repetitions each:
 
 ## Windows results
 
-Six rounds ran all 23 tasks on Windows 11 under `native` and `ultra-edit`,
-with `claude-sonnet-5-5` and 3 repetitions each: 828 runs of those two arms,
+Seven rounds ran all 23 tasks on Windows 11 under `native` and `ultra-edit`,
+with `claude-sonnet-5-5` and 3 repetitions each: 966 runs of those two arms,
 none invalid. The first four ran Claude Code 2.1.303 and development builds
-between 0.4.0 and 0.5.0; the last two ran builds after 0.5.0, with 2.1.303 and
-then 2.1.306. Costs compare within a round only. Prompts in the first three
-were the same in every round, so an arm whose build had not changed could
-start with its task prompts cached by the round before; from the fourth, every
-prompt starts with a marker drawn per invocation. The first four also ran
-logged in, where a prompt-cache entry lasts an hour, so a task's later
-repetitions read the prompt its first one wrote; the last two ran with
+between 0.4.0 and 0.5.0; the last three ran builds after 0.5.0, the first of
+them with 2.1.303 and the others with 2.1.306. Costs compare within a round
+only. Prompts in the first three were the same in every round, so an arm whose
+build had not changed could start with its task prompts cached by the round
+before; from the fourth, every prompt starts with a marker drawn per
+invocation, and from the seventh, one per invocation and arm. The first four
+also ran logged in, where a prompt-cache entry lasts an hour, so a task's later
+repetitions read the prompt its first one wrote; the last three ran with
 `ANTHROPIC_API_KEY`, whose entries last five minutes, so every run writes its
 own.
 
@@ -349,6 +350,7 @@ own.
 | 2026-10-20 03:56 | `bec2512` | 68/69 | 69/69 | 63/69 | 65/69 | 1.00x | 0.64x |
 | 2026-10-21 00:26 | `bb6cc54` | 67/69 | 69/69 | 65/69 | 66/69 | 1.03x | 0.57x |
 | 2026-10-21 04:23 | `fdeb1ad` | 69/69 | 69/69 | 63/69 | 64/69 | 1.03x | 0.63x |
+| 2026-10-21 05:41 | `420e5fe` | 69/69 | 69/69 | 66/69 | 64/69 | 1.01x | 0.61x |
 
 Cost and turns are `ultra-edit`'s against `native`, as geometric means of
 per-task ratios. In the 00:26 round, 39 `native` runs read a task prompt that
@@ -356,24 +358,28 @@ an `ultra-edit-deferred` run had written (see [Arms](../eval/README.md#arms));
 the table charges those reads as writes, and as recorded the ratio is 1.08x.
 
 In the last round, against `native`, with 95% bootstrap intervals,
-`ultra-edit` cost 1.03x (0.99-1.07), with 0.96x (0.90-1.02) the context
-tokens, 0.96x (0.92-1.02) the output tokens, 0.63x (0.59-0.70) the turns, and
-0.58x (0.53-0.65) the tool calls. It cost 1.00x (0.95-1.06) on the 14
-exact-text tasks, 1.12x (1.08-1.18) on the 8 intent-level tasks, and 0.69x
-(0.59-0.81) on the stale-file task. Its first API call carried 2.1k more
-context tokens than native's, 24.6k against 22.5k. Cost varied less across
-repetitions, a mean coefficient of variation of 0.05 against 0.13.
+`ultra-edit` cost 1.01x (0.98-1.04), with 0.94x (0.90-0.99) the context
+tokens, 0.99x (0.95-1.04) the output tokens, 0.61x (0.58-0.66) the turns, and
+0.56x (0.52-0.62) the tool calls. It cost 1.00x (0.97-1.04) on the 14
+exact-text tasks, 1.09x (1.03-1.16) on the 8 intent-level tasks, and 0.61x
+(0.57-0.70) on the stale-file task. Its first API call carried 2.1k more
+context tokens than native's, 24.6k against 22.6k. Cost varied less across
+repetitions, a mean coefficient of variation of 0.05 against 0.11. Its build
+left the `report` out of committed `ultra_edit` results, which came to 1,958
+bytes each against 2,560 in the round before.
 
 - Fewer turns did not make `ultra-edit` cheaper because its runs wrote more to
-  the prompt cache: 11.7k tokens per run against 10.5k, $0.0030 at the rates
+  the prompt cache: 11.2k tokens per run against 10.5k, $0.0016 at the rates
   that reproduce the runs' reported costs. It wrote 0.5k more on the first
   call, where the deferred tool names, the skill listing, and the session-start
-  context are written anew every session, and 0.7k more on later calls, whose
-  tool results were 1.6 KB larger per run. Its 6.0k fewer cache reads and 0.1k
-  fewer output tokens saved $0.0018.
+  context are written anew every session, and 0.1k more on later calls, whose
+  tool results were 0.4 KB larger per run. Its 6.8k fewer cache reads and 51
+  fewer output tokens saved $0.0012. In the round before, later calls wrote
+  0.7k more and tool results were 1.6 KB larger; 0.8 KB of that was the
+  `report` of committed results.
 - Claude Code's Bash tool on Windows strips a level of backslash escaping, so
   the shell routes were expected to fail. `native` wrote through the shell in
-  213 of 414 runs, and every one of those runs ended with the expected bytes.
+  248 of 483 runs, and every one of those runs ended with the expected bytes.
   Its six wrong results were all Edit slips, on five tasks; two, in different
   rounds, dropped the final newline of `remove-deprecated-option`'s test file.
 - `ultra-edit`'s one wrong result, on `collapse-feature-flag`, deleted
@@ -382,22 +388,24 @@ repetitions, a mean coefficient of variation of 0.05 against 0.13.
   had two. That committed without a warning; `BLANK_LINES_DROPPED` now flags
   it. In the 03:56 round the warning fired accurately but saved no calls: the
   model's own Read or `git diff` caught the same drops.
-- The last round's five `ultra-edit` first-try misses, three on
-  `move-function-between-modules` and two on `replace-function-body`, each
-  sent an `after` with a blank `expect`, refused as `LINE_GUARD_WEAK` with
-  nothing written; one also gave a `lines` range whose `expect` named the line
-  above its end. The next call committed each time. `native`'s six were four
-  runs with failed Edits, an `old_string` not found or found more than once or
-  a file modified since read, and two whose Python edit scripts, run through
-  Bash, raised.
+- The last round's five `ultra-edit` first-try misses each had a call refused
+  as `LINE_GUARD_WEAK` with nothing written, and the call after each of those
+  refusals committed. Three, two on `move-function-between-modules` and one on
+  `replace-function-body`, sent an `after` with a blank `expect`. The two on
+  `move-and-delete-blocks` guarded a 29-line `lines` range with its blank
+  first line and a closing `)`, a pair found at two ranges; each run also gave
+  an `expect` one line off from its range, refused as `EXPECTED_TEXT_MISMATCH`.
+  `native`'s three were two `edit-while-file-changes` runs whose Edits failed,
+  on a file modified since read and an `old_string` found twice, and one whose
+  Python edit script, run through Bash, raised.
 - The 00:26 round also ran `ultra-edit-short` and `ultra-edit-deferred`, the
   `ULTRA_EDIT_CARD` variants that send the model to native Edit first. Both
   were exact in all 69 runs, as `ultra-edit` was, but right on the first try in
   54 and 61 against its 66, and cost 1.11x (1.08-1.13) and 1.14x (1.11-1.17)
   what it did, with the second's reads of `native`'s cache entries charged as
   writes.
-- Over the six rounds, 1 wrong of 414 against 6 gives p = 0.12, and on the
-  first try 32 misses against 37, p = 0.62: on Windows the two routes are not
+- Over the seven rounds, 1 wrong of 483 against 6 gives p = 0.12, and on the
+  first try 37 misses against 40, p = 0.81: on Windows the two routes are not
   distinguishable on correctness at this size.
 
 ### Two-task rounds

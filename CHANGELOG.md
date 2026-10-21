@@ -87,7 +87,12 @@ All notable changes to Ultra Edit are documented here. Releases follow
   them: 705 of an average committed result's 2,560 bytes. Replayed through this
   build, the round's 79 `ultra_edit` calls outside the concurrent-writer task
   keep their outcomes, and each committed result is its old one without that
-  field.
+  field. In the fourteenth round, the first on this build, committed
+  `ultra_edit` results came to 1,958 bytes each, Ultra Edit's tool results to
+  8,059 bytes per run against native's 7,651, and its later API calls wrote
+  0.1k more prompt-cache tokens per run than native's, against 0.7k in the
+  thirteenth. Its cost was 1.01x (0.98-1.04) native's, within the 1.00x to
+  1.05x of the six rounds before.
 
 ### Fixed
 
