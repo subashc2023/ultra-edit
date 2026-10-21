@@ -165,40 +165,41 @@ native Claude Code.
 
 ### Windows
 
-Nine more rounds ran all 23 tasks on Windows 11 from 2026-10-19 to 21, with
+Ten more rounds ran all 23 tasks on Windows 11 from 2026-10-19 to 21, with
 Sonnet 5.5, 3 times each, comparing Ultra Edit with native Claude Code. The
 first four ran Claude Code 2.1.303 and development builds between 0.4.0 and
-0.5.0; the last five ran builds after 0.5.0, the last four with Claude Code
+0.5.0; the last six ran builds after 0.5.0, the last five with Claude Code
 2.1.306. Costs compare only within a round, since the prompt cache treated the
 rounds differently ([per-round results](docs/performance.md#windows-results)).
 The last round gave:
 
 | | Ultra Edit | Native |
 | --- | --- | --- |
-| Exact final bytes | 69/69 | 69/69 |
+| Exact final bytes | 69/69 | 68/69 |
 | Right on the first try | 64/69 | 62/69 |
-| Cost | 0.95x (0.91-0.99) | 1.00x |
-| Turns | 0.55x (0.50-0.61) | 1.00x |
-| Tool calls | 0.49x (0.44-0.56) | 1.00x |
-| Context tokens | 0.88x (0.83-0.94) | 1.00x |
-| Output tokens | 0.89x (0.85-0.95) | 1.00x |
+| Cost | 0.97x (0.94-1.02) | 1.00x |
+| Turns | 0.60x (0.56-0.65) | 1.00x |
+| Tool calls | 0.55x (0.51-0.61) | 1.00x |
+| Context tokens | 0.96x (0.91-1.01) | 1.00x |
+| Output tokens | 0.93x (0.89-1.00) | 1.00x |
 
-Over all nine rounds, Ultra Edit was exact in 619 of 621 runs and native in
-614 (p = 0.18), and right on the first try in 569 and 568. Native wrote
-through the shell in 314 of its 621 runs, and none of those ended wrong; all
-seven of its wrong results were written with Edit. Both of Ultra Edit's wrong
+Over all ten rounds, Ultra Edit was exact in 688 of 690 runs and native in
+682 (p = 0.11), and right on the first try in 633 and 630. Native wrote
+through the shell in 348 of its 690 runs, and none of those ended wrong; all
+eight of its wrong results were written with Edit. Both of Ultra Edit's wrong
 results wrote text as the model sent it: an `old` that also took one of the
 two blank lines below a deleted function, which the server now flags as
 `BLANK_LINES_DROPPED`, and an insertion whose `new` began with a newline,
 putting a blank line above the new block where the task wanted none. The last
-round's build takes a short guard on `after` a blank line, which 0.6.0
-refused: it took two, each inserting a changelog entry, and both of those
-runs were right on the first try. Each of its five first-try misses had a
-call refused with nothing written, four of them short guards on ranges, and
-each of those runs ended exact. Its runs wrote 0.3k more tokens to the prompt
-cache than native's, nearly all of it per-session context on the first call,
-and cost 0.95x native's; apart from the two saved retries, the change from
-0.99x in the round before is variation between rounds.
+round's build takes a short guard on a deletion from a blank line below text
+to the end of a file, which the build of the round before refused: it took
+two, each deleting a class from the end of a module, and both of those runs
+were right on the first try. Each of its five first-try misses had a call that
+wrote nothing, four of them refused by the server, and each of those runs
+ended exact. Its runs wrote 0.1k more tokens to the prompt cache than
+native's, and cost 0.97x native's. Its first call was the same as in the round
+before, and replayed through both builds, the round's calls differ only in
+those two, so the change from 0.95x is variation between rounds.
 
 ### Failure rates
 
@@ -258,7 +259,7 @@ and the gap to native with shell writes blocked, 8 wrong in 111, is significant
 - **Fewer, larger calls:** on Sonnet's exact-text tasks, Ultra Edit runs took
   0.75x native's turns and 0.72x its tool calls; on Haiku, across all tasks,
   0.54x and 0.49x, with 0.91x the context tokens but 1.16x the output tokens;
-  on Windows, across all tasks, 0.55x and 0.49x at 0.95x the cost.
+  on Windows, across all tasks, 0.60x and 0.55x at 0.97x the cost.
   Each change restates its text: a 29-site CSS rename was 3.1k output tokens as
   one `ultra_edit` call and 0.8k as native's one `perl` regex. In the 1.22x
   intent-level round, the two renames and a function move, after which the

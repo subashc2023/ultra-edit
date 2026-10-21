@@ -61,7 +61,12 @@ All notable changes to Ultra Edit are documented here. Releases follow
   Each leaves every file it names as the task expects and the same files as
   the logged retry, and 3 of those runs had no other failed call, so they would
   have been right on the first try, 2 of them in the sixteenth round: 66 of its
-  69 runs against native's 62.
+  69 runs against native's 62. In the seventeenth Windows round, the first on
+  this build, two calls sent that deletion, and both runs ended exact with no
+  failed call. Replayed through the sixteenth round's build, the round's
+  logged calls had the same outcomes on both until, in those two runs, that
+  build refuses the call. Ultra Edit was right on the first try in 64 of 69
+  runs against native's 62, and exact in all 69 against native's 68.
 
 ## [0.6.0] - 2026-10-21
 
