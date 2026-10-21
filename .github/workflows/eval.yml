@@ -48,7 +48,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_VERSION: 1.89.0
-  # The build of every round in docs/performance.md, so new rounds compare with them.
+  # The build of the Linux rounds in docs/performance.md, so new rounds compare with them.
   CLAUDE_CODE_VERSION: 2.1.294
 
 jobs:
