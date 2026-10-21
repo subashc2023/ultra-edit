@@ -183,7 +183,8 @@ fn edit(request_id: &str, base: &Value, span: &str, text: &str) -> Value {
 }
 
 /// What repeating the call that returned `original` returns: the same recorded
-/// result, flagged, with the replay notice leading its report.
+/// result, flagged, with the replay notice leading its report, or as its report
+/// when a committed result has none.
 /// A committed response as its receipt is retrieved later: without the changed
 /// lines, which show the files only as the commit left them.
 fn recorded(original: &Value) -> Value {
@@ -199,10 +200,13 @@ fn replay_of(original: &Value) -> Value {
     // A replay shows no changed lines: the files may have changed since.
     let mut replay = recorded(original);
     replay["replayed"] = json!(true);
-    replay["report"] = json!(format!(
-        "{REPLAY_NOTICE}\n{}",
-        original["report"].as_str().unwrap()
-    ));
+    replay["report"] = match original["report"].as_str() {
+        Some(report) => json!(format!("{REPLAY_NOTICE}\n{report}")),
+        None => {
+            assert_eq!(original["commit"], "committed", "{original}");
+            json!(REPLAY_NOTICE)
+        }
+    };
     replay
 }
 
@@ -1326,12 +1330,8 @@ fn focused_batch_edit_preserves_bytes_and_retries_after_restart() {
     );
     assert_eq!(receipt["receipt"]["files"].as_array().unwrap().len(), 2);
     assert!(receipt["receipt"].get("validation").is_none());
-    assert!(
-        !committed["report"]
-            .as_str()
-            .unwrap()
-            .contains("Validation:")
-    );
+    // Its IDs, plan, and files are fields of their own, so a commit has no report.
+    assert!(committed.get("report").is_none(), "{committed}");
     let evidence = client.call(
         "ultra_edit_status",
         json!({"query":{"kind":"evidence","reference":one["snapshot"]}}),
@@ -2299,7 +2299,8 @@ fn the_routing_cards_example_commits_through_the_server_by_path() {
             "9 |     run(argv)"
         ])
     );
-    assert!(done["report"].as_str().unwrap().len() + done["changed"].to_string().len() < 1_000);
+    assert!(done.get("report").is_none(), "{done}");
+    assert!(done.to_string().len() < 1_000, "{done}");
     // Resending the identical call replays the recorded result and writes nothing.
     let again = client.call("ultra_edit", example, false);
     assert_eq!(again["commit"], "committed");

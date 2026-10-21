@@ -77,6 +77,17 @@ All notable changes to Ultra Edit are documented here. Releases follow
   range that would have cut the wrong lines: the last `expect` item was not the
   range's last line but a line inside it, such as the one before a closing
   fence or parenthesis, or the neighbour below it.
+- An MCP result whose `commit` is `committed` leaves out `report`, which only
+  repeated its request and plan IDs, the plan again as the undo reference, its
+  warnings, and each file's path, which `changed` lists after a new commit. A
+  replayed commit's report is the replay notice alone. A result where some file
+  did not commit keeps its report, as every CLI result does. In the thirteenth
+  Windows round, Ultra Edit's tool results came to 9,036 bytes per run against
+  native's 7,391, and the reports of committed `ultra_edit` results to 787 of
+  them: 705 of an average committed result's 2,560 bytes. Replayed through this
+  build, the round's 79 `ultra_edit` calls outside the concurrent-writer task
+  keep their outcomes, and each committed result is its old one without that
+  field.
 
 ### Fixed
 

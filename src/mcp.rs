@@ -12,7 +12,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::workspace::{EditResult, receipt_report, repair_request_id, undo_request_id};
+use crate::workspace::{
+    EditResult, REPLAY_NOTICE, receipt_report, repair_request_id, undo_request_id,
+};
 use crate::{
     Change, CommitStatus, EditRequest, Error, FullRead, ObservedState, Preparation, Receipt,
     ReconciliationRequest, Workspace, report,
@@ -576,8 +578,16 @@ fn completed(
         "commit": receipt.commit,
         "warning_count": receipt.warnings.len(),
         "warnings": report::warning_summaries(&receipt.warnings),
-        "report": receipt_report(&receipt, replayed),
     });
+    // A committed receipt's report only repeats these fields (its IDs, its plan as
+    // the undo reference) and its files, which `changed` lists on a new commit.
+    // The model reads every byte here, so the report comes only when some file did
+    // not commit; a replayed commit gets just the replay notice.
+    if receipt.commit != CommitStatus::Committed {
+        value["report"] = json!(receipt_report(&receipt, replayed));
+    } else if replayed {
+        value["report"] = json!(REPLAY_NOTICE);
+    }
     if !changed.is_empty() {
         value["changed"] = json!(changed);
     }

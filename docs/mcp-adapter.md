@@ -162,12 +162,17 @@ request semantics. Inspect the returned `commit`, request ID, and plan ID rather
 than treating a successful transport exchange as confirmed persistence.
 
 Engine results contain structured JSON and equivalent JSON text. Compact completed
-results use `{kind: "completed", request_id, plan_id, commit, report}`. A
-preparation uses `kind: "ready"` or `"rejected"`, with `request_id`, `reference`,
-`ready`, diagnostic count, compact diagnostics, and a report. `request_id` is the
+results use `{kind: "completed", request_id, plan_id, commit, warning_count,
+warnings}`, with a `report` of each file's outcome unless `commit` is
+`committed`, where it would only repeat the IDs, the plan as the undo
+reference, the warnings, and the files that `changed` lists. A preparation uses
+`kind: "ready"` or `"rejected"`, with `request_id`, `reference`, `ready`,
+diagnostic count, compact diagnostics, and a report. `request_id` is the
 derived ID when the call omitted one. A result returned for an already recorded
 request without a new commit attempt adds `replayed: true` (omitted otherwise),
-and its report begins with a replay notice; a replay never writes target files.
+and its report begins with a replay notice, which is all of a committed
+result's report; a replay never writes target files. The CLI's results keep
+the report in every case.
 A completed `ultra_edit` call that made a new commit attempt adds `changed`:
 for each committed file, `{path, lines, omitted?}`, where `lines` holds each
 changed region as it now reads, as `"12 | body"` with Read's line numbers and
