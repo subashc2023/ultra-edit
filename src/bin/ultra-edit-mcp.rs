@@ -33,6 +33,36 @@ const CLAUDE_CARD: &str = include_str!("../../plugin/claude-code/instructions.md
 const CLAUDE_CONTEXT: &str = "# Ultra Edit\n\nEdit existing text files with the `ultra_edit` MCP tool, \
 following its description: put ALL related changes, across all files, in ONE call. Never write \
 project files through the shell; a hook denies it. Use Write for new files.\n";
+/// Selects an experimental native-first card for `--plugin-card` and the context hooks.
+const CARD_VARIANT: &str = "ULTRA_EDIT_CARD";
+/// The `short` variant's always-loaded `ultra_edit` description.
+const SHORT_CARD: &str = include_str!("../../plugin/claude-code/instructions-short.md");
+/// The context both native-first variants give: native tools first, `ultra_edit`
+/// where native edits or shell writes do worst.
+const NATIVE_FIRST_CONTEXT: &str = "# Ultra Edit\n\nPrefer native Edit and Write. Use the \
+`ultra_edit` MCP tool instead where you would write files through the shell (a hook denies \
+that), and when a task changes several files or many places in one (renames, repeated text): \
+put ALL those changes, across all files, in ONE call, following its description.\n";
+/// The `deferred` variant leaves the tool behind ToolSearch, so it names the query.
+const DEFERRED_HINT: &str =
+    "Load it with ToolSearch \"select:mcp__plugin_ultra-edit_ultra-edit__ultra_edit\".\n";
+
+/// Which card `ULTRA_EDIT_CARD` selects: unset or empty is the default card.
+#[derive(Clone, Copy)]
+enum Card {
+    Full,
+    Short,
+    Deferred,
+}
+
+fn card_variant() -> Result<Card, String> {
+    match env::var(CARD_VARIANT).as_deref() {
+        Err(env::VarError::NotPresent) | Ok("") => Ok(Card::Full),
+        Ok("short") => Ok(Card::Short),
+        Ok("deferred") => Ok(Card::Deferred),
+        _ => Err(format!("{CARD_VARIANT} must be unset, short, or deferred")),
+    }
+}
 
 fn main() -> ExitCode {
     let arguments = env::args_os().skip(1).collect::<Vec<_>>();
@@ -46,6 +76,8 @@ fn main() -> ExitCode {
              model the same routing.\n\
              --plugin-card also describes ultra_edit with the Claude Code plugin's routing card,\n\
              which the host caches with its tool list; the plugin starts the server this way.\n\
+             {}=short gives it a short native-first card, and =deferred the full card behind\n\
+             ToolSearch; both also change --claude-context. These are experimental.\n\
              JSON-RPC lines are limited to 16 MiB. Protocol output uses stdout; errors use stderr.\n\
              Cancellation or disconnection does not imply rollback; query receipts before retrying.\n\
              --claude-context prints plugin hook JSON and exits without opening a workspace.\n\
@@ -56,6 +88,7 @@ fn main() -> ExitCode {
              event's cwd) are allowed, as is anything it cannot parse.\n\
              {}=allow disables the guard.",
             env!("CARGO_PKG_VERSION"),
+            CARD_VARIANT,
             shell_guard::ESCAPE_HATCH
         );
         return ExitCode::SUCCESS;
@@ -72,9 +105,18 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         };
+        let context = match card_variant() {
+            Ok(Card::Full) => CLAUDE_CONTEXT.to_owned(),
+            Ok(Card::Short) => NATIVE_FIRST_CONTEXT.to_owned(),
+            Ok(Card::Deferred) => format!("{NATIVE_FIRST_CONTEXT}{DEFERRED_HINT}"),
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::from(2);
+            }
+        };
         let output = serde_json::json!({"hookSpecificOutput": {
             "hookEventName": event,
-            "additionalContext": CLAUDE_CONTEXT,
+            "additionalContext": context,
         }});
         let mut stdout = io::stdout().lock();
         if serde_json::to_writer(&mut stdout, &output).is_err() || writeln!(stdout).is_err() {
@@ -110,6 +152,13 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let card = match card_variant() {
+        Ok(card) => card,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(2);
+        }
+    };
     let workspace = match Workspace::open(PathBuf::from(&arguments[1])) {
         Ok(workspace) => workspace,
         Err(error) => {
@@ -131,9 +180,18 @@ fn main() -> ExitCode {
     let server = match flag {
         None => server,
         Some(flag) if flag == "--no-instructions" => server.without_instructions(),
-        Some(_) => server
-            .without_instructions()
-            .with_edit_description(CLAUDE_CARD),
+        Some(_) => match card {
+            Card::Full => server
+                .without_instructions()
+                .with_edit_description(CLAUDE_CARD),
+            Card::Short => server
+                .without_instructions()
+                .with_edit_description(SHORT_CARD),
+            Card::Deferred => server
+                .without_instructions()
+                .with_edit_description(CLAUDE_CARD)
+                .with_deferred_edit(),
+        },
     };
     match runtime.block_on(serve(server)) {
         Ok(()) => ExitCode::SUCCESS,

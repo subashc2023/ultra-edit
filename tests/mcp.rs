@@ -1085,7 +1085,10 @@ fn bundled_plugin_launches_hooks_and_mcp_without_path_lookup() {
                     .replace("${CLAUDE_PROJECT_DIR}", root.path().to_str().unwrap()),
             );
         }
-        command.current_dir(root.path()).env("PATH", "");
+        command
+            .current_dir(root.path())
+            .env("PATH", "")
+            .env_remove("ULTRA_EDIT_CARD");
         command
     };
     let configuration: Value =
@@ -1185,6 +1188,88 @@ fn bundled_plugin_launches_hooks_and_mcp_without_path_lookup() {
             .as_str()
             .unwrap()
             .starts_with("Advanced: replace existing change IDs")
+    );
+    client.close();
+}
+
+#[test]
+fn native_first_cards_change_the_edit_tool_and_the_session_context() {
+    let root = TempDir::new().unwrap();
+    let binary = |card: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ultra-edit-mcp"));
+        command
+            .current_dir(root.path())
+            .env("ULTRA_EDIT_CARD", card);
+        command
+    };
+    let short = include_str!("../plugin/claude-code/instructions-short.md");
+    for (card, description, always) in [
+        ("short", short, json!(true)),
+        (
+            "deferred",
+            include_str!("../plugin/claude-code/instructions.md"),
+            json!(null),
+        ),
+    ] {
+        let mut server = binary(card);
+        server.args(["--root", ".", "--plugin-card"]);
+        let mut client = Client::connect(server);
+        let listed = client.rpc("tools/list", json!({}));
+        let tools = listed["result"]["tools"].as_array().unwrap();
+        let edit = tools
+            .iter()
+            .find(|tool| tool["name"] == "ultra_edit")
+            .unwrap();
+        assert_eq!(edit["description"], description, "{card}");
+        assert_eq!(edit["_meta"]["anthropic/alwaysLoad"], always, "{card}");
+        client.close();
+        let output = binary(card)
+            .args(["--claude-context", "SessionStart"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let context = value["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(
+            context.contains("Prefer native Edit and Write"),
+            "{context}"
+        );
+        assert!(context.contains("through the shell"), "{context}");
+        assert_eq!(
+            context.contains("\"select:mcp__plugin_ultra-edit_ultra-edit__ultra_edit\""),
+            card == "deferred",
+            "{context}"
+        );
+        assert!(context.len() <= 400, "{} bytes: {context}", context.len());
+    }
+    for args in [
+        vec!["--root", ".", "--plugin-card"],
+        vec!["--claude-context", "SessionStart"],
+    ] {
+        let output = binary("Short").args(args).output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("ULTRA_EDIT_CARD"));
+    }
+    // The short card's example commits as written, like the full card's.
+    let start = short.find("{\"files\"").unwrap();
+    let end = short[start..].find("]}]}").unwrap() + start + 4;
+    let file = root.path().join("app.py");
+    fs::write(
+        &file,
+        "import os\n\nretries = 2\ncfg = load(cfg)\n\n\ndef main():\n    run()\n",
+    )
+    .unwrap();
+    let mut example: Value = serde_json::from_str(&short[start..end]).unwrap();
+    example["files"][0]["path"] = json!(file.to_str().unwrap());
+    let mut client = Client::start(root.path());
+    let done = client.call("ultra_edit", example, false);
+    assert_eq!(done["commit"], "committed", "{done}");
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "import os\n\nretries = 2\nconfig = load(config)\n\n\ndef main(argv):\n    run(argv)\n"
     );
     client.close();
 }

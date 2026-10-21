@@ -94,6 +94,7 @@ DEFAULT_ALLOWED_TOOLS = ("Bash", "Edit", "Write", "Read", "Glob", "Grep", "Skill
 # Variables that mark a parent Claude Code session or inject configuration into
 # a child session. Authentication and provider variables are kept.
 STRIPPED_ENV = (
+    "ULTRA_EDIT_CARD",  # an arm's env sets it
     "CLAUDECODE",
     "CLAUDE_CODE_ENTRYPOINT",
     "CLAUDE_CODE_CHILD_SESSION",
@@ -235,6 +236,8 @@ class ArmSpec:
     # Full names of the tools whose commands the method hook checks.
     method_tools: tuple[str, ...] = ("Bash",)
     method_how: str | None = None  # how the prompt and hook name the method; else METHODS'
+    # Set in Claude Code's environment, which its plugin server and hooks inherit.
+    env: Mapping[str, str] = field(default_factory=dict, hash=False, compare=False)
 
     @property
     def third_party(self) -> bool:
@@ -268,6 +271,7 @@ class ArmSpec:
             "method": self.method,
             "method_tools": list(self.method_tools),
             "method_how": self.method_how,
+            "env": dict(self.env),
         }
 
     @property
@@ -327,6 +331,18 @@ BUILTIN_ARMS: dict[str, ArmSpec] = {
         ArmSpec("native", "Claude Code only: native Read/Edit/Write/Bash."),
         ArmSpec("native-guard", "Native tools plus Ultra Edit's shell guard hook.", guard_hook=True),
         ArmSpec("ultra-edit", "The full Ultra Edit plugin alongside native tools.", plugin=True),
+        ArmSpec(
+            "ultra-edit-short",
+            "The plugin with its short native-first card (ULTRA_EDIT_CARD=short).",
+            plugin=True,
+            env={"ULTRA_EDIT_CARD": "short"},
+        ),
+        ArmSpec(
+            "ultra-edit-deferred",
+            "The plugin with ultra_edit behind ToolSearch and native-first context (ULTRA_EDIT_CARD=deferred).",
+            plugin=True,
+            env={"ULTRA_EDIT_CARD": "deferred"},
+        ),
         ArmSpec(
             "ultra-edit-only",
             "The full Ultra Edit plugin with Edit/Write/MultiEdit/NotebookEdit disallowed.",
@@ -2359,6 +2375,7 @@ def run_one(config: Config, spec: RunSpec) -> dict[str, Any]:
             config_dir = temp_root / "claude-config"
             config_dir.mkdir()
         env, removed = build_env(base_env, config_dir)
+        env.update(arm.env)
         use_arg = config.prompt_via == "arg"
         prompt = marked_prompt(spec.task.prompt, config.prompt_marker)
         mcp_path = None
@@ -2388,7 +2405,11 @@ def run_one(config: Config, spec: RunSpec) -> dict[str, Any]:
                 "cwd": str(repo),
                 "prompt": f"{spec.task.name}/prompt.md via {'argument' if use_arg else 'stdin'}",
                 "prompt_marker": config.prompt_marker,
-                "env_set": {**CHILD_ENV, **({"CLAUDE_CONFIG_DIR": str(config_dir)} if config_dir else {})},
+                "env_set": {
+                    **CHILD_ENV,
+                    **({"CLAUDE_CONFIG_DIR": str(config_dir)} if config_dir else {}),
+                    **arm.env,
+                },
                 "env_removed": removed,
             },
         )

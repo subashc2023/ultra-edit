@@ -835,9 +835,12 @@ class CommandTests(unittest.TestCase):
             "CLAUDECODE": "1",
             "CLAUDE_CODE_PLUGIN_DIRS": "/somewhere/ultra-edit",
             "GIT_DIR": "/elsewhere/.git",
+            "ULTRA_EDIT_CARD": "short",
         }
         env, removed = evaluation.build_env(base, PureWindowsPath(r"C:\t\claude-config"))
-        self.assertEqual(sorted(removed), ["CLAUDECODE", "CLAUDE_CODE_PLUGIN_DIRS", "GIT_DIR"])
+        self.assertEqual(
+            sorted(removed), ["CLAUDECODE", "CLAUDE_CODE_PLUGIN_DIRS", "GIT_DIR", "ULTRA_EDIT_CARD"]
+        )
         self.assertEqual(env["ANTHROPIC_API_KEY"], "sk-test")
         self.assertEqual(env["DISABLE_AUTOUPDATER"], "1")
         self.assertEqual(env["ENABLE_CLAUDEAI_MCP_SERVERS"], "false")
@@ -1630,6 +1633,8 @@ class ArmRegistryTests(unittest.TestCase):
                 "native",
                 "native-guard",
                 "ultra-edit",
+                "ultra-edit-short",
+                "ultra-edit-deferred",
                 "ultra-edit-only",
                 "shell-sed",
                 "shell-python",
@@ -1644,6 +1649,8 @@ class ArmRegistryTests(unittest.TestCase):
             "native": (default_rules, None, None, False),
             "native-guard": (default_rules, None, None, False),
             "ultra-edit": (default_rules, None, None, True),
+            "ultra-edit-short": (default_rules, None, None, True),
+            "ultra-edit-deferred": (default_rules, None, None, True),
             "ultra-edit-only": (without_edit, "Edit,Write,MultiEdit,NotebookEdit", None, True),
             "shell-sed": (without_edit, "Edit,Write,MultiEdit,NotebookEdit", "running sed (or awk", False),
             "shell-python": (without_edit, "Edit,Write,MultiEdit,NotebookEdit", "python3 - <<'PY'", False),
@@ -1673,6 +1680,14 @@ class ArmRegistryTests(unittest.TestCase):
                 )
                 self.assertNotIn("--allowedTools", bypass)
                 self.assertEqual("--disallowedTools" in bypass, bool(disallowed))
+        # Only the native-first arms choose a card, through the environment.
+        self.assertEqual(
+            {name: dict(spec.env) for name, spec in evaluation.BUILTIN_ARMS.items() if spec.env},
+            {
+                "ultra-edit-short": {"ULTRA_EDIT_CARD": "short"},
+                "ultra-edit-deferred": {"ULTRA_EDIT_CARD": "deferred"},
+            },
+        )
         guard = evaluation.build_settings("native-guard", "/x/ultra-edit-mcp")
         self.assertIn("hooks", guard)
         self.assertEqual(evaluation.build_settings("ultra-edit-only"), evaluation.build_settings("native"))
