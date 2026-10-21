@@ -165,39 +165,40 @@ native Claude Code.
 
 ### Windows
 
-Eight more rounds ran all 23 tasks on Windows 11 from 2026-10-19 to 21, with
+Nine more rounds ran all 23 tasks on Windows 11 from 2026-10-19 to 21, with
 Sonnet 5.5, 3 times each, comparing Ultra Edit with native Claude Code. The
 first four ran Claude Code 2.1.303 and development builds between 0.4.0 and
-0.5.0; the last four ran builds after 0.5.0, the last three with Claude Code
+0.5.0; the last five ran builds after 0.5.0, the last four with Claude Code
 2.1.306. Costs compare only within a round, since the prompt cache treated the
 rounds differently ([per-round results](docs/performance.md#windows-results)).
 The last round gave:
 
 | | Ultra Edit | Native |
 | --- | --- | --- |
-| Exact final bytes | 68/69 | 68/69 |
-| Right on the first try | 59/69 | 63/69 |
-| Cost | 0.99x (0.95-1.03) | 1.00x |
-| Turns | 0.64x (0.59-0.69) | 1.00x |
-| Tool calls | 0.60x (0.54-0.67) | 1.00x |
-| Context tokens | 0.97x (0.91-1.03) | 1.00x |
-| Output tokens | 0.97x (0.92-1.02) | 1.00x |
+| Exact final bytes | 69/69 | 69/69 |
+| Right on the first try | 64/69 | 62/69 |
+| Cost | 0.95x (0.91-0.99) | 1.00x |
+| Turns | 0.55x (0.50-0.61) | 1.00x |
+| Tool calls | 0.49x (0.44-0.56) | 1.00x |
+| Context tokens | 0.88x (0.83-0.94) | 1.00x |
+| Output tokens | 0.89x (0.85-0.95) | 1.00x |
 
-Over all eight rounds, Ultra Edit was exact in 550 of 552 runs and native in
-545 (p = 0.18), and right on the first try in 505 and 506. Native wrote
-through the shell in 283 of its 552 runs, and none of those ended wrong; all
+Over all nine rounds, Ultra Edit was exact in 619 of 621 runs and native in
+614 (p = 0.18), and right on the first try in 569 and 568. Native wrote
+through the shell in 314 of its 621 runs, and none of those ended wrong; all
 seven of its wrong results were written with Edit. Both of Ultra Edit's wrong
 results wrote text as the model sent it: an `old` that also took one of the
 two blank lines below a deleted function, which the server now flags as
-`BLANK_LINES_DROPPED`, and, in the last round, an insertion whose `new` began
-with a newline, putting a blank line above the new block where the task
-wanted none. In that round, nine of its ten first-try misses had a call
-refused with nothing written, five of them line guards on blank lines, and
-each of those nine runs ended exact. Its build serves the rarely used
-operations through one deferred tool, so each session's first API call
-carried 225 to 230 fewer tokens than in the round before. Its runs still wrote
-0.4k more tokens to the prompt cache than native's, 0.3k of it per-session
-context on the first call, and cost 0.99x native's.
+`BLANK_LINES_DROPPED`, and an insertion whose `new` began with a newline,
+putting a blank line above the new block where the task wanted none. The last
+round's build takes a short guard on `after` a blank line, which 0.6.0
+refused: it took two, each inserting a changelog entry, and both of those
+runs were right on the first try. Each of its five first-try misses had a
+call refused with nothing written, four of them short guards on ranges, and
+each of those runs ended exact. Its runs wrote 0.3k more tokens to the prompt
+cache than native's, nearly all of it per-session context on the first call,
+and cost 0.95x native's; apart from the two saved retries, the change from
+0.99x in the round before is variation between rounds.
 
 ### Failure rates
 
@@ -257,7 +258,7 @@ and the gap to native with shell writes blocked, 8 wrong in 111, is significant
 - **Fewer, larger calls:** on Sonnet's exact-text tasks, Ultra Edit runs took
   0.75x native's turns and 0.72x its tool calls; on Haiku, across all tasks,
   0.54x and 0.49x, with 0.91x the context tokens but 1.16x the output tokens;
-  on Windows, across all tasks, 0.64x and 0.60x at 0.99x the cost.
+  on Windows, across all tasks, 0.55x and 0.49x at 0.95x the cost.
   Each change restates its text: a 29-site CSS rename was 3.1k output tokens as
   one `ultra_edit` call and 0.8k as native's one `perl` regex. In the 1.22x
   intent-level round, the two renames and a function move, after which the

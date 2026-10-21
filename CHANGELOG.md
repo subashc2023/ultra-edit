@@ -30,7 +30,15 @@ All notable changes to Ultra Edit are documented here. Releases follow
   meant and one empty where a function belonged; each commit carries
   `FINAL_LINE_BREAK_KEPT` or `BLANK_LINES_JOINED` naming the lines, and each of
   the 13 logged commits with one of those warnings in those rounds was followed
-  by another edit of the warned file, in a run that ended correct.
+  by another edit of the warned file, in a run that ended correct. In the
+  sixteenth Windows round, the first on this build, two calls had such a
+  guard, each inserting `replace-function-body`'s changelog entry below a blank
+  line with `expect: ""`; 0.6.0 refuses both, this build committed them, and
+  both runs ended exact with no failed call. Ultra Edit was right on the first
+  try in 64 of 69 runs against native's 62, and both were exact in all 69.
+  Four of its five misses were short guards on ranges, still refused: two of
+  the end-of-file shape, which would have been right, and two blank at both
+  ends, each one blank line too long.
 
 ## [0.6.0] - 2026-10-21
 

@@ -328,17 +328,17 @@ arms with the same settings, 3 repetitions each:
 
 ## Windows results
 
-Eight rounds ran all 23 tasks on Windows 11 under `native` and `ultra-edit`,
-with `claude-sonnet-5-5` and 3 repetitions each: 1,104 runs of those two arms,
+Nine rounds ran all 23 tasks on Windows 11 under `native` and `ultra-edit`,
+with `claude-sonnet-5-5` and 3 repetitions each: 1,242 runs of those two arms,
 none invalid. The first four ran Claude Code 2.1.303 and development builds
-between 0.4.0 and 0.5.0; the last four ran builds after 0.5.0, the first of
+between 0.4.0 and 0.5.0; the last five ran builds after 0.5.0, the first of
 them with 2.1.303 and the others with 2.1.306. Costs compare within a round
 only. Prompts in the first three were the same in every round, so an arm whose
 build had not changed could start with its task prompts cached by the round
 before; from the fourth, every prompt starts with a marker drawn per
 invocation, and from the seventh, one per invocation and arm. The first four
 also ran logged in, where a prompt-cache entry lasts an hour, so a task's later
-repetitions read the prompt its first one wrote; the last four ran with
+repetitions read the prompt its first one wrote; the last five ran with
 `ANTHROPIC_API_KEY`, whose entries last five minutes, so every run writes its
 own. The eighth stopped after 54 runs when the key's credit ran out, and
 `--resume` ran the other 84 with another key; every run's first call read the
@@ -354,6 +354,7 @@ same cached prefix as the rest of its arm's runs.
 | 2026-10-21 04:23 | `fdeb1ad` | 69/69 | 69/69 | 63/69 | 64/69 | 1.03x | 0.63x |
 | 2026-10-21 05:41 | `420e5fe` | 69/69 | 69/69 | 66/69 | 64/69 | 1.01x | 0.61x |
 | 2026-10-21 07:41 | `95e7801` | 68/69 | 68/69 | 63/69 | 59/69 | 0.99x | 0.64x |
+| 2026-10-21 14:45 | `ddd80d9` | 69/69 | 69/69 | 62/69 | 64/69 | 0.95x | 0.55x |
 
 Cost and turns are `ultra-edit`'s against `native`, as geometric means of
 per-task ratios. In the 00:26 round, 39 `native` runs read a task prompt that
@@ -361,33 +362,37 @@ an `ultra-edit-deferred` run had written (see [Arms](../eval/README.md#arms));
 the table charges those reads as writes, and as recorded the ratio is 1.08x.
 
 In the last round, against `native`, with 95% bootstrap intervals,
-`ultra-edit` cost 0.99x (0.95-1.03), with 0.97x (0.91-1.03) the context
-tokens, 0.97x (0.92-1.02) the output tokens, 0.64x (0.59-0.69) the turns, and
-0.60x (0.54-0.67) the tool calls. It cost 0.95x (0.91-0.99) on the 14
-exact-text tasks, 1.15x (1.07-1.24) on the 8 intent-level tasks, and 0.57x
-(0.51-0.70) on the stale-file task. Its build serves the eight rarely used MCP
-operations through one deferred tool, `ultra_edit_plan`, so a session lists
-three deferred tool names instead of ten: every `ultra-edit` run's first API
-call carried 225 to 230 fewer tokens than the same task and repetition in the
-round before, while `native`'s ranged from 1 fewer to 5 more as the prompt
-marker changed, and both arms read the same cached prefix as before. Its first
-call carried 1.9k more context tokens than native's, 24.4k against 22.6k,
-where the round before had 2.1k more. Cost varied about as much across
-repetitions, a mean coefficient of variation of 0.10 against 0.09.
+`ultra-edit` cost 0.95x (0.91-0.99), with 0.88x (0.83-0.94) the context
+tokens, 0.89x (0.85-0.95) the output tokens, 0.55x (0.50-0.61) the turns, and
+0.49x (0.44-0.56) the tool calls. It cost 0.91x (0.87-0.96) on the 14
+exact-text tasks, 1.05x (1.00-1.12) on the 8 intent-level tasks, and 0.68x
+(0.54-0.87) on the stale-file task. Its build takes a short `expect` on
+`after` a blank line, which 0.6.0 refuses as `LINE_GUARD_WEAK`, and changes
+nothing else in the server. Replayed through 0.6.0 and this build, the
+round's logged `ultra_edit` calls had the same outcomes apart from two, on
+`replace-function-body`, that inserted the changelog entry below a blank line
+with `expect: ""`: this build committed both, each the run's last edit, and
+both runs were right on the first try. In the round before, the same
+insertion was refused in two runs. Its first call was the same as in that
+round, with 1.9k more context tokens than native's, 24.4k against 22.6k; each
+arm's runs read the same cached prefix as before; and no run loaded the
+skill, whose reference this build edits. Of the 17 fewer API calls
+`ultra-edit`'s runs made than in the round before, the two saved retries
+account for about two; the rest, like the 9 more that `native`'s made, is
+variation between rounds. Cost varied less across repetitions, a mean
+coefficient of variation of 0.09 against 0.13.
 
-- Fewer turns made `ultra-edit` only a little cheaper because its runs wrote
-  more to the prompt cache: 11.0k tokens per run against 10.6k, $0.0010 at the
-  rates that reproduce the runs' reported costs. It wrote 260 more on the
-  first call, where the deferred tool names, the skill listing, and the
-  session-start context are written anew every session, against 489 in the
-  round before, and 151 more on later calls, whose tool results were 0.6 KB
-  larger per run, against 141 in the round before and 0.7k in the one before
-  that, whose committed results still carried a `report`. Its 3.3k fewer cache
-  reads and 142 fewer output tokens saved $0.0018, so its runs cost $0.0562 on
-  average against $0.0569.
+- `ultra-edit`'s runs still wrote more to the prompt cache than `native`'s:
+  11.0k tokens per run against 10.7k, $0.0007 at the rates that reproduce the
+  runs' reported costs. It wrote 260 more on the first call, where the
+  deferred tool names, the skill listing, and the session-start context are
+  written anew every session, as in the round before, and 16 more on later
+  calls, against 151 in the round before. Its 14.3k fewer cache reads and 263
+  fewer output tokens saved $0.0041, so its runs cost $0.0546 on average
+  against $0.0580.
 - Claude Code's Bash tool on Windows strips a level of backslash escaping, so
   the shell routes were expected to fail. `native` wrote through the shell in
-  283 of 552 runs, and every one of those runs ended with the expected bytes.
+  314 of 621 runs, and every one of those runs ended with the expected bytes.
   Its seven wrong results were all Edit slips, on five tasks; two, in
   different rounds, dropped the final newline of `remove-deprecated-option`'s
   test file, and two, also in different rounds, the space after the version in
@@ -399,34 +404,35 @@ repetitions, a mean coefficient of variation of 0.10 against 0.09.
   had two. That committed without a warning; `BLANK_LINES_DROPPED` now flags
   it. In the 03:56 round the warning fired accurately but saved no calls: the
   model's own Read or `git diff` caught the same drops. The second, in the
-  last round, on `shell-hostile-scripts`, inserted a block directly after a
+  07:41 round, on `shell-hostile-scripts`, inserted a block directly after a
   heredoc's `EOF` line, as the task asked, but began its `new` with a newline,
   so a blank line stood above the block as well as below it. The server wrote
   the text as given; the committed result's `changed` lines showed the extra
   blank line, and the model did not check them against the task.
-- Nine of the last round's ten `ultra-edit` first-try misses had a call
-  refused with nothing written, and all nine runs ended exact. Five were line
-  guards on blank lines: two `after`s with a blank `expect` on
-  `replace-function-body`, a `remove-deprecated-option` range guarded with
-  `["", ""]`, a `move-and-delete-blocks` range guarded with its blank first
-  line and a closing `)`, and a `move-function-between-modules` run that sent
-  both kinds. Of the other four, one `old` was not in the file, one `expect`
-  did not match its lines, one change carried `"comment": ""`, a field the
-  schema does not have, and one call's JSON did not parse in Claude Code. The
-  tenth was the wrong result above. `native`'s six were its wrong result, two
-  `edit-while-file-changes` runs whose Edits failed on a file modified since
-  read and an `old_string` found twice, two `move-and-delete-blocks` runs whose
-  Python edit scripts, run through Bash, failed their own assertions, and a
-  `yaml-near-duplicates` run whose Edit found its `old_string` twice and then
-  a longer one nowhere.
+- Each of the last round's five `ultra-edit` first-try misses had a call
+  refused with nothing written, and each run ended exact. Four were short
+  guards on `lines` ranges, which this build still refuses: two
+  `move-and-delete-blocks` runs guarded a 29-line range with its blank first
+  line and the closing `)` that ends the file, and two
+  `move-function-between-modules` runs guarded a `docs/api.md` range with
+  `["", ""]`. Taken at the stated lines, the first two would have been exact,
+  and the other two would each have removed one blank line too many. The
+  fifth, on `tabs-makefile-go`, sent an `old` of `go build -o` for a line that
+  reads `$(GO) build -o`. `native`'s seven were two `edit-while-file-changes`
+  runs whose Edits failed on a file modified since read, one of them then on
+  an `old_string` found twice, two `bump-version-in-context` runs whose
+  `old_string` was found two and three times, two Python edit scripts, run
+  through Bash on `move-and-delete-blocks` and `windows-paths-escapes`, that
+  failed their own assertions, and a `yaml-near-duplicates` run with four
+  failed Edits.
 - The 00:26 round also ran `ultra-edit-short` and `ultra-edit-deferred`, the
   `ULTRA_EDIT_CARD` variants that send the model to native Edit first. Both
   were exact in all 69 runs, as `ultra-edit` was, but right on the first try in
   54 and 61 against its 66, and cost 1.11x (1.08-1.13) and 1.14x (1.11-1.17)
   what it did, with the second's reads of `native`'s cache entries charged as
   writes.
-- Over the eight rounds, 2 wrong of 552 against 7 gives p = 0.18, and on the
-  first try 47 misses against 46, p = 1.00: on Windows the two routes are not
+- Over the nine rounds, 2 wrong of 621 against 7 gives p = 0.18, and on the
+  first try 52 misses against 53, p = 1.00: on Windows the two routes are not
   distinguishable on correctness at this size.
 
 ### Two-task rounds
