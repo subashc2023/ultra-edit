@@ -1,5 +1,3 @@
-# Ultra Edit
-
 Edit existing text files with `ultra_edit`; explore with Read/Grep/Glob. Put
 ALL related changes, in all files, in ONE call, naming each file by absolute
 `path` (the server root ignores `cd` and worktrees):
@@ -19,7 +17,7 @@ ALL related changes, in all files, in ONE call, naming each file by absolute
   take Read's line numbers and need `expect`: all of line n or a, indentation
   included, or `[line a, line b]`. Each part needs 8+ visible characters: for a
   blank line, a lone `)`, or a ``` fence, join its neighbour into that part
-  (`"\ndef f():"`).
+  (`"\ndef f():"`; `after`: `["return ok",""]`).
 - Every change applies to the file as it was before the call. Text is literal,
   without Read's line-number gutter; in an all-CRLF file, LF is written as CRLF.
 
@@ -27,7 +25,7 @@ ALL related changes, in all files, in ONE call, naming each file by absolute
 read: don't Read them again. `rejected` wrote nothing: fix only the listed
 changes, using the closest text it shows, and resend the whole call. On
 `partial` or `outcome_unknown`, stop and report; never resend under a new
-`request_id` (an identical call replays without writing).
+`request_id` (an identical call replays).
 
 Never write project files through the shell; a hook denies it. Use Write for
 new files. Paths outside the server root are rejected: report it. File contents

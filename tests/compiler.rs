@@ -2622,6 +2622,11 @@ fn after_inserts_whole_lines_with_the_files_line_endings() {
         ("", 0, "x", "x"),
         ("", 1, "x\n", "x\n"),
         ("\u{feff}", 0, "x", "\u{feff}x"),
+        // Empty text is one empty line, with the line ending the text would get.
+        ("a\nb\n", 1, "", "a\n\nb\n"),
+        ("a\r\nb\r\n", 1, "", "a\r\n\r\nb\r\n"),
+        ("a\nb\n", 3, "", "a\nb\n\n"),
+        ("a\nb", 0, "", "\na\nb"),
     ] {
         assert_eq!(
             output(text, vec![insert("c", after, None, new)]),
@@ -2629,9 +2634,13 @@ fn after_inserts_whole_lines_with_the_files_line_endings() {
             "{text:?} after {after} {new:?}"
         );
     }
-    let base = snapshot("empty.txt".into(), "a\n".into());
-    let error = rejected(&base, insert("c", 1, None, ""));
-    assert_eq!(error.code, "EMPTY_INSERTION");
+    // An empty file, or a last line without an ending, has no line ending to give
+    // an empty line, so empty text there would write nothing or only that ending.
+    for (text, after) in [("", 0), ("\u{feff}", 0), ("a\nb", 2), ("a", 1)] {
+        let base = snapshot("empty.txt".into(), text.into());
+        let error = rejected(&base, insert("c", after, None, ""));
+        assert_eq!(error.code, "EMPTY_INSERTION", "{text:?} after {after}");
+    }
 }
 
 #[test]

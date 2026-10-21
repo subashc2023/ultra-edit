@@ -115,7 +115,8 @@ ending before it, so the file still lacks one. Inserted lines get the file's
 line ending the same way.
 
 `expect` on `lines` and `after` is compared line by line, ignoring line endings.
-For `after`, it gives the lines ending at `after`. For `lines`, a string gives
+For `after`, it gives the lines ending at `after`, so after a blank line it
+names the line above too: `["return ok",""]`. For `lines`, a string gives
 the first lines of the range, and `[first, last]` gives its first and last
 lines (each may hold several lines). It is required unless the base disclosed
 every addressed line (a `path` file discloses none), and then must reach the
@@ -141,8 +142,9 @@ read. An `old` with 8 or more visible characters whose `in` lines hold no match,
 as lines from a stale read may not, applies at the one match an unrestricted
 `old` would take, with the same `LINES_MOVED` warning; otherwise it is
 `TARGET_NOT_FOUND`. Empty `old` is rejected with `EMPTY_TARGET`; insert with
-`after` instead, and give `after` nonempty text (`EMPTY_INSERTION`). `after`
-keeps its line, so
+`after` instead. Empty `new` on `after` inserts one empty line, except in an
+empty file or after a last line without a line ending (`EMPTY_INSERTION`).
+`after` keeps its line, so
 text whose leading lines restate the lines ending at it is refused
 (`INSERT_REPEATS_LINE`, 8 or more visible characters in those lines) unless
 other changes in the call delete each of them, and any copied lines below,
