@@ -27,7 +27,9 @@ All notable changes to Ultra Edit are documented here. Releases follow
   replace-function-body to two, from ten in those tasks' 30 earlier runs, but
   five of its nine failed calls gave a `lines` range with blank ends an
   `expect` item that was neither its first nor its last line, as if the list
-  held neighbours, as that example's does. To stay within 2,048 bytes, the
+  held neighbours, as that example's does. With this card, the same 20 runs
+  gave such an item once, though three of the ten move-function-between-modules
+  runs still anchored `after` on a blank line. To stay within 2,048 bytes, the
   card drops its heading and shortens its replay note.
 
 ## [0.5.0] - 2026-10-20
