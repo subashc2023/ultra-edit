@@ -306,7 +306,11 @@ removes none.
 Repeated long lines, such as `port = 8080` in many service blocks, are what line
 numbers tell apart, so they are accepted. For a range that ends at the file's
 last line, the ranges one line longer and shorter are checked too, since Read's
-empty last line keeps such a range's end through a one-line shift. Lines between
+empty last line keeps such a range's end through a one-line shift. A deletion
+from a blank line below text to a last line with text is the exception: the
+longer range would start on that text, and the shorter one would leave a blank
+line at the end of the file, so a shift that made the deletion from that one
+removes only the blank line it kept last. Lines between
 the first and last parts are not compared: a blank or repeated last line pins
 the range's end only weakly, so prefer lines with text as `[first, last]`. `after:0` takes none.
 When the stated lines do not hold `expect`, the change applies where it holds,

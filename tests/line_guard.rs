@@ -102,6 +102,38 @@ fn an_insertion_after_a_blank_line_takes_a_blank_guard() {
     assert_eq!(rejected(&blocks, range).code, "LINE_GUARD_WEAK");
 }
 
+/// A deletion from a blank line below text to a last line with text keeps a text
+/// line last, so a short guard takes it, though the range one line shorter fits too:
+/// that one would leave a blank line at the end. From the first line, a second blank
+/// line or a text line, with text to write, or to a blank last line, the range one
+/// line shorter or longer is as likely, and a range of the same length elsewhere
+/// still makes it weak.
+#[test]
+fn a_deletion_to_the_end_from_below_text_takes_a_short_guard() {
+    let base = spanless("def a():\n    return ok\n\n\ndef b():\n    pass\n");
+    let pass = Some("    pass");
+    assert_eq!(
+        outcome(&base, ends([3, 6], Some(""), pass, "")).unwrap(),
+        "def a():\n    return ok\n"
+    );
+    let trailing = spanless("def a():\n    return ok\n\n\ndef b():\n    pass\n\n");
+    let closings = spanless("a = 1\n}\n}\nend\n");
+    let twice =
+        spanless("def a():\n    return ok\n\n\ndef b():\n    pass\n\n\ndef c():\n    pass\n");
+    let leading = spanless("\n\nfoo\n");
+    let c = "def c():\n    pass\n";
+    for (base, change) in [
+        (&leading, ends([1, 3], Some(""), Some("foo"), "")),
+        (&base, ends([4, 6], Some(""), pass, "")),
+        (&closings, ends([2, 4], Some("}"), Some("end"), "")),
+        (&base, ends([3, 6], Some(""), pass, c)),
+        (&trailing, ends([3, 7], Some(""), Some(""), "")),
+        (&twice, ends([7, 10], Some(""), pass, "")),
+    ] {
+        assert_eq!(rejected(base, change).code, "LINE_GUARD_WEAK");
+    }
+}
+
 /// A guard is strong when it is long, since repeated lines such as `port = 8080`
 /// are what line numbers tell apart, or when it matches one place; a short guard
 /// that matches elsewhere too is weak.

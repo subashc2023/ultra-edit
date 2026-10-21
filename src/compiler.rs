@@ -3209,8 +3209,18 @@ fn line_guard(
                 .collect();
             // Read's empty line after a final newline clamps to the last line, so a
             // range ending there keeps its end through a one-line shift while its
-            // length changes: try the ranges one line longer and shorter too.
-            if last == count {
+            // length changes: try the ranges one line longer and shorter too. A
+            // deletion from a blank line below text to a last line with text needs
+            // neither: the longer range would start on that text, and the shorter one
+            // would leave a blank line at the end of the file, so if a shift made this
+            // range from that one, taking it removes only the blank line kept last.
+            let blank = |line: usize| base.text[lines.body(line)].trim().is_empty();
+            let keeps_text_last = change.text.is_empty()
+                && first > 1
+                && blank(first)
+                && !blank(first - 1)
+                && !blank(count);
+            if last == count && !keeps_text_last {
                 for start in [first.wrapping_sub(1), first + 1] {
                     let length = (count + 1).wrapping_sub(start);
                     if (1..=count).contains(&start)

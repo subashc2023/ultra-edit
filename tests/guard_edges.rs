@@ -104,24 +104,49 @@ fn compiles(base: &Snapshot, change: Change) -> bool {
 fn a_range_named_to_the_phantom_line_is_not_applied_after_a_one_line_shift() {
     let read = "import os\n\n\ndef a():\n    x = 1\n    return x\n\n\ndef b():\n    pass\n";
     let (dir, workspace) = setup(&[("m.py", read)]);
-    // Read showed 10 lines and the phantom 11; [8,11] was [8,10]: a blank line and b.
-    // A short guard that also fits [7,10] cannot tell them apart, before or after.
-    assert!(!compiles(
-        &spanless(read),
-        pair([8, 11], "", "    pass", "")
-    ));
+    // Read showed 10 lines and the phantom 11; [8,11] was [8,10]: a blank line and b,
+    // replaced by c. A short guard that also fits [7,10] cannot tell them apart,
+    // before or after.
+    let c = "def c():\n    pass\n";
+    assert!(!compiles(&spanless(read), pair([8, 11], "", "    pass", c)));
     // A rigid one-line shift: nothing inside or at the guarded lines changed.
     committed(edit(
         &workspace,
         "m.py",
         exact("import os\n", "import os\nimport sys\n"),
     ));
-    let result = edit(&workspace, "m.py", pair([8, 11], "", "    pass", ""));
+    let result = edit(&workspace, "m.py", pair([8, 11], "", "    pass", c));
     assert_refused(
         &dir,
         "m.py",
         result,
-        "import os\nimport sys\n\n\ndef a():\n    x = 1\n    return x\n\n",
+        "import os\nimport sys\n\n\ndef a():\n    x = 1\n    return x\n\ndef c():\n    pass\n",
+    );
+}
+
+/// A deletion from a blank line below text to a last line with text is taken on a
+/// short guard, since the range one line shorter would leave a blank line at the
+/// end. So the shift above turns such a shorter deletion, named to the phantom line,
+/// into one that also removes the blank line it kept last, and nothing else.
+#[test]
+fn a_deletion_named_to_the_phantom_line_loses_only_its_last_blank_line_to_a_one_line_shift() {
+    let read = "import os\n\n\ndef a():\n    x = 1\n    return x\n\n\ndef b():\n    pass\n";
+    let (dir, workspace) = setup(&[("m.py", read)]);
+    // [8,11] was [8,10]: the second blank line and b, which keeps a blank line last,
+    // so the short guard is weak as read.
+    assert!(!compiles(
+        &spanless(read),
+        pair([8, 11], "", "    pass", "")
+    ));
+    committed(edit(
+        &workspace,
+        "m.py",
+        exact("import os\n", "import os\nimport sys\n"),
+    ));
+    committed(edit(&workspace, "m.py", pair([8, 11], "", "    pass", "")));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("m.py")).unwrap(),
+        "import os\nimport sys\n\n\ndef a():\n    x = 1\n    return x\n"
     );
 }
 
@@ -244,9 +269,11 @@ fn a_weak_guard_message_at_eight_digit_lines_fits_240_chars() {
 fn a_range_ending_at_the_last_line_is_not_applied_after_a_one_line_deletion_above() {
     let read = "import os\nimport sys\n\n\ndef b():\n    pass\n";
     let (dir, workspace) = setup(&[("m.py", read)]);
-    // Read showed 6 lines: [3,6] is both blank lines and b, which [4,6] also fits.
-    assert!(!compiles(&spanless(read), pair([3, 6], "", "    pass", "")));
+    // Read showed 6 lines: [3,6] is both blank lines and b. [4,6] also fits, but it
+    // would leave a blank line last, so the deletion is taken as stated.
+    assert!(compiles(&spanless(read), pair([3, 6], "", "    pass", "")));
     committed(edit(&workspace, "m.py", exact("import sys\n", "")));
+    // [3,6] clamps to [3,5], below a blank line that it would leave last.
     let result = edit(&workspace, "m.py", pair([3, 6], "", "    pass", ""));
     assert_refused(&dir, "m.py", result, "import os\n");
 }

@@ -15,7 +15,8 @@ All notable changes to Ultra Edit are documented here. Releases follow
   `after` a text line, such as `}`, and on a `lines` range, where a shifted
   number would replace other lines; a range from a blank line to a short last
   line at the end of a file matches again after a one-line shift, and tests
-  keep it refused. The plugin card still asks for a text anchor. In the eight
+  keep it refused unless it deletes from below text, as the next entry says.
+  The plugin card still asks for a text anchor. In the eight
   full Windows eval rounds before this change, Ultra Edit calls in 23 of the
   552 runs sent 30 short guards that were refused: 23 on `after` a blank line,
   4 on ranges blank at both ends, each one blank line too long, and 3 on ranges
@@ -36,9 +37,31 @@ All notable changes to Ultra Edit are documented here. Releases follow
   line with `expect: ""`; 0.6.0 refuses both, this build committed them, and
   both runs ended exact with no failed call. Ultra Edit was right on the first
   try in 64 of 69 runs against native's 62, and both were exact in all 69.
-  Four of its five misses were short guards on ranges, still refused: two of
-  the end-of-file shape, which would have been right, and two blank at both
-  ends, each one blank line too long.
+  Four of its five misses were short guards on ranges, which that build
+  refuses: two of the end-of-file shape, which would have been right and the
+  next entry takes, and two blank at both ends, each one blank line too long.
+- A `lines` range that deletes from a blank line below text to a last line
+  with text, as `{"lines":[231,259],"expect":["","        )"],"new":""}` at
+  the end of a file, is taken where the stated lines hold its short guard. A
+  range that ends at the file's last line is checked against the ranges one
+  line longer and shorter too, since Read's empty last line keeps such a
+  range's end through a one-line shift; here the longer one would start on the
+  text, and the shorter one would leave a blank line at the end of the file. A
+  shift that made the deletion from that shorter one now removes the blank line
+  it kept last too, and nothing else. Tests keep the check for a range that
+  writes text, starts on the first line, a second blank line, or a text line,
+  or ends on a blank line, and a range of the same length elsewhere in the file
+  still makes the guard weak. In the nine full Windows eval rounds through the
+  sixteenth, Ultra Edit calls sent 5 such guards, each deleting `RetryPolicy`
+  and the two blank lines above it from the end of `move-and-delete-blocks`'s
+  `app/handlers.py`. Replayed through the sixteenth round's build and this one,
+  the logged calls of all 621 runs had the same outcomes on both, apart from a
+  call both refuse for another change's `EXPECTED_TEXT_MISMATCH`, which loses
+  its `LINE_GUARD_WEAK` code, until, in the other 4 runs, the call commits.
+  Each leaves every file it names as the task expects and the same files as
+  the logged retry, and 3 of those runs had no other failed call, so they would
+  have been right on the first try, 2 of them in the sixteenth round: 66 of its
+  69 runs against native's 62.
 
 ## [0.6.0] - 2026-10-21
 
