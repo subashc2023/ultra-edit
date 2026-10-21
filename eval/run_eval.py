@@ -164,10 +164,14 @@ GIT_DATE = "2026-01-01T00:00:00+00:00"
 
 NATIVE_WRITE_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 SHELL_TOOLS = frozenset({"Bash", "PowerShell"})
+# ultra_edit_plan runs these operations, each a tool of its own before it; the old
+# names stay so earlier rounds' transcripts still classify.
+ULTRA_PLAN_KINDS = frozenset({"prepare", "diff", "commit", "repair", "retry", "status", "inspect", "reconcile"})
 ULTRA_TOOLS = frozenset(
     {
         "ultra_edit_snapshot",
         "ultra_edit",
+        "ultra_edit_plan",
         "ultra_edit_status",
         "ultra_edit_prepare",
         "ultra_edit_commit",
@@ -959,6 +963,15 @@ def ultra_tool(name: str) -> str | None:
     return None
 
 
+def ultra_operation(name: str, arguments: Any) -> str | None:
+    """ultra_tool, but an ultra_edit_plan call is named by the tool its action replaced,
+    such as ultra_edit_commit, so its writes and recoveries count as they did."""
+    tool = ultra_tool(name)
+    action = arguments.get("action") if tool == "ultra_edit_plan" and isinstance(arguments, dict) else None
+    kind = action.get("kind") if isinstance(action, dict) else None
+    return f"ultra_edit_{kind}" if isinstance(kind, str) and kind in ULTRA_PLAN_KINDS else tool
+
+
 def _json_object(text: Any) -> dict[str, Any] | None:
     if not isinstance(text, str):
         return None
@@ -1443,7 +1456,7 @@ def compute_metrics(
             if result is not None and not result.is_error:
                 counts["off_method_writes"] += 1
         is_edit = False
-        ultra = ultra_tool(call.name)
+        ultra = ultra_operation(call.name, call.input)
         target = _read_target(call, cwd if isinstance(cwd, str) else None)
         if call.name == "Read" or ultra == "ultra_edit_snapshot":
             counts["read_calls"] += 1

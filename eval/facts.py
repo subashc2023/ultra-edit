@@ -204,7 +204,7 @@ def steps_for(transcript, stream: Path, edit_tools: Sequence[str]) -> list[dict[
     for index, call in enumerate(transcript.tool_calls):
         if call.parent_tool_use_id:
             continue
-        ultra = harness.ultra_tool(call.name)
+        ultra = harness.ultra_operation(call.name, call.input)
         status = harness.ultra_result_status(ultra, call.result) if ultra else None
         command = _command(call) if call.name in harness.SHELL_TOOLS else ""
         features = shell_features(command) if command else []

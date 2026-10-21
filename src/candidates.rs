@@ -110,7 +110,7 @@ const KEYWORDS: [&str; 61] = [
 const MESSAGE_CHARS: usize = 240;
 /// Escaped characters of actual span text quoted by an expectation mismatch.
 const QUOTED_CHARS: usize = 60;
-const REPAIR: &str = "(ultra_edit_repair can replace just this change)";
+const REPAIR: &str = "(ultra_edit_plan can repair just this change)";
 
 type Found = Vec<(Range<usize>, Option<u8>)>;
 

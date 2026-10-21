@@ -84,9 +84,9 @@ exposed by this host.
 3. Inspect the outcome. A rejection wrote nothing; its diagnostics can list
    `candidates` with the current text and lines. Copy an `exact` or `whitespace`
    candidate's `text` verbatim into `old`, confirm a `similar` one is the
-   intended region, and resend the whole call (or call `ultra_edit_repair` with
-   the draft `reference`, replacing only the failed `change_id`). Run project
-   validation separately; the engine runs no tests.
+   intended region, and resend the whole call (or send `ultra_edit_plan` a
+   `repair` action with the draft `reference`, replacing only the failed
+   `change_id`). Run project validation separately; the engine runs no tests.
 
 ## Span targets
 

@@ -17,7 +17,8 @@ consecutive line IDs into `r12..r18` (itself a usable span; see below), and list
 `r0` has no listing entry. Choose `r{n}` from that listing instead of counting
 newlines; `text` still holds the exact selected bytes, which is what `expect`
 guards and multi-line `exact` targets copy. Byte offsets stay server-side: full
-evidence retains byte offsets, retrieved with `ultra_edit_status` evidence.
+evidence retains byte offsets, retrieved with an `ultra_edit_plan` `status`
+evidence query.
 
 Every snapshot response identifies its base in `snapshot`. Stored full evidence
 retains the engine's internal `id`. Use only span IDs actually returned for that base. A focused
@@ -237,8 +238,8 @@ A scoped target first checks whether its exact text occurs elsewhere in the file
 since an off-by-one scope is a common miss; otherwise a missing target is searched
 within its scope, or the whole file if unscoped. An `expect` mismatch searches
 the whole snapshot, and its message quotes what the span holds. Send
-`ultra_edit_repair` with the draft `reference`, replacing only the failed change
-ID. Copied text may occur more than once; add a scope if the repair reports
-`TARGET_AMBIGUOUS`. Ambiguous targets and count mismatches where something matched
-get no candidates, and only the first six failed targets of a request are
-searched.
+`ultra_edit_plan` a `repair` action with the draft `reference`, replacing only
+the failed change ID. Copied text may occur more than once; add a scope if the
+repair reports `TARGET_AMBIGUOUS`. Ambiguous targets and count mismatches where
+something matched get no candidates, and only the first six failed targets of a
+request are searched.

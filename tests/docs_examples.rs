@@ -2,6 +2,7 @@
 //! documented spelling never drifts from the parser.
 
 use serde_json::Value;
+use ultra_edit::mcp::PlanRequest;
 use ultra_edit::{Change, EditRequest};
 
 const DOCS: [(&str, &str); 7] = [
@@ -60,6 +61,10 @@ fn every_documented_request_parses() {
                 serde_json::from_value::<EditRequest>(value)
                     .unwrap_or_else(|error| panic!("{name}: {error}\n{block}"));
                 requests += 1;
+            } else if value.get("action").is_some() {
+                serde_json::from_value::<PlanRequest>(value)
+                    .unwrap_or_else(|error| panic!("{name}: {error}\n{block}"));
+                requests += 1;
             } else if let Some(changes) = value.get("changes") {
                 serde_json::from_value::<Vec<Change>>(changes.clone())
                     .unwrap_or_else(|error| panic!("{name}: {error}\n{block}"));
@@ -67,6 +72,6 @@ fn every_documented_request_parses() {
             }
         }
     }
-    // README, reference (3), SKILL, contract, recovery, and the card.
-    assert_eq!(requests, 8);
+    // README, reference (3), SKILL, contract, recovery (2), and the card.
+    assert_eq!(requests, 9);
 }

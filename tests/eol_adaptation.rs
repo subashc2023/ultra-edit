@@ -514,8 +514,8 @@ fn mcp_repair_of_an_undo_draft_is_a_tool_error() {
     let (error, undo) = client.call("ultra_edit_undo", json!({"plan":done["plan_id"]}));
     assert!(error, "{undo}");
     let (error, repaired) = client.call(
-        "ultra_edit_repair",
-        json!({"reference":undo["reference"],"changes":[{"id":"undo-1","span":"r0","new":"a\r\nb\r\n"}]}),
+        "ultra_edit_plan",
+        json!({"action":{"kind":"repair","reference":undo["reference"],"changes":[{"id":"undo-1","span":"r0","new":"a\r\nb\r\n"}]}}),
     );
     assert!(error, "{repaired}");
     assert_eq!(repaired["error"]["code"], "INVALID_REFERENCE", "{repaired}");

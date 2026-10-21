@@ -964,7 +964,7 @@ fn whitespace_candidates_carry_exact_source_text_and_lines() {
     assert_eq!(error.candidates, [tab]);
     assert_eq!(
         error.message,
-        "Expected 1 occurrence(s), found 0; a candidate at line 2 differs only in whitespace. Copy its exact text into `old` (ultra_edit_repair can replace just this change)."
+        "Expected 1 occurrence(s), found 0; a candidate at line 2 differs only in whitespace. Copy its exact text into `old` (ultra_edit_plan can repair just this change)."
     );
     let copied = exact("tabs", "\tlet x = 1;", "\tlet x = 2;");
     let plan = compile(&request(&base, vec![copied]), &bases(&base)).unwrap();
@@ -1061,7 +1061,7 @@ fn similar_candidates_catch_changed_operators_and_names_but_not_unrelated_text()
     assert_eq!(error.candidates, [operator]);
     assert_eq!(
         error.message,
-        "Expected 1 occurrence(s), found 0; a 96% similar candidate is at line 2. Verify it, then copy its exact text into `old` (ultra_edit_repair can replace just this change)."
+        "Expected 1 occurrence(s), found 0; a 96% similar candidate is at line 2. Verify it, then copy its exact text into `old` (ultra_edit_plan can repair just this change)."
     );
     // A fragment is matched by the corresponding fragment, never a partial word.
     let error = rejected(&base, exact("fragment", "role === \"admin\"", "x"));
@@ -1141,7 +1141,7 @@ fn expectation_mismatch_quotes_the_span_and_finds_the_expected_text() {
     assert_eq!(error.candidates, [second]);
     assert_eq!(
         error.message,
-        r#"Span holds "first\tline \"one\"", not expect; the expected text is at line 2. Copy its exact text into `old` (ultra_edit_repair can replace just this change)."#
+        r#"Span holds "first\tline \"one\"", not expect; the expected text is at line 2. Copy its exact text into `old` (ultra_edit_plan can repair just this change)."#
     );
 
     // An expectation differing only in whitespace finds its source spelling.
@@ -1574,7 +1574,7 @@ fn an_lf_target_on_a_mixed_eol_file_gets_a_line_ending_hint() {
     assert_eq!(error.code, "TARGET_NOT_FOUND");
     assert_eq!(
         error.message,
-        "Expected 1 occurrence(s), found 0; a candidate at lines 2-4 differs only in its CRLF line endings. Copy its exact text, \\r\\n included, into `old` (ultra_edit_repair can replace just this change)."
+        "Expected 1 occurrence(s), found 0; a candidate at lines 2-4 differs only in its CRLF line endings. Copy its exact text, \\r\\n included, into `old` (ultra_edit_plan can repair just this change)."
     );
     assert_eq!(
         error.candidates[0].text.as_deref(),
@@ -2815,7 +2815,7 @@ fn line_expect_compares_whole_lines_ignoring_line_endings() {
     );
     assert_eq!(
         errors[0].message,
-        "Line 5 holds \"    setting_5 = 5\", not expect; it is at line 6, so use lines [6,6] if the whole range moved (ultra_edit_repair can replace just this change)."
+        "Line 5 holds \"    setting_5 = 5\", not expect; it is at line 6, so use lines [6,6] if the whole range moved (ultra_edit_plan can repair just this change)."
     );
     // A line added inside the range moves its end, which the last lines catch.
     let mut grown: Vec<String> = settings(12, "\n").lines().map(str::to_owned).collect();
@@ -2828,7 +2828,7 @@ fn line_expect_compares_whole_lines_ignoring_line_endings() {
     assert_eq!(error.code, "EXPECTED_TEXT_MISMATCH");
     assert_eq!(
         error.message,
-        "Line 8 holds \"    setting_7 = 7\", not the expected last lines; it is at line 9, so use lines [5,9] if the range ends there (ultra_edit_repair can replace just this change)."
+        "Line 8 holds \"    setting_7 = 7\", not the expected last lines; it is at line 9, so use lines [5,9] if the range ends there (ultra_edit_plan can repair just this change)."
     );
     assert_eq!(
         error.candidates,
@@ -2855,7 +2855,7 @@ fn line_expect_compares_whole_lines_ignoring_line_endings() {
     let error = rejected(&base, lines_change("c", [5, 5], Some("    setting_5"), "x"));
     assert_eq!(
         error.message,
-        "Line 5 holds \"    setting_5 = 5\", not expect; expect compares whole lines, and its text is only part of line 5; give whole lines (ultra_edit_repair can replace just this change)."
+        "Line 5 holds \"    setting_5 = 5\", not expect; expect compares whole lines, and its text is only part of line 5; give whole lines (ultra_edit_plan can repair just this change)."
     );
     // The lines above an insertion guard it; more lines than exist is explained.
     let error = rejected(

@@ -23,6 +23,25 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ### Changed
 
+- The eight rarely needed MCP tools are now actions of one deferred tool,
+  `ultra_edit_plan`. A call sends `{"action": {"kind": …}}`, where `kind` is
+  `prepare`, `diff`, `commit`, `repair`, `retry`, `status`, `inspect`, or
+  `reconcile` and the other fields are the arguments the tool of that name
+  took: `ultra_edit_commit`'s `{plan}` becomes
+  `{"action": {"kind": "commit", "plan": …}}`. `ultra_edit`,
+  `ultra_edit_snapshot`, `ultra_edit_undo`, and the CLI are unchanged. Claude
+  Code names every deferred tool in each session's uncached context, a
+  subagent's included: counted with the token-counting API on
+  claude-sonnet-5-5 in Claude Code 2.1.306's listing, the ten names took 325
+  tokens and the three left take 98, about $0.0006 of the $0.056 an Ultra Edit
+  run cost in the fourteenth Windows round. In the 897 Ultra Edit runs of the
+  21 recorded eval rounds, the eight were called three times, `repair` twice in
+  one run and `commit` once. The plan tool is marked destructive and not
+  read-only, so one permission rule covers all its actions, and Claude Code's
+  plan mode holds back the receipt and diff reads that the read-only
+  `ultra_edit_status` and `ultra_edit_diff` could make there. Diagnostics that
+  named `ultra_edit_repair` now end `(ultra_edit_plan can repair just this
+  change)`, and the eval counts a plan call as the tool its action replaced.
 - `after` with empty `new` inserts one empty line, ended as any text there
   would be, as `after` already writes `new` followed by that line ending. It was
   `EMPTY_INSERTION`, which now refuses empty text only in an empty file, where

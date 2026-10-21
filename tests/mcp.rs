@@ -136,6 +136,12 @@ impl Client {
         content
     }
 
+    /// Runs the `kind` operation of `ultra_edit_plan`, whose other fields are `arguments`.
+    fn plan(&mut self, kind: &str, mut arguments: Value, is_error: bool) -> Value {
+        arguments["kind"] = json!(kind);
+        self.call("ultra_edit_plan", json!({"action": arguments}), is_error)
+    }
+
     fn range(&mut self, path: &str, first: usize, last: usize) -> Value {
         self.call(
             "ultra_edit_snapshot",
@@ -248,18 +254,13 @@ fn startup_requires_explicit_root_and_keeps_protocol_stdout_clean() {
     let mut client = Client::start(root.path());
     let listed = client.rpc("tools/list", json!({}));
     let tools = listed["result"]["tools"].as_array().unwrap();
+    // Each deferred tool costs its name in every Claude Code session.
+    assert_eq!(tools.len(), 4, "{listed}");
     for name in [
         "ultra_edit_snapshot",
         "ultra_edit",
-        "ultra_edit_status",
-        "ultra_edit_prepare",
-        "ultra_edit_commit",
-        "ultra_edit_repair",
+        "ultra_edit_plan",
         "ultra_edit_undo",
-        "ultra_edit_retry",
-        "ultra_edit_diff",
-        "ultra_edit_inspect",
-        "ultra_edit_reconcile",
     ] {
         let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
         assert_eq!(tool["inputSchema"]["type"], "object", "{tool}");
@@ -305,7 +306,7 @@ fn buffered_custom_notifications_do_not_block_valid_requests() {
 #[test]
 fn malformed_frames_return_protocol_errors_and_continue_buffered_requests() {
     for (malformed, code, id) in [
-        (r#"{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"ultra_edit_prepare","arguments":{"text":"a\ud800b"}}}"#.to_owned(), -32700, json!(null)),
+        (r#"{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"ultra_edit_plan","arguments":{"text":"a\ud800b"}}}"#.to_owned(), -32700, json!(null)),
         ("{broken".to_owned(), -32700, json!(null)),
         ("[]".to_owned(), -32600, json!(null)),
         (json!({"method":"notifications/custom","params":{}}).to_string(), -32600, json!(null)),
@@ -559,7 +560,7 @@ fn full_read_guard_pagination_and_scope_guards_work_over_mcp() {
     let mut guarded = edit("wrong-span", &later["snapshot"], "m981", "replacement");
     guarded["files"][0]["changes"][0]["target"]["expect"] = json!("wrong original");
     assert_eq!(
-        client.call("ultra_edit_prepare", guarded, true)["diagnostics"][0]["code"],
+        client.plan("prepare", guarded, true)["diagnostics"][0]["code"],
         "EXPECTED_TEXT_MISMATCH"
     );
     client.close();
@@ -854,7 +855,7 @@ fn declared_schema_minimums_agree_with_the_runtime_line_and_count_rules() {
     zero["files"][0]["changes"][0]["target"] =
         json!({"kind":"all","old":"one","scope":"selection","expected":0});
     assert_eq!(
-        client.call("ultra_edit_prepare", zero, true)["diagnostics"][0]["code"],
+        client.plan("prepare", zero, true)["diagnostics"][0]["code"],
         "INVALID_EXPECTED_COUNT"
     );
     client.close();
@@ -874,7 +875,7 @@ fn diff_and_byte_warnings_are_available_before_and_after_commit() {
         {"id":"two","target":{"kind":"exact","old":"line 35"},"text":"changed\u{0000}35"},
         {"id":"three","target":{"kind":"exact","old":"line 20\r\n"},"text":"line 20"}
     ]}]});
-    let prepared = client.call("ultra_edit_prepare", request.clone(), false);
+    let prepared = client.plan("prepare", request.clone(), false);
     assert_eq!(prepared["warning_count"], 3);
     // Byte warnings come first; the edge lint follows them.
     assert_eq!(prepared["warnings"][0]["code"], "NUL_BYTE");
@@ -887,11 +888,7 @@ fn diff_and_byte_warnings_are_available_before_and_after_commit() {
             "message": "Change three: `old` ends in whitespace `new` drops, joining what follows; line 20 now reads \"line 20line 21\"",
         })
     );
-    let diff = client.call(
-        "ultra_edit_diff",
-        json!({"plan":prepared["reference"]}),
-        false,
-    );
+    let diff = client.plan("diff", json!({"plan":prepared["reference"]}), false);
     let text = diff["diff"].as_str().unwrap();
     assert!(text.contains("-line 10\r\n+changed 10\n"), "{text}");
     assert!(!text.contains("line 27"), "{text}");
@@ -901,8 +898,8 @@ fn diff_and_byte_warnings_are_available_before_and_after_commit() {
     assert_eq!(committed["warnings"], prepared["warnings"]);
     client.close();
     let mut client = Client::start(root.path());
-    let status = client.call(
-        "ultra_edit_status",
+    let status = client.plan(
+        "status",
         json!({"query":{"kind":"receipt","request_id":"review"}}),
         false,
     );
@@ -953,10 +950,10 @@ fn canonical_windows_paths_are_display_only_across_mcp_responses() {
             }],
         }],
     });
-    let prepared = client.call("ultra_edit_prepare", request.clone(), false);
+    let prepared = client.plan("prepare", request.clone(), false);
     assert_eq!(prepared["warnings"][0]["file"], displayed);
     let plan_id = prepared["reference"].as_str().unwrap();
-    let diff = client.call("ultra_edit_diff", json!({"plan": plan_id}), false);
+    let diff = client.plan("diff", json!({"plan": plan_id}), false);
     assert!(
         diff["diff"]
             .as_str()
@@ -965,14 +962,14 @@ fn canonical_windows_paths_are_display_only_across_mcp_responses() {
         "{diff}"
     );
 
-    let snapshot_evidence = client.call(
-        "ultra_edit_status",
+    let snapshot_evidence = client.plan(
+        "status",
         json!({"query":{"kind":"evidence","reference":full["snapshot"]}}),
         false,
     );
     assert_eq!(snapshot_evidence["value"]["path"], displayed);
-    let plan_evidence = client.call(
-        "ultra_edit_status",
+    let plan_evidence = client.plan(
+        "status",
         json!({"query":{"kind":"evidence","reference":plan_id}}),
         false,
     );
@@ -982,8 +979,8 @@ fn canonical_windows_paths_are_display_only_across_mcp_responses() {
     );
     assert_eq!(plan_evidence["value"]["warnings"][0]["file"], displayed);
 
-    let rejected = client.call(
-        "ultra_edit_prepare",
+    let rejected = client.plan(
+        "prepare",
         json!({
             "request_id": "windows-display-draft",
             "files": [{
@@ -997,8 +994,8 @@ fn canonical_windows_paths_are_display_only_across_mcp_responses() {
         }),
         true,
     );
-    let draft_evidence = client.call(
-        "ultra_edit_status",
+    let draft_evidence = client.plan(
+        "status",
         json!({"query":{"kind":"evidence","reference":rejected["reference"]}}),
         false,
     );
@@ -1006,18 +1003,18 @@ fn canonical_windows_paths_are_display_only_across_mcp_responses() {
 
     let committed = client.call("ultra_edit", request, false);
     assert_eq!(committed["warnings"][0]["file"], displayed);
-    let receipt = client.call(
-        "ultra_edit_status",
+    let receipt = client.plan(
+        "status",
         json!({"query":{"kind":"receipt","request_id":"windows-display","full":true}}),
         false,
     );
     assert_eq!(receipt["receipt"]["files"][0]["path"], displayed);
     assert_eq!(receipt["receipt"]["warnings"][0]["file"], displayed);
 
-    let inspection = client.call("ultra_edit_inspect", json!({"plan":plan_id}), false);
+    let inspection = client.plan("inspect", json!({"plan":plan_id}), false);
     assert_eq!(inspection["files"][0]["path"], displayed);
-    let inspection_evidence = client.call(
-        "ultra_edit_status",
+    let inspection_evidence = client.plan(
+        "status",
         json!({"query":{"kind":"evidence","reference":inspection["inspection"]}}),
         false,
     );
@@ -1183,16 +1180,14 @@ fn bundled_plugin_launches_hooks_and_mcp_without_path_lookup() {
     // Claude Code clips an always-loaded tool's description at 16,384 characters.
     assert!(edit["description"].as_str().unwrap().chars().count() <= 16_384);
     // The other tools keep their generic descriptions.
-    let repair = tools
+    let plan = tools
         .iter()
-        .find(|tool| tool["name"] == "ultra_edit_repair")
+        .find(|tool| tool["name"] == "ultra_edit_plan")
         .unwrap();
-    assert!(
-        repair["description"]
-            .as_str()
-            .unwrap()
-            .starts_with("Advanced: replace existing change IDs")
-    );
+    let description = plan["description"].as_str().unwrap();
+    assert!(description.starts_with("Advanced: one operation on a stored plan"));
+    // Claude Code clips a deferred tool's description at 4,096 characters.
+    assert!(description.chars().count() <= 4_096);
     client.close();
 }
 
@@ -1313,8 +1308,8 @@ fn focused_batch_edit_preserves_bytes_and_retries_after_restart() {
     client.close();
 
     let mut client = Client::start(root.path());
-    let status = client.call(
-        "ultra_edit_status",
+    let status = client.plan(
+        "status",
         json!({"query":{"kind":"receipt","request_id":"batch"}}),
         false,
     );
@@ -1323,8 +1318,8 @@ fn focused_batch_edit_preserves_bytes_and_retries_after_restart() {
         client.call("ultra_edit", request.clone(), false),
         replay_of(&committed)
     );
-    let receipt = client.call(
-        "ultra_edit_status",
+    let receipt = client.plan(
+        "status",
         json!({"query":{"kind":"receipt","request_id":"batch","full":true}}),
         false,
     );
@@ -1332,8 +1327,8 @@ fn focused_batch_edit_preserves_bytes_and_retries_after_restart() {
     assert!(receipt["receipt"].get("validation").is_none());
     // Its IDs, plan, and files are fields of their own, so a commit has no report.
     assert!(committed.get("report").is_none(), "{committed}");
-    let evidence = client.call(
-        "ultra_edit_status",
+    let evidence = client.plan(
+        "status",
         json!({"query":{"kind":"evidence","reference":one["snapshot"]}}),
         false,
     );
@@ -1383,15 +1378,15 @@ fn stale_file_rejects_whole_batch_and_never_refreshes_its_base() {
         fs::read_to_string(root.path().join("two.txt")).unwrap(),
         "target\nexternal change"
     );
-    let unavailable = client.call(
-        "ultra_edit_status",
+    let unavailable = client.plan(
+        "status",
         json!({"query":{"kind":"receipt","request_id":"stale"}}),
         false,
     );
     assert_eq!(unavailable["kind"], "receipt_unavailable");
     assert!(unavailable["receipt"].is_null());
-    let unknown = client.call(
-        "ultra_edit_status",
+    let unknown = client.plan(
+        "status",
         json!({"query":{"kind":"receipt","request_id":"never-seen"}}),
         true,
     );
@@ -1408,10 +1403,10 @@ fn preview_repair_commit_and_conditional_undo_use_retained_plans() {
     let request = json!({"request_id":"ambiguous","files":[{"base":snapshot["snapshot"],"changes":[{
         "id":"change","target":{"kind":"exact","old":"x"},"text":"y"
     }]}]});
-    let rejected = client.call("ultra_edit_prepare", request, true);
+    let rejected = client.plan("prepare", request, true);
     assert_eq!(rejected["kind"], "rejected");
-    let repaired = client.call(
-        "ultra_edit_repair",
+    let repaired = client.plan(
+        "repair",
         json!({"reference":rejected["reference"],"request_id":"fixed","changes":[{
             "id":"change","target":{"kind":"all","old":"x","scope":"r0","expected":2},"text":"y"
         }]}),
@@ -1423,7 +1418,7 @@ fn preview_repair_commit_and_conditional_undo_use_retained_plans() {
         "x x\r\n"
     );
     let plan = repaired["reference"].clone();
-    let committed = client.call("ultra_edit_commit", json!({"plan":plan}), false);
+    let committed = client.plan("commit", json!({"plan":plan}), false);
     assert_eq!(committed["commit"], "committed");
     assert_eq!(
         fs::read_to_string(root.path().join("file.txt")).unwrap(),
@@ -1475,8 +1470,8 @@ fn near_miss_targets_return_copyable_candidates_over_mcp() {
     );
     let message = diagnostic["message"].as_str().unwrap();
     assert!(message.contains("a candidate at line 2 differs only in whitespace"));
-    let evidence = client.call(
-        "ultra_edit_status",
+    let evidence = client.plan(
+        "status",
         json!({"query":{"kind":"evidence","reference":rejected["reference"]}}),
         false,
     );
@@ -1485,8 +1480,8 @@ fn near_miss_targets_return_copyable_candidates_over_mcp() {
         diagnostic["candidates"]
     );
     // Replacing just the failed change with the candidate's exact text succeeds.
-    let repaired = client.call(
-        "ultra_edit_repair",
+    let repaired = client.plan(
+        "repair",
         json!({"reference":rejected["reference"],"request_id":"near-miss-repaired","changes":[{
             "id":"x","target":{"kind":"exact","old":diagnostic["candidates"][0]["text"]},
             "text":"\tlet x = 2;"
@@ -1494,11 +1489,7 @@ fn near_miss_targets_return_copyable_candidates_over_mcp() {
         false,
     );
     assert_eq!(repaired["kind"], "ready");
-    let committed = client.call(
-        "ultra_edit_commit",
-        json!({"plan":repaired["reference"]}),
-        false,
-    );
+    let committed = client.plan("commit", json!({"plan":repaired["reference"]}), false);
     assert_eq!(committed["commit"], "committed");
     assert_eq!(
         fs::read_to_string(root.path().join("main.rs")).unwrap(),
@@ -1509,7 +1500,7 @@ fn near_miss_targets_return_copyable_candidates_over_mcp() {
     let ambiguous = json!({"request_id":"no-candidates","files":[{"base":snapshot["snapshot"],"changes":[{
         "id":"n","target":{"kind":"exact","old":"n"},"text":"N"
     }]}]});
-    let rejected = client.call("ultra_edit_prepare", ambiguous, true);
+    let rejected = client.plan("prepare", ambiguous, true);
     assert_eq!(rejected["diagnostics"][0]["code"], "TARGET_AMBIGUOUS");
     assert!(rejected["diagnostics"][0].get("candidates").is_none());
     client.close();
@@ -1522,8 +1513,8 @@ fn retry_preflight_failure_keeps_original_receipt_and_candidate() {
     fs::write(&path, "before").unwrap();
     let mut client = Client::start(root.path());
     let base = client.full("file.txt");
-    let plan = client.call(
-        "ultra_edit_prepare",
+    let plan = client.plan(
+        "prepare",
         edit("preflight", &base["snapshot"], "r0", "after"),
         false,
     )["reference"]
@@ -1532,20 +1523,17 @@ fn retry_preflight_failure_keeps_original_receipt_and_candidate() {
     let mut read_only = original_permissions.clone();
     read_only.set_readonly(true);
     fs::set_permissions(&path, read_only).unwrap();
-    let failed = client.call("ultra_edit_commit", json!({"plan":plan}), true);
+    let failed = client.plan("commit", json!({"plan":plan}), true);
     fs::set_permissions(&path, original_permissions).unwrap();
     assert_eq!(failed["commit"], "not_committed");
     assert_eq!(fs::read_to_string(&path).unwrap(), "before");
     let arguments = json!({"plan":plan,"request_id":"preflight-retry"});
-    let retried = client.call("ultra_edit_retry", arguments.clone(), false);
+    let retried = client.plan("retry", arguments.clone(), false);
     assert_eq!(retried["commit"], "committed");
     assert_eq!(fs::read_to_string(&path).unwrap(), "after");
+    assert_eq!(client.plan("retry", arguments, false), replay_of(&retried));
     assert_eq!(
-        client.call("ultra_edit_retry", arguments, false),
-        replay_of(&retried)
-    );
-    assert_eq!(
-        client.call("ultra_edit_commit", json!({"plan":plan}), true),
+        client.plan("commit", json!({"plan":plan}), true),
         replay_of(&failed)
     );
     client.close();
@@ -1627,6 +1615,13 @@ fn malformed_arguments_and_outside_paths_fail_without_writes() {
             "ultra_edit_snapshot",
             json!({"path":"file.txt","selection":{"kind":"search","query":"x","first":1}}),
         ),
+        // Undo is a tool of its own, and an action's fields go inside `action`.
+        (
+            "ultra_edit_plan",
+            json!({"action":{"kind":"undo","plan":"p0"}}),
+        ),
+        ("ultra_edit_plan", json!({"kind":"commit","plan":"p0"})),
+        ("ultra_edit_plan", json!({"action":{"plan":"p0"}})),
         ("not_a_tool", json!({})),
     ] {
         let response = client.rpc("tools/call", json!({"name":name,"arguments":arguments}));
@@ -1656,8 +1651,8 @@ fn path_shaped_snapshot_references_remain_non_path_data_over_mcp() {
     let root = TempDir::new().unwrap();
     let reference = r"\\?\C:\looks-like-a-path";
     let mut client = Client::start(root.path());
-    let rejected = client.call(
-        "ultra_edit_prepare",
+    let rejected = client.plan(
+        "prepare",
         json!({
             "request_id": "invalid-reference",
             "files": [{
@@ -1686,8 +1681,8 @@ fn path_shaped_snapshot_references_remain_non_path_data_over_mcp() {
             .sum::<usize>()
     };
     assert_eq!(mentions(&rejected["diagnostics"]), 1);
-    let evidence = client.call(
-        "ultra_edit_status",
+    let evidence = client.plan(
+        "status",
         json!({"query":{"kind":"evidence","reference":rejected["reference"]}}),
         false,
     );
@@ -1710,9 +1705,9 @@ fn interrupted_commit_and_corrupt_journal_preserve_unknown_status_and_references
     let mut client = Client::start(root.path());
     let snapshot = client.full("file.txt");
     let request = edit("interrupted", &snapshot["snapshot"], "r0", "xx");
-    let preview = client.call("ultra_edit_prepare", request.clone(), false);
-    let evidence = client.call(
-        "ultra_edit_status",
+    let preview = client.plan("prepare", request.clone(), false);
+    let evidence = client.plan(
+        "status",
         json!({"query":{"kind":"evidence","reference":preview["reference"]}}),
         false,
     );
@@ -1747,8 +1742,8 @@ fn interrupted_commit_and_corrupt_journal_preserve_unknown_status_and_references
     assert_eq!(result["commit"], "outcome_unknown");
     assert_eq!(result["plan_id"], plan.id);
     assert_eq!(result["request_id"], "interrupted");
-    let receipt = client.call(
-        "ultra_edit_status",
+    let receipt = client.plan(
+        "status",
         json!({"query":{"kind":"receipt","request_id":"interrupted","full":true}}),
         false,
     );
@@ -1773,11 +1768,11 @@ fn interrupted_commit_and_corrupt_journal_preserve_unknown_status_and_references
         "xx"
     );
     assert_eq!(fs::read(&journal_path).unwrap(), journal);
-    let inspection = client.call("ultra_edit_inspect", json!({"plan":plan.id}), false);
+    let inspection = client.plan("inspect", json!({"plan":plan.id}), false);
     assert_eq!(inspection["receipt_error"]["code"], "JOURNAL_CORRUPT");
     assert_eq!(inspection["files"][0]["state"]["digest"], digest(b"xx"));
-    let evidence = client.call(
-        "ultra_edit_status",
+    let evidence = client.plan(
+        "status",
         json!({"query":{"kind":"evidence","reference":inspection["inspection"]}}),
         false,
     );
@@ -1788,16 +1783,13 @@ fn interrupted_commit_and_corrupt_journal_preserve_unknown_status_and_references
     let accepted = json!({"inspection":inspection["inspection"],"decision":"accept_current","note":"Fixture operator reviewed journal and current bytes"});
     fs::write(root.path().join("file.txt"), "changed since inspection").unwrap();
     assert_eq!(
-        client.call("ultra_edit_reconcile", accepted.clone(), true)["error"]["code"],
+        client.plan("reconcile", accepted.clone(), true)["error"]["code"],
         "STALE_INSPECTION"
     );
     fs::write(root.path().join("file.txt"), "xx").unwrap();
-    let resolved = client.call("ultra_edit_reconcile", accepted.clone(), false);
+    let resolved = client.plan("reconcile", accepted.clone(), false);
     assert_eq!(resolved["plan_id"], plan.id);
-    assert_eq!(
-        client.call("ultra_edit_reconcile", accepted, false),
-        resolved
-    );
+    assert_eq!(client.plan("reconcile", accepted, false), resolved);
     assert_eq!(fs::read(&journal_path).unwrap(), journal);
     client.close();
 }
@@ -1827,8 +1819,8 @@ fn cancelled_call_can_be_recovered_without_reapplying_the_edit() {
     assert_eq!(client.rpc("ping", json!({}))["result"], json!({}));
     drop(lock);
     let recovered = client.call("ultra_edit", request.clone(), false);
-    let status = client.call(
-        "ultra_edit_status",
+    let status = client.plan(
+        "status",
         json!({"query":{"kind":"receipt","request_id":"cancelled"}}),
         false,
     );
@@ -2096,27 +2088,38 @@ fn request_and_change_ids_are_optional_except_for_retry() {
             .map(|name| name.as_str().unwrap().to_owned())
             .collect::<Vec<_>>()
     };
-    for name in ["ultra_edit", "ultra_edit_prepare"] {
-        let schema = schema(name);
-        assert_eq!(required(&schema), ["files"], "{name}");
-        assert_eq!(schema["properties"]["request_id"]["type"], "string");
+    let plan = schema("ultra_edit_plan");
+    assert_eq!(required(&plan), ["action"]);
+    let action = |kind: &str| {
+        plan["$defs"]["PlanAction"]["oneOf"]
+            .as_array()
+            .unwrap_or_else(|| panic!("actions are not variants: {plan}"))
+            .iter()
+            .find(|variant| variant["properties"]["kind"]["const"] == kind)
+            .unwrap_or_else(|| panic!("no {kind} action: {plan}"))
+            .clone()
+    };
+    let edit = schema("ultra_edit");
+    assert_eq!(required(&edit), ["files"]);
+    assert_eq!(edit["properties"]["request_id"]["type"], "string");
+    let prepare = action("prepare");
+    assert_eq!(required(&prepare), ["kind", "files"]);
+    assert_eq!(prepare["properties"]["request_id"]["type"], "string");
+    for name in ["ultra_edit", "ultra_edit_plan"] {
         // Every change field is optional in the schema; parsing enforces the forms.
-        let change = &schema["$defs"]["Change"];
+        let change = schema(name)["$defs"]["Change"].clone();
         assert!(change.get("required").is_none(), "{name}: {change}");
         assert_eq!(change["properties"]["id"]["type"], "string");
     }
     assert_eq!(
-        required(&schema("ultra_edit_repair")),
-        ["reference", "changes"]
+        required(&action("repair")),
+        ["kind", "reference", "changes"]
     );
     assert_eq!(required(&schema("ultra_edit_undo")), ["plan"]);
-    assert_eq!(
-        required(&schema("ultra_edit_retry")),
-        ["plan", "request_id"]
-    );
+    assert_eq!(required(&action("retry")), ["kind", "plan", "request_id"]);
     let refused = client.rpc(
         "tools/call",
-        json!({"name":"ultra_edit_retry","arguments":{"plan":"p0"}}),
+        json!({"name":"ultra_edit_plan","arguments":{"action":{"kind":"retry","plan":"p0"}}}),
     );
     assert!(
         refused["error"].is_object() || refused["result"]["isError"] == true,
@@ -2148,26 +2151,22 @@ fn omitted_ids_are_derived_and_identical_calls_replay_with_a_flag() {
     assert_eq!(replay, replay_of(&committed));
     assert_eq!(fs::read_to_string(&path).unwrap(), "one\n");
     assert_eq!(
-        client.call("ultra_edit_prepare", request, false),
+        client.plan("prepare", request, false),
         replay_of(&committed)
     );
     assert_eq!(
-        client.call(
-            "ultra_edit_commit",
-            json!({"plan":committed["plan_id"]}),
-            false
-        ),
+        client.plan("commit", json!({"plan":committed["plan_id"]}), false),
         replay_of(&committed)
     );
     assert_eq!(fs::read_to_string(&path).unwrap(), "one\n");
-    let status = client.call(
-        "ultra_edit_status",
+    let status = client.plan(
+        "status",
         json!({"query":{"kind":"receipt","request_id":request_id}}),
         false,
     );
     assert_eq!(status, recorded(&committed));
-    let evidence = client.call(
-        "ultra_edit_status",
+    let evidence = client.plan(
+        "status",
         json!({"query":{"kind":"evidence","reference":committed["plan_id"]}}),
         false,
     );
@@ -2197,7 +2196,7 @@ fn rejections_repairs_and_undos_replay_under_derived_ids() {
     let request = json!({"files":[{"base":snapshot["snapshot"],"changes":[
         {"target":{"kind":"exact","old":"x"},"text":"y"}
     ]}]});
-    let rejected = client.call("ultra_edit_prepare", request.clone(), true);
+    let rejected = client.plan("prepare", request.clone(), true);
     assert_eq!(rejected["kind"], "rejected");
     assert!(rejected.get("replayed").is_none(), "{rejected}");
     assert_eq!(rejected["diagnostics"][0]["change_id"], "1.1");
@@ -2205,8 +2204,8 @@ fn rejections_repairs_and_undos_replay_under_derived_ids() {
         client.call("ultra_edit", request, true),
         replay_of(&rejected)
     );
-    let unnamed = client.call(
-        "ultra_edit_repair",
+    let unnamed = client.plan(
+        "repair",
         json!({"reference":rejected["reference"],"changes":[
             {"target":{"kind":"all","old":"x","scope":"r0","expected":2},"text":"y"}
         ]}),
@@ -2216,7 +2215,7 @@ fn rejections_repairs_and_undos_replay_under_derived_ids() {
     let repair = json!({"reference":rejected["reference"],"changes":[
         {"id":"1.1","target":{"kind":"all","old":"x","scope":"r0","expected":2},"text":"y"}
     ]});
-    let repaired = client.call("ultra_edit_repair", repair.clone(), false);
+    let repaired = client.plan("repair", repair.clone(), false);
     assert_eq!(repaired["kind"], "ready");
     assert!(repaired.get("replayed").is_none(), "{repaired}");
     assert!(
@@ -2227,12 +2226,9 @@ fn rejections_repairs_and_undos_replay_under_derived_ids() {
         "{repaired}"
     );
     assert_ne!(repaired["request_id"], rejected["request_id"]);
-    assert_eq!(
-        client.call("ultra_edit_repair", repair, false),
-        replay_of(&repaired)
-    );
+    assert_eq!(client.plan("repair", repair, false), replay_of(&repaired));
     let plan = repaired["reference"].clone();
-    let committed = client.call("ultra_edit_commit", json!({"plan":plan}), false);
+    let committed = client.plan("commit", json!({"plan":plan}), false);
     assert!(committed.get("replayed").is_none(), "{committed}");
     assert_eq!(fs::read_to_string(&path).unwrap(), "y y\n");
     let undone = client.call("ultra_edit_undo", json!({"plan":plan}), false);

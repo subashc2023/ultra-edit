@@ -1,38 +1,47 @@
 # Preview, repair, and recovery
 
+Previews, repair, retry, receipts, inspection, and reconciliation are actions of
+one tool, `ultra_edit_plan`. It takes `{"action": {"kind": …}}`: `kind` names the
+action, and the action's other fields are its arguments. Undo is a tool of its
+own, `ultra_edit_undo`.
+
 ## Preview before committing
 
-When the task calls for a preview, send the normal edit request to
-`ultra_edit_prepare`. Inspect the compact report and candidate warnings. Review
-the unified diff with `ultra_edit_diff` using `{plan}`; follow its `next_offset`
-in subsequent `{plan, offset}` calls for pages of at most 6,000 Unicode
-characters. Diff offsets count characters, not search matches. Retrieve full
-plan evidence through `ultra_edit_status` when needed. A ready preparation has a plan
-`reference`; commit that exact stored candidate with:
+When the task calls for a preview, send the normal edit request's fields as a
+`prepare` action, `{"action": {"kind": "prepare", "files": […]}}`. Inspect the
+compact report and candidate warnings. Review the unified diff with a `diff`
+action holding `plan`; follow its `next_offset` in later diffs holding `plan`
+and `offset` for pages of at most 6,000 Unicode characters. Diff offsets count
+characters, not search matches. Retrieve full plan evidence through a `status`
+action when needed. A ready preparation has a plan `reference`; commit that
+exact stored candidate with:
 
 ```json
-{ "plan": "REPLACE_WITH_RETURNED_PLAN" }
+{ "action": { "kind": "commit", "plan": "REPLACE_WITH_RETURNED_PLAN" } }
 ```
 
-Send this to `ultra_edit_commit`. It rechecks every base and never reruns matching
+Send this to `ultra_edit_plan`. It rechecks every base and never reruns matching
 against changed files. A failed preflight rejects the complete batch. A plan that
 already has a receipt returns it with `replayed: true`: a historical outcome, not
 a new attempt.
 
 ## Correct a rejected request
 
-`ultra_edit_repair` replaces known changes by ID, retains the original snapshots,
+A `repair` action replaces known changes by ID, retains the original snapshots,
 and recompiles the entire request under a new request ID, derived from the
 reference and corrections when omitted:
 
 ```json
 {
-  "reference": "REPLACE_WITH_RETURNED_DRAFT_OR_PLAN",
-  "changes": [{
-    "id": "1.1",
-    "old": "const RETRIES: usize = 1;",
-    "new": "const RETRIES: usize = 3;"
-  }]
+  "action": {
+    "kind": "repair",
+    "reference": "REPLACE_WITH_RETURNED_DRAFT_OR_PLAN",
+    "changes": [{
+      "id": "1.1",
+      "old": "const RETRIES: usize = 1;",
+      "new": "const RETRIES: usize = 3;"
+    }]
+  }
 }
 ```
 
@@ -62,8 +71,8 @@ preflight failure has the separate retry route below.
 Repeat the identical call. It binds the same request ID, derived or explicit, so
 it returns the recorded draft, preview, or receipt with `replayed: true`, or, if
 the commit never started, makes that first commit; it never writes twice. With the
-request ID in hand, you can instead call `ultra_edit_status` with
-`{"query":{"kind":"receipt","request_id":"REQUEST_ID"}}`. `UNKNOWN_REQUEST`
+request ID in hand, you can instead send a `status` action,
+`{"action":{"kind":"status","query":{"kind":"receipt","request_id":"REQUEST_ID"}}}`. `UNKNOWN_REQUEST`
 means the ID was not recorded in this root; verify the configured root before
 retrying.
 
@@ -74,8 +83,9 @@ plan returns the stored/recovered result and does not write again. To apply
 identical content again after a recorded outcome, take fresh snapshots or pass a
 new explicit ID.
 
-After correcting an environmental failure such as a read-only target, call
-`ultra_edit_retry` with `{"plan":"FAILED_PLAN","request_id":"NEW_RETRY_ID"}`.
+After correcting an environmental failure such as a read-only target, send a
+`retry` action,
+`{"action":{"kind":"retry","plan":"FAILED_PLAN","request_id":"NEW_RETRY_ID"}}`.
 Retry always needs a new explicit ID; a derived one would replay the first
 attempt. For new journals, retry requires durable proof that no target was
 written: a completed failed preflight with no write intent, or every file
@@ -96,7 +106,7 @@ mutation. New journals distinguish and reject this post-staging case.
 
 ## Partial or uncertain persistence
 
-For `partial`, request
+For `partial`, send a `status` action with
 `{"query":{"kind":"receipt","request_id":"ORIGINAL_REQUEST_ID","full":true}}`
 and inspect all file outcomes and the retained plan before
 deciding which fresh edits are needed. For `outcome_unknown`, `JOURNAL_UNCERTAIN`,
@@ -109,11 +119,11 @@ The workspace lists the plans still awaiting resolution as empty marker files in
 only once the plan records a certain outcome or an operator resolution. Do not create
 or delete these markers by hand: removing one hides an unresolved uncertain commit.
 
-Crash inspection and reconciliation are available through MCP. Call
-`ultra_edit_inspect` with `{plan}`, then retrieve the complete saved inspection
-with `ultra_edit_status` and `query.kind: "evidence"`. Only after an explicit
-operator decision based on that evidence, call `ultra_edit_reconcile` with
-`{inspection, decision: "accept_current", note}`.
+Crash inspection and reconciliation are available through MCP. Send an
+`inspect` action holding `plan`, then retrieve the complete saved inspection
+with a `status` action whose `query.kind` is `"evidence"`. Only after an explicit
+operator decision based on that evidence, send a `reconcile` action holding
+`inspection`, `decision: "accept_current"`, and `note`.
 
 The same workflow is available through the CLI using the server's root.
 The bare `ultra-edit` name below assumes a standalone CLI

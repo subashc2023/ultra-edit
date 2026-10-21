@@ -325,6 +325,34 @@ class StreamParsingTests(unittest.TestCase):
         self.assertIsNone(evaluation.ultra_tool("mcp__ultrasearch__ultra_edit"))
         self.assertIsNone(evaluation.ultra_tool("Edit"))
 
+    def test_plan_calls_count_as_the_tools_their_actions_replaced(self):
+        plan = ULTRA + "ultra_edit_plan"
+        receipt = {"kind": "receipt", "request_id": "r0"}
+        transcript = transcript_from(
+            init_message(tools=("Read", plan)),
+            assistant("m1", tool_use("t1", plan, {"action": {"kind": "prepare", "files": []}})),
+            tool_result("t1", ultra_json(kind="ready", ready=True, reference="p1")),
+            assistant("m2", tool_use("t2", plan, {"action": {"kind": "commit", "plan": "p1"}})),
+            tool_result("t2", ultra_json(kind="completed", request_id="r1", commit="committed")),
+            assistant("m3", tool_use("t3", plan, {"action": {"kind": "status", "query": receipt}})),
+            # As from ultra_edit_status, an old partial commit read back is not a failed call.
+            tool_result("t3", ultra_json(kind="completed", request_id="r0", commit="partial")),
+            assistant("m4", tool_use("t4", plan, {"action": {"kind": "repair", "reference": "d1", "changes": []}})),
+            tool_result("t4", ultra_json(kind="ready", ready=True, reference="p2")),
+            result_message(),
+        )
+        metrics = evaluation.compute_metrics(transcript)
+        self.assertEqual(metrics["tool_calls_by_name"], {plan: 4})
+        self.assertEqual(metrics["ultra_edit_statuses"], {"ok": 4})
+        self.assertEqual(metrics["edit_calls"], 1)
+        self.assertEqual(metrics["ultra_recovery_calls"], 1)
+        self.assertEqual(metrics["tool_errors"], 0)
+        self.assertEqual(evaluation.ultra_operation(plan, {"action": {"kind": "retry"}}), "ultra_edit_retry")
+        # A malformed action, or one that is a tool of its own, keeps the tool's name.
+        for arguments in (None, {}, {"action": "commit"}, {"action": {"kind": ["commit"]}}, {"action": {"kind": "undo"}}):
+            self.assertEqual(evaluation.ultra_operation(plan, arguments), "ultra_edit_plan")
+        self.assertEqual(evaluation.ultra_operation(ULTRA + "ultra_edit", {"action": {"kind": "commit"}}), "ultra_edit")
+
     def test_non_committed_edit_detected_from_content_or_structured_result(self):
         edit = ULTRA + "ultra_edit"
         partial = evaluation.ToolResult(True, ultra_json(kind="completed", commit="partial"))

@@ -309,16 +309,16 @@ fn the_mcp_surface_advertises_the_shorthand() {
     assert_eq!(change["properties"]["expect"]["anyOf"][0]["type"], "string");
     assert_eq!(change["properties"]["expect"]["anyOf"][1]["minItems"], 2);
     assert!(change["properties"]["in"]["anyOf"].is_array());
-    let repair = tool("ultra_edit_repair");
-    assert!(repair["_meta"]["anthropic/alwaysLoad"].is_null());
+    let plan = tool("ultra_edit_plan");
+    assert!(plan["_meta"]["anthropic/alwaysLoad"].is_null());
     assert!(
-        repair["inputSchema"]["$defs"]["Change"]["properties"]
+        plan["inputSchema"]["$defs"]["Change"]["properties"]
             .get("id")
             .is_some()
     );
     let response = client.rpc(
         "tools/call",
-        json!({"name":"ultra_edit_repair","arguments":{"reference":"x","changes":[{"id":"1.1","old":"one","new":"1"},{"lines":[1,1],"expect":7,"new":""}]}}),
+        json!({"name":"ultra_edit_plan","arguments":{"action":{"kind":"repair","reference":"x","changes":[{"id":"1.1","old":"one","new":"1"},{"lines":[1,1],"expect":7,"new":""}]}}}),
     );
     assert_eq!(
         response["result"]["content"][0]["text"],

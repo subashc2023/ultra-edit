@@ -128,18 +128,34 @@ The names below are server-side names; the host may add a namespace.
 | --- | --- | --- |
 | `ultra_edit_snapshot` | `{path, selection: {kind: "range", first, last, snapshot?}}`, `{path, selection: {kind: "search", query, offset?, snapshot?}}`, or `{path, selection: {kind: "full", expected_bytes?}}` | Focused range, paged literal search, or bounded full read; `snapshot` continues a prior snapshot |
 | `ultra_edit` | `EditRequest`: `{request_id?, files: [{path or base, changes: [{old, new, count?, in?} or {lines, expect, new} or {after, expect, new} or {span, expect?, new}]}]}` | Prepare and commit through `edit` |
-| `ultra_edit_status` | `{query: {kind: "receipt", request_id, full?: boolean}}` or `{query: {kind: "evidence", reference}}` | Retrieve a compact outcome (default), full receipt (`full: true`), or explicit evidence |
-| `ultra_edit_prepare` | The same direct `EditRequest` as `ultra_edit` | Persist a preview or rejected draft |
-| `ultra_edit_commit` | `{plan}` | Commit the stored candidate |
-| `ultra_edit_retry` | `{plan, request_id}` | Retry a failure that proves no target write (failed preflight, or `REPLACEMENT_FAILED` with the target unchanged) under a required new ID, retaining the exact original candidate |
-| `ultra_edit_repair` | `{reference, request_id?, changes}` | Replace retained changes by ID and prepare again |
+| `ultra_edit_plan` | `{action: {kind, …}}`, one of the actions below | The operation `kind` names |
 | `ultra_edit_undo` | `{plan, request_id?}` | Conditionally restore confirmed committed files |
-| `ultra_edit_diff` | `{plan, offset?}` | Read a unified diff in pages of at most 6,000 Unicode characters |
-| `ultra_edit_inspect` | `{plan}` | Persist current recovery evidence and return a compact description and inspection reference |
-| `ultra_edit_reconcile` | `{inspection, decision: "accept_current", note}` | Record an explicit reviewed operator decision; never automatically accept an uncertain outcome |
 
-Ordinary work uses snapshot → edit → outcome inspection, with status for receipt
-details. After a lost response, repeat the identical call. Mutation results carry
+`ultra_edit_plan` runs the rarely needed operations. Its `action` holds a
+`kind` and that operation's arguments, as in
+`{"action": {"kind": "commit", "plan": "p…"}}`:
+
+| `kind` | Other fields | Engine operation |
+| --- | --- | --- |
+| `prepare` | The `EditRequest` fields `ultra_edit` takes | Persist a preview or rejected draft |
+| `diff` | `{plan, offset?}` | Read a unified diff in pages of at most 6,000 Unicode characters |
+| `commit` | `{plan}` | Commit the stored candidate |
+| `repair` | `{reference, request_id?, changes}` | Replace retained changes by ID and prepare again |
+| `retry` | `{plan, request_id}` | Retry a failure that proves no target write (failed preflight, or `REPLACEMENT_FAILED` with the target unchanged) under a required new ID, retaining the exact original candidate |
+| `status` | `{query: {kind: "receipt", request_id, full?: boolean}}` or `{query: {kind: "evidence", reference}}` | Retrieve a compact outcome (default), full receipt (`full: true`), or explicit evidence |
+| `inspect` | `{plan}` | Persist current recovery evidence and return a compact description and inspection reference |
+| `reconcile` | `{inspection, decision: "accept_current", note}` | Record an explicit reviewed operator decision; never automatically accept an uncertain outcome |
+
+In 0.5.0 and earlier, each action was a tool of its own, named `ultra_edit_`
+and its `kind`. Claude Code names every deferred tool in each session's uncached
+context, so one tool for all eight costs one name. The plan tool is marked
+destructive and not read-only, since commit, retry, and reconcile change state,
+so one permission rule covers every action, and Claude Code's plan mode holds
+back its `status` and `diff` too.
+
+Ordinary work uses snapshot → edit → outcome inspection, with the plan tool's
+`status` for receipt details. After a lost response, repeat the identical call.
+Mutation results carry
 compact reports and references; full source, all diagnostics, and prepared output
 require explicit evidence retrieval. Every snapshot response uses `snapshot` for
 its base. Full reads default to 24,000 source bytes and 400 lines; an exact
@@ -178,8 +194,8 @@ for each committed file, `{path, lines, omitted?}`, where `lines` holds each
 changed region as it now reads, as `"12 | body"` with Read's line numbers and
 one line of context above and below. It holds at most 40 lines of at most 160
 characters in all, and `omitted` counts the lines left out. A replay, a
-`ultra_edit_commit`, and a receipt read later carry no `changed`, since the
-files may have changed since.
+`commit` action, and a receipt read later carry no `changed`, since the files
+may have changed since.
 Each of the first six compact diagnostics can carry up to three `candidates`,
 `{kind, line, end_line, text?, similarity?}`, for a missing `old` target or a
 failed span or line `expect`; full drafts carry them for every diagnostic. Receipt
@@ -208,11 +224,13 @@ status reads do not set it merely because a historical receipt describes a
 failure. Cancellation or disconnection cannot establish rollback; repeat the
 identical call or inspect its receipt before starting new work.
 
-Every tool schema has an object at its root. The `selection` and `query` fields
-contain the typed alternatives for snapshot and status requests, respectively.
+Every tool schema has an object at its root. The `selection`, `action`, and
+`query` fields contain the typed alternatives for snapshot, plan, and status
+requests, respectively.
 
-Recovery tools expose the same inspection and reconciliation protocol as the
-CLI. Inspect the complete evidence through status before submitting an explicit
+The plan tool's `inspect`, `status`, and `reconcile` actions expose the same
+inspection and reconciliation protocol as the CLI. Inspect the complete evidence
+through `status` before submitting an explicit
 operator decision; an ordinary edit request does not authorize accepting an
 uncertain state. There is no file creation/deletion/rename tool, generic shell
 dispatcher, automatic reconciliation, or model-supplied workspace root.
@@ -281,9 +299,13 @@ contract, so recheck them on major Claude Code upgrades.
   sometimes calls a deferred tool directly. Ultra Edit marks only `ultra_edit`,
   the tool every edit uses, so an editing session skips the round trip (about
   0.9 extra API calls per run in the benchmark). Ordinary edits name files by
-  `path` and need no snapshot, so `ultra_edit_snapshot` stays deferred with the
-  recovery tools. The schema adds about 2 KB to every request, which the prompt
-  cache serves after the first.
+  `path` and need no snapshot, so `ultra_edit_snapshot` stays deferred with
+  `ultra_edit_plan` and `ultra_edit_undo`. The schema adds about 2 KB to every
+  request, which the prompt cache serves after the first. A deferred tool still
+  costs its name, written uncached in every session and subagent: counted with
+  the token-counting API on claude-sonnet-5-5 in Claude Code 2.1.306's listing,
+  the ten deferred names of 0.5.0's eleven tools took 325 tokens, and these
+  three take 98.
 - Results. When a tool result has only text `content`, the model sees that text.
   When it has both text `content` and `structuredContent`, the model sees only
   the serialized `structuredContent` JSON and never the text. A results mode

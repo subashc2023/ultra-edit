@@ -594,9 +594,10 @@ still requires the `id` of the change it replaces (`INVALID_REPAIR` otherwise):
 Corrections cannot add unknown IDs or change retained snapshots. A stale base
 requires a fresh read and request. Repair closes after **any commit attempt**.
 For an environmental failure, fix the cause and use
-`retry PLAN NEW_REQUEST_ID` (MCP `ultra_edit_retry`). Retry always takes an
-explicit new ID, because a derived one would replay the first attempt instead of
-retrying. New journals must provide durable proof that no target was written:
+`retry PLAN NEW_REQUEST_ID` (over MCP, a `retry` action of `ultra_edit_plan`).
+Retry always takes an explicit new ID, because a derived one would replay the
+first attempt instead of retrying. New journals must provide durable proof that
+no target was written:
 either preflight completed unsuccessfully with no write intent, or every file
 records a failed replacement the engine confirmed had left the original bytes and
 file identity in place (`REPLACEMENT_FAILED`) or was never attempted. It clones
@@ -683,9 +684,10 @@ near-miss candidates. `get` retrieves full plans/drafts/snapshots/inspections,
 including every diagnostic's candidates; drafts stored before candidates existed
 still load. `receipt` retrieves every file outcome.
 `diff` returns a unified diff with changed regions, surrounding context, deletions,
-and missing-final-newline markers. MCP `ultra_edit_diff` takes `{plan, offset?}`
-and returns at most 6,000 Unicode characters with `next_offset` for continuation;
-diff offsets count characters, whereas search offsets count matches. Its quoted
+and missing-final-newline markers. Over MCP, a `diff` action of `ultra_edit_plan`
+takes `plan` and an optional `offset`, and returns at most 6,000 Unicode
+characters with `next_offset` for continuation; diff offsets count characters,
+whereas search offsets count matches. Its quoted
 paths are for inspection; patch import is not implemented. Explicit evidence
 commands are not subject to compact-report limits.
 
@@ -748,11 +750,11 @@ evidence uses `{"encoding":"utf8","text":"..."}`; non-UTF-8 evidence uses
 `get INSPECTION` retrieves the saved evidence after a restart. Inspection writes
 only workspace state, never target files.
 
-MCP `ultra_edit_inspect` accepts `{plan}` and returns a compact description with
-the inspection reference. Retrieve complete inspection evidence using
-`ultra_edit_status` with `query.kind: "evidence"` and that reference. After
-reviewing the evidence, submit an explicit operator decision through
-`ultra_edit_reconcile` or the CLI:
+Over MCP, an `inspect` action of `ultra_edit_plan` takes `plan` and returns a
+compact description with the inspection reference. Retrieve complete inspection
+evidence with a `status` action whose `query.kind` is `"evidence"`, with that
+reference. After reviewing the evidence, submit an explicit operator decision
+through the CLI, or as a `reconcile` action holding these fields:
 
 ```json
 {

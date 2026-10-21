@@ -131,9 +131,9 @@ Check `/mcp` for the plugin server, then make an ordinary multi-file edit reques
 The plugin automatically supplies its routing instructions; `/ultra-edit:edit`
 is optional workflow detail. Use the actual MCP tool names Claude Code exposes;
 plugin tools may be namespaced.
-The core names are `ultra_edit_snapshot`, `ultra_edit`, and `ultra_edit_status`.
-Preview/commit, repair, preflight retry, undo, diff, inspection, and explicit
-reconciliation have separate tools. See the official
+The tools are `ultra_edit`, `ultra_edit_snapshot`, `ultra_edit_undo`, and
+`ultra_edit_plan`, whose actions cover receipts, preview and commit, diff,
+repair, preflight retry, inspection, and explicit reconciliation. See the official
 [local plugin testing instructions](https://code.claude.com/docs/en/plugins#test-your-plugins-locally).
 
 Copied source plugins do not update automatically. Update the installed plugin
