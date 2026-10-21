@@ -15,9 +15,9 @@ ALL related changes, in all files, in ONE call, naming each file by absolute
 - `lines:[a,b]` replaces whole lines (`"new":""` deletes them); `after:n`
   inserts after line n (0 = top) and keeps it, so `new` must not repeat it. Both
   take Read's line numbers and need `expect`: all of line n or a, indentation
-  included, or `[line a, line b]`. Each part needs 8+ visible characters: for a
-  blank line, a lone `)`, or a ``` fence, join its neighbour into that part
-  (`"\ndef f():"`; `after`: `["return ok",""]`).
+  included, or `[line a, line b]`: 8+ visible characters in total, else join
+  a neighbour into a part (`"\ndef f():"`). Anchor `after` on a text line, not
+  a blank one, putting blank lines in `new`.
 - Every change applies to the file as it was before the call. Text is literal,
   without Read's line-number gutter; in an all-CRLF file, LF is written as CRLF.
 

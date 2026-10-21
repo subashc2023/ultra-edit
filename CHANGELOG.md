@@ -16,13 +16,19 @@ All notable changes to Ultra Edit are documented here. Releases follow
   Replayed, the two with a text `expect` now commit and leave the file as the
   task expects, where each run took four more calls; the third also gave a
   blank `expect` and is still refused, as `LINE_GUARD_WEAK`.
-- The plugin card shows the guard for an insertion after a blank line: the
-  line above joined to it, as `["return ok",""]`. In those rounds, Ultra Edit
-  runs sent a blank `expect` with `after` ten times, between functions or
-  sections, and every one was refused, eight as `LINE_GUARD_WEAK`; none joined
-  a neighbour, which the card's one example showed only for a range's first
-  line. To stay within 2,048 bytes, the card drops its heading and shortens
-  its replay note.
+- The plugin card states the line guard as the server checks it, 8 or more
+  visible characters in the whole `expect` rather than in each part, so the
+  text at one end of a range can carry a blank line at the other, and tells
+  `after` to anchor on a text line, with blank lines in `new`. In those rounds,
+  Ultra Edit runs sent a blank `expect` with `after` ten times, between
+  functions or sections, and every one was refused, eight as
+  `LINE_GUARD_WEAK`. A card showing `["return ok",""]` for `after` instead cut
+  blank-line rejections in 20 runs of move-function-between-modules and
+  replace-function-body to two, from ten in those tasks' 30 earlier runs, but
+  five of its nine failed calls gave a `lines` range with blank ends an
+  `expect` item that was neither its first nor its last line, as if the list
+  held neighbours, as that example's does. To stay within 2,048 bytes, the
+  card drops its heading and shortens its replay note.
 
 ## [0.5.0] - 2026-10-20
 

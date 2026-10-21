@@ -317,7 +317,8 @@ text inserts one empty line: the line ending any text there would get. In an
 empty file, where text is written as given, and after a last line that lacks a
 terminator, where it would only add one, empty text is `EMPTY_INSERTION`. For
 `after` a blank line, an `expect` of it alone matches every blank line; give
-the line above too, as `["return ok",""]`. `after` keeps line `after`, so text that starts by
+the line above too, as `["return ok",""]`, or anchor `after` on that line and
+start the text with the blank line. `after` keeps line `after`, so text that starts by
 restating it is `INSERT_REPEATS_LINE`: its leading lines equal the lines ending
 at `after`, compared without trailing whitespace, as when `expect` or the lines
 to replace were copied into `new`, with at least 8 non-whitespace characters in

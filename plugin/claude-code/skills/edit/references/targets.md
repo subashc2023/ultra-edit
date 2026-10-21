@@ -116,7 +116,8 @@ line ending the same way.
 
 `expect` on `lines` and `after` is compared line by line, ignoring line endings.
 For `after`, it gives the lines ending at `after`, so after a blank line it
-names the line above too: `["return ok",""]`. For `lines`, a string gives
+names the line above too, `["return ok",""]`, or anchor on that line and put
+the blank line in `new`. For `lines`, a string gives
 the first lines of the range, and `[first, last]` gives its first and last
 lines (each may hold several lines). It is required unless the base disclosed
 every addressed line (a `path` file discloses none), and then must reach the
