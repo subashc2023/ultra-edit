@@ -135,8 +135,11 @@ at exactly one place where the whole change fits (both parts of a pair shifted
 together), moves the change there, with a nonblocking `LINES_MOVED` warning
 naming the lines given and used. Otherwise, or when the moved change would
 overlap another change, a mismatch is `EXPECTED_TEXT_MISMATCH`, and when the
-expected lines occur elsewhere the message gives the current range. A line past
-the end is `LINE_OUT_OF_RANGE`. On `span`, `expect` is byte-exact.
+expected lines occur once elsewhere the message offers the target that holds
+them, as a condition: `use lines [a,b] if the whole range moved` or `use
+after:n`, or, for a range's last lines alone, `use lines [a,b] if the range
+ends there`. Use it only if those are the lines you mean; a last line you gave
+may sit inside the range. A line past the end is `LINE_OUT_OF_RANGE`. On `span`, `expect` is byte-exact.
 
 Unrestricted `old` searches the complete original file even after a focused
 read. An `old` with 8 or more visible characters whose `in` lines hold no match,

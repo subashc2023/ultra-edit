@@ -315,8 +315,13 @@ nonblocking `LINES_MOVED` warning names the lines given and the lines used, and
 the stored plan records the lines used. Otherwise, and
 when the moved target would conflict with another change in the request, a
 mismatch is `EXPECTED_TEXT_MISMATCH`: the message quotes the addressed lines
-and, when the expected lines occur elsewhere, gives the current range, and the
-diagnostic carries them as `exact` candidates, or near misses as below. `after` with empty
+and, when the expected lines occur once elsewhere, names that line and offers
+the target as a condition, `use lines [a,b] if the whole range moved` or `use
+after:n`. When only a range's last lines are elsewhere, it keeps the range's
+start and offers `use lines [a,b] if the range ends there`, since callers more
+often give a line inside the range, or the one below it, as its last lines than
+miscount its end. The diagnostic carries the lines as `exact` candidates, or
+near misses as below. `after` with empty
 text inserts one empty line: the line ending any text there would get. In an
 empty file, where text is written as given, and after a last line that lacks a
 terminator, where it would only add one, empty text is `EMPTY_INSERTION`. For

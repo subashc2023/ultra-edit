@@ -47,7 +47,8 @@ use the parenthesized non-overlapping count as `count`. For `EMPTY_TARGET`,
 insert with `{"after":n,"expect":…,"new":…}`. For `LINE_GUARD_REQUIRED`,
 `LINE_GUARD_WEAK`, or a line-target `EXPECTED_TEXT_MISMATCH`, add or extend
 `expect`, taking the text of the lines a weak guard's message names from your
-own view of the file, or use the current line numbers the message gives. A `path` file's
+own view of the file, or use the line numbers a mismatch offers if they name the
+lines you mean. A `path` file's
 draft keeps the bytes it read as its base, so a repair is judged against them.
 Unknown change IDs cannot be added, and a repair cannot replace the base snapshots.
 A successful repair is a preview;

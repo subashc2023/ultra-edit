@@ -27,6 +27,8 @@ and every third-party arm in `third_party/arms.json`.
 | `native` | Claude Code only | The baseline: native Read/Edit/Write/Bash. |
 | `native-guard` | Native tools plus Ultra Edit's shell guard: a `PreToolUse` hook (matcher `Bash\|PowerShell`, set by `--guard-matcher`) running `<staged runtime>/ultra-edit-mcp --claude-hook PreToolUse`, configured in a generated `--settings` file | Whether blocking heredoc, here-string, inline-script, `sed -i`, `-replace`, and `echo`/`printf`/`Set-Content` writes into the project alone improves native editing. |
 | `ultra-edit` | The full plugin via `--plugin-dir <staged plugin>`: MCP tools, routing hooks, skill | The complete product against both baselines. |
+| `ultra-edit-short` | `ultra-edit` with `ULTRA_EDIT_CARD=short` in Claude Code's environment: a 1.2 KB native-first card as the `ultra_edit` description, and context hooks that prefer native Edit and Write | Whether sending the model to native edits first, and to Ultra Edit only for shell writes, several files, or repeated text, costs less. |
+| `ultra-edit-deferred` | `ultra-edit` with `ULTRA_EDIT_CARD=deferred`: the full card, but `ultra_edit` behind `ToolSearch`, and the same native-first context naming the query that loads it | The same, without the always-loaded schema. |
 | `ultra-edit-only` | `ultra-edit` plus `--disallowedTools Edit,Write,MultiEdit,NotebookEdit` | Ultra Edit when the model cannot fall back to native edits. |
 | `shell-sed` | Native tools minus Edit/Write/MultiEdit/NotebookEdit; `--append-system-prompt` asks for sed, awk, or perl one-liners through Bash; a method hook enforces it | Stream-editor edits. |
 | `shell-python` | Same, asking for Python 3 code through Bash (`python3 - <<'PY' ... PY`) | Scripted edits. |
@@ -71,14 +73,27 @@ measured with different ones unless `--allow-drift` is given.
 Every prompt starts with the line `<!-- MARKER -->`, MARKER being 8 hex digits
 that each invocation draws afresh, `--resume` included (`prompt_marker` in
 `manifest.json` and each run's `command.json`). The prompt cache keeps a
-request's prefix, task prompt included, for an hour after its last use, so
-without the marker an arm whose tools and system prompt had not changed since
-the previous invocation began with its task prompts cached while an arm whose
-build had changed paid to write them: in the tenth Windows round, started 24
-minutes after the ninth, about 1,900 tokens per first-repetition Ultra Edit
-run, or near 4% of that arm's cost over the round. With it, each arm writes
-each task prompt once per invocation, an arm restarted by `--rerun-arm`
-included, and later repetitions read it.
+request's prefix, task prompt included, for a while after its last use: an hour
+in the Windows rounds through the eleventh, which ran logged in, and five
+minutes from the twelfth, which ran with `ANTHROPIC_API_KEY`. Without the
+marker, an arm whose tools and system prompt had not changed since the previous
+invocation began with its task prompts cached while an arm whose build had
+changed paid to write them: in the tenth Windows round, started 24 minutes
+after the ninth, about 1,900 tokens per first-repetition Ultra Edit run, or
+near 4% of that arm's cost over the round. With it, each arm writes each task
+prompt once per invocation, an arm restarted by `--rerun-arm` included, and
+later repetitions read it while the entry lasts; repetitions run a whole pass
+of tasks apart, so with five-minute entries every run writes its own.
+
+The marker is the same for every arm, so arms whose requests match through the
+task prompt still share its cache entry. In the twelfth Windows round
+(2026-10-21 00:26), `native` and `ultra-edit-deferred` sent the same tools,
+system prompt, and task prompt, so in each task's repetition whichever ran
+first wrote it and the other read it: 39 `native` runs and 30
+`ultra-edit-deferred` runs read another arm's entry. Charged as cache writes,
+those reads lift `native`'s mean cost from $0.0524 to $0.0551 and
+`ultra-edit`'s cost ratio against it from 1.08 to 1.03. Compare such arms only
+on runs that wrote their task prompt, or reprice those reads.
 
 ### Third-party arms
 
@@ -203,20 +218,22 @@ leak into any arm. By default each run uses:
 - `--no-session-persistence`, plus these environment variables:
   `DISABLE_AUTOUPDATER=1`, `ENABLE_CLAUDEAI_MCP_SERVERS=false`,
   `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, `CLAUDE_CODE_SKIP_PROMPT_HISTORY=1`.
-  The harness removes `CLAUDE_CODE_PLUGIN_DIRS` and the markers a parent
-  Claude Code session exports (`CLAUDECODE`, ...). It also removes behavior
-  settings a host may set for itself, such as `CLAUDE_EFFORT`,
-  `MCP_CONNECTION_NONBLOCKING`, `ENABLE_TOOL_SEARCH`, and
-  `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH`, plus variables starting with
-  `CLAUDE_CODE_ARTIFACT_`, `CLAUDE_CODE_REMOTE`, or `CLAUDE_CODE_SYNC_`, so
-  every arm runs with Claude Code's defaults. Pass `--effort` to set effort.
+  The harness removes `CLAUDE_CODE_PLUGIN_DIRS`, `ULTRA_EDIT_CARD` (which only
+  its arms set), and the markers a parent Claude Code session exports
+  (`CLAUDECODE`, ...). It also removes behavior settings a host may set for
+  itself, such as `CLAUDE_EFFORT`, `MCP_CONNECTION_NONBLOCKING`,
+  `ENABLE_TOOL_SEARCH`, and `CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH`, plus
+  variables starting with `CLAUDE_CODE_ARTIFACT_`, `CLAUDE_CODE_REMOTE`, or
+  `CLAUDE_CODE_SYNC_`, so every arm runs with Claude Code's defaults. Pass
+  `--effort` to set effort.
 
 Every run is then checked against its `system/init` message and hook events:
 
 - A run of an arm without the plugin that shows any Ultra Edit plugin, MCP
   server, or tool is marked `invalid`.
-- An `ultra-edit` or `ultra-edit-only` run whose plugin or server did not load,
-  or whose `SessionStart` hook failed, is marked `invalid`.
+- A run of an arm with the plugin (`ultra-edit`, `ultra-edit-only`, and the
+  two card variants) whose plugin or server did not load, or whose
+  `SessionStart` hook failed, is marked `invalid`.
 - A `native-guard` run is marked `invalid` if a shell tool that the matcher
   names ran without any `PreToolUse` hook event, or if the hook failed.
 - A third-party run is marked `invalid` if its server is missing or not

@@ -70,8 +70,15 @@ It also replaces the generic `ultra_edit` description with that card. Claude
 Code caches tool definitions across sessions but writes hook context anew in
 each one: measured with Claude Code 2.1.303, the card cost 788 uncached tokens
 per session as hook context. `--no-instructions` alone keeps the generic
-description. Other hosts start the server without either flag and receive the
-instructions. The native launcher
+description. For evaluation, `ULTRA_EDIT_CARD=short` in the server's
+environment gives `--plugin-card` a 1.2 KB native-first card instead, and
+`ULTRA_EDIT_CARD=deferred` keeps the card but leaves `ultra_edit` behind
+`ToolSearch`; both make the context hooks prefer native Edit and Write. Unset
+or empty keeps the default, and any other value is refused at startup. In a
+Windows eval round, the variants cost 1.11x and 1.14x what the default card did
+and missed more first tries, so the plugin does not set it (see
+[Windows results](performance.md#windows-results)). Other hosts start the
+server without either flag and receive the instructions. The native launcher
 resolves `.exe` on Windows. Hook entries point to the same executable with an
 explicit argument array, so they launch directly without a shell. `runtime/`
 keeps the binaries private; a plugin `bin/` directory would be added to Claude's

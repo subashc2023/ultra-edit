@@ -5,17 +5,33 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ## [Unreleased]
 
+### Added
+
+- An experimental `ULTRA_EDIT_CARD` environment variable selects a native-first
+  variant of the plugin's card, for evaluation. `short` makes the `ultra_edit`
+  description a 1.2 KB card that prefers native Edit and Write and keeps
+  `ultra_edit` for shell writes, several files, and repeated text; `deferred`
+  keeps the full card but leaves `ultra_edit` behind `ToolSearch`. Both change
+  the `SessionStart` and `SubagentStart` context to prefer native edits. Unset
+  or empty keeps the default card, and any other value is refused at startup.
+  The eval's `ultra-edit-short` and `ultra-edit-deferred` arms set it. In a
+  Windows round of all 23 tasks, 3 times each, both were exact in all 69 runs,
+  as the default card was, but right on the first try in 54 and 61 against its
+  66, and cost 1.11x (1.08-1.13) and 1.14x (1.11-1.17) as much, the second
+  charged for the prompt-cache entries it read from `native` runs, so the
+  plugin keeps the default card.
+
 ### Changed
 
 - `after` with empty `new` inserts one empty line, ended as any text there
   would be, as `after` already writes `new` followed by that line ending. It was
   `EMPTY_INSERTION`, which now refuses empty text only in an empty file, where
   text is written as given, and after a last line without a line ending, where
-  it would only add one. In the last five full Windows eval rounds, all three
-  `EMPTY_INSERTION` rejections of Ultra Edit runs were meant as one empty line.
-  Replayed, the two with a text `expect` now commit and leave the file as the
-  task expects, where each run took four more calls; the third also gave a
-  blank `expect` and is still refused, as `LINE_GUARD_WEAK`.
+  it would only add one. In the five full Windows eval rounds before this
+  change, all three `EMPTY_INSERTION` rejections of Ultra Edit runs were meant
+  as one empty line. Replayed, the two with a text `expect` now commit and
+  leave the file as the task expects, where each run took four more calls; the
+  third also gave a blank `expect` and is still refused, as `LINE_GUARD_WEAK`.
 - The plugin card states the line guard as the server checks it, 8 or more
   visible characters in the whole `expect` rather than in each part, so the
   text at one end of a range can carry a blank line at the other, and tells
@@ -27,27 +43,33 @@ All notable changes to Ultra Edit are documented here. Releases follow
   replace-function-body to two, from ten in those tasks' 30 earlier runs, but
   five of its nine failed calls gave a `lines` range with blank ends an
   `expect` item that was neither its first nor its last line, as if the list
-  held neighbours, as that example's does. With this card, the same 20 runs
-  gave such an item once, though three of the ten move-function-between-modules
-  runs still anchored `after` on a blank line. A card that instead showed a
-  second `after` example, anchored on a function's last line with the blank
-  lines in `new`, did not lower that, and four of ten replace-function-body
-  runs then gave their changelog entry an `after` with a blank `expect`, which
-  no run of the two rounds before had. To stay within 2,048 bytes, the
-  card drops its heading and shortens its replay note.
+  held neighbours, as that example's does. With this card, two rounds of the
+  same 20 runs gave such a list once in all, but blank `after` anchors were not
+  fewer: 4 and 10 calls. Five of the 10 came from replace-function-body runs
+  that inserted their changelog entry after the blank line below its
+  subheading, with a blank `expect`, which the round of 4 had not done. A card
+  that showed a second `after` example instead, anchored on a function's last
+  line with the blank lines in `new`, also gave 10, so no wording tried moved
+  blank anchors by more than rounds of one card vary. Each refusal names the
+  lines that would guard it, and in the round of 10 on this card, the call
+  after each one committed. In a full Windows round on this card, the five
+  Ultra Edit runs that missed their first try, all in those two tasks, each
+  sent a blank `after` anchor, and each next call committed. To stay within
+  2,048 bytes, the card drops its heading and shortens its replay note.
 - A change takes what callers add to a deletion: `delete: true`, or
   `delete_line: true`, beside the `"new":""` of an `old`, `span`, or `lines`
   change, which it repeats, and fields whose names begin with `_`, as JSON's
   conventional comments do, as notes. Neither is stored, so the request ID is
   unchanged. A null `new` deletes as `""` does, and is refused with `after`;
-  any other field a change does not take is still refused. In the 17 recorded
-  eval rounds, all ten such refusals of Ultra Edit calls were a correct deletion
-  of one line in move-function-between-modules with one addition (`delete`
-  three times, `delete_line` once, `_` four times, `_note` once, and a null
-  `new` once), and each cost its run a call. Replayed, all ten commit and leave
-  every file they touch as the task expects. In a further ten runs of that
-  task, two deletions came with `delete: true` and were taken; a third, with
-  `delete: false`, is refused, since it could mean an emptied line.
+  any other field a change does not take is still refused. In the 17 eval
+  rounds recorded before this change, all ten such refusals of Ultra Edit calls
+  were a correct deletion of one line in move-function-between-modules with one
+  addition (`delete` three times, `delete_line` once, `_` four times, `_note`
+  once, and a null `new` once), and each cost its run a call. Replayed, all ten
+  commit and leave every file they touch as the task expects. In the three
+  rounds since, ten deletions came with an addition, `delete: true` four times,
+  a null `new` four times, and `_note` twice, and all were taken; one with
+  `delete: false` is refused, since it could mean an emptied line.
 - When the last lines of a `lines` change's `expect` are found where its range
   does not end, the refusal offers the range that ends there as a condition,
   `use lines [a,b] if the range ends there`, rather than stating `the range is

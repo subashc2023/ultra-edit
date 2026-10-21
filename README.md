@@ -21,10 +21,10 @@ as MCP JSON to a native Rust engine, are checked against the files' current
 bytes, and land all together or not at all. A hook blocks shell commands that
 write file content into the project.
 
-Every model-level benchmark so far ran on Linux, where native Claude Code is as
-accurate and on most tasks slightly cheaper, mostly because it writes through
-the shell.
-Ultra Edit pays off where that route is unsafe or unwanted: with shell writes
+In every benchmark so far, native Claude Code was nearly as accurate. On Linux
+it was slightly cheaper on most tasks, mostly because it writes through the
+shell; on Windows, Ultra Edit cost about the same in about 0.6x the turns.
+Ultra Edit pays off where shell writes are unsafe or unwanted: with them
 blocked, it was the cheapest route that stayed exact, and unlike two of the
 three MCP edit servers tested, it never changed bytes outside the requested
 edits. See [Benchmarks](#benchmarks).
@@ -82,7 +82,7 @@ source builds, session-only loading with `--plugin-dir`, and troubleshooting.
 
 No commands needed: ask for a change as usual. The plugin starts the server with
 `["--root", "${CLAUDE_PROJECT_DIR}", "--plugin-card"]`, so the `ultra_edit`
-description is a short routing card (about 2.2 KB) that tells Claude to edit
+description is a short routing card (about 2 KB) that tells Claude to edit
 existing files with Ultra Edit, create new files with Write, and never write
 project files through the shell. Claude Code caches it with the tool list, and
 session-start hooks, including for subagents, resumed sessions, and compacted
@@ -165,27 +165,34 @@ native Claude Code.
 
 ### Windows
 
-Four more rounds ran all 23 tasks on Windows 11 on 2026-10-19 and 20, with
-Claude Code 2.1.303 and Sonnet 5.5, 3 times each, comparing Ultra Edit with
-native Claude Code. They ran development builds between 0.4.0 and 0.5.0. The
-last round, whose prompts carry a marker drawn per run so that no run reuses
-another's cached prompt, gave:
+Six more rounds ran all 23 tasks on Windows 11 from 2026-10-19 to 21, with
+Sonnet 5.5, 3 times each, comparing Ultra Edit with native Claude Code. The
+first four ran Claude Code 2.1.303 and development builds between 0.4.0 and
+0.5.0; the last two ran builds after 0.5.0, the last with Claude Code 2.1.306.
+Costs compare only within a round, since the prompt cache treated the rounds
+differently ([per-round results](docs/performance.md#windows-results)). The
+last round gave:
 
 | | Ultra Edit | Native |
 | --- | --- | --- |
-| Exact final bytes | 69/69 | 68/69 |
-| Right on the first try | 65/69 | 63/69 |
-| Cost | 1.00x (0.97-1.04) | 1.00x |
-| Turns | 0.64x (0.60-0.69) | 1.00x |
-| Tool calls | 0.59x (0.55-0.65) | 1.00x |
-| Output tokens | 0.95x (0.91-0.99) | 1.00x |
+| Exact final bytes | 69/69 | 69/69 |
+| Right on the first try | 64/69 | 63/69 |
+| Cost | 1.03x (0.99-1.07) | 1.00x |
+| Turns | 0.63x (0.59-0.70) | 1.00x |
+| Tool calls | 0.58x (0.53-0.65) | 1.00x |
+| Output tokens | 0.96x (0.92-1.02) | 1.00x |
 
-Over all four rounds, Ultra Edit was exact in 275 of 276 runs and native in
-272 (p = 0.37), and right on the first try in 252 and 249. Native wrote
-through the shell in 142 of its 276 runs, and none of those ended wrong; all
-four of its wrong results were written with Edit. Ultra Edit's one wrong
+Over all six rounds, Ultra Edit was exact in 413 of 414 runs and native in
+408 (p = 0.12), and right on the first try in 382 and 377. Native wrote
+through the shell in 213 of its 414 runs, and none of those ended wrong; all
+six of its wrong results were written with Edit. Ultra Edit's one wrong
 result deleted a function with an `old` that also took one of the two blank
-lines below it, which the server now flags as `BLANK_LINES_DROPPED`.
+lines below it, which the server now flags as `BLANK_LINES_DROPPED`. In the
+last round, each of its five first-try misses gave an `after` a blank
+`expect`, which is refused with nothing written; the next call committed.
+Fewer turns did not lower its cost because its runs wrote 1.2k more tokens to
+the prompt cache: 0.5k of per-session context on the first call, and 0.7k on
+later calls, whose tool results are larger.
 
 ### Failure rates
 
@@ -245,7 +252,7 @@ and the gap to native with shell writes blocked, 8 wrong in 111, is significant
 - **Fewer, larger calls:** on Sonnet's exact-text tasks, Ultra Edit runs took
   0.75x native's turns and 0.72x its tool calls; on Haiku, across all tasks,
   0.54x and 0.49x, with 0.91x the context tokens but 1.16x the output tokens;
-  on Windows, across all tasks, 0.64x and 0.59x at the same cost.
+  on Windows, across all tasks, 0.63x and 0.58x at 1.03x the cost.
   Each change restates its text: a 29-site CSS rename was 3.1k output tokens as
   one `ultra_edit` call and 0.8k as native's one `perl` regex. In the 1.22x
   intent-level round, the two renames and a function move, after which the

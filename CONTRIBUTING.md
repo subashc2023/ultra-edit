@@ -62,12 +62,12 @@ require the caller to hold its coordinator lock.
 The [harness](eval/README.md) runs fixture tasks through native Claude Code, the
 plugin, shell-edit routes, and third-party MCP edit servers, and scores exact
 final bytes, first-try success, tool calls, and cost. The recorded rounds in
-[performance](docs/performance.md#model-level-results) all ran on Linux; a
-Windows round is the next one to run, since Windows is where Claude Code's Bash
-tool corrupts command payloads. The manual `Eval` workflow runs one on
-`windows-2025`, or with `runner: both` the same round on Linux at the same time,
-with the same build, model, and settings; `preflight-only` checks the runner
-setup without starting a model session. See
+[performance](docs/performance.md#model-level-results) ran every route on
+Linux, and `native` against `ultra-edit` on a Windows 11 machine, where Claude
+Code's Bash tool corrupts command payloads. The manual `Eval` workflow runs a
+round on `windows-2025`, or with `runner: both` the same round on Linux at the
+same time, with the same build, model, and settings; `preflight-only` checks
+the runner setup without starting a model session. See
 [GitHub Actions](eval/README.md#github-actions). Earlier live checks are
 recorded under [validation](docs/mcp-adapter.md#validation).
 
