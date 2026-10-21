@@ -5,6 +5,8 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-21
+
 ### Added
 
 - An experimental `ULTRA_EDIT_CARD` environment variable selects a native-first
@@ -587,6 +589,7 @@ All notable changes to Ultra Edit are documented here. Releases follow
 - A self-hosted Claude Code marketplace package with SHA-256 verification and
   GitHub build-provenance attestations.
 
+[0.6.0]: https://github.com/subashc2023/ultra-edit/releases/tag/v0.6.0
 [0.5.0]: https://github.com/subashc2023/ultra-edit/releases/tag/v0.5.0
 [0.4.0]: https://github.com/subashc2023/ultra-edit/releases/tag/v0.4.0
 [0.3.0]: https://github.com/subashc2023/ultra-edit/releases/tag/v0.3.0
