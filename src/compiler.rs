@@ -2971,7 +2971,8 @@ enum Placed {
 /// line numbers from elsewhere may be stale, so one is required: for `lines`, it
 /// must reach the range's last line, either by giving every line or by giving the
 /// last lines too, and it must have `MIN_GUARD_CHARS` visible characters or match
-/// this place alone, so a shifted number cannot find the same short text elsewhere.
+/// this place alone, so a shifted number cannot find the same short text elsewhere,
+/// unless it guards an insertion after a blank line, which replaces nothing.
 /// When the stated lines do not hold it, a guard that reaches the target's end
 /// with `MIN_GUARD_CHARS` visible characters places the target where it holds,
 /// if that is exactly one place: a stale or miscounted number then applies only
@@ -3187,8 +3188,16 @@ fn line_guard(
     if !required || visible >= MIN_GUARD_CHARS {
         return Placed::Stated;
     }
-    // A short guard, such as a blank line or `}`, must match this place alone: one
-    // that matches elsewhere too could still match after the file shifted.
+    // An insertion replaces nothing, so a stale or miscounted number that lands on
+    // another blank line misplaces its text but removes none: after a blank line,
+    // a short guard is taken where the stated lines hold it.
+    if let Guard::Above { line } = guard
+        && base.text[lines.body(line)].trim().is_empty()
+    {
+        return Placed::Stated;
+    }
+    // Any other short guard, such as a blank line or `}`, must match this place
+    // alone: one that matches elsewhere too could still match after the file shifted.
     let places: Vec<usize> = match guard {
         Guard::Prefix { first, last } => {
             let count = lines.count();

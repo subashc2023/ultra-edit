@@ -116,14 +116,16 @@ ending before it, so the file still lacks one. Inserted lines get the file's
 line ending the same way.
 
 `expect` on `lines` and `after` is compared line by line, ignoring line endings.
-For `after`, it gives the lines ending at `after`, so after a blank line it
-names the line above too, `["return ok",""]`, or anchor on that line and put
-the blank line in `new`. For `lines`, a string gives
+For `after`, it gives the lines ending at `after`. After a blank line, the
+blank line alone is taken but matches every blank line, so to catch a stale
+number, name the line above too, `["return ok",""]`, or anchor on that line and
+put the blank line in `new`. For `lines`, a string gives
 the first lines of the range, and `[first, last]` gives its first and last
 lines (each may hold several lines). It is required unless the base disclosed
 every addressed line (a `path` file discloses none), and then must reach the
 range's last line, by giving every line or the `[first, last]` pair, and must
-have 8 or more visible characters or match nowhere else in the file
+have 8 or more visible characters or match nowhere else in the file, unless it
+guards an insertion after a blank line
 (`LINE_GUARD_REQUIRED`, `LINE_GUARD_WEAK`), so a line added or removed inside
 the range since your Read is caught. Repeated lines such as `port = 8080` are
 what line numbers tell apart, so a long guard may repeat. Lines between the

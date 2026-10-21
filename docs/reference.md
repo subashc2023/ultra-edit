@@ -299,6 +299,10 @@ make the guard strong, never their text, since the number may be the stale
 part): a short guard such as a `}` or blank line
 that also matches elsewhere could still match after the file shifts, while a
 short one that matches once cannot without also matching the moved lines.
+`after` a blank line is the exception: a short guard there is taken where the
+stated lines hold it, since an insertion replaces nothing, so a number that went
+stale or was miscounted and lands on another blank line misplaces the text but
+removes none.
 Repeated long lines, such as `port = 8080` in many service blocks, are what line
 numbers tell apart, so they are accepted. For a range that ends at the file's
 last line, the ranges one line longer and shorter are checked too, since Read's
@@ -325,9 +329,10 @@ near misses as below. `after` with empty
 text inserts one empty line: the line ending any text there would get. In an
 empty file, where text is written as given, and after a last line that lacks a
 terminator, where it would only add one, empty text is `EMPTY_INSERTION`. For
-`after` a blank line, an `expect` of it alone matches every blank line; give
-the line above too, as `["return ok",""]`, or anchor `after` on that line and
-start the text with the blank line. `after` keeps line `after`, so text that starts by
+`after` a blank line, an `expect` of it alone is taken but matches every blank
+line; giving the line above too, as `["return ok",""]`, or anchoring `after` on
+that line and starting the text with the blank line, catches a number that went
+stale. `after` keeps line `after`, so text that starts by
 restating it is `INSERT_REPEATS_LINE`: its leading lines equal the lines ending
 at `after`, compared without trailing whitespace, as when `expect` or the lines
 to replace were copied into `new`, with at least 8 non-whitespace characters in

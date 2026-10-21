@@ -5,6 +5,33 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ## [Unreleased]
 
+### Changed
+
+- A short `expect` on `after` a blank line, such as `""`, is taken where the
+  stated lines hold it, though it matches every blank line in the file: an
+  insertion replaces nothing, so a number that went stale or was miscounted and
+  lands on another blank line misplaces the text but removes none. It was
+  `LINE_GUARD_WEAK`, as a short guard that also matches elsewhere still is on
+  `after` a text line, such as `}`, and on a `lines` range, where a shifted
+  number would replace other lines; a range from a blank line to a short last
+  line at the end of a file matches again after a one-line shift, and tests
+  keep it refused. The plugin card still asks for a text anchor. In the eight
+  full Windows eval rounds before this change, Ultra Edit calls in 23 of the
+  552 runs sent 30 short guards that were refused: 23 on `after` a blank line,
+  4 on ranges blank at both ends, each one blank line too long, and 3 on ranges
+  of that end-of-file shape, two of which would have been right. Replayed
+  through 0.6.0 and this build, the logged calls of all 552 runs had the same
+  outcomes on both, apart from 2 calls both refuse that lose their
+  `LINE_GUARD_WEAK` codes, until, in 15 runs, a call 0.6.0 refuses only as
+  `LINE_GUARD_WEAK` commits. In 13 of them the commit leaves every file it
+  names as the task expects, and 10 of those runs had no other failed call, so
+  they would have been right on the first try, 515 of the 552 against native's
+  506. In the other two, `new` was wrong, one ending without the blank line it
+  meant and one empty where a function belonged; each commit carries
+  `FINAL_LINE_BREAK_KEPT` or `BLANK_LINES_JOINED` naming the lines, and each of
+  the 13 logged commits with one of those warnings in those rounds was followed
+  by another edit of the warned file, in a run that ended correct.
+
 ## [0.6.0] - 2026-10-21
 
 ### Added

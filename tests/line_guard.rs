@@ -81,18 +81,25 @@ fn an_array_expect_keeps_an_empty_last_line() {
     assert_eq!(rejected(&full, change).code, "EXPECTED_TEXT_MISMATCH");
 }
 
-/// The card's guard for an insertion after a blank line, which alone is weak where
-/// blank lines repeat: the line above joined to it, as an array ending in the blank.
+/// An insertion replaces nothing, so after a blank line a blank `expect` guards it
+/// even where blank lines repeat, as the card's guard, the line above joined to
+/// it, does. The blank line must still be at the stated line, and a short guard
+/// on a range's blank ends is still weak.
 #[test]
-fn an_insertion_after_a_blank_line_is_guarded_by_the_line_above() {
+fn an_insertion_after_a_blank_line_takes_a_blank_guard() {
     let base = spanless("def a():\n    return ok\n\n\ndef b():\n    pass\n");
-    let alone = parsed(json!({"id":"c","after":3,"expect":"","new":"x"}));
-    assert_eq!(rejected(&base, alone).code, "LINE_GUARD_WEAK");
-    let joined = parsed(json!({"id":"c","after":3,"expect":["    return ok",""],"new":"x"}));
-    assert_eq!(
-        outcome(&base, joined).unwrap(),
-        "def a():\n    return ok\n\nx\n\ndef b():\n    pass\n"
-    );
+    for expect in [json!(""), json!(["    return ok", ""])] {
+        let change = parsed(json!({"id":"c","after":3,"expect":expect,"new":"x"}));
+        assert_eq!(
+            outcome(&base, change).unwrap(),
+            "def a():\n    return ok\n\nx\n\ndef b():\n    pass\n"
+        );
+    }
+    let text_line = parsed(json!({"id":"c","after":2,"expect":"","new":"x"}));
+    assert_eq!(rejected(&base, text_line).code, "EXPECTED_TEXT_MISMATCH");
+    let blocks = spanless("a = 1\n\nb = 2\n\nc = 3\n\nd = 4\n");
+    let range = parsed(json!({"id":"c","lines":[2,4],"expect":["",""],"new":""}));
+    assert_eq!(rejected(&blocks, range).code, "LINE_GUARD_WEAK");
 }
 
 /// A guard is strong when it is long, since repeated lines such as `port = 8080`
@@ -1182,15 +1189,16 @@ fn weak_guard_advice_names_the_lines_to_add() {
         "{}",
         error.message
     );
-    // An insertion after a blank line names the lines above to give.
-    let blanks = spanless("first text line\n\nsecond text line\n\n");
-    let error = rejected(&blanks, insert(2, Some(""), "x"));
+    // An insertion after a short line names the lines above to give.
+    let closings = spanless("first text line\n}\nsecond text line\n}\n");
+    let error = rejected(&closings, insert(2, Some("}"), "x"));
     assert!(
         error.message.contains("give lines 1-2 as expect"),
         "{}",
         error.message
     );
     // A one-line range widens toward a neighbour with text.
+    let blanks = spanless("first text line\n\nsecond text line\n\n");
     let error = rejected(&blanks, ends([2, 2], Some(""), None, ""));
     assert!(
         error
@@ -1211,7 +1219,7 @@ fn weak_guard_advice_names_the_lines_to_add() {
     );
     for error in [
         rejected(&fences, ends([6, 8], Some("```"), Some("```"), "x")),
-        rejected(&blanks, insert(2, Some(""), "x")),
+        rejected(&closings, insert(2, Some("}"), "x")),
     ] {
         assert!(error.message.chars().count() <= 240, "{}", error.message);
     }
