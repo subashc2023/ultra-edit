@@ -81,6 +81,20 @@ fn an_array_expect_keeps_an_empty_last_line() {
     assert_eq!(rejected(&full, change).code, "EXPECTED_TEXT_MISMATCH");
 }
 
+/// The card's guard for an insertion after a blank line, which alone is weak where
+/// blank lines repeat: the line above joined to it, as an array ending in the blank.
+#[test]
+fn an_insertion_after_a_blank_line_is_guarded_by_the_line_above() {
+    let base = spanless("def a():\n    return ok\n\n\ndef b():\n    pass\n");
+    let alone = parsed(json!({"id":"c","after":3,"expect":"","new":"x"}));
+    assert_eq!(rejected(&base, alone).code, "LINE_GUARD_WEAK");
+    let joined = parsed(json!({"id":"c","after":3,"expect":["    return ok",""],"new":"x"}));
+    assert_eq!(
+        outcome(&base, joined).unwrap(),
+        "def a():\n    return ok\n\nx\n\ndef b():\n    pass\n"
+    );
+}
+
 /// A guard is strong when it is long, since repeated lines such as `port = 8080`
 /// are what line numbers tell apart, or when it matches one place; a short guard
 /// that matches elsewhere too is weak.

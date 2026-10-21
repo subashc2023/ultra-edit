@@ -102,6 +102,26 @@ fn a_path_edit_commits_and_records_the_bytes_it_read_as_a_stored_base() {
 }
 
 #[test]
+fn empty_text_after_a_path_line_commits_one_empty_line() {
+    let (dir, workspace) = setup(&[("a.py", "import os\ndef main():\n    run()\n")]);
+    let blank = Change {
+        id: String::new(),
+        target: Target::Insert {
+            after: 1,
+            expect: Some("import os".into()),
+        },
+        text: String::new(),
+    };
+    let (done, _) = receipt(
+        workspace
+            .edit(request(vec![at("a.py", vec![blank])]))
+            .unwrap(),
+    );
+    assert_eq!(done.commit, CommitStatus::Committed);
+    assert_eq!(read(&dir, "a.py"), "import os\n\ndef main():\n    run()\n");
+}
+
+#[test]
 fn spellings_of_one_path_derive_one_request_and_replay() {
     let (dir, workspace) = setup(&[("a.txt", "one\n")]);
     let absolute = dir.path().join("a.txt").to_str().unwrap().to_owned();

@@ -1265,17 +1265,7 @@ fn validate_target(change: &Change, path: Option<&str>, diagnostics: &mut Vec<Di
         Target::Every { old, scope, lines } => (Some(old), scope.as_ref(), lines.as_ref()),
         Target::Span { span, .. } => (None, Some(span), None),
         Target::Lines { lines, .. } => (None, None, Some(lines)),
-        Target::Insert { .. } => {
-            if change.text.is_empty() {
-                diagnostics.push(at(
-                    path,
-                    Some(change),
-                    "EMPTY_INSERTION",
-                    "Inserted text must not be empty; to delete lines, use lines with new \"\"",
-                ));
-            }
-            (None, None, None)
-        }
+        Target::Insert { .. } => (None, None, None),
     };
     if old.is_some_and(String::is_empty) {
         diagnostics.push(at(
@@ -1832,9 +1822,28 @@ fn resolve_change<'a>(
                 diagnostics.push(context.out_of_range(change, *after));
                 return;
             }
-            // An empty insertion was reported by `validate_target`.
+            // Empty text is one empty line: the line ending it writes. An empty file
+            // receives text as given, and a last line without an ending would only
+            // gain one, so there the text must say what to write.
             if change.text.is_empty() {
-                return;
+                let reason = if lines.body(1).start == base.text.len() {
+                    Some("The file is empty, so empty text would insert nothing; give the text to insert".to_owned())
+                } else if line > 0 && lines.terminator(&base.text, line).is_empty() {
+                    Some(format!(
+                        "Line {line} ends the file without a line ending, so empty text after it would add only that ending; give the text to insert, or to add the ending, replace line {line} with its text and a line feed"
+                    ))
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    diagnostics.push(at(
+                        Some(&base.path),
+                        Some(change),
+                        "EMPTY_INSERTION",
+                        reason,
+                    ));
+                    return;
+                }
             }
             (Guard::Above { line }, (expect, &None))
         }

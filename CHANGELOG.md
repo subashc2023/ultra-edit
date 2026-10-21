@@ -5,6 +5,25 @@ All notable changes to Ultra Edit are documented here. Releases follow
 
 ## [Unreleased]
 
+### Changed
+
+- `after` with empty `new` inserts one empty line, ended as any text there
+  would be, as `after` already writes `new` followed by that line ending. It was
+  `EMPTY_INSERTION`, which now refuses empty text only in an empty file, where
+  text is written as given, and after a last line without a line ending, where
+  it would only add one. In the last five full Windows eval rounds, all three
+  `EMPTY_INSERTION` rejections of Ultra Edit runs were meant as one empty line.
+  Replayed, the two with a text `expect` now commit and leave the file as the
+  task expects, where each run took four more calls; the third also gave a
+  blank `expect` and is still refused, as `LINE_GUARD_WEAK`.
+- The plugin card shows the guard for an insertion after a blank line: the
+  line above joined to it, as `["return ok",""]`. In those rounds, Ultra Edit
+  runs sent a blank `expect` with `after` ten times, between functions or
+  sections, and every one was refused, eight as `LINE_GUARD_WEAK`; none joined
+  a neighbour, which the card's one example showed only for a range's first
+  line. To stay within 2,048 bytes, the card drops its heading and shortens
+  its replay note.
+
 ## [0.5.0] - 2026-10-20
 
 ### Added
