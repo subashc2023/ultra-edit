@@ -172,6 +172,15 @@ impl McpServer {
         self
     }
 
+    /// Leaves `ultra_edit` behind Claude Code's ToolSearch like the other tools, for a
+    /// host whose session context says when to load it.
+    pub fn with_deferred_edit(mut self) -> Self {
+        if let Some(route) = self.tool_router.map.get_mut("ultra_edit") {
+            route.attr.meta = None;
+        }
+        self
+    }
+
     async fn operate(
         &self,
         recovery: Recovery,
