@@ -165,38 +165,39 @@ native Claude Code.
 
 ### Windows
 
-Seven more rounds ran all 23 tasks on Windows 11 from 2026-10-19 to 21, with
+Eight more rounds ran all 23 tasks on Windows 11 from 2026-10-19 to 21, with
 Sonnet 5.5, 3 times each, comparing Ultra Edit with native Claude Code. The
 first four ran Claude Code 2.1.303 and development builds between 0.4.0 and
-0.5.0; the last three ran builds after 0.5.0, the last two with Claude Code
+0.5.0; the last four ran builds after 0.5.0, the last three with Claude Code
 2.1.306. Costs compare only within a round, since the prompt cache treated the
 rounds differently ([per-round results](docs/performance.md#windows-results)).
 The last round gave:
 
 | | Ultra Edit | Native |
 | --- | --- | --- |
-| Exact final bytes | 69/69 | 69/69 |
-| Right on the first try | 64/69 | 66/69 |
-| Cost | 1.01x (0.98-1.04) | 1.00x |
-| Turns | 0.61x (0.58-0.66) | 1.00x |
-| Tool calls | 0.56x (0.52-0.62) | 1.00x |
-| Context tokens | 0.94x (0.90-0.99) | 1.00x |
-| Output tokens | 0.99x (0.95-1.04) | 1.00x |
+| Exact final bytes | 68/69 | 68/69 |
+| Right on the first try | 59/69 | 63/69 |
+| Cost | 0.99x (0.95-1.03) | 1.00x |
+| Turns | 0.64x (0.59-0.69) | 1.00x |
+| Tool calls | 0.60x (0.54-0.67) | 1.00x |
+| Context tokens | 0.97x (0.91-1.03) | 1.00x |
+| Output tokens | 0.97x (0.92-1.02) | 1.00x |
 
-Over all seven rounds, Ultra Edit was exact in 482 of 483 runs and native in
-477 (p = 0.12), and right on the first try in 446 and 443. Native wrote
-through the shell in 248 of its 483 runs, and none of those ended wrong; all
-six of its wrong results were written with Edit. Ultra Edit's one wrong
-result deleted a function with an `old` that also took one of the two blank
-lines below it, which the server now flags as `BLANK_LINES_DROPPED`. In the
-last round, each of its five first-try misses had a line guard refused as too
-weak, with nothing written: three gave an `after` a blank `expect`, and two a
-range whose `expect` was a blank line and a closing `)`. The call after each
-of those refusals committed. Fewer turns did not lower its cost because its
-runs wrote 0.6k more tokens to the prompt cache, 0.5k of it per-session
-context on the first call; its later calls, whose committed results no longer
-repeat their fields in a report, wrote 0.1k more than native's, against 0.7k
-in the round before.
+Over all eight rounds, Ultra Edit was exact in 550 of 552 runs and native in
+545 (p = 0.18), and right on the first try in 505 and 506. Native wrote
+through the shell in 283 of its 552 runs, and none of those ended wrong; all
+seven of its wrong results were written with Edit. Both of Ultra Edit's wrong
+results wrote text as the model sent it: an `old` that also took one of the
+two blank lines below a deleted function, which the server now flags as
+`BLANK_LINES_DROPPED`, and, in the last round, an insertion whose `new` began
+with a newline, putting a blank line above the new block where the task
+wanted none. In that round, nine of its ten first-try misses had a call
+refused with nothing written, five of them line guards on blank lines, and
+each of those nine runs ended exact. Its build serves the rarely used
+operations through one deferred tool, so each session's first API call
+carried 225 to 230 fewer tokens than in the round before. Its runs still wrote
+0.4k more tokens to the prompt cache than native's, 0.3k of it per-session
+context on the first call, and cost 0.99x native's.
 
 ### Failure rates
 
@@ -248,7 +249,7 @@ and the gap to native with shell writes blocked, 8 wrong in 111, is significant
 
 ### Context and cost
 
-- **Fixed overhead:** about 2.0k tokens on every API call (2.1k in the last
+- **Fixed overhead:** about 2.0k tokens on every API call (1.9k in the last
   Windows round), mostly the `ultra_edit` description, which is the routing
   card, and its schema. Both load up front so an edit needs no `ToolSearch`
   round trip. The prompt cache serves them after the first call, and the
@@ -256,7 +257,7 @@ and the gap to native with shell writes blocked, 8 wrong in 111, is significant
 - **Fewer, larger calls:** on Sonnet's exact-text tasks, Ultra Edit runs took
   0.75x native's turns and 0.72x its tool calls; on Haiku, across all tasks,
   0.54x and 0.49x, with 0.91x the context tokens but 1.16x the output tokens;
-  on Windows, across all tasks, 0.61x and 0.56x at 1.01x the cost.
+  on Windows, across all tasks, 0.64x and 0.60x at 0.99x the cost.
   Each change restates its text: a 29-site CSS rename was 3.1k output tokens as
   one `ultra_edit` call and 0.8k as native's one `perl` regex. In the 1.22x
   intent-level round, the two renames and a function move, after which the

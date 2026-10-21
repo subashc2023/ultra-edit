@@ -34,9 +34,13 @@ All notable changes to Ultra Edit are documented here. Releases follow
   subagent's included: counted with the token-counting API on
   claude-sonnet-5-5 in Claude Code 2.1.306's listing, the ten names took 325
   tokens and the three left take 98, about $0.0006 of the $0.056 an Ultra Edit
-  run cost in the fourteenth Windows round. In the 897 Ultra Edit runs of the
-  21 recorded eval rounds, the eight were called three times, `repair` twice in
-  one run and `commit` once. The plan tool is marked destructive and not
+  run cost in the fourteenth Windows round. In the fifteenth, the first on this
+  build, every Ultra Edit run's first API call carried 225 to 230 fewer tokens
+  than the same task and repetition in the fourteenth, while native's changed
+  by at most 5, and Ultra Edit cost 0.99x (0.95-1.03) native's, against 1.01x
+  (0.98-1.04). In the 897 Ultra Edit runs of the 21 eval rounds before this
+  change, the eight were called three times, `repair` twice in one run and
+  `commit` once. The plan tool is marked destructive and not
   read-only, so one permission rule covers all its actions, and Claude Code's
   plan mode holds back the receipt and diff reads that the read-only
   `ultra_edit_status` and `ultra_edit_diff` could make there. Diagnostics that
