@@ -87,7 +87,9 @@ existing files with Ultra Edit, create new files with Write, and never write
 project files through the shell. Claude Code caches it with the tool list, and
 session-start hooks, including for subagents, resumed sessions, and compacted
 sessions, add a short context that routes edits to it. `/ultra-edit:edit` loads
-optional detail on recovery and span targets.
+optional detail on recovery and span targets. Meant to be used with larger models, 
+but only thoroughly tested on Sonnet and Haiku. though Sonnet is now as good as 
+Opus on most benchmarks.
 
 A typical call puts every related change in one request:
 
@@ -173,15 +175,15 @@ first four ran Claude Code 2.1.303 and development builds between 0.4.0 and
 rounds differently ([per-round results](docs/performance.md#windows-results)).
 The last round gave:
 
-| | Ultra Edit | Native |
-| --- | --- | --- |
-| Exact final bytes | 69/69 | 68/69 |
-| Right on the first try | 64/69 | 62/69 |
-| Cost | 0.97x (0.94-1.02) | 1.00x |
-| Turns | 0.60x (0.56-0.65) | 1.00x |
-| Tool calls | 0.55x (0.51-0.61) | 1.00x |
-| Context tokens | 0.96x (0.91-1.01) | 1.00x |
-| Output tokens | 0.93x (0.89-1.00) | 1.00x |
+| | Ultra Edit | Native | Difference vs native |
+| --- | --- | --- | --- |
+| Exact final bytes | 69/69 | 68/69 | ~=
+| Right on the first try | 64/69 | 62/69 | ~=
+| Cost | 0.97x (0.94-1.02) | 1.00x | -6% to +2% 
+| Turns | 0.60x (0.56-0.65) | 1.00x | -35% to -45%
+| Tool calls | 0.55x (0.51-0.61) | 1.00x | -39% to -49% 
+| Context tokens | 0.96x (0.91-1.01) | 1.00x | -9% to +1%
+| Output tokens | 0.93x (0.89-1.00) | 1.00x | -11 to +-0%
 
 Over all ten rounds, Ultra Edit was exact in 688 of 690 runs and native in
 682 (p = 0.11), and right on the first try in 633 and 630. Native wrote
